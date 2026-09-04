@@ -5,6 +5,19 @@
 
 local ext2 = {}
 
+-- 权限需要当前进程 uid/gid; 不在内核 bundle 里(如 DLUB 引导器)则视为 root(不强制)。
+local process = nil
+pcall(function() process = require("kernel.process") end)
+
+-- 权限强制辅助(及早定义, 供 create/backend 使用)
+local function cred() if not process then return { uid = 0, gid = 0 } end return process.current() end
+local function hasPerm(inode, uid, gid, perm) -- perm: 1=x,2=w,4=r
+    if uid == 0 then return true end
+    local c = (uid == inode.uid) and 6 or ((gid == inode.gid) and 3 or 0)
+    local m = math.floor(inode.perms / (2 ^ c)) % 8
+    return m % (perm * 2) >= perm
+end
+
 -- 读小端
 local function u16(s, off) local a, b = s:byte(off + 1, off + 2); return a + b * 256 end
 local function u32(s, off) local a, b, c, d = s:byte(off + 1, off + 4); return a + b * 256 + c * 65536 + d * 16777216 end
@@ -455,11 +468,14 @@ function ext2.addDirEntry(fs, dirIno, name, childIno, fileType)
     return true
 end
 
-function ext2.create(fs, dirPath, name, mode)
+function ext2.create(fs, dirPath, name, mode, uid, gid)
     local parent = ext2.lookup(fs, dirPath)
     if not parent or parent.type ~= T_DIR then return nil, "parent not a dir" end
     if findDirEntry(fs, parent, name) then return nil, "exists" end
-    local ino = ext2.allocInode(fs, mode, 0, 0)
+    local c = cred()
+    uid = uid or c.uid
+    gid = gid or c.gid
+    local ino = ext2.allocInode(fs, mode, uid, gid)
     if not ino then return nil, "alloc inode failed" end
     local inode = ext2.readInode(fs, ino)
     local now = math.floor(os.epoch("utc") / 1000)
@@ -563,6 +579,25 @@ function ext2.delete(fs, dirPath, name)
     return true
 end
 
+--- 改权限(保留类型位)。
+function ext2.chmod(fs, path, mode)
+    local inode = ext2.lookup(fs, path)
+    if not inode then return nil, "no such file: " .. tostring(path) end
+    inode.mode = inode.type + (mode % 0x1000)
+    ext2.writeInode(fs, inode)
+    return true
+end
+
+--- 改属主(uid/gid)。
+function ext2.chown(fs, path, uid, gid)
+    local inode = ext2.lookup(fs, path)
+    if not inode then return nil, "no such file" end
+    if uid then inode.uid = uid end
+    if gid then inode.gid = gid end
+    ext2.writeInode(fs, inode)
+    return true
+end
+
 -- ---------------------------------------------------------------
 -- VFS 后端(读写)
 -- ---------------------------------------------------------------
@@ -587,6 +622,8 @@ function ext2.backend(fs)
         list = function(rel)
             local inode = ext2.lookup(fs, rel or "/")
             if not inode or inode.type ~= T_DIR then return nil end
+            local c = cred()
+            if not hasPerm(inode, c.uid, c.gid, 4) then return nil, "permission denied" end
             local out = {}
             for _, e in ipairs(ext2.readDir(fs, inode)) do
                 if e.name ~= "." and e.name ~= ".." then out[#out + 1] = e.name end
@@ -603,15 +640,25 @@ function ext2.backend(fs)
         getCapacity = function() return fs.blocks * fs.blockSize end,
         open = function(rel, mode)
             local i = ext2.lookup(fs, rel)
+            local c = cred()
+            local function checkDirWrite(pdir)
+                local parent = ext2.lookup(fs, pdir)
+                if parent and not (hasPerm(parent, c.uid, c.gid, 2) and hasPerm(parent, c.uid, c.gid, 1)) then
+                    return false
+                end
+                return true
+            end
             if mode and mode:find("w") then
                 if not i then
                     local pdir = rel:match("^(.*)/[^/]*$") or "/"
                     local pname = rel:match("([^/]*)$") or rel
+                    if not checkDirWrite(pdir) then return nil, "permission denied (dir)" end
                     local ino, err = ext2.create(fs, pdir, pname, 0x81A4)
                     if not ino then return nil, err end
                     i = ext2.readInode(fs, ino)
                 end
                 if i.type == T_DIR then return nil, "is a directory" end
+                if not hasPerm(i, c.uid, c.gid, 2) then return nil, "permission denied (file)" end
                 ext2.writeFile(fs, i.ino, "")
                 local parts = {}
                 return {
@@ -624,6 +671,7 @@ function ext2.backend(fs)
             end
             if not i then return nil, "no such file" end
             if i.type == T_DIR then return nil, "is a directory" end
+            if not hasPerm(i, c.uid, c.gid, 4) then return nil, "permission denied (read)" end
             local content = ext2.readFile(fs, i)
             return {
                 readAll = function() return content end,
@@ -637,6 +685,11 @@ function ext2.backend(fs)
         makeDir = function(rel)
             local pdir = rel:match("^(.*)/[^/]*$") or "/"
             local pname = rel:match("([^/]*)$") or rel
+            local parent = ext2.lookup(fs, pdir)
+            local c = cred()
+            if parent and not (hasPerm(parent, c.uid, c.gid, 2) and hasPerm(parent, c.uid, c.gid, 1)) then
+                error("permission denied", 2)
+            end
             local ino, err = ext2.create(fs, pdir, pname, 0x41ED)
             if not ino then error(tostring(err), 2) end
             return true
@@ -644,10 +697,17 @@ function ext2.backend(fs)
         delete = function(rel)
             local pdir = rel:match("^(.*)/[^/]*$") or "/"
             local pname = rel:match("([^/]*)$") or rel
+            local parent = ext2.lookup(fs, pdir)
+            local c = cred()
+            if parent and not (hasPerm(parent, c.uid, c.gid, 2) and hasPerm(parent, c.uid, c.gid, 1)) then
+                error("permission denied", 2)
+            end
             local ok, err = ext2.delete(fs, pdir, pname)
             if not ok then error(tostring(err), 2) end
             return true
         end,
+        chmod = function(rel, mode) return ext2.chmod(fs, rel, mode) end,
+        chown = function(rel, uid, gid) return ext2.chown(fs, rel, uid, gid) end,
     }
 end
 

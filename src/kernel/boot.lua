@@ -92,6 +92,11 @@ local function bootExt2(bi)
         { read = function(...) return read(...) end },
         { write = function(s) return write(s) end, writeLine = function(s) return write(s .. "\n") end, flush = function() return true end }
     )
+    -- 用户库(从 EXT2 根 /etc/passwd 读) + 注册 user.* syscalls
+    local user = require("kernel.user")
+    local db = user.init(vfs_api.fs)
+    user.registerSyscalls(db)
+    kprint("users loaded: " .. table.concat(user.list(db), ","))
     launch(EXT2_INIT_SOURCE, "ext2")
 end
 

@@ -36,15 +36,19 @@ end
 --- 构造一个进程的隔离环境。
 ---@param pid integer
 ---@param ppid integer
+---@param uid integer|nil
+---@param gid integer|nil
 ---@return table
-local function buildEnv(pid, ppid)
+local function buildEnv(pid, ppid, uid, gid)
     ---@type table
     local env = setmetatable({
         pid   = pid,
         ppid  = ppid,
+        uid   = uid or 0,
+        gid   = gid or 0,
         print = kprint,
-        spawn = function(src, name)
-            return process.spawn(src, name, pid)
+        spawn = function(src, name, childUid, childGid)
+            return process.spawn(src, name, pid, childUid, childGid)
         end,
     }, { __index = _G })
     vfs_api.installForEnv(env) -- 替换 fs/io 为 VFS
@@ -75,15 +79,22 @@ end
 ---@param src string        源码字符串(非闭包/路径)
 ---@param name string|nil   进程名(调试用)
 ---@param ppid integer|nil  父进程 pid(默认 0)
+---@param uid integer|nil   uid(默认继承父/0)
+---@param gid integer|nil   gid(默认继承父/0)
 ---@return integer|nil pid, table|nil proc, string|nil err
-function process.spawn(src, name, ppid)
+function process.spawn(src, name, ppid, uid, gid)
     ppid = ppid or 0
     if type(src) ~= "string" then
         return nil, nil, "spawn expects a source string, got " .. type(src)
     end
 
+    -- 继承父进程 uid/gid
+    local parent = registry[ppid]
+    uid = uid or (parent and parent.uid) or 0
+    gid = gid or (parent and parent.gid) or 0
+
     local pid = nextPid()
-    local env = buildEnv(pid, ppid)
+    local env = buildEnv(pid, ppid, uid, gid)
 
     local chunk, loadErr = load(src, name or ("proc#" .. pid), "t", env)
     if not chunk then
@@ -95,6 +106,7 @@ function process.spawn(src, name, ppid)
     local proc = {
         pid = pid, ppid = ppid, name = name or ("proc#" .. pid),
         co = co, status = "running", exitCode = nil,
+        uid = uid, gid = gid,
     }
 
     proc.onExit = function(self, status, err)
@@ -120,6 +132,17 @@ end
 ---@return DelinProcess|nil
 function process.info(pid)
     return registry[pid]
+end
+
+--- 当前进程的 {pid, uid, gid}。通过 coroutine.running() 查进程表。
+---@return table
+function process.current()
+    local co = coroutine.running()
+    if not co then return { pid = 0, uid = 0, gid = 0 } end -- 内核/主线程 -> root
+    for pid, p in pairs(registry) do
+        if p.co == co then return { pid = pid, uid = p.uid, gid = p.gid } end
+    end
+    return { pid = 0, uid = 0, gid = 0 }
 end
 
 --- 打印进程树(调试/验证用)。

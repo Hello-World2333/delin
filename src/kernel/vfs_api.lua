@@ -86,6 +86,8 @@ function fsapi.move(a, b) local ba, ra = dispatch(a); local bb, rb = dispatch(b)
 function fsapi.copy(a, b) local ba, ra = dispatch(a); local bb, rb = dispatch(b); return ba.copy(ra, rb) end
 function fsapi.delete(path) local b, r = dispatch(path); return b.delete(r) end
 function fsapi.open(path, mode) local b, r = dispatch(path); return b.open(r, mode) end
+function fsapi.chmod(path, mode) local b, r = dispatch(path); if b.chmod then return b.chmod(r, mode) end return nil, "chmod not supported" end
+function fsapi.chown(path, uid, gid) local b, r = dispatch(path); if b.chown then return b.chown(r, uid, gid) end return nil, "chown not supported" end
 function fsapi.isFile(path)
     local b, r = dispatch(path)
     if b.isFile then return b.isFile(r) end
@@ -158,6 +160,9 @@ end
 function vfsapi.mountDev()
     vfs.mount("/dev", devBackend)
 end
+
+--- 暴露 fs 门面(供内核/模块/cat 使用)。
+vfsapi.fs = fsapi
 
 --- 列出已注册设备名。
 ---@return string[]
