@@ -8,6 +8,7 @@ local scheduler = require("kernel.scheduler")
 local process    = require("kernel.process")
 local vfs        = require("kernel.vfs")
 local vfs_api    = require("kernel.vfs_api")
+local modules    = require("kernel.modules")
 local INIT_SOURCE = require("kernel.init_src") -- 打包器注入的 init 源码字符串
 
 local log = nil
@@ -40,36 +41,25 @@ local function setupVfs()
     end
     vfs_api.mountDev()
 
-    -- 演示设备: null(丢弃写/返回 EOF读) 与 test(读回写入内容)
-    vfs_api.registerDevice("null", {
-        open = function()
-            local buf = ""
-            return {
-                read = function() return nil end,
-                readLine = function() return nil end,
-                readAll = function() return "" end,
-                write = function(s) return #s end,
-                writeLine = function(s) return #s + 1 end,
-                close = function() end,
-            }
-        end,
-    })
-    local testBuf = {}
-    vfs_api.registerDevice("test", {
-        open = function()
-            return {
-                read = function() return table.concat(testBuf) end,
-                write = function(s) testBuf[#testBuf + 1] = s; return #s end,
-                close = function() end,
-            }
-        end,
-    })
-
     -- 终端 stdio(io.write/read 兜底)
     vfs_api.setStdio(
         { read = function(...) return read(...) end },
         { write = function(s) return write(s) end, writeLine = function(s) return write(s .. "\n") end, flush = function() return true end }
     )
+end
+
+--- 在磁盘上找模块目录: /lib/modules/<version>/ (真实 fs 路径)。
+local function findModuleDir()
+    local v = modules.version
+    for _, name in ipairs(peripheral.getNames()) do
+        if disk.hasData(name) then
+            local mp = disk.getMountPath(name)
+            if mp and fs.exists(mp .. "/lib/modules/" .. v .. "/manifest") then
+                return mp .. "/lib/modules/" .. v
+            end
+        end
+    end
+    return nil
 end
 
 local boot = {}
@@ -79,7 +69,7 @@ function boot.boot()
     log = fs.open("/delin.log", "w")
     process.log = kprint
 
-    kprint("Delin OS 0.0.1 boot")
+    kprint("Delin OS " .. modules.version .. " boot")
     kprint("craftos=" .. os.version())
 
     local okVfs, errVfs = pcall(setupVfs)
@@ -87,7 +77,28 @@ function boot.boot()
         kprint("FATAL: setupVfs failed: " .. tostring(errVfs))
         return
     end
-    kprint("vfs ready; devices=" .. table.concat(vfs_api.devices(), ","))
+    kprint("vfs ready")
+
+    -- 模块系统: 初始化 + 按 manifest 装载(fail-fast)
+    modules.log = kprint
+    local mdir = findModuleDir()
+    if mdir then
+        modules.init(mdir)
+        local okM, errM = modules.loadAll()
+        if not okM then
+            kprint("FATAL: module load failed: " .. tostring(errM))
+            return
+        end
+        kprint("modules loaded from " .. mdir)
+    else
+        kprint("no module dir found (modules skipped)")
+    end
+
+    local devNameList = table.concat(vfs_api.devices(), ",")
+    local scNameList = {}
+    for sn in pairs(modules.syscalls()) do scNameList[#scNameList + 1] = sn end
+    kprint("devices=" .. devNameList)
+    kprint("syscalls=" .. table.concat(scNameList, ","))
 
     if not (type(INIT_SOURCE) == "string") then
         kprint("FATAL: init source missing")

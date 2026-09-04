@@ -1,0 +1,66 @@
+--@name demo
+--@version 0.1.0
+--@description A demo module registering a syscall, a /dev device and a /proc fs
+--@deps
+
+return {
+    init = function(kapi)
+        -- syscall: demo.echo
+        kapi.registerSyscall("demo.echo", function(...)
+            local parts = {}
+            for i = 1, select("#", ...) do parts[i] = tostring(select(i, ...)) end
+            return table.concat(parts, " ")
+        end)
+
+        -- device: /dev/demo (回显写入的内容)
+        kapi.registerDevice("demo", {
+            open = function(mode)
+                local out = {}
+                return {
+                    read = function() return table.concat(out) end,
+                    readLine = function() return table.concat(out) end,
+                    readAll = function() return table.concat(out) end,
+                    write = function(s) out[#out + 1] = s; return #s end,
+                    writeLine = function(s) out[#out + 1] = s .. "\n"; return #s + 1 end,
+                    close = function() end,
+                }
+            end,
+        })
+
+        -- fs: /proc (虚拟)
+        kapi.registerFS("/proc", {
+            kind = "virtual",
+            list = function() return { "cpu", "mem" } end,
+            exists = function(rel)
+                local n = rel:gsub("^/+", "")
+                return n == "" or n == "cpu" or n == "mem"
+            end,
+            isDir = function(rel) return rel:gsub("^/+", "") == "" end,
+            attributes = function(rel)
+                local n = rel:gsub("^/+", "")
+                return { size = 0, isDir = (n == ""), isReadOnly = true, name = n }
+            end,
+            getSize = function() return 0 end,
+            getDrive = function() return "proc" end,
+            getFreeSpace = function() return 0 end,
+            getCapacity = function() return 0 end,
+            isReadOnly = function() return true end,
+            open = function(rel)
+                local n = rel:gsub("^/+", "")
+                local content = (n == "cpu") and "cpu: 1 @ 100%" or ((n == "mem") and "mem: 64k" or "")
+                return {
+                    read = function() return content end,
+                    readLine = function() return content end,
+                    readAll = function() return content end,
+                    write = function() end,
+                    writeLine = function() end,
+                    close = function() end,
+                }
+            end,
+            makeDir = function() error("read-only fs", 2) end,
+            move = function() error("read-only fs", 2) end,
+            copy = function() error("read-only fs", 2) end,
+            delete = function() error("read-only fs", 2) end,
+        })
+    end,
+}

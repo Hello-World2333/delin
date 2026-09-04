@@ -7,6 +7,7 @@
 
 local scheduler = require("kernel.scheduler")
 local vfs_api  = require("kernel.vfs_api")
+local modules  = require("kernel.modules")
 
 local process = {}
 
@@ -47,6 +48,7 @@ local function buildEnv(pid, ppid)
         end,
     }, { __index = _G })
     vfs_api.installForEnv(env) -- 替换 fs/io 为 VFS
+    modules.applyToEnv(env)    -- 注入 syscalls 表
     env._G = env -- 子进程的 _G 是自己的环境(隔离)
     return env
 end
