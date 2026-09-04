@@ -12,14 +12,17 @@ local modules    = require("kernel.modules")
 local INIT_SOURCE = require("kernel.init_src") -- 打包器注入的 init 源码字符串
 
 local log = nil
+local bootMs = nil
 
---- 内核受控 print: 时间戳行写到日志 + 终端。
+--- 内核受控 print: 时间戳(自引导起的毫秒)写到日志 + 终端。
 local function kprint(...)
     local parts = {}
     for i = 1, select("#", ...) do
         parts[i] = tostring(select(i, ...))
     end
-    local line = string.format("[%7.3f] %s", os.clock(), table.concat(parts, "\t"))
+    local now = os.epoch("utc")
+    local el = (bootMs and (now - bootMs)) or 0
+    local line = string.format("[%8.3f] %s", el / 1000, table.concat(parts, "\t"))
     -- CC 的 fs 文件句柄方法用点号(非冒号), 否则会写成 tostring(handle)
     if log then log.writeLine(line); log.flush() end
     print(line) -- 也输出到终端(view 可见)
@@ -67,6 +70,7 @@ local boot = {}
 function boot.boot()
     -- 打开日志(电脑自身 FS)
     log = fs.open("/delin.log", "w")
+    bootMs = os.epoch("utc")
     process.log = kprint
 
     kprint("Delin OS " .. modules.version .. " boot")
