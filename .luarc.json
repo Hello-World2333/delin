@@ -1,0 +1,41 @@
+{
+  "workspace.checkThirdParty": false,
+  "runtime.version": "Lua 5.2",
+  "runtime.nonstandardSymbol": [
+    "bit32",
+    "loadfile"
+  ],
+  "diagnostics.globals": [
+    "term",
+    "colors",
+    "keys",
+    "peripheral",
+    "disk",
+    "settings",
+    "os",
+    "fs",
+    "io",
+    "print",
+    "sleep",
+    "write",
+    "parallel",
+    "rednet",
+    "paintutils",
+    "shell",
+    "textutils",
+    "vector",
+    "bit",
+    "http",
+    "gb",
+    "turtle",
+    "commands",
+    "colours",
+    "side",
+    "gps",
+    "help",
+    "multishell",
+    "pocket",
+    "redstone",
+    "window"
+  ]
+}

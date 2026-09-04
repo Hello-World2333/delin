@@ -1,0 +1,5 @@
+# dist output (generated)
+dist/
+
+# Lua compilation intermediate
+*.luac
