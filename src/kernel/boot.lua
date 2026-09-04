@@ -10,6 +10,7 @@ local vfs        = require("kernel.vfs")
 local vfs_api    = require("kernel.vfs_api")
 local modules    = require("kernel.modules")
 local ext2       = require("kernel.ext2")
+local display    = require("kernel.display")
 local INIT_SOURCE = require("kernel.init_src") -- 打包器注入的 init 源码字符串
 local EXT2_INIT_SOURCE = require("kernel.ext2_init_src") -- EXT2 根引导用最小 PID1
 
@@ -81,6 +82,18 @@ local function launch(initSrc, label)
     if log then log.close(); log = nil end
 end
 
+--- 显示设备 syscalls(供进程使用 display 驱动)。
+local function registerDisplaySyscalls()
+    local sc = modules.syscalls()
+    sc["display.list"]  = function() return display.list() end
+    sc["display.size"]  = function(id) local d = display.get(id); if d then return d.getSize() end end
+    sc["display.write"] = function(id, x, y, text, fg, bg)
+        local d = display.get(id); if not d then return nil, "no display" end
+        if d.blit then return d.blit(x, y, text, fg, bg) end; return nil, "unsupported"
+    end
+    sc["display.fill"]  = function(id, color) local d = display.get(id); if d and d.fill then return d.fill(color) end end
+end
+
 --- EXT2 根引导: 挂根分区为 "/", 再跑最小 PID1。
 local function bootExt2(bi)
     kprint("EXT2 boot: root=" .. (bi.rootFstype or "?") .. " " .. (bi.rootPath or "?"))
@@ -97,6 +110,7 @@ local function bootExt2(bi)
     local db = user.init(vfs_api.fs)
     user.registerSyscalls(db)
     kprint("users loaded: " .. table.concat(user.list(db), ","))
+    registerDisplaySyscalls()
     launch(EXT2_INIT_SOURCE, "ext2")
 end
 
@@ -144,6 +158,7 @@ function boot.boot()
     kprint("devices=" .. devNameList)
     kprint("syscalls=" .. table.concat(scNameList, ","))
 
+    registerDisplaySyscalls()
     launch(INIT_SOURCE, "")
 end
 

@@ -36,6 +36,7 @@ local profiles = {
             ["kernel.blockdev"]  = "src/kernel/blockdev.lua",
             ["kernel.ext2"]      = "src/kernel/ext2.lua",
             ["kernel.user"]      = "src/kernel/user.lua",
+            ["kernel.display"]   = "src/kernel/display.lua",
         },
         assets = {
             ["init"]      = "src/init/init.lua",

@@ -1,0 +1,49 @@
+--@name void
+--@version 0.1.0
+--@description Void PowerMod hologram display driver (0-based; base of drawPixel/drawText to-verify).
+--@deps
+
+return {
+    init = function(kapi)
+        local side, hol = nil, nil
+        for _, name in ipairs(peripheral.getNames()) do
+            if peripheral.getType(name) == "hologram" then side = name; break end
+        end
+        if not side then kapi.log("void: no hologram peripheral"); return end
+        hol = peripheral.wrap(side)
+
+        local w, h = 256, 192
+        local okFb, fb = pcall(hol.allocateFrameBuffer, w, h)
+        if not okFb or not fb then
+            kapi.log("void: allocateFrameBuffer failed (" .. tostring(fb) .. ")")
+            return
+        end
+        pcall(hol.activateFrameBuffer, fb)
+        -- 软件变换: 让帧缓冲作为一个"正常"屏幕呈现(朝向/缩放/位置)
+        pcall(hol.setScale, 1)
+        pcall(hol.setRotation, 0, 0, 0)
+        kapi.log("void: hologram fb=" .. tostring(fb) .. " " .. w .. "x" .. h)
+
+        local dev = {
+            id = "void:" .. side,
+            type = "hologram",
+            name = side,
+            device = hol,
+            fb = fb,
+            width = w, height = h,
+            getSize = function() return w, h end,
+            blit = function(x, y, text, fg, bg) pcall(hol.drawText, x, y, text, fg or 0xFFFFFF) end,
+            text = function(x, y, s, fg, bg) pcall(hol.drawText, x, y, s, fg or 0xFFFFFF) end,
+            fill = function(color) pcall(hol.fill, color or 0) end,
+            setPixel = function(x, y, color) pcall(hol.drawPixel, x, y, color or 0) end,
+            rect = function(x, y, w2, h2, color)
+                pcall(hol.drawLine, x, y, x + w2, y, color or 0)
+                pcall(hol.drawLine, x, y + h2, x + w2, y + h2, color or 0)
+            end,
+            flush = function() pcall(hol.sync) end,
+            release = function() pcall(hol.releaseFrameBuffer, fb) end,
+        }
+        kapi.registerDisplay(dev)
+        kapi.log("void: display '" .. dev.id .. "' registered (" .. w .. "x" .. h .. ")")
+    end,
+}

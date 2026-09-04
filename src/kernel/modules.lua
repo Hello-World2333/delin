@@ -7,6 +7,7 @@
 
 local vfs_api = require("kernel.vfs_api")
 local vfs     = require("kernel.vfs")
+local display = require("kernel.display")
 
 local modules = {}
 
@@ -75,6 +76,9 @@ local function makeKapi(name)
         registerSyscall = function(sn, fn) syscalls[sn] = fn end,
         registerDevice  = function(dn, handler) vfs_api.registerDevice(dn, handler) end,
         registerFS      = function(mnt, backend) vfs.mount(mnt, backend) end,
+        registerDisplay = function(dev) return display.register(dev) end,
+        unregisterDisplay = function(id) display.unregister(id) end,
+        displayList     = function() return display.list() end,
     }
 end
 

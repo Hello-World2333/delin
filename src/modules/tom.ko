@@ -1,0 +1,55 @@
+--@name tom
+--@version 0.1.0
+--@description Tom's Peripherals GPU display driver (unified 0-based ScreenDevice).
+--@deps
+
+return {
+    init = function(kapi)
+        -- 探测 tm_gpu 外设
+        local side, gpu = nil, nil
+        for _, name in ipairs(peripheral.getNames()) do
+            if peripheral.getType(name) == "tm_gpu" then side = name; break end
+        end
+        if not side then kapi.log("tom: no tm_gpu peripheral"); return end
+        gpu = peripheral.wrap(side)
+
+        -- 启动顺序(必须): refreshSize -> setSize -> getSize
+        gpu.refreshSize()
+        gpu.setSize(64)
+        local wPx, hPx, wBlk, hBlk, res = gpu.getSize()
+        if not wPx or wPx == 0 then
+            kapi.log("tom: getSize returned 0 (monitor arrangement?), using fallback")
+            wPx, hPx = 192, 128
+        end
+        kapi.log("tom: gpu " .. wPx .. "x" .. hPx .. " px (" .. (wBlk or "?") .. "x" .. (hBlk or "?")
+            .. (res and (" blk, res " .. res) or "") .. ")")
+
+        -- Tom 的 drawText/filledRectangle 是 1-based; 统一层 0-based -> +1。
+        -- line/rectangle/drawPixel 等基准存疑, 这里用 verified 的 filledRectangle 当像素/矩形。
+        local dev = {
+            id = "tom:" .. side,
+            type = "gpu",
+            name = side,
+            device = gpu,
+            width = wPx, height = hPx,
+            getSize = function() return wPx, hPx end,
+            blit = function(x, y, text, fg, bg)
+                gpu.drawText(x + 1, y + 1, text, fg or -1, bg or -1)
+            end,
+            text = function(x, y, s, fg, bg)
+                gpu.drawText(x + 1, y + 1, s, fg or -1, bg or -1)
+            end,
+            fill = function(color) pcall(gpu.fill, color or -1) end,
+            rect = function(x, y, w, h, color)
+                pcall(gpu.filledRectangle, math.max(x + 1, 1), math.max(y + 1, 1), w, h, color)
+            end,
+            setPixel = function(x, y, color)
+                pcall(gpu.filledRectangle, x + 1, y + 1, 1, 1, color)
+            end,
+            flush = function() if gpu.sync then pcall(gpu.sync) end end,
+            release = function() end,
+        }
+        kapi.registerDisplay(dev)
+        kapi.log("tom: display '" .. dev.id .. "' registered (" .. wPx .. "x" .. hPx .. ")")
+    end,
+}
