@@ -9,7 +9,6 @@ local process    = require("kernel.process")
 local vfs        = require("kernel.vfs")
 local vfs_api    = require("kernel.vfs_api")
 local modules    = require("kernel.modules")
-local dlub       = require("kernel.dlub")
 local ext2       = require("kernel.ext2")
 local INIT_SOURCE = require("kernel.init_src") -- 打包器注入的 init 源码字符串
 local EXT2_INIT_SOURCE = require("kernel.ext2_init_src") -- EXT2 根引导用最小 PID1
@@ -69,17 +68,7 @@ local function findModuleDir()
 end
 
 --- 在磁盘上找带 /parts/manifest 的(引导盘)。返回真实 fs 路径。
-local function findManifestDisk()
-    for _, name in ipairs(peripheral.getNames()) do
-        if disk.hasData(name) then
-            local mp = disk.getMountPath(name)
-            if mp and fs.exists(mp .. "/parts/manifest") then
-                return mp
-            end
-        end
-    end
-    return nil
-end
+-- (DLUB 独立文件自己扫描; 内核不再需要)
 
 local function launch(initSrc, label)
     if type(initSrc) ~= "string" then kprint("FATAL: " .. label .. " init source missing"); return end
@@ -110,7 +99,7 @@ local boot = {}
 
 function boot.boot()
     -- 打开日志(电脑自身 FS, 追加以便 DLUB 引导的两段都记录)
-    log = fs.open("/delin.log", "w")
+    log = fs.open("/delin.log", "a")
     bootMs = os.epoch("utc")
     process.log = kprint
 
@@ -122,16 +111,7 @@ function boot.boot()
         return bootExt2(__boot_info)
     end
 
-    -- 2) 磁盘上有 /parts/manifest -> DLUB 引导(读内核镜像并运行)
-    local manifestDisk = findManifestDisk()
-    if manifestDisk then
-        kprint("manifest on " .. manifestDisk .. "; DLUB boot")
-        local okD, errD = dlub.boot(manifestDisk, kprint)
-        if not okD then kprint("FATAL: DLUB: " .. tostring(errD)) end
-        return
-    end
-
-    -- 3) 默认 CC-fs 引导
+    -- 2) 默认 CC-fs 引导
     local okVfs, errVfs = pcall(setupVfs)
     if not okVfs then
         kprint("FATAL: setupVfs failed: " .. tostring(errVfs))
