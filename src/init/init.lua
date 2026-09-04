@@ -27,7 +27,7 @@ print("init: /proc/cpu content=" .. (pf and ("[" .. pf.readAll() .. "]") or "(no
 if pf then pf.close() end
 print("init: /proc list=" .. table.concat(fs.list("/proc"), ","))
 
--- 模块装的 EXT2 只读挂载(phase A)
+-- 模块装的 EXT2 只读挂载(phase A) + 现在写(phase B)
 print("init: /mnt/ext2 list=" .. table.concat(fs.list("/mnt/ext2") or {}, ","))
 local h2 = fs.open("/mnt/ext2/etc/hostname", "r")
 print("init: hostname=[" .. (h2 and h2.readAll() or "(none)") .. "]")
@@ -37,6 +37,18 @@ print("init: hostname attrs mode=" .. (ea and string.format("%o", ea.mode) or "?
     .. " uid=" .. (ea and tostring(ea.uid) or "?")
     .. " gid=" .. (ea and tostring(ea.gid) or "?")
     .. " size=" .. (ea and tostring(ea.size) or "?"))
+
+-- phase B: EXT2 写
+local wf = fs.open("/mnt/ext2/etc/delin-test.txt", "w")
+wf.writeLine("written from Delin EXT2 write (pid " .. pid .. ")")
+wf.close()
+local rf = fs.open("/mnt/ext2/etc/delin-test.txt", "r")
+print("init: delin-test.txt=[" .. (rf and rf.readAll() or "(none)") .. "]")
+if rf then rf.close() end
+print("init: mkdir /mnt/ext2/newdir -> " .. tostring((fs.makeDir("/mnt/ext2/newdir") or true)))
+print("init: delete /mnt/ext2/etc/hostname -> " .. tostring(fs.delete("/mnt/ext2/etc/hostname")))
+print("init: /mnt/ext2/etc list=" .. table.concat(fs.list("/mnt/ext2/etc") or {}, ","))
+print("init: /mnt/ext2 list=" .. table.concat(fs.list("/mnt/ext2") or {}, ","))
 
 -- 子进程经 VFS 读回 + 看 syscalls
 local childSrc = "local fd = fs.open('/hello-vfs.txt','r')\n"
