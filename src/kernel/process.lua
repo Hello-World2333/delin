@@ -6,6 +6,7 @@
      - 父死子并入 init (pid 1)  ]]
 
 local scheduler = require("kernel.scheduler")
+local vfs_api  = require("kernel.vfs_api")
 
 local process = {}
 
@@ -45,6 +46,7 @@ local function buildEnv(pid, ppid)
             return process.spawn(src, name, pid)
         end,
     }, { __index = _G })
+    vfs_api.installForEnv(env) -- 替换 fs/io 为 VFS
     env._G = env -- 子进程的 _G 是自己的环境(隔离)
     return env
 end

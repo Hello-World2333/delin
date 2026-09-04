@@ -20,6 +20,8 @@ local modules = {
     ["kernel.scheduler"] = "src/kernel/scheduler.lua",
     ["kernel.process"]   = "src/kernel/process.lua",
     ["kernel.boot"]      = "src/kernel/boot.lua",
+    ["kernel.vfs"]       = "src/kernel/vfs.lua",
+    ["kernel.vfs_api"]   = "src/kernel/vfs_api.lua",
 }
 -- asset(source 字符串) -> 源文件路径
 local assets = {
