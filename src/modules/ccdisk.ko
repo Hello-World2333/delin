@@ -1,0 +1,18 @@
+--@name ccdisk
+--@version 0.1.0
+--@description CC native filesystem compat. Not auto-mounted on the Delin VFS; exposes mount.ccdisk syscall to mount a CC fs on demand.
+--@deps
+
+local vfs = require("kernel.vfs")
+
+return {
+    init = function(kapi)
+        kapi.log("ccdisk: registered (CC native fs) — not auto-mounted on VFS")
+        -- 按需把某个 CC fs 路径挂到 VFS 挂载点
+        kapi.registerSyscall("mount.ccdisk", function(realPath, mountPath)
+            if not vfs.real then return nil, "vfs missing" end
+            vfs.mount(mountPath, vfs.real(realPath))
+            return true
+        end)
+    end,
+}

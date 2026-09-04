@@ -27,6 +27,17 @@ print("init: /proc/cpu content=" .. (pf and ("[" .. pf.readAll() .. "]") or "(no
 if pf then pf.close() end
 print("init: /proc list=" .. table.concat(fs.list("/proc"), ","))
 
+-- 模块装的 EXT2 只读挂载(phase A)
+print("init: /mnt/ext2 list=" .. table.concat(fs.list("/mnt/ext2") or {}, ","))
+local h2 = fs.open("/mnt/ext2/etc/hostname", "r")
+print("init: hostname=[" .. (h2 and h2.readAll() or "(none)") .. "]")
+if h2 then h2.close() end
+local ea = fs.attributes("/mnt/ext2/etc/hostname")
+print("init: hostname attrs mode=" .. (ea and string.format("%o", ea.mode) or "?")
+    .. " uid=" .. (ea and tostring(ea.uid) or "?")
+    .. " gid=" .. (ea and tostring(ea.gid) or "?")
+    .. " size=" .. (ea and tostring(ea.size) or "?"))
+
 -- 子进程经 VFS 读回 + 看 syscalls
 local childSrc = "local fd = fs.open('/hello-vfs.txt','r')\n"
     .. "print('child: readback=' .. (fd and fd.readAll() or '(none)'))\n"

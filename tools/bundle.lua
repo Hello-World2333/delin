@@ -23,6 +23,8 @@ local modules = {
     ["kernel.vfs"]       = "src/kernel/vfs.lua",
     ["kernel.vfs_api"]   = "src/kernel/vfs_api.lua",
     ["kernel.modules"]   = "src/kernel/modules.lua",
+    ["kernel.blockdev"]  = "src/kernel/blockdev.lua",
+    ["kernel.ext2"]      = "src/kernel/ext2.lua",
 }
 -- asset(source 字符串) -> 源文件路径
 local assets = {

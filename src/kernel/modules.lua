@@ -105,8 +105,8 @@ local function loadModule(name)
         if not ok then return nil, "dep '" .. dep .. "' failed: " .. tostring(err) end
     end
 
-    -- 独立内核态环境
-    local env = setmetatable({}, { __index = _G })
+    -- 独立内核态环境(带 require, 可引入内核模块)
+    local env = setmetatable({ require = require }, { __index = _G })
     local chunk, loadErr = load(src, name, "t", env)
     if not chunk then return nil, "load failed: " .. tostring(loadErr) end
     local okRun, mod = pcall(chunk)
