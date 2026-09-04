@@ -25,10 +25,13 @@ local modules = {
     ["kernel.modules"]   = "src/kernel/modules.lua",
     ["kernel.blockdev"]  = "src/kernel/blockdev.lua",
     ["kernel.ext2"]      = "src/kernel/ext2.lua",
+    ["kernel.manifest"]  = "src/kernel/manifest.lua",
+    ["kernel.dlub"]      = "src/kernel/dlub.lua",
 }
 -- asset(source 字符串) -> 源文件路径
 local assets = {
-    ["init"] = "src/init/init.lua",
+    ["init"]        = "src/init/init.lua",
+    ["ext2_init"]   = "src/init/ext2_init.lua",
 }
 
 -- 选一个 init 源码里不出现的长括号定界符层数。
