@@ -5,13 +5,7 @@
 
 return {
     init = function(kapi, device)
-        -- device = 外设名(由 modules.use(type, device) 传入); 否则自扫兜底
-        if not device then
-            for _, name in ipairs(peripheral.getNames()) do
-                if peripheral.getType(name) == "tm_gpu" then device = name; break end
-            end
-        end
-        if not device then kapi.log("tom: no tm_gpu peripheral"); return end
+        -- device = 外设名(由 modules.use(type, device) 传入)
         local side = device
         local gpu = peripheral.wrap(side)
 

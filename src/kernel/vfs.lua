@@ -51,8 +51,6 @@ function vfs.resolve(path)
     end
     local rel
     if best.root == "/" then
-        rel = (path ~= "/") and (path:gsub("^/", "/")) or ""
-        -- 对于根挂载, rel 保留绝对形式
         rel = path  -- 根挂载时 rel 就是原路径(以"/"开头)
     else
         if path == best.root then

@@ -38,14 +38,14 @@ local function newCtx(dev)
     local ctx
     if dev.mode == "term" then
         -- 原生字符终端: 一个终端单元格 = 屏幕一个字符格
-        ctx = { dev = dev, mode = "term", cols = math.max(1, math.floor(w or 1)), rows = math.max(1, math.floor(h or 1)), cellW = 1, cellH = 1 }
+        ctx = { dev = dev, mode = "term", cols = math.floor(w), rows = math.floor(h), cellW = 1, cellH = 1 }
     else
-        local cw = dev.cellW or 6
-        local ch = dev.cellH or 8
+        local cw = dev.cellW
+        local ch = dev.cellH
         ctx = {
             dev = dev, mode = "pixel",
-            cols = math.max(1, math.floor((w or 1) / cw)),
-            rows = math.max(1, math.floor((h or 1) / ch)),
+            cols = math.floor(w / cw),
+            rows = math.floor(h / ch),
             cellW = cw, cellH = ch,
         }
     end
@@ -128,7 +128,7 @@ local function flushDirty(ctx)
         local col = (idx - 1) % ctx.cols
         local row = math.floor((idx - 1) / ctx.cols)
         if ctx.mode == "term" then
-            pcall(dev.text, col, row, cell.ch, cell.fg, cell.bg)
+            dev.text(col, row, cell.ch, cell.fg, cell.bg)
         else
             -- pixel 型: 字符在自己的字格里水平居中(字体是比例字体, 左对齐会窄字贴边/字距怪异)
             local x = col * ctx.cellW
@@ -137,13 +137,13 @@ local function flushDirty(ctx)
                 local off = math.floor((ctx.cellW - cw) / 2)
                 if off > 0 then x = x + off end
             end
-            pcall(dev.text, x, row * ctx.cellH, cell.ch,
-                PALETTE[cell.fg] or 0xFFFFFF, PALETTE[cell.bg] or 0x000000)
+            dev.text(x, row * ctx.cellH, cell.ch,
+                PALETTE[cell.fg], PALETTE[cell.bg])
         end
     end
     ctx.dirty = {}
     ctx.dirtyList = {}
-    if dev.flush then pcall(dev.flush) end
+    dev.flush()
 end
 
 --- 打开句柄(绑定共享 ctx)。
@@ -170,11 +170,11 @@ local function openHandle(ctx, mode)
             end
             -- 用设备填充整屏背景, 避免逐格重画(慢)
             if ctx.mode == "term" then
-                if ctx.dev.fill then pcall(ctx.dev.fill, ctx.bg) end
+                ctx.dev.fill(ctx.bg)
             else
-                if ctx.dev.fill then pcall(ctx.dev.fill, PALETTE[ctx.bg] or 0x000000) end
+                ctx.dev.fill(PALETTE[ctx.bg])
             end
-            if ctx.dev.flush then pcall(ctx.dev.flush) end
+            ctx.dev.flush()
             ctx.cursorX, ctx.cursorY = 0, 0
             ctx.dirty = {}
             ctx.dirtyList = {}
@@ -186,8 +186,8 @@ local function openHandle(ctx, mode)
             ctx.cursorY = math.max(0, math.min(ctx.rows - 1, math.floor(y or 0)))
             return true
         end,
-        setTextColor = function(self, c) ctx.fg = c or ctx.fg; return true end,
-        setBackgroundColor = function(self, c) ctx.bg = c or ctx.bg; return true end,
+        setTextColor = function(self, c) ctx.fg = c; return true end,
+        setBackgroundColor = function(self, c) ctx.bg = c; return true end,
         getCursor = function() return ctx.cursorX, ctx.cursorY end,
         getSize = function() return ctx.cols, ctx.rows end,
         flush = function() flushDirty(ctx); return true end,
@@ -229,13 +229,13 @@ function tty.resize(name)
     local w, h = dev.getSize()
     local cols, rows
     if dev.mode == "term" then
-        cols = math.max(1, math.floor(w or 1))
-        rows = math.max(1, math.floor(h or 1))
+        cols = math.floor(w)
+        rows = math.floor(h)
     else
-        local cw = dev.cellW or 6
-        local ch = dev.cellH or 8
-        cols = math.max(1, math.floor((w or 1) / cw))
-        rows = math.max(1, math.floor((h or 1) / ch))
+        local cw = dev.cellW
+        local ch = dev.cellH
+        cols = math.floor(w / cw)
+        rows = math.floor(h / ch)
     end
     local oldCols, oldRows = ctx.cols, ctx.rows
     local newGrid = {}

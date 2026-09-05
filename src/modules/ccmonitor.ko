@@ -5,12 +5,6 @@
 
 return {
     init = function(kapi, device)
-        if not device then
-            for _, name in ipairs(peripheral.getNames()) do
-                if peripheral.getType(name) == "monitor" then device = name; break end
-            end
-        end
-        if not device then kapi.log("ccmonitor: no monitor peripheral"); return end
         local side = device
         local mon = peripheral.wrap(side)
         local function hex(c) return string.format("%x", c) end

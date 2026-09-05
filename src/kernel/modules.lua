@@ -59,8 +59,7 @@ local function parseMeta(src)
 end
 
 local function readAll(path)
-    local openFn = modules.fs and modules.fs.open or fs.open
-    local f = openFn(path, "r")
+    local f = modules.fs.open(path, "r")
     if not f then return nil end
     local c = f.readAll()
     f.close()

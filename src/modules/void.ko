@@ -25,12 +25,6 @@ end
 
 return {
     init = function(kapi, device)
-        if not device then
-            for _, name in ipairs(peripheral.getNames()) do
-                if peripheral.getType(name) == "hologram" then device = name; break end
-            end
-        end
-        if not device then kapi.log("void: no hologram peripheral"); return end
         local side = device
         local hol = peripheral.wrap(side)
 

@@ -40,8 +40,8 @@ end
 ---@param dev table ScreenDevice (getSize 返回像素宽高; 有 setPixel/fill/rect/flush)
 local function newCtx(dev)
     local w, h = dev.getSize()
-    w = math.max(1, math.floor(w or 1))
-    h = math.max(1, math.floor(h or 1))
+    w = math.floor(w)
+    h = math.floor(h)
     local n = w * h
     local px = {}
     for i = 1, n do px[i] = DEFAULT_BG end
@@ -66,11 +66,11 @@ local function doFlush(ctx)
         for x = x0, x1 do
             local c = ctx.px[y * ctx.w + x + 1]
             if c ~= DEFAULT_BG then
-                pcall(ctx.dev.setPixel, x, y, c)
+                ctx.dev.setPixel(x, y, c)
             end
         end
     end
-    if ctx.dev.flush then pcall(ctx.dev.flush) end
+    ctx.dev.flush()
     return true
 end
 
@@ -87,7 +87,7 @@ local function openHandle(ctx, mode)
                 local x = ctx.pos % ctx.w
                 local y = math.floor(ctx.pos / ctx.w)
                 if y < ctx.h then
-                    ctx.px[y * ctx.w + x + 1] = bytesToArgb(a or 0, r or 0, g or 0, b or 0)
+                    ctx.px[y * ctx.w + x + 1] = bytesToArgb(a, r, g, b)
                     setDirty(ctx, x, y)
                 end
                 ctx.pos = (ctx.pos + 1) % (ctx.w * ctx.h)
@@ -116,7 +116,6 @@ local function openHandle(ctx, mode)
         end,
         clear = function(self, color)
             if ctx.closed then return nil, "device closed" end
-            color = color or DEFAULT_BG
             for x = 0, ctx.w - 1 do for y = 0, ctx.h - 1 do ctx.px[y * ctx.w + x + 1] = color end end
             ctx.hasDirty = true
             ctx.dirtyX0, ctx.dirtyY0, ctx.dirtyX1, ctx.dirtyY1 = 0, 0, ctx.w - 1, ctx.h - 1
@@ -126,7 +125,7 @@ local function openHandle(ctx, mode)
             if ctx.closed then return nil, "device closed" end
             x, y = math.floor(x or 0), math.floor(y or 0)
             if x < 0 or y < 0 or x >= ctx.w or y >= ctx.h then return nil, "out of range" end
-            ctx.px[y * ctx.w + x + 1] = color or DEFAULT_BG
+            ctx.px[y * ctx.w + x + 1] = color
             setDirty(ctx, x, y)
             return true
         end,
@@ -181,8 +180,8 @@ function fb.resize(name)
     local ctx = devices[name]
     if not ctx then return end
     local w, h = ctx.dev.getSize()
-    w = math.max(1, math.floor(w or 1))
-    h = math.max(1, math.floor(h or 1))
+    w = math.floor(w)
+    h = math.floor(h)
     local oldW, oldH = ctx.w, ctx.h
     local newPx = {}
     for y = 0, h - 1 do
