@@ -11,8 +11,14 @@ local devices = {}
 --- 注册一个设备节点(列在 /dev/<name>)。
 ---@param name string
 ---@param handler table 提供 open(mode)->handle(handle: read(n)/readLine()/write(s)/close())
+---   handler.writable=true 时允许以 "w" 打开(字符设备如 tty/fb); 默认只读。
 function vfsapi.registerDevice(name, handler)
     devices[name] = handler
+end
+
+--- 注销一个设备节点。
+function vfsapi.unregisterDevice(name)
+    devices[name] = nil
 end
 
 local function strip(rel)
@@ -48,7 +54,7 @@ local devBackend = vfs.virtual({
         local name = strip(rel)
         local d = devices[name]
         if not d then return nil, "no such device: " .. name end
-        if mode and mode:find("w") then
+        if not d.writable and mode and mode:find("w") then
             error("device is read-only: " .. name, 2)
         end
         if d.open then return d.open(mode) end

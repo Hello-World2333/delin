@@ -1,0 +1,63 @@
+--@name ccmonitor
+--@version 0.1.0
+--@description CC:Tweaked 原生 monitor 显示器驱动 (term 型: /dev/ttyN, 无 /dev/fbN)。
+--@deps
+
+return {
+    init = function(kapi, device)
+        if not device then
+            for _, name in ipairs(peripheral.getNames()) do
+                if peripheral.getType(name) == "monitor" then device = name; break end
+            end
+        end
+        if not device then kapi.log("ccmonitor: no monitor peripheral"); return end
+        local side = device
+        local mon = peripheral.wrap(side)
+        local function hex(c) return string.format("%x", c) end
+        local mw, mh = mon.getSize()
+
+        local dev = {
+            id = "monitor:" .. side,
+            type = "monitor",
+            mode = "term",         -- 原生字符终端: /dev/ttyN, 无像素层
+            name = side,
+            device = mon,
+            width = mw, height = mh,
+            getSize = function() return mon.getSize() end,
+            -- 0-based -> 1-based; 前/背景为 CC 色码(0-15), 用 blit 十六进制码
+            text = function(x, y, s, fg, bg)
+                mon.setCursorPos(x + 1, y + 1)
+                if fg and bg then
+                    local n = #s
+                    mon.blit(s, string.rep(hex(fg), n), string.rep(hex(bg), n))
+                else
+                    mon.write(s)
+                end
+            end,
+            blit = function(x, y, text, fg, bg)
+                mon.setCursorPos(x + 1, y + 1)
+                local n = #text
+                mon.blit(text, string.rep(hex(fg or 0), n), string.rep(hex(bg or 0), n))
+            end,
+            fill = function(color)
+                mon.setBackgroundColour(color or 0)
+                mon.clear()
+            end,
+            rect = function(x, y, w, h, color)
+                -- 用背景色填充一个矩形区域 (仅 cell 级)
+                local fg = mon.getTextColour and mon.getTextColour()
+                mon.setBackgroundColour(color or 0)
+                for row = y, y + h - 1 do
+                    mon.setCursorPos(x + 1, row + 1)
+                    mon.write("")
+                end
+                if fg then mon.setTextColour(fg) end
+            end,
+            -- term 型无像素层: 不提供 setPixel/fb
+            flush = function() end,
+            release = function() end,
+        }
+        kapi.registerDisplay(dev)
+        kapi.log("ccmonitor: display '" .. dev.id .. "' registered (term)")
+    end,
+}

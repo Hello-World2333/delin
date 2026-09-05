@@ -10,7 +10,8 @@ local vfs        = require("kernel.vfs")
 local vfs_api    = require("kernel.vfs_api")
 local modules    = require("kernel.modules")
 local ext2       = require("kernel.ext2")
-local display    = require("kernel.display")
+local tty        = require("kernel.tty")
+local fb         = require("kernel.fb")
 local INIT_SOURCE = require("kernel.init_src") -- 打包器注入的 init 源码字符串
 local EXT2_INIT_SOURCE = require("kernel.ext2_init_src") -- EXT2 根引导用最小 PID1
 
@@ -82,16 +83,12 @@ local function launch(initSrc, label)
     if log then log.close(); log = nil end
 end
 
---- 显示设备 syscalls(供进程使用 display 驱动)。
+--- 显示设备 syscalls(供进程枚举 /dev/ttyN、/dev/fbN; 写入走设备文件)。
+--- 遵循 Linux: 进程面向 tty/fb 字符设备文件, 不设 display.* 写接口。
 local function registerDisplaySyscalls()
     local sc = modules.syscalls()
-    sc["display.list"]  = function() return display.list() end
-    sc["display.size"]  = function(id) local d = display.get(id); if d then return d.getSize() end end
-    sc["display.write"] = function(id, x, y, text, fg, bg)
-        local d = display.get(id); if not d then return nil, "no display" end
-        if d.blit then return d.blit(x, y, text, fg, bg) end; return nil, "unsupported"
-    end
-    sc["display.fill"]  = function(id, color) local d = display.get(id); if d and d.fill then return d.fill(color) end end
+    sc["tty.list"] = function() return tty.list() end
+    sc["fb.list"]  = function() return fb.list() end
 end
 
 --- 装载内核模块: init(目录) -> loadAll -> loadAliases -> 按外设 autoload 驱动。

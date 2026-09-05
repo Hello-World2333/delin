@@ -32,6 +32,8 @@ return {
         local dev = {
             id = "tom:" .. side,
             type = "gpu",
+            mode = "pixel",        -- 像素帧缓冲: /dev/ttyN + /dev/fbN
+            cellW = 6, cellH = 8,  -- 字格(px), 与 Tom 默认字体一致
             name = side,
             device = gpu,
             width = wPx, height = hPx,

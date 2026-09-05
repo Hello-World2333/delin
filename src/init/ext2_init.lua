@@ -53,5 +53,50 @@ print("alice: done")
 ]]
 spawn(asrc, "alice", 1000, 1000)
 
+sleep(0.2)
+
+-- 显示设备抽象: /dev/ttyN(全类型) + /dev/fbN(pixel 型)。遵循 Linux, 进程面向设备文件。
+print("ext2-init: tty=" .. table.concat((syscalls and syscalls["tty.list"] and syscalls["tty.list"]()) or {}, ",")
+    .. " fb=" .. table.concat((syscalls and syscalls["fb.list"] and syscalls["fb.list"]()) or {}, ","))
+local okDisp, dispErr = pcall(function()
+    local tname = (syscalls and syscalls["tty.list"] and syscalls["tty.list"]()) or {}
+    tname = tname[1]
+    if tname then
+        local t = fs.open("/dev/" .. tname, "w")
+        if t then
+            local w, h = t:getSize()
+            print("ext2-init: /dev/" .. tname .. " size=" .. tostring(w) .. "x" .. tostring(h))
+            t:clear(0x0)
+            t:write("Delin OS display driver test")
+            t:write("\n")
+            t:writeLine("pid " .. pid .. " via " .. tname)
+            t:flush()
+            t:close()
+            print("ext2-init: wrote to /dev/" .. tname)
+        else
+            print("ext2-init: open /dev/" .. tname .. " failed")
+        end
+    end
+    local fbs = (syscalls and syscalls["fb.list"] and syscalls["fb.list"]()) or {}
+    local fname = fbs[1]
+    if fname then
+        local fb = fs.open("/dev/" .. fname, "w")
+        if fb then
+            local w, h = fb:getSize()
+            print("ext2-init: /dev/" .. fname .. " " .. tostring(w) .. "x" .. tostring(h) .. " bpp=" .. tostring(fb:getBpp()))
+            fb:clear(0x000000)
+            fb:setPixel(0, 0, 0xFF0000)
+            fb:setPixel(1, 0, 0x00FF00)
+            fb:setPixel(2, 0, 0x0000FF)
+            fb:flush()
+            fb:close()
+            print("ext2-init: drew pixels to /dev/" .. fname)
+        else
+            print("ext2-init: open /dev/" .. fname .. " failed")
+        end
+    end
+end)
+print("ext2-init: display test ok=" .. tostring(okDisp) .. (okDisp and "" or (" err=" .. tostring(dispErr))))
+
 sleep(0.6)
 print("ext2-init: done pid=" .. pid)
