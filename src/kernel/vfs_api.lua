@@ -135,15 +135,15 @@ end
 function ioapi.write(...)
     local parts = {}
     for i = 1, select("#", ...) do parts[i] = tostring(select(i, ...)) end
-    if stdio and stdio.output then return stdio.output.write(table.concat(parts)) end
+    if stdio and stdio.output then return stdio.output:write(table.concat(parts)) end
     return write(table.concat(parts))
 end
 function ioapi.read(...)
-    if stdio and stdio.input then return stdio.input.read(...) end
+    if stdio and stdio.input then return stdio.input:read(...) end
     return read(...)
 end
-function ioapi.close(file) if file and file.close then return file.close() end end
-function ioapi.flush() if stdio and stdio.output and stdio.output.flush then return stdio.output.flush() end end
+function ioapi.close(file) if file and file.close then return file:close() end end
+function ioapi.flush() if stdio and stdio.output and stdio.output.flush then return stdio.output:flush() end end
 function ioapi.lines(filename, ...)
     if filename then
         local f = fsapi.open(filename, "r")

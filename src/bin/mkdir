@@ -1,0 +1,17 @@
+-- Delin mkdir: 建目录。用法: mkdir <dir>...
+local args = args or {}
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+for _, p in ipairs(args) do
+    if fs.exists(p) then
+        stderr("mkdir: " .. p .. ": File exists\n")
+    else
+        local ok, err = pcall(fs.makeDir, p)
+        if not ok then
+            stderr("mkdir: " .. p .. ": " .. tostring(err) .. "\n")
+        end
+    end
+end

@@ -452,7 +452,9 @@ function ext2.addDirEntry(fs, dirIno, name, childIno, fileType)
                 if slack >= rec then
                     data = setU16(data, off + 4, actual)
                     local newOff = off + actual
-                    local entry = w32(childIno) .. w16(rec) .. string.char(nameLen, fileType) .. name .. string.rep("\0", rec - (8 + nameLen))
+                    -- 新条目必须占满被拆出来的整个 slack 区域(rec_len = slack),
+                    -- 否则会在块内留下无 rec_len 的间隙, readDir 视其为坏目录项。
+                    local entry = w32(childIno) .. w16(slack) .. string.char(nameLen, fileType) .. name .. string.rep("\0", slack - (8 + nameLen))
                     data = data:sub(1, newOff) .. entry .. data:sub(newOff + 1)
                     writeBlockStr(fs, blockNum, data)
                     return true
@@ -679,10 +681,29 @@ function ext2.backend(fs)
             if i.type == T_DIR then return nil, "is a directory" end
             if not hasPerm(i, c.uid, c.gid, 4) then return nil, "permission denied (read)" end
             local content = ext2.readFile(fs, i)
+            local pos = 0 -- 字节读偏移
             return {
-                readAll = function() return content end,
-                read = function(n) return n and content:sub(1, n) or content end,
-                readLine = function() return content end,
+                readAll = function() pos = #content; return content end,
+                read = function(n)
+                    if n == nil then
+                        local r = content:sub(pos + 1); pos = #content; return r
+                    end
+                    local r = content:sub(pos + 1, pos + n)
+                    pos = pos + #r
+                    return r
+                end,
+                readLine = function()
+                    if pos >= #content then return nil end
+                    local nl = content:find("\n", pos + 1, true)
+                    if nl then
+                        local r = content:sub(pos + 1, nl - 1)
+                        pos = nl -- 越过换行
+                        return r
+                    end
+                    local r = content:sub(pos + 1)
+                    pos = #content
+                    return r
+                end,
                 write = function() end, writeLine = function() end,
                 close = function() end, flush = function() return true end,
                 seek = function() return 0 end,

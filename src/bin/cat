@@ -1,0 +1,16 @@
+-- Delin cat: 连接并打印文件。用法: cat <file>...
+local args = args or {}
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+for _, p in ipairs(args) do
+    local f = fs.open(p, "r")
+    if not f then
+        stderr("cat: " .. p .. ": No such file or directory\n")
+        return
+    end
+    io.write(f.readAll())
+    f.close()
+end

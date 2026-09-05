@@ -2,12 +2,17 @@
      内建文本缓冲(字符×前景/背景色) + 光标 + 换行 + 滚动 + 清屏。
      write(s) 在当前光标处绘制并推进; flush() 把脏单元格推到 ScreenDevice。
      term 型设备(CC monitor)按原生单元格绘制; pixel 型设备(Tom/Void)按
-     像素字格(cellW×cellH)绘制, 颜色码(0-15)先换算成 ARGB 再下发。 ]]
+     像素字格(cellW×cellH)绘制, 颜色码(0-15)先换算成 ARGB 再下发。
+
+     键盘输入: 每个 tty 维护前台焦点(focus)。调度器把 CC 的 char/key/paste
+     事件经 tty.feedInput 路由给焦点 tty, 由它做行缓冲 + 回显(经典 canonical
+     行规程); 句柄的 readLine()/read() 阻塞调用进程直到拿到一整行。 ]]
 
 local tty = {}
 
 local nextIndex = 0
 local devices = {} -- "ttyN" -> console ctx
+local focus = nil  -- 前台 tty 名(接收键盘输入)
 
 -- CC 终端 16 色 -> ARGB(0xAARRGGBB)。索引为 blit 十六进制码 0-f。
 local PALETTE = {
@@ -58,6 +63,9 @@ local function newCtx(dev)
     ctx.dirty = {}      -- flat index -> true
     ctx.dirtyList = {}  -- array of flat index
     ctx.closed = false
+    -- 行输入状态(canonical): 正在编辑的行 与 已完成的整行队列
+    ctx.inputBuffer = ""
+    ctx.lineQueue = {}
     return ctx
 end
 
@@ -146,9 +154,95 @@ local function flushDirty(ctx)
     dev.flush()
 end
 
+-- ---------------------------------------------------------------
+-- 行输入行规程(canonical): 调度器把字符喂进来, 这里负责缓冲 + 回显。
+-- ---------------------------------------------------------------
+--- 回显一个字符(推进光标)。
+local function echoChar(ctx, ch)
+    putChar(ctx, ch)
+    flushDirty(ctx)
+end
+
+--- 从行缓冲区删最后一个字符, 屏上回退并擦除一格。
+local function backspaceChar(ctx)
+    if #ctx.inputBuffer > 0 then
+        ctx.inputBuffer = ctx.inputBuffer:sub(1, -2)
+        if ctx.cursorX > 0 then
+            putChar(ctx, "\b")
+            putChar(ctx, " ")
+            putChar(ctx, "\b")
+            flushDirty(ctx)
+        end
+    end
+end
+
+--- 结束当前行: 换行并把已完成的行压入 lineQueue, 重置输入缓冲。
+local function finalizeLine(ctx)
+    putChar(ctx, "\n")
+    flushDirty(ctx)
+    ctx.lineQueue[#ctx.lineQueue + 1] = ctx.inputBuffer
+    ctx.inputBuffer = ""
+end
+
+--- 喂一个字符(可打印 / 换行 / 退格)。
+local function feedChar(ctx, ch)
+    if ch == "\n" or ch == "\r" then
+        finalizeLine(ctx)
+    elseif ch == "\b" then
+        backspaceChar(ctx)
+    else
+        ctx.inputBuffer = ctx.inputBuffer .. ch
+        echoChar(ctx, ch)
+    end
+end
+
+--- 喂一个按键(key 事件)。只处理按下(非按住), 针对 backspace/enter。
+local function feedKey(ctx, keycode, isHeld)
+    if isHeld then return end
+    local name = keys.getName(keycode)
+    if name == "backspace" then
+        backspaceChar(ctx)
+    elseif name == "enter" or name == "return" or name == "keypadenter" or name == "keypad_enter" then
+        finalizeLine(ctx)
+    end
+    -- 其余按键(方向/Delete/Tab...)留给后续; 本版忽略。
+end
+
+--- 调度器把键盘事件路由给前台 tty(canonical 行规程)。
+---@param event table CC 事件表 {name, ...}
+function tty.feedInput(event)
+    local ctx = focus and devices[focus]
+    if not ctx then return end
+    local ev = event[1]
+    if ev == "char" then
+        feedChar(ctx, tostring(event[2] or ""))
+    elseif ev == "key" then
+        feedKey(ctx, event[2], event[3])
+    elseif ev == "paste" then
+        local text = tostring(event[2] or "")
+        for i = 1, #text do feedChar(ctx, text:sub(i, i)) end
+    end
+end
+
+--- 设置前台 tty(接收键盘输入)。"console" 别名 => 第一个已注册 tty。
+function tty.setFocus(name)
+    if name == "console" then
+        focus = nil
+        for n in pairs(devices) do if not focus then focus = n end end
+    elseif devices[name] then
+        focus = name
+    end
+    return focus
+end
+
+function tty.getFocus()
+    return focus
+end
+
 --- 打开句柄(绑定共享 ctx)。
 local function openHandle(ctx, mode)
-    return {
+    local handle = {
+        isTTY = true,
         write = function(self, s)
             if ctx.closed then return nil, "device closed" end
             s = tostring(s or "")
@@ -191,8 +285,31 @@ local function openHandle(ctx, mode)
         getCursor = function() return ctx.cursorX, ctx.cursorY end,
         getSize = function() return ctx.cols, ctx.rows end,
         flush = function() flushDirty(ctx); return true end,
-        close = function() ctx.closed = true; return true end,
+        -- 字符设备: 打开多个句柄共享同一 ctx, close 不真正关闭设备(可重开)。
+        close = function() return true end,
     }
+
+    --- 阻塞读取一整行。调度器把键盘事件喂进 ctx.lineQueue; 这里轮询队列。
+    handle.readLine = function()
+        if ctx.closed then return nil, "device closed" end
+        while true do
+            if #ctx.lineQueue > 0 then
+                local line = table.remove(ctx.lineQueue, 1)
+                ctx.inputBuffer = ""
+                return line
+            end
+            -- 阻塞进程直到有事件; feedInput 已处理缓冲+回显。忽略非键盘事件。
+            os.pullEvent()
+        end
+    end
+
+    --- 通用 read: 默认给一整行。
+    handle.read = function()
+        if ctx.closed then return nil, "device closed" end
+        return handle.readLine()
+    end
+
+    return handle
 end
 
 --- 注册一个 /dev/ttyN 设备。
@@ -203,6 +320,7 @@ function tty.registerDevice(dev)
     nextIndex = nextIndex + 1
     local ctx = newCtx(dev)
     devices[name] = ctx
+    if not focus then focus = name end -- 第一个 tty 成为默认前台
     local handler = {
         writable = true,
         open = function(mode) return openHandle(ctx, mode) end,

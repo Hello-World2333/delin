@@ -12,6 +12,7 @@ local modules    = require("kernel.modules")
 local ext2       = require("kernel.ext2")
 local tty        = require("kernel.tty")
 local fb         = require("kernel.fb")
+local display    = require("kernel.display")
 local sysfs      = require("kernel.sysfs")
 local INIT_SOURCE = require("kernel.init_src") -- 打包器注入的 init 源码字符串
 local EXT2_INIT_SOURCE = require("kernel.ext2_init_src") -- EXT2 根引导用最小 PID1
@@ -49,10 +50,10 @@ local function setupVfs()
     end
     vfs_api.mountDev()
 
-    -- 终端 stdio(io.write/read 兜底)
+    -- 终端 stdio(io.write/read 兜底)。用冒号调用(io.write 经 stdio.output:write)。
     vfs_api.setStdio(
-        { read = function(...) return read(...) end },
-        { write = function(s) return write(s) end, writeLine = function(s) return write(s .. "\n") end, flush = function() return true end }
+        { read = function(self, ...) return read(...) end },
+        { write = function(self, s) return write(s) end, writeLine = function(self, s) return write(s .. "\n") end, flush = function(self) return true end }
     )
 end
 
@@ -90,6 +91,59 @@ local function registerDisplaySyscalls()
     local sc = modules.syscalls()
     sc["tty.list"] = function() return tty.list() end
     sc["fb.list"]  = function() return fb.list() end
+end
+
+--- 运行时 syscalls(给 shell / 工具用): 等待子进程、注入 stdio、前台 tty 控制。
+local function registerRuntimeSyscalls()
+    local sc = modules.syscalls()
+    sc["proc.wait"] = function(pid)
+        -- 阻塞等待一个子进程退出(轮询; 进程自身 yield, 调度器驱动)。
+        while true do
+            local p = process.info(pid)
+            if not p then return -1 end
+            if p.status == "dead" or p.status == "error" then return p.exitCode or 0 end
+            if os.sleep then os.sleep(0.05) end
+        end
+    end
+    sc["proc.info"] = function(pid) return process.info(pid) end
+    sc["stdio.set"] = function(input, output) return vfs_api.setStdio(input, output) end
+    sc["tty.setFocus"] = function(name) return tty.setFocus(name) end
+    sc["tty.console"] = function() return tty.getFocus() end
+end
+
+--- 注册电脑自身 term 作为 /dev/ttyN 控制台(console)。
+local function registerConsole()
+    local function hex(c) return string.format("%x", c) end
+    local cons = {
+        id = "console",
+        type = "console",
+        mode = "term",
+        name = "term",
+        device = term,
+        getSize = function() return term.getSize() end,
+        text = function(x, y, s, fg, bg)
+            term.setCursorPos(x + 1, y + 1)
+            if fg and bg then
+                local n = #s
+                term.blit(s, string.rep(hex(fg), n), string.rep(hex(bg), n))
+            else
+                term.write(s)
+            end
+        end,
+        blit = function(x, y, text, fg, bg)
+            term.setCursorPos(x + 1, y + 1)
+            local n = #text
+            term.blit(text, string.rep(hex(fg or 0), n), string.rep(hex(bg or 0), n))
+        end,
+        fill = function(color)
+            term.setBackgroundColor(color or 0)
+            term.clear()
+        end,
+        flush = function() end,
+        release = function() end,
+    }
+    display.register(cons)
+    kprint("console tty registered -> " .. tty.getFocus())
 end
 
 --- 装载内核模块: init(目录) -> loadAll -> loadAliases -> 按外设 autoload 驱动。
@@ -131,9 +185,10 @@ local function bootExt2(bi)
     if not rfs then kprint("FATAL: root ext2 mount: " .. tostring(ferr)); return end
     vfs.mount("/", ext2.backend(rfs)) -- 根 = ext2 分区
     vfs_api.mountDev()
+    registerConsole() -- 电脑自身 term 控制台(键盘输入焦点)
     vfs_api.setStdio(
-        { read = function(...) return read(...) end },
-        { write = function(s) return write(s) end, writeLine = function(s) return write(s .. "\n") end, flush = function() return true end }
+        { read = function(self, ...) return read(...) end },
+        { write = function(self, s) return write(s) end, writeLine = function(self, s) return write(s .. "\n") end, flush = function(self) return true end }
     )
     -- 用户库(从 EXT2 根 /etc/passwd 读) + 注册 user.* syscalls
     local user = require("kernel.user")
@@ -156,6 +211,7 @@ local function bootExt2(bi)
     end
 
     registerDisplaySyscalls()
+    registerRuntimeSyscalls()
     sysfs.mount() -- /sys/class/display 虚拟配置 fs(display 已注册)
     launch(EXT2_INIT_SOURCE, "ext2")
 end
@@ -183,6 +239,7 @@ function boot.boot()
         return
     end
     kprint("vfs ready")
+    registerConsole() -- 电脑自身 term 控制台(键盘输入焦点)
 
     local mdir = findModuleDir()
     if mdir then
@@ -202,6 +259,7 @@ function boot.boot()
     kprint("syscalls=" .. table.concat(scNameList, ","))
 
     registerDisplaySyscalls()
+    registerRuntimeSyscalls()
     sysfs.mount() -- /sys/class/display 虚拟配置 fs(display 已注册)
     launch(INIT_SOURCE, "")
 end

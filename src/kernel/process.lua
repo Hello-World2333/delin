@@ -38,17 +38,26 @@ end
 ---@param ppid integer
 ---@param uid integer|nil
 ---@param gid integer|nil
+---@param argv table|nil  参数表 { [0]=程序名, [1..]=位置参数 } (可缺省)
 ---@return table
-local function buildEnv(pid, ppid, uid, gid)
+local function buildEnv(pid, ppid, uid, gid, argv)
+    -- argv 约定: [0]=程序名/[1..]=位置参数。args = 只含位置参数(不含 [0]).
+    argv = argv or {}
+    local args = {}
+    for i = 1, #argv do args[i] = argv[i] end
     ---@type table
     local env = setmetatable({
         pid   = pid,
         ppid  = ppid,
         uid   = uid or 0,
         gid   = gid or 0,
+        argv  = argv,
+        args  = args,
+        argc  = #args,
+        arg0  = argv[0] or args[1] or "",
         print = kprint,
-        spawn = function(src, name, childUid, childGid)
-            return process.spawn(src, name, pid, childUid, childGid)
+        spawn = function(src, name, childUid, childGid, childArgv)
+            return process.spawn(src, name, pid, childUid, childGid, childArgv)
         end,
     }, { __index = _G })
     vfs_api.installForEnv(env) -- 替换 fs/io 为 VFS
@@ -81,8 +90,9 @@ end
 ---@param ppid integer|nil  父进程 pid(默认 0)
 ---@param uid integer|nil   uid(默认继承父/0)
 ---@param gid integer|nil   gid(默认继承父/0)
+---@param argv table|nil    参数表 { [0]=程序名, [1..]=位置参数 } (可缺省)
 ---@return integer|nil pid, table|nil proc, string|nil err
-function process.spawn(src, name, ppid, uid, gid)
+function process.spawn(src, name, ppid, uid, gid, argv)
     ppid = ppid or 0
     if type(src) ~= "string" then
         return nil, nil, "spawn expects a source string, got " .. type(src)
@@ -94,7 +104,7 @@ function process.spawn(src, name, ppid, uid, gid)
     gid = gid or (parent and parent.gid) or 0
 
     local pid = nextPid()
-    local env = buildEnv(pid, ppid, uid, gid)
+    local env = buildEnv(pid, ppid, uid, gid, argv)
 
     local chunk, loadErr = load(src, name or ("proc#" .. pid), "t", env)
     if not chunk then
@@ -109,9 +119,11 @@ function process.spawn(src, name, ppid, uid, gid)
         uid = uid, gid = gid,
     }
 
-    proc.onExit = function(self, status, err)
-        self.status = status
-        self.exitCode = (status == "dead") and 0 or nil
+    -- onExit: 更新 registry 里的规范 proc 表(status/exitCode), 不是调度器的临时 proc 对象。
+    -- 否则 process.info(pid) 永远看到 status="running", proc.wait 无法感知子进程退出。
+    proc.onExit = function(_, status, err)
+        proc.status = status
+        proc.exitCode = (status == "dead") and 0 or nil
         reparentOrphans(pid)
     end
 

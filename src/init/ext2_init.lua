@@ -141,3 +141,68 @@ print("ext2-init: sysfs config test ok=" .. tostring(okCfg) .. (okCfg and "" or 
 
 sleep(0.6)
 print("ext2-init: done pid=" .. pid)
+
+-- ═══════════ shell + tty 键盘输入 ═══════════
+local console = syscalls["tty.console"]()
+print("ext2-init: console tty=" .. tostring(console))
+
+-- 1) tty 键盘输入: 模拟按键 -> canonical 行规程(回显+缓冲) -> readLine。
+--    结果经 print 记录到 /delin.log(电脑自身 fs); 不写 ext2 根(避免触发 ext2 写 bug)。
+local ttytest
+do
+    local t = fs.open("/dev/" .. console, "rw")
+    if not t then
+        ttytest = "no-open /dev/" .. tostring(console)
+    else
+        for _, ch in ipairs({ "h", "i" }) do os.queueEvent("char", ch) end
+        os.queueEvent("key", keys.enter, false)
+        sleep(0.05) -- 让调度器处理已入队事件(喂给前台 tty)
+        local line = t:readLine()
+        ttytest = "got=[" .. tostring(line) .. "]"
+    end
+end
+print("ext2-init: tty keyboard test => " .. ttytest)
+
+-- 2) shell 脚本模式: 内存命令行(stdin) -> 内存输出缓冲(stdout)。
+--    验证内建(cd/pwd/echo/exit) + 只读外部工具(ls/cat) + spawn/argv/wait。
+--    用内存 stdio, 不写 ext2 根; 结果经 print 记录到 /delin.log。
+local shHand = fs.open("/bin/sh", "r")
+local shSrc = shHand and shHand.readAll() or nil
+if shHand then shHand.close() end
+if not shSrc then
+    print("ext2-init: /bin/sh not found")
+else
+    local lines = { "pwd", "echo HELLO_SHELL", "ls /", "cat /etc/passwd", "exit" }
+    local li = 0
+    local inH = { readLine = function(self) li = li + 1; return lines[li] end }
+    local outbuf = {}
+    local outH = {
+        write = function(self, s) outbuf[#outbuf + 1] = tostring(s); return #s end,
+        writeLine = function(self, s) outbuf[#outbuf + 1] = tostring(s) .. "\n"; return #s + 1 end,
+    }
+    syscalls["stdio.set"](inH, outH)
+    local spid = spawn(shSrc, "sh", nil, nil, { [0] = "/bin/sh" })
+    print("ext2-init: shell spawn pid=" .. tostring(spid))
+    local code
+    local tries = 0
+    while tries < 30 do
+        local p = syscalls["proc.info"](spid)
+        if not p then code = -1; break end
+        if p.status == "dead" or p.status == "error" then code = p.exitCode or 0; break end
+        sleep(0.1); tries = tries + 1
+    end
+    if code == nil then code = "TIMEOUT" end
+    print("ext2-init: shell exited code=" .. tostring(code))
+    print("ext2-init: shell out=[" .. table.concat(outbuf) .. "]")
+end
+
+-- 3) 交互 shell(产品形态): 控制台 tty 在前台焦点, 交给用户; init 保持存活。
+if shSrc then
+    local t = fs.open("/dev/" .. console, "rw")
+    syscalls["stdio.set"](t, t) -- shell 的 stdin/stdout 指到控制台 tty
+    spawn(shSrc, "sh", nil, nil, { [0] = "/bin/sh" })
+    print("ext2-init: interactive shell on " .. tostring(console))
+end
+
+-- init 永不退出; 否则 spawned 的 shell 会变为孤儿。
+while true do os.sleep(1) end

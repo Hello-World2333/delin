@@ -1,0 +1,17 @@
+-- Delin rm: 删除文件/目录。用法: rm <path>...
+local args = args or {}
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+for _, p in ipairs(args) do
+    if not fs.exists(p) then
+        stderr("rm: " .. p .. ": No such file or directory\n")
+    else
+        local ok, err = pcall(fs.delete, p)
+        if not ok then
+            stderr("rm: " .. p .. ": " .. tostring(err) .. "\n")
+        end
+    end
+end

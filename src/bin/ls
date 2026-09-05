@@ -1,0 +1,28 @@
+-- Delin ls: 列目录。用法: ls [dir]
+-- dir 缺省为 "/"。输出每行一个名字, 目录名带尾随 "/"。写入 io.stdout。
+local args = args or {}
+local path = args[1] or "/"
+path = path:gsub("/+$", "")
+if path == "" then path = "/" end
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+if not fs.exists(path) then
+    stderr("ls: " .. (args[1] or "") .. ": No such file or directory\n")
+    return
+end
+
+if fs.isDir(path) then
+    local names = fs.list(path) or {}
+    table.sort(names)
+    for _, name in ipairs(names) do
+        local full = (path == "/") and ("/" .. name) or (path .. "/" .. name)
+        io.write(name .. (fs.isDir(full) and "/" or "") .. "\n")
+    end
+else
+    -- 单文件
+    io.write(path .. "\n")
+end

@@ -14,6 +14,8 @@
 ---@field error any
 ---@field onExit fun(self:DelinProc, status:string, err:any)|nil
 
+local tty = require("kernel.tty")
+
 local scheduler = {}
 
 ---@type DelinProc[]
@@ -70,6 +72,10 @@ function scheduler.run()
 
         if #procs > 0 then
             event = table.pack(os.pullEventRaw())
+            -- 键盘事件路由给前台 tty(canonical 行规程: 缓冲+回显)。
+            if event[1] == "char" or event[1] == "key" or event[1] == "paste" then
+                tty.feedInput(event)
+            end
         end
     end
 end

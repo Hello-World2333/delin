@@ -1,0 +1,157 @@
+-- Delin sh: 极简 POSIX shell。
+-- 交互模式(stdin 是 tty): 显示提示符, 读命令行, 执行, 循环。
+-- 脚本模式(stdin 是文件): 逐行读 stdin, 执行, 到 EOF 为止。
+-- 内建: cd pwd echo exit help。外部命令: /bin 下的独立工具(当子进程 spawn, 传 argv, wait)。
+-- 输出走 io.stdout(父进程把它指向控制台 tty 或文件), 绝不 print(kprint 走日志+term)。
+
+local stdin  = io.stdin()
+local stdout = io.stdout()
+local interactive = stdin and stdin.isTTY
+
+local cwd = "/"
+local lastExit = 0
+
+local function outln(s)
+    if stdout and stdout.write then stdout:write((s or "") .. "\n") end
+end
+local function errln(s)
+    local e = io.stderr()
+    if e and e.write then e:write((s or "") .. "\n") end
+end
+
+-- 相对路径 -> 绝对(基于 cwd; 不展开 .. )。fail-fast: 不做多余回退。
+local function resolve(p)
+    p = p or ""
+    if p:sub(1, 1) == "/" then
+        if p == "" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    local joined = base .. "/" .. p
+    -- 折叠重复斜杠
+    return (joined:gsub("/+", "/")):gsub("/+$", "")
+end
+
+--- 拆一行为 { cmd, args... }。极简: 按空白切分, 不处理引号/宏/管道/重定向。
+local function tokenize(line)
+    local toks = {}
+    for tok in line:gmatch("%S+") do toks[#toks + 1] = tok end
+    return toks
+end
+
+local builtins = {}
+
+builtins.pwd = function(args)
+    outln(cwd)
+end
+
+builtins.echo = function(args)
+    outln(table.concat(args, " "))
+end
+
+builtins.cd = function(args)
+    local target = resolve(args[1] or "/")
+    if not fs.isDir(target) then
+        errln("cd: " .. (args[1] or "") .. ": No such directory")
+        lastExit = 1
+    else
+        cwd = target
+        lastExit = 0
+    end
+end
+
+builtins.help = function(args)
+    outln("Delin sh v0.0.1")
+    outln("builtins : cd pwd echo exit help")
+    outln("external : /bin/ls /bin/cat /bin/rm /bin/mkdir")
+    outln("usage    : sh [script]  (no script => interactive on stdio)")
+end
+
+builtins.exit = function(args)
+    lastExit = tonumber(args[1]) or 0
+    return "EXIT"
+end
+
+--- 外部命令: 在 /bin 下找, 读源码, spawn 子进程(传 argv), wait 等退出。
+local function runExternal(cmd, args)
+    local path
+    if cmd:sub(1, 1) == "/" then
+        path = cmd
+    else
+        path = "/bin/" .. cmd
+    end
+    local f = fs.open(path, "r")
+    if not f then
+        errln("sh: " .. cmd .. ": command not found")
+        lastExit = 127
+        return
+    end
+    local src = f.readAll()
+    f.close()
+
+    -- 相对路径参数按 cwd 解析成绝对(子进程各自独立的 cwd)。
+    local rfargs = {}
+    for i = 1, #args do
+        local a = args[i]
+        if a:sub(1, 1) == "/" or a:sub(1, 1) == "-" then
+            rfargs[i] = a
+        else
+            rfargs[i] = resolve(a)
+        end
+    end
+
+    local argv = { [0] = path }
+    for i = 1, #rfargs do argv[i] = rfargs[i] end
+
+    local child, cerr = spawn(src, cmd, nil, nil, argv)
+    if not child then
+        errln("sh: " .. cmd .. ": " .. tostring(cerr))
+        lastExit = 126
+        return
+    end
+    local code = syscalls["proc.wait"](child)
+    lastExit = code or 0
+    if lastExit ~= 0 then
+        errln("sh: " .. cmd .. ": exit " .. tostring(lastExit))
+    end
+end
+
+--- 执行一行命令。内建优先; 否则外部。返回 "EXIT" 表示退出 shell。
+local function execLine(line)
+    if not line then return end
+    line = line:match("^%s*(.-)%s*$")
+    if line == "" then return end
+    local toks = tokenize(line)
+    if #toks == 0 then return end
+    local cmd = toks[1]
+    local args = {}
+    for i = 2, #toks do args[#args + 1] = toks[i] end
+    if builtins[cmd] then
+        return builtins[cmd](args)
+    end
+    runExternal(cmd, args)
+end
+
+if interactive then
+    while true do
+        local prompt = "root@delin:" .. (cwd == "/" and "/" or cwd) .. "# "
+        if stdout and stdout.write then stdout:write(prompt) end
+        local line = stdin:readLine()
+        if line == nil then break end -- EOF
+        local r = execLine(line)
+        if r == "EXIT" then break end
+    end
+else
+    -- 脚本模式: 逐行读 stdin 直到 EOF(结果写到 stdout)。整行以 # 开头视为注释。
+    while true do
+        local line = stdin:readLine()
+        if line == nil then break end
+        local trimmed = (line or ""):match("^%s*(.-)%s*$")
+        if trimmed ~= "" and trimmed:sub(1, 1) ~= "#" then
+            local r = execLine(trimmed)
+            if r == "EXIT" then break end
+        end
+    end
+end
+
+return "sh done"
