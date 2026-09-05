@@ -30,6 +30,7 @@ end
 --- 事件循环。直到没有任何存活进程才返回。
 function scheduler.run()
     local event = { n = 0 }
+    local blinkTimer = os.startTimer(0.5) -- 光标闪烁节拍
     while #procs > 0 do
         local i = 1
         while i <= #procs do
@@ -72,6 +73,12 @@ function scheduler.run()
 
         if #procs > 0 then
             event = table.pack(os.pullEventRaw())
+            -- 内核光标闪烁计时器: 翻转光标并继续, 不外发给进程(避免唤醒 os.sleep 等)。
+            if event[1] == "timer" and event[2] == blinkTimer then
+                tty.blinkTick()
+                blinkTimer = os.startTimer(0.5)
+                event = { n = 0 }
+            end
             -- 键盘事件路由给前台 tty(canonical 行规程: 缓冲+回显)。
             -- key/key_up 走 routeKey(跟踪修饰键 + Ctrl+Alt+数字切换前台 tty)。
             if event[1] == "char" or event[1] == "paste" then

@@ -7,6 +7,7 @@ return {
     init = function(kapi, device)
         local side = device
         local mon = peripheral.wrap(side)
+        pcall(mon.setCursorBlink, false) -- 光标由 tty 层自己反显, 关掉 CC 原生闪烁避免双光标
         local function hex(c) return string.format("%x", c) end
         local mw, mh = mon.getSize()
 

@@ -113,6 +113,7 @@ end
 
 --- 注册电脑自身 term 作为 /dev/ttyN 控制台(console)。
 local function registerConsole()
+    pcall(term.setCursorBlink, false) -- 光标由 tty 层自己反显, 关掉 CC 原生闪烁避免双光标
     local function hex(c) return string.format("%x", c) end
     local cons = {
         id = "console",

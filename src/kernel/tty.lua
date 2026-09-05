@@ -67,6 +67,9 @@ local function newCtx(dev)
     ctx.inputBuffer = ""
     ctx.lineQueue = {}
     ctx.echo = true -- 回显开(密码时 login 置 false)
+    -- 光标: cursorOn 当前是否显示(闪烁 tick 翻转); cursorRenderedIdx 已按光标反显渲染的单元格。
+    ctx.cursorOn = true
+    ctx.cursorRenderedIdx = nil
     return ctx
 end
 
@@ -76,6 +79,21 @@ local function markCell(ctx, idx)
         ctx.dirty[idx] = true
         ctx.dirtyList[#ctx.dirtyList + 1] = idx
     end
+end
+
+--- 某单元格(flat index)是否正位于光标之上。
+local function cursorAt(ctx, idx)
+    return (idx - 1) == ctx.cursorY * ctx.cols + ctx.cursorX
+end
+
+--- 光标移动/显隐后更新脏标记: 旧光标格恢复正显, 新光标格反显。
+--- 调用后需 flushDirty 才能真正画到设备。
+local function updateCursor(ctx)
+    local old = ctx.cursorRenderedIdx
+    local new = ctx.cursorOn and (ctx.cursorY * ctx.cols + ctx.cursorX + 1) or nil
+    if old then markCell(ctx, old) end
+    if new then markCell(ctx, new) end
+    ctx.cursorRenderedIdx = new
 end
 
 local function scroll(ctx)
@@ -97,9 +115,11 @@ local function putChar(ctx, ch)
         ctx.cursorX = 0
     elseif ch == "\r" then
         ctx.cursorX = 0
+        updateCursor(ctx)
         return
     elseif ch == "\b" then
         if ctx.cursorX > 0 then ctx.cursorX = ctx.cursorX - 1 end
+        updateCursor(ctx)
         return
     elseif ch == "\t" then
         -- 前进到下一 tab 停靠点(8)
@@ -127,17 +147,20 @@ local function putChar(ctx, ch)
             scroll(ctx)
         end
     end
+    updateCursor(ctx)
 end
 
---- 绘制脏单元格到设备。
+--- 绘制脏单元格到设备。光标所在格以反显(前景/背景互换)渲染, 形成区块光标。
 local function flushDirty(ctx)
     local dev = ctx.dev
     for _, idx in ipairs(ctx.dirtyList) do
         local cell = ctx.grid[idx]
         local col = (idx - 1) % ctx.cols
         local row = math.floor((idx - 1) / ctx.cols)
+        local fg, bg = cell.fg, cell.bg
+        if ctx.cursorOn and cursorAt(ctx, idx) then fg, bg = bg, fg end -- 光标反显
         if ctx.mode == "term" then
-            dev.text(col, row, cell.ch, cell.fg, cell.bg)
+            dev.text(col, row, cell.ch, fg, bg)
         else
             -- pixel 型: 字符在自己的字格里水平居中(字体是比例字体, 左对齐会窄字贴边/字距怪异)
             local x = col * ctx.cellW
@@ -146,8 +169,7 @@ local function flushDirty(ctx)
                 local off = math.floor((ctx.cellW - cw) / 2)
                 if off > 0 then x = x + off end
             end
-            dev.text(x, row * ctx.cellH, cell.ch,
-                PALETTE[cell.fg], PALETTE[cell.bg])
+            dev.text(x, row * ctx.cellH, cell.ch, PALETTE[fg], PALETTE[bg])
         end
     end
     ctx.dirty = {}
@@ -309,12 +331,17 @@ local function openHandle(ctx, mode)
             ctx.cursorX, ctx.cursorY = 0, 0
             ctx.dirty = {}
             ctx.dirtyList = {}
+            ctx.cursorRenderedIdx = nil
+            updateCursor(ctx)
+            flushDirty(ctx) -- 清屏后立即在 (0,0) 显示光标
             return true
         end,
         setCursor = function(self, x, y)
             if ctx.closed then return nil, "device closed" end
             ctx.cursorX = math.max(0, math.min(ctx.cols - 1, math.floor(x or 0)))
             ctx.cursorY = math.max(0, math.min(ctx.rows - 1, math.floor(y or 0)))
+            updateCursor(ctx)
+            flushDirty(ctx) -- 光标跳到新位置
             return true
         end,
         setTextColor = function(self, c) ctx.fg = c; return true end,
@@ -409,9 +436,22 @@ function tty.resize(name)
     -- 全部重画到新分辨率布局
     ctx.dirty = {}
     ctx.dirtyList = {}
+    ctx.cursorRenderedIdx = nil
+    updateCursor(ctx)
     for i = 1, cols * rows do markCell(ctx, i) end
     flushDirty(ctx)
     return true
+end
+
+--- 光标闪烁 tick: 翻转所有 tty 光标显隐并重画(由内核调度器周期驱动)。
+function tty.blinkTick()
+    for _, ctx in pairs(devices) do
+        if not ctx.closed then
+            ctx.cursorOn = not ctx.cursorOn
+            updateCursor(ctx)
+            flushDirty(ctx)
+        end
+    end
 end
 
 return tty
