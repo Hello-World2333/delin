@@ -4,13 +4,15 @@
 --@deps
 
 return {
-    init = function(kapi)
-        local side, hol = nil, nil
-        for _, name in ipairs(peripheral.getNames()) do
-            if peripheral.getType(name) == "hologram" then side = name; break end
+    init = function(kapi, device)
+        if not device then
+            for _, name in ipairs(peripheral.getNames()) do
+                if peripheral.getType(name) == "hologram" then device = name; break end
+            end
         end
-        if not side then kapi.log("void: no hologram peripheral"); return end
-        hol = peripheral.wrap(side)
+        if not device then kapi.log("void: no hologram peripheral"); return end
+        local side = device
+        local hol = peripheral.wrap(side)
 
         local w, h = 256, 192
         local okFb, fb = pcall(hol.allocateFrameBuffer, w, h)

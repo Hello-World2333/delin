@@ -152,6 +152,24 @@ function boot.boot()
         kprint("no module dir found (modules skipped)")
     end
 
+    -- 别名 + 按外设自动加载驱动模块 (modprobe 风格, modules.use)
+    local okA, errA = modules.loadAliases()
+    if okA then
+        for _, name in ipairs(peripheral.getNames()) do
+            local typ = peripheral.getType(name)
+            if typ then
+                local okU, errU = modules.use(typ, name)
+                if not okU and errU and errU:find("no module for alias") then
+                    -- 无别名, 忽略(普通外设)
+                elseif not okU then
+                    kprint("autoload " .. typ .. ": " .. tostring(errU))
+                end
+            end
+        end
+    elseif errA and errA:find("no modules.alias") then
+        kprint("no modules.alias (drivers not auto-loaded)")
+    end
+
     local devNameList = table.concat(vfs_api.devices(), ",")
     local scNameList = {}
     for sn in pairs(modules.syscalls()) do scNameList[#scNameList + 1] = sn end

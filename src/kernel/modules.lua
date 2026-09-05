@@ -94,8 +94,9 @@ end
 
 --- 单个模块装载(递归先装依赖)。
 ---@param name string
+---@param device any|null  传给 init(kapi, device) 的设备(绑定用)
 ---@return boolean, string|nil
-local function loadModule(name)
+local function loadModule(name, device)
     if reg[name] and reg[name].state == "active" then return true end
     if not loadDir then return nil, "module manager not initialized" end
 
@@ -120,7 +121,7 @@ local function loadModule(name)
     local rec = { name = name, meta = meta, mod = mod, deps = meta.deps, ref = 0, state = "loading" }
 
     if mod.init then
-        local okI, errI = pcall(mod.init, makeKapi(name))
+        local okI, errI = pcall(mod.init, makeKapi(name), device)
         if not okI then
             rec.state = "error"; reg[name] = rec
             return nil, "init error: " .. tostring(errI)
@@ -140,6 +141,35 @@ end
 ---@return boolean, string|nil
 function modules.load(name)
     return loadModule(name)
+end
+
+-- 别名表: 设备/外设类型 -> 模块名 (modprobe 风格)
+local aliasTable = {}
+
+--- 读取 /lib/modules/<version>/modules.alias。
+function modules.loadAliases()
+    if not loadDir then return nil, "module manager not initialized" end
+    local src = readAll(loadDir .. "/modules.alias")
+    if not src then return nil, "no modules.alias at " .. loadDir end
+    aliasTable = {}
+    for line in src:gmatch("[^\r\n]+") do
+        line = line:gsub("%s*#.*$", ""):gsub("^%s*", ""):gsub("%s*$", "")
+        if line ~= "" then
+            local alias, mod = line:match("^(%S+)%s+(%S+)$")
+            if alias and mod then aliasTable[alias] = mod end
+        end
+    end
+    return true
+end
+
+--- modprobe 风格: 按别名加载模块, 并把 device 传给 init(kapi, device)。
+---@param alias string  设备/外设类型(如 "tm_gpu")
+---@param device any    要绑定的外设(如 "right")
+---@return boolean, string|nil
+function modules.use(alias, device)
+    local modName = aliasTable[alias]
+    if not modName then return nil, "no module for alias '" .. tostring(alias) .. "' (see modules.alias)" end
+    return loadModule(modName, device)
 end
 
 --- 按 manifest 装载所有模块(顺序 = manifest, 依赖拓扑排序)。fail-fast。

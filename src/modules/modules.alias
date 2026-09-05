@@ -1,0 +1,4 @@
+# Delin module aliases (modprobe 风格): <设备/外设类型> <模块名>
+tm_gpu   tom
+hologram void
+monitor  ccmonitor
