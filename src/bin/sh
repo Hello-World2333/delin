@@ -8,7 +8,16 @@ local stdin  = io.stdin()
 local stdout = io.stdout()
 local interactive = stdin and stdin.isTTY
 
+-- 当前用户(登录后由 login spawn; 依据 uid 查 /etc/passwd) -> 起始目录 + 提示符名。
+local uname = "root"
 local cwd = "/"
+if syscalls and syscalls["user.byUid"] then
+    local u = syscalls["user.byUid"](uid)
+    if u then
+        uname = u.name
+        if u.home and fs.isDir(u.home) then cwd = u.home end
+    end
+end
 local lastExit = 0
 
 local function outln(s)
@@ -134,7 +143,7 @@ end
 
 if interactive then
     while true do
-        local prompt = "root@delin:" .. (cwd == "/" and "/" or cwd) .. "# "
+        local prompt = uname .. "@delin:" .. (cwd == "/" and "/" or cwd) .. "# "
         if stdout and stdout.write then stdout:write(prompt) end
         local line = stdin:readLine()
         if line == nil then break end -- EOF

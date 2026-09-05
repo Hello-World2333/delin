@@ -106,7 +106,7 @@ local function registerRuntimeSyscalls()
         end
     end
     sc["proc.info"] = function(pid) return process.info(pid) end
-    sc["stdio.set"] = function(input, output) return vfs_api.setStdio(input, output) end
+    sc["stdio.set"] = function(input, output) return process.setStdio(input, output) end
     sc["tty.setFocus"] = function(name) return tty.setFocus(name) end
     sc["tty.console"] = function() return tty.getFocus() end
 end

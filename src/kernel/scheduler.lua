@@ -73,8 +73,11 @@ function scheduler.run()
         if #procs > 0 then
             event = table.pack(os.pullEventRaw())
             -- 键盘事件路由给前台 tty(canonical 行规程: 缓冲+回显)。
-            if event[1] == "char" or event[1] == "key" or event[1] == "paste" then
+            -- key/key_up 走 routeKey(跟踪修饰键 + Ctrl+Alt+数字切换前台 tty)。
+            if event[1] == "char" or event[1] == "paste" then
                 tty.feedInput(event)
+            elseif event[1] == "key" or event[1] == "key_up" then
+                tty.routeKey(event)
             end
         end
     end

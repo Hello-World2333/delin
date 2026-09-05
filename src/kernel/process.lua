@@ -106,6 +106,15 @@ function process.spawn(src, name, ppid, uid, gid, argv)
     local pid = nextPid()
     local env = buildEnv(pid, ppid, uid, gid, argv)
 
+    -- 继承父进程 stdio(或 boot 默认终端)。每个进程独立 stdio, 子进程在 spawn 时刻
+    -- 继承父进程当前的 stdin/stdout, 之后各自变化互不影响。
+    local parentProc = registry[ppid]
+    local inherit = (parentProc and parentProc.stdio) or vfs_api.getStdio()
+    if inherit then
+        env.__stdio.input = inherit.input
+        env.__stdio.output = inherit.output
+    end
+
     local chunk, loadErr = load(src, name or ("proc#" .. pid), "t", env)
     if not chunk then
         return nil, nil, "load failed: " .. tostring(loadErr)
@@ -117,6 +126,7 @@ function process.spawn(src, name, ppid, uid, gid, argv)
         pid = pid, ppid = ppid, name = name or ("proc#" .. pid),
         co = co, status = "running", exitCode = nil,
         uid = uid, gid = gid,
+        stdio = env.__stdio,
     }
 
     -- onExit: 更新 registry 里的规范 proc 表(status/exitCode), 不是调度器的临时 proc 对象。
@@ -155,6 +165,19 @@ function process.current()
         if p.co == co then return { pid = pid, uid = p.uid, gid = p.gid } end
     end
     return { pid = 0, uid = 0, gid = 0 }
+end
+
+--- 设置当前进程的 stdio(进程侧 stdin/stdout 重定向)。
+---@param input table|nil
+---@param output table|nil
+---@return boolean
+function process.setStdio(input, output)
+    local cur = process.current()
+    local p = registry[cur.pid]
+    if not p or not p.stdio then return false end
+    p.stdio.input = input
+    p.stdio.output = output
+    return true
 end
 
 --- 打印进程树(调试/验证用)。

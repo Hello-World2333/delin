@@ -196,13 +196,21 @@ else
     print("ext2-init: shell out=[" .. table.concat(outbuf) .. "]")
 end
 
--- 3) 交互 shell(产品形态): 控制台 tty 在前台焦点, 交给用户; init 保持存活。
-if shSrc then
-    local t = fs.open("/dev/" .. console, "rw")
-    syscalls["stdio.set"](t, t) -- shell 的 stdin/stdout 指到控制台 tty
-    spawn(shSrc, "sh", nil, nil, { [0] = "/bin/sh" })
-    print("ext2-init: interactive shell on " .. tostring(console))
+-- 3) 产品形态: 在每个 tty 上 spawn 一个 login 进程(登录到 sh)。init 保持存活。
+--    login 各自绑定自己的 tty(per-process stdio), 经 Ctrl+Alt+数字切换前台焦点共用一把键盘。
+local loginSrc
+do
+    local lf = fs.open("/bin/login", "r")
+    if lf then loginSrc = lf.readAll(); lf.close() end
+end
+if loginSrc then
+    for _, tn in ipairs((syscalls and syscalls["tty.list"] and syscalls["tty.list"]()) or {}) do
+        local lpid = spawn(loginSrc, "login", 0, 0, { [0] = "/bin/login", tn })
+        print("ext2-init: login on " .. tn .. " (pid " .. tostring(lpid) .. ")")
+    end
+else
+    print("ext2-init: /bin/login not found")
 end
 
--- init 永不退出; 否则 spawned 的 shell 会变为孤儿。
+-- init 永不退出; 否则 login 会变为孤儿。
 while true do os.sleep(1) end

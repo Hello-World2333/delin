@@ -19,6 +19,11 @@
   自己用 `fs` 读、把内容当字符串传给 `spawn`。
 - **进程树**：`{ pid, ppid, status, children }`；父死子并入 init。
 - **print 覆盖**：内核自供 `print`（写日志 + 终端），因为 CC 自带 `print` 不走 `io.stdout`。
+- **stdio 按进程隔离**：每个进程有自己的 `stdin/stdout`；spawn 时从父进程继承（或 boot 默认终端），
+  `stdio.set` 只改当前进程。这样多个 tty 的 login 各自绑定自己的 tty，互不覆盖。
+- **getty/login**：开机后 init 在每个 `/dev/ttyN` 上 spawn 一个 `login` 进程；login 提示用户名/密码
+  （密码隐藏回显），验证通过后用该用户的 uid/gid spawn `sh`（同 tty stdio），`sh` 退出后回到 login 循环。
+- **tty 焦点切换**：只有前台 tty 接收键盘。`Ctrl+Alt+1..0` 切换前台 tty，让多个 tty 共用一把键盘。
 
 ### 构建
 
@@ -39,7 +44,11 @@ lua5.1 tools/bundle.lua          # 生成 dist/delin-0.0.1.lua
 src/kernel/scheduler.lua   协程调度器(事件循环)
 src/kernel/process.lua     进程表/pid/spawn(source)/隔离 env
 src/kernel/boot.lua        入口: 日志→spawn PID1(init)→run
-src/init/init.lua          PID 1 程序
+src/kernel/tty.lua         字符终端(/dev/ttyN): 行规程+回显+焦点切换
+src/kernel/user.lua        用户库(/etc/passwd|shadow|group, salt+hash)
+src/init/ext2_init.lua     EXT2 根引导的 PID 1: 在每个 tty spawn login
+src/bin/sh                 交互/脚本 shell
+src/bin/login              getty/login: 登录提示→验证→启动 sh→循环
 tools/bundle.lua           打包 src/ → dist/delin-*.lua
 dist/                      生成物(不提交)
 ```

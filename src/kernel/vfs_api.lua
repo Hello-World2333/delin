@@ -120,9 +120,12 @@ end
 -- ---------------------------------------------------------------
 -- io 门面
 -- ---------------------------------------------------------------
-local ioapi = {}
----@type table|nil 默认输入/输出(终端)
-local stdio
+-- stdio 按进程隔离(每个进程有自己的 stdin/stdout)。进程 spawn 时由 process.lua
+-- 从父进程继承(或从 boot 默认终端)填充 env.__stdio; 该表被本进程 io 闭包捕获。
+-- 这样多个 tty 的 login 各自绑定自己的 tty, 互不覆盖。
+---@type table|nil boot 默认终端(pid 1/无父进程进程的最初 stdio)
+local defaultStdio = nil
+local ioapi = {} -- 共享的纯函数面(open/type/close/lines 与 stdio 无关)
 
 function ioapi.open(path, mode) return fsapi.open(path, mode or "r") end
 function ioapi.type(obj)
@@ -132,18 +135,7 @@ function ioapi.type(obj)
     if type(obj) == "userdata" then return "file" end
     return nil
 end
-function ioapi.write(...)
-    local parts = {}
-    for i = 1, select("#", ...) do parts[i] = tostring(select(i, ...)) end
-    if stdio and stdio.output then return stdio.output:write(table.concat(parts)) end
-    return write(table.concat(parts))
-end
-function ioapi.read(...)
-    if stdio and stdio.input then return stdio.input:read(...) end
-    return read(...)
-end
 function ioapi.close(file) if file and file.close then return file:close() end end
-function ioapi.flush() if stdio and stdio.output and stdio.output.flush then return stdio.output:flush() end end
 function ioapi.lines(filename, ...)
     if filename then
         local f = fsapi.open(filename, "r")
@@ -152,14 +144,46 @@ function ioapi.lines(filename, ...)
     end
     return function() return nil end
 end
-function ioapi.stdout() return stdio and stdio.output end
-function ioapi.stderr() return stdio and stdio.output end
-function ioapi.stdin() return stdio and stdio.input end
 
+--- 按指定 stdio 表构造一个进程专属 io 门面(捕获该表, 读当前进程的 stdin/stdout)。
+---@param stdio table { input=, output= }
+---@return table io
+local function makeIoapi(stdio)
+    return {
+        open = ioapi.open,
+        type = ioapi.type,
+        close = ioapi.close,
+        lines = ioapi.lines,
+        write = function(...)
+            local parts = {}
+            for i = 1, select("#", ...) do parts[i] = tostring(select(i, ...)) end
+            if stdio.output then return stdio.output:write(table.concat(parts)) end
+            return write(table.concat(parts))
+        end,
+        read = function(...)
+            if stdio.input then return stdio.input:read(...) end
+            return read(...)
+        end,
+        flush = function()
+            if stdio.output and stdio.output.flush then return stdio.output:flush() end
+        end,
+        stdout = function() return stdio.output end,
+        stderr = function() return stdio.output end,
+        stdin  = function() return stdio.input end,
+    }
+end
+
+--- 设置 boot 默认终端 stdio(进程未继承父进程时使用)。boot 调用一次。
 --- @param input table 终端输入(有 read)
 --- @param output table 终端输出(有 write/writeLine/flush)
 function vfsapi.setStdio(input, output)
-    stdio = { input = input, output = output }
+    defaultStdio = { input = input, output = output }
+end
+
+--- 取 boot 默认终端 stdio(供 pid 1 初始化)。
+---@return table|nil
+function vfsapi.getStdio()
+    return defaultStdio
 end
 
 --- 挂载 /dev 虚拟文件系统。
@@ -184,7 +208,10 @@ end
 ---@param env table 进程环境
 function vfsapi.installForEnv(env)
     env.fs = fsapi
-    env.io = ioapi
+    -- 每个进程独立的 stdio 表(由 process.spawn 填充); io 闭包捕获它。
+    local stdio = { input = nil, output = nil }
+    env.__stdio = stdio
+    env.io = makeIoapi(stdio)
 end
 
 return vfsapi

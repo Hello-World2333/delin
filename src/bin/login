@@ -1,0 +1,78 @@
+-- Delin login: 提示用户名/密码, 验证后启动用户 shell, 退出后回到登录(循环)。
+--   用法: login <ttyName>   (由 init 在每个 tty 上 spawn, argv[1] 为该 tty 名)
+-- 运行在隔离进程环境(uid/gid/spawn/syscalls/args 由内核注入, 原始 API 直用)。
+-- 进程以 root 启动; 验证成功后以用户 uid/gid spawn sh(同 tty stdio), proc.wait 等退出。
+
+local ttyName = args[1]
+local t = fs.open("/dev/" .. (ttyName or ""), "rw")
+if not t then
+    print("login: cannot open /dev/" .. tostring(ttyName))
+    return
+end
+-- 绑定本进程 stdio 到该 tty(per-process stdio, 不与其他 tty 的 login 互扰)
+syscalls["stdio.set"](t, t)
+local stdin  = io.stdin()
+local stdout = io.stdout()
+
+local function outln(s)
+    if stdout and stdout.write then stdout:write((s or "") .. "\n") end
+end
+
+-- 读 /bin/sh 源码(登录成功后启动用户 shell)
+local function readBin(p)
+    local f = fs.open(p, "r")
+    if not f then return nil end
+    local s = f.readAll(); f.close()
+    return s
+end
+
+local shSrc = readBin("/bin/sh")
+if not shSrc then
+    outln("login: /bin/sh not found")
+    return
+end
+
+if not (syscalls and syscalls["user.verify"]) then
+    outln("login: user.verify syscall not available")
+    return
+end
+
+--- 隐藏回显读取一行(密码)。tty 行规程 setEcho(false) -> 输入不显示, 回车仅换行。
+local function readHidden(prompt)
+    if stdout and stdout.write then stdout:write(prompt) end
+    if stdin.setEcho then stdin:setEcho(false) end
+    local line = stdin:readLine()
+    if stdin.setEcho then stdin:setEcho(true) end
+    return line
+end
+
+local function doLogin()
+    while true do
+        outln("Delin OS login:")
+        if stdout and stdout.write then stdout:write("login: ") end
+        local name = stdin:readLine()
+        if name == nil then return end -- tty 关闭/EOF
+        name = name:gsub("^%s+", ""):gsub("%s+$", "")
+        if name == "" then
+            outln("")
+        else
+            local pw = readHidden("Password: ") or ""
+            if syscalls["user.verify"](name, pw) then
+                local u = syscalls["user.get"](name)
+                outln("Welcome, " .. name .. "!")
+                local child = spawn(shSrc, "sh", u and u.uid or 0, u and u.gid or 0,
+                    { [0] = "/bin/sh" })
+                if not child then
+                    outln("login: failed to start shell for " .. name)
+                else
+                    syscalls["proc.wait"](child)
+                end
+                outln("") -- sh 退出 -> 回到登录
+            else
+                outln("Login incorrect")
+            end
+        end
+    end
+end
+
+doLogin()

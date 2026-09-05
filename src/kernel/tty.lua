@@ -66,6 +66,7 @@ local function newCtx(dev)
     -- 行输入状态(canonical): 正在编辑的行 与 已完成的整行队列
     ctx.inputBuffer = ""
     ctx.lineQueue = {}
+    ctx.echo = true -- 回显开(密码时 login 置 false)
     return ctx
 end
 
@@ -163,11 +164,11 @@ local function echoChar(ctx, ch)
     flushDirty(ctx)
 end
 
---- 从行缓冲区删最后一个字符, 屏上回退并擦除一格。
+--- 从行缓冲区删最后一个字符, 屏上回退并擦除一格(无回显时仅改缓冲)。
 local function backspaceChar(ctx)
     if #ctx.inputBuffer > 0 then
         ctx.inputBuffer = ctx.inputBuffer:sub(1, -2)
-        if ctx.cursorX > 0 then
+        if ctx.echo and ctx.cursorX > 0 then
             putChar(ctx, "\b")
             putChar(ctx, " ")
             putChar(ctx, "\b")
@@ -184,7 +185,7 @@ local function finalizeLine(ctx)
     ctx.inputBuffer = ""
 end
 
---- 喂一个字符(可打印 / 换行 / 退格)。
+--- 喂一个字符(可打印 / 换行 / 退格)。无回显(echo=false)时缓冲但不绘制。
 local function feedChar(ctx, ch)
     if ch == "\n" or ch == "\r" then
         finalizeLine(ctx)
@@ -192,7 +193,7 @@ local function feedChar(ctx, ch)
         backspaceChar(ctx)
     else
         ctx.inputBuffer = ctx.inputBuffer .. ch
-        echoChar(ctx, ch)
+        if ctx.echo then echoChar(ctx, ch) end
     end
 end
 
@@ -208,6 +209,40 @@ local function feedKey(ctx, keycode, isHeld)
     -- 其余按键(方向/Delete/Tab...)留给后续; 本版忽略。
 end
 
+-- 键盘组合: Ctrl+Alt+1..0 切换前台 tty(Linux tty 切换)。修饰键状态经 key_down/key_up 跟踪。
+local ctrlDown, altDown = false, false
+local DIGIT_KEYS = { one = 1, two = 2, three = 3, four = 4, five = 5,
+                     six = 6, seven = 7, eight = 8, nine = 9, zero = 0 }
+local function isCtrl(name) return name == "leftCtrl" or name == "rightCtrl" end
+local function isAlt(name) return name == "leftAlt" or name == "rightAlt" end
+
+--- 调度器路由 key/key_up: 跟踪修饰键, 识别 Ctrl+Alt+数字切换焦点, 其余按键喂前台 tty。
+function tty.routeKey(event)
+    local ev = event[1]
+    local key = event[2]
+    local name = keys.getName(key)
+    if not name then return end
+    if isCtrl(name) then
+        ctrlDown = (ev == "key")
+        return
+    elseif isAlt(name) then
+        altDown = (ev == "key")
+        return
+    end
+    -- 释放的普通键不再处理
+    if ev ~= "key" then return end
+    if ctrlDown and altDown then
+        local n = DIGIT_KEYS[name]
+        if n then
+            local target = "tty" .. tostring(n - 1)
+            if devices[target] then tty.setFocus(target) end
+            return
+        end
+    end
+    local ctx = focus and devices[focus]
+    if ctx then feedKey(ctx, key, event[3] or false) end
+end
+
 --- 调度器把键盘事件路由给前台 tty(canonical 行规程)。
 ---@param event table CC 事件表 {name, ...}
 function tty.feedInput(event)
@@ -215,6 +250,8 @@ function tty.feedInput(event)
     if not ctx then return end
     local ev = event[1]
     if ev == "char" then
+        -- Ctrl+Alt 组合(如 tty 切换)期间抑制字符落屏
+        if ctrlDown and altDown then return end
         feedChar(ctx, tostring(event[2] or ""))
     elseif ev == "key" then
         feedKey(ctx, event[2], event[3])
@@ -282,6 +319,8 @@ local function openHandle(ctx, mode)
         end,
         setTextColor = function(self, c) ctx.fg = c; return true end,
         setBackgroundColor = function(self, c) ctx.bg = c; return true end,
+        -- 回显开关: login 密码输入时置 false(不显示 + 回车仅换行)。
+        setEcho = function(self, enable) ctx.echo = (enable ~= false); return true end,
         getCursor = function() return ctx.cursorX, ctx.cursorY end,
         getSize = function() return ctx.cols, ctx.rows end,
         flush = function() flushDirty(ctx); return true end,
