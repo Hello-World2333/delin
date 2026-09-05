@@ -220,7 +220,7 @@ end
 builtins.help = function(args)
     outln("Delin sh v0.0.1")
     outln("builtins : cd pwd echo exit help jobs fg bg kill")
-    outln("external : ls cat rm mkdir cp mv touch head tail wc grep")
+    outln("external : ls cat rm mkdir cp mv touch head tail wc grep sed")
     outln("usage    : sh [script]  (no script => interactive on stdio)")
 end
 

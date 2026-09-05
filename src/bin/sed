@@ -1,0 +1,655 @@
+-- Delin sed: 流式文本编辑器 (GNU sed 子集)。
+--   用法: sed [OPTION]... {script-only-if-no-other-script} [file...]
+--   无 file 时读 stdin。输出到 stdout。
+--
+--   支持的命令: s y d p q a i c =  ; 行号/ $ / /regex/ 地址与区间, ! 取反。
+--   支持的选项: -n -s -e script -f file -i[suffix]。
+--   正则用 Lua pattern(与 grep 一致): % 是转义符, () 是捕获; 替换里 & = 整串匹配,
+--   \1..\9 = 捕获组, \n/\t 换行/制表, \& \\ 转义。BRE 风格的 \(...\) 与模式内 \1 逆引用不支持。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+local function ioeMsg(err)
+    if err and (err:find("permission") or err:find("denied")) then return "Permission denied" end
+    if err and err:find("directory") then return "Is a directory" end
+    return "No such file or directory"
+end
+
+-- ---------------------------------------------------------------
+-- 命令行解析
+-- ---------------------------------------------------------------
+local quiet, inplace, inSuffix, perFile = false, false, nil, false
+local scripts = {}
+local files = {}
+local seenScriptOpt = false
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if a == "-n" or a == "--quiet" or a == "--silent" then
+        quiet = true
+    elseif a == "-s" or a == "--separate" then
+        perFile = true
+    elseif a == "-e" or a == "--expression" then
+        i = i + 1
+        if not args[i] then stderr("sed: option requires an argument -- e\n"); return end
+        scripts[#scripts + 1] = args[i]
+        seenScriptOpt = true
+    elseif a:match("^%-%-expression=(.*)$") then
+        scripts[#scripts + 1] = a:match("^%-%-expression=(.*)$")
+        seenScriptOpt = true
+    elseif a == "-f" or a == "--file" then
+        i = i + 1
+        if not args[i] then stderr("sed: option requires an argument -- f\n"); return end
+        local sp = resolve(args[i])
+        local fh, ferr = fs.open(sp, "r")
+        if not fh then stderr("sed: can't read " .. sp .. ": " .. ioeMsg(ferr) .. "\n"); return end
+        scripts[#scripts + 1] = fh.readAll()
+        fh.close()
+        seenScriptOpt = true
+    elseif a:match("^%-%-file=(.*)$") then
+        local sp = resolve(a:match("^%-%-file=(.*)$"))
+        local fh, ferr = fs.open(sp, "r")
+        if not fh then stderr("sed: can't read " .. sp .. ": " .. ioeMsg(ferr) .. "\n"); return end
+        scripts[#scripts + 1] = fh.readAll()
+        fh.close()
+        seenScriptOpt = true
+    elseif a == "-i" or a == "--in-place" then
+        inplace = true; inSuffix = nil
+    elseif a:match("^%-%-in%-place=(.*)$") then
+        inplace = true; inSuffix = a:match("^%-%-in%-place=(.*)$")
+    elseif a:match("^%-i(.*)$") and #a > 2 then
+        inplace = true; inSuffix = a:sub(3)
+    elseif a == "--" then
+        i = i + 1
+        while i <= #args do files[#files + 1] = args[i]; i = i + 1 end
+        break
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        stderr("sed: invalid option -- " .. a .. "\n")
+        return
+    else
+        -- 第一个非选项参数是脚本; 若已用 -e/-f, 则都当文件。
+        if not seenScriptOpt and #scripts == 0 and #files == 0 then
+            scripts[#scripts + 1] = a
+            seenScriptOpt = true
+        else
+            files[#files + 1] = a
+        end
+    end
+    i = i + 1
+end
+
+if #scripts == 0 then
+    stderr("sed: no script specified\n")
+    return
+end
+if inplace and #files == 0 then
+    stderr("sed: can't read stdin (in-place needs files)\n")
+    return
+end
+
+-- ---------------------------------------------------------------
+-- 工具: Lua pattern 大小写不敏感转换
+-- ---------------------------------------------------------------
+local function swapcase(c)
+    local u = c:upper()
+    if u ~= c then return u end
+    return c:lower()
+end
+local function makeCI(pat)
+    -- 把模式里的大写/小写字母变成不区分大小写 (ASCII 近似)。
+    -- %转义原样保留; 方括号类追加对侧大小写; 其他元字符(.)(*)(+)(?)(^)($)不动。
+    local out = {}
+    local i = 1
+    local n = #pat
+    while i <= n do
+        local c = pat:sub(i, i)
+        if c == "%" then
+            out[#out + 1] = c .. (pat:sub(i + 1, i + 1) or "")
+            i = i + 2
+        elseif c == "[" then
+            local j = i + 1
+            local body = {}
+            local k = j
+            local neg = ""
+            if pat:sub(k, k) == "^" then neg = "^"; k = k + 1 end
+            while k <= n do
+                local ck = pat:sub(k, k)
+                if ck == "]" then break end
+                body[#body + 1] = ck
+                k = k + 1
+            end
+            -- 追加对侧大小写 (含区间端点; 简单起见把出现过的字母全补上对侧)
+            local extra = {}
+            for _, ch in ipairs(body) do
+                if ch:match("%a") then extra[#extra + 1] = swapcase(ch) end
+            end
+            out[#out + 1] = "[" .. neg .. table.concat(body) .. table.concat(extra) .. "]"
+            i = (pat:sub(k, k) == "]") and (k + 1) or k
+        elseif c:match("%a") then
+            out[#out + 1] = "[" .. c .. swapcase(c) .. "]"
+            i = i + 1
+        else
+            out[#out + 1] = c
+            i = i + 1
+        end
+    end
+    return table.concat(out)
+end
+
+-- sed 替换串 -> Lua gsub 替换串
+local function toLuaRepl(repl)
+    local out = {}
+    local i = 1
+    while i <= #repl do
+        local c = repl:sub(i, i)
+        if c == "\\" then
+            local nx = repl:sub(i + 1, i + 1)
+            if nx:match("%d") then
+                out[#out + 1] = "%" .. nx; i = i + 2
+            elseif nx == "&" then
+                out[#out + 1] = "&"; i = i + 2
+            elseif nx == "\\" then
+                out[#out + 1] = "\\"; i = i + 2
+            elseif nx == "n" then
+                out[#out + 1] = "\n"; i = i + 2
+            elseif nx == "t" then
+                out[#out + 1] = "\t"; i = i + 2
+            else
+                out[#out + 1] = "\\" .. nx; i = i + 2
+            end
+        elseif c == "&" then
+            out[#out + 1] = "%0"; i = i + 1
+        elseif c == "%" then
+            out[#out + 1] = "%%"; i = i + 1
+        else
+            out[#out + 1] = c; i = i + 1
+        end
+    end
+    return table.concat(out)
+end
+local function buildRepl(repl, whole, caps)
+    local out = {}
+    local i = 1
+    while i <= #repl do
+        local c = repl:sub(i, i)
+        if c == "&" then
+            out[#out + 1] = whole; i = i + 1
+        elseif c == "\\" then
+            local nx = repl:sub(i + 1, i + 1)
+            if nx:match("%d") then
+                out[#out + 1] = caps[tonumber(nx)] or ""; i = i + 2
+            elseif nx == "&" then
+                out[#out + 1] = "&"; i = i + 2
+            elseif nx == "\\" then
+                out[#out + 1] = "\\"; i = i + 2
+            elseif nx == "n" then
+                out[#out + 1] = "\n"; i = i + 2
+            elseif nx == "t" then
+                out[#out + 1] = "\t"; i = i + 2
+            else
+                out[#out + 1] = "\\" .. nx; i = i + 2
+            end
+        else
+            out[#out + 1] = c; i = i + 1
+        end
+    end
+    return table.concat(out)
+end
+local function translit(pattern, cmd)
+    local src, dst = cmd.src, cmd.dst
+    local map = {}
+    for j = 1, #src do
+        local k = math.min(j, #dst)
+        map[src:sub(j, j)] = dst:sub(k, k)
+    end
+    local out = {}
+    for j = 1, #pattern do
+        local ch = pattern:sub(j, j)
+        out[#out + 1] = map[ch] or ch
+    end
+    return table.concat(out)
+end
+
+-- ---------------------------------------------------------------
+-- 脚本编译: 把一条脚本字符串编译成命令表
+-- ---------------------------------------------------------------
+local function skipSep(script, i, n)
+    while i <= n do
+        local c = script:sub(i, i)
+        if c == " " or c == "\t" or c == "\n" or c == "\r" or c == ";" then
+            i = i + 1
+        else
+            break
+        end
+    end
+    return i
+end
+local function parseAddr(script, i, n)
+    if i > n then return nil, i end
+    local c = script:sub(i, i)
+    if c == "$" then
+        return { kind = "dollar" }, i + 1
+    elseif c == "/" then
+        local buf = {}
+        local j = i + 1
+        while j <= n do
+            local ch = script:sub(j, j)
+            if ch == "\\" and script:sub(j + 1, j + 1) == "/" then
+                buf[#buf + 1] = "/"; j = j + 2
+            elseif ch == "/" then
+                return { kind = "regex", pat = table.concat(buf) }, j + 1
+            else
+                buf[#buf + 1] = ch; j = j + 1
+            end
+        end
+        return nil, i
+    elseif c:match("%d") then
+        local num = script:match("^%d+", i)
+        return { kind = "num", n = tonumber(num) }, i + #num
+    end
+    return nil, i
+end
+local function readDelimited(script, i, n, delim)
+    local buf = {}
+    while i <= n do
+        local c = script:sub(i, i)
+        if c == "\\" then
+            local nx = script:sub(i + 1, i + 1)
+            if nx == delim then
+                buf[#buf + 1] = delim; i = i + 2
+            else
+                buf[#buf + 1] = "\\"; i = i + 1
+            end
+        elseif c == delim then
+            return table.concat(buf), i + 1
+        else
+            buf[#buf + 1] = c; i = i + 1
+        end
+    end
+    return nil, i
+end
+
+local function parseCmd(script, i)
+    local n = #script
+    i = skipSep(script, i, n)
+    if i > n then return nil, i end
+    local addr
+    local a1, ni = parseAddr(script, i, n)
+    if a1 then
+        i = skipSep(script, ni, n)
+        if script:sub(i, i) == "," then
+            local a2, ni2 = parseAddr(script, skipSep(script, i + 1, n), n)
+            if not a2 then return nil, i end
+            addr = { kind = "range", start = a1, stop = a2 }
+            i = skipSep(script, ni2, n)
+        else
+            addr = a1
+        end
+    end
+    if addr and addr.kind == "num" and addr.n == 0 then
+        return nil, i -- 0 只允许作范围起点
+    end
+    local neg = false
+    if script:sub(i, i) == "!" then
+        neg = true; i = i + 1
+    end
+    i = skipSep(script, i, n)
+    local c = script:sub(i, i)
+    if c == "" then return nil, i end
+    i = i + 1
+    local cmd = { addr = addr, neg = neg, type = c, inRange = false, atStart = false, atEnd = false }
+    if c == "s" then
+        local d = script:sub(i, i)
+        if d == "" or d == ";" or d == "\n" then return nil, i end
+        i = i + 1
+        local pat, ni = readDelimited(script, i, n, d)
+        if not pat then return nil, i end
+        i = ni
+        local repl, ni2 = readDelimited(script, i, n, d)
+        if not repl then return nil, i end
+        i = ni2
+        -- flags
+        local g, count, pr, ci = false, nil, false, false
+        while i <= n do
+            local f = script:sub(i, i)
+            if f:match("%d") then count = tonumber(f)
+            elseif f == "g" then g = true
+            elseif f == "p" then pr = true
+            elseif f == "i" or f == "I" then ci = true
+            else break end
+            i = i + 1
+        end
+        cmd.pat = pat
+        cmd.repl = repl
+        cmd.luaRepl = toLuaRepl(repl)
+        cmd.global = g
+        cmd.count = count
+        cmd.print = pr
+        cmd.ignorecase = ci
+    elseif c == "y" then
+        local d = script:sub(i, i)
+        if d == "" or d == ";" or d == "\n" then return nil, i end
+        i = i + 1
+        local src, ni = readDelimited(script, i, n, d)
+        if not src then return nil, i end
+        local dst, ni2 = readDelimited(script, ni, n, d)
+        if not dst then return nil, i end
+        i = ni2
+        cmd.src = src; cmd.dst = dst
+    elseif c == "a" or c == "i" or c == "c" then
+        local text = script:sub(i)
+        text = text:gsub("^\\", ""):gsub("^%s+", "")
+        -- 文本到下一个 ';' 或换行为止
+        local stop = text:find("[\n;]")
+        if stop then
+            cmd.text = text:sub(1, stop - 1)
+            i = i + (stop - 1)
+        else
+            cmd.text = text
+            i = n + 1
+        end
+    elseif c == "q" then
+        local num = script:match("^%d+", i)
+        if num then cmd.code = tonumber(num); i = i + #num end
+    elseif c == "d" or c == "p" or c == "=" then
+        -- 无参数
+    else
+        return nil, i
+    end
+    return cmd, i
+end
+
+local function compileScript(script)
+    local cmds = {}
+    local i = 1
+    local n = #script
+    while i <= n do
+        i = skipSep(script, i, n)
+        if i > n then break end
+        if script:sub(i, i) == "#" then
+            while i <= n and script:sub(i, i) ~= "\n" do i = i + 1 end
+            i = i + 1
+        else
+            local cmd, ni = parseCmd(script, i)
+            if not cmd then
+                stderr("sed: can't parse command near: " .. script:sub(i) .. "\n")
+                return nil
+            end
+            cmds[#cmds + 1] = cmd
+            i = ni
+        end
+    end
+    return cmds
+end
+
+local cmds = {}
+for _, s in ipairs(scripts) do
+    local compiled = compileScript(s)
+    if not compiled then return end
+    for _, c in ipairs(compiled) do cmds[#cmds + 1] = c end
+end
+if #cmds == 0 then
+    stderr("sed: no usable commands\n")
+    return
+end
+
+-- ---------------------------------------------------------------
+-- 地址匹配
+-- ---------------------------------------------------------------
+local function singleMatch(a, ln, pattern, L)
+    if a.kind == "num" then return ln == a.n
+    elseif a.kind == "dollar" then return ln == L
+    elseif a.kind == "regex" then return pattern:find(a.pat, 1) ~= nil end
+    return false
+end
+local function startMatch(a, ln, pattern, L)
+    if a.kind == "num" then
+        if a.n == 0 then return true end
+        return ln == a.n
+    elseif a.kind == "dollar" then return ln == L
+    elseif a.kind == "regex" then return pattern:find(a.pat, 1) ~= nil end
+    return false
+end
+local function endMatch(a, ln, pattern, L)
+    if a.kind == "num" then return ln == a.n
+    elseif a.kind == "dollar" then return ln == L
+    elseif a.kind == "regex" then return pattern:find(a.pat, 1) ~= nil end
+    return false
+end
+local function addrMatch(cmd, ln, pattern, L)
+    local a = cmd.addr
+    if not a then return true end
+    if a.kind ~= "range" then return singleMatch(a, ln, pattern, L) end
+    local aStart, aStop = a.start, a.stop
+    if not cmd.inRange then
+        if startMatch(aStart, ln, pattern, L) then
+            cmd.inRange = true
+            cmd.atStart = true
+            if endMatch(aStop, ln, pattern, L) then
+                cmd.inRange = false
+                cmd.atEnd = true
+            else
+                cmd.atEnd = false
+            end
+            return true
+        end
+        cmd.atStart, cmd.atEnd = false, false
+        return false
+    else
+        cmd.atStart = false
+        if endMatch(aStop, ln, pattern, L) then
+            cmd.inRange = false
+            cmd.atEnd = true
+        else
+            cmd.atEnd = false
+        end
+        return true
+    end
+end
+
+-- ---------------------------------------------------------------
+-- 替换 / 主循环
+-- ---------------------------------------------------------------
+local function subst(pattern, cmd)
+    local pat = cmd.pat
+    if cmd.ignorecase then pat = makeCI(pat) end
+    local s = pattern
+    if cmd.count and cmd.count > 0 then
+        local b = 1
+        local seen = 0
+        while true do
+            local s0, e0 = string.find(s, pat, b)
+            if not s0 then break end
+            seen = seen + 1
+            if seen == cmd.count then
+                local whole = s:sub(s0, e0)
+                local caps = { string.match(s, pat, s0) }
+                local theRepl = buildRepl(cmd.repl, whole, caps)
+                return s:sub(1, s0 - 1) .. theRepl .. s:sub(e0 + 1), true
+            end
+            b = e0 + 1
+        end
+        return s, false
+    else
+        local repl = cmd.luaRepl
+        if cmd.global then
+            local res, n = s:gsub(pat, repl)
+            return res, (n > 0)
+        else
+            local res, n = s:gsub(pat, repl, 1)
+            return res, (n > 0)
+        end
+    end
+end
+
+local curOut -- nil => stdout; 否则为写入的文件句柄
+local function wline(s)
+    if curOut then curOut.write((s or "") .. "\n") else io.write((s or "") .. "\n") end
+end
+
+local function readAllLines(handle)
+    local lines = {}
+    while true do
+        local l = handle.readLine()
+        if l == nil then break end
+        lines[#lines + 1] = l
+    end
+    return lines
+end
+
+local function process(lines, source)
+    local L = #lines
+    local quit = false
+    local quitCode = 0
+    for ln = 1, L do
+        if quit then break end
+        local pattern = lines[ln]
+        local deleted = false
+        local skipRest = false
+        for ci = 1, #cmds do
+            local cmd = cmds[ci]
+            if skipRest then break end
+            local matched = addrMatch(cmd, ln, pattern, L)
+            if cmd.neg then matched = not matched end
+            if matched then
+                local t = cmd.type
+                if t == "s" then
+                    local np, changed = subst(pattern, cmd)
+                    pattern = np
+                    if changed and cmd.print then wline(pattern) end
+                elseif t == "d" then
+                    deleted = true; skipRest = true
+                elseif t == "p" then
+                    wline(pattern)
+                elseif t == "=" then
+                    wline(tostring(ln))
+                elseif t == "q" then
+                    if not quiet then wline(pattern) end
+                    quit = true; quitCode = cmd.code or 0; skipRest = true
+                elseif t == "y" then
+                    pattern = translit(pattern, cmd)
+                elseif t == "a" then
+                    if cmd.addr and cmd.addr.kind == "range" then
+                        if cmd.atEnd then wline(cmd.text) end
+                    else
+                        wline(cmd.text)
+                    end
+                elseif t == "i" then
+                    if cmd.addr and cmd.addr.kind == "range" then
+                        if cmd.atStart then wline(cmd.text) end
+                    else
+                        wline(cmd.text)
+                    end
+                elseif t == "c" then
+                    if cmd.addr and cmd.addr.kind == "range" then
+                        deleted = true; skipRest = true
+                        if cmd.atEnd then wline(cmd.text) end
+                    else
+                        wline(cmd.text); deleted = true; skipRest = true
+                    end
+                end
+            end
+            if skipRest then break end
+        end
+        if not quit and not deleted and not quiet then
+            wline(pattern)
+        end
+    end
+    return quit, quitCode
+end
+
+-- 写出(仅其自身路径)文件名
+local function sourceName(path)
+    if path == "/" then return "/" end
+    return path:gsub("/+$", "")
+end
+
+-- ---------------------------------------------------------------
+-- 逐源处理
+-- ---------------------------------------------------------------
+local function runOne(lines, absPath)
+    local outH
+    if inplace and absPath then
+        -- 读回写: 先读进内存(上面已读), 再以 "w" 打开(会截断)写回。
+        local oerr
+        outH, oerr = fs.open(absPath, "w")
+        if not outH then
+            stderr("sed: " .. sourceName(absPath) .. ": " .. ioeMsg(oerr) .. "\n")
+            return true, 0
+        end
+        curOut = outH
+    else
+        curOut = nil
+    end
+    local quit, quitCode = process(lines, absPath)
+    if outH then outH.close() end
+    return quit, quitCode
+end
+
+if #files == 0 then
+    -- stdin
+    local h = io.stdin()
+    if not h then return end
+    local lines = readAllLines(h)
+    runOne(lines, nil)
+else
+    if inplace then
+        for _, p in ipairs(files) do
+            local abs = resolve(p)
+            local fh, e = fs.open(abs, "r")
+            if not fh then
+                stderr("sed: " .. sourceName(abs) .. ": " .. ioeMsg(e) .. "\n"); return
+            end
+            local lines = readAllLines(fh)
+            fh.close()
+            if inSuffix then
+                local bak = abs .. inSuffix
+                local bh = assert(fs.open(bak, "w"))
+                for _, l in ipairs(lines) do bh.write(l .. "\n") end
+                bh.close()
+            end
+            local q = runOne(lines, abs)
+            if q then return end
+        end
+    elseif perFile then
+        for _, p in ipairs(files) do
+            local abs = resolve(p)
+            local fh, e = fs.open(abs, "r")
+            if not fh then
+                stderr("sed: " .. sourceName(abs) .. ": " .. ioeMsg(e) .. "\n"); return
+            end
+            local lines = readAllLines(fh)
+            fh.close()
+            local q = nil
+            curOut = nil
+            q = process(lines, abs)
+            if q then return end
+        end
+    else
+        -- 多文件视为连续流: 收集所有行, 行号连续, $ 是最后一行。
+        local all = {}
+        for _, p in ipairs(files) do
+            local abs = resolve(p)
+            local fh, e = fs.open(abs, "r")
+            if not fh then
+                stderr("sed: " .. sourceName(abs) .. ": " .. ioeMsg(e) .. "\n"); return
+            end
+            for _, l in ipairs(readAllLines(fh)) do all[#all + 1] = l end
+            fh.close()
+        end
+        curOut = nil
+        process(all, nil)
+    end
+end

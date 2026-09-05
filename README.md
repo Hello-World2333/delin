@@ -59,6 +59,7 @@ src/bin/head               打印前 N 行 (-n N|-N)
 src/bin/tail               打印后 N 行 (-n N|-N)
 src/bin/wc                 统计行/词/字节 (-l|-w|-c)
 src/bin/grep               按 Lua 模式查找行 (-n|-i|-v)
+src/bin/sed                流式文本编辑器 (s/y/d/p/q/a/i/c/=, 地址区间, -n -s -e -f -i)
 src/bin/kill               发送信号到进程/进程组 (kill [-SIG] pid|-pgid; kill -l)
 src/bin/login              getty/login: 登录提示→验证→启动 sh→循环
 src/bin/sh                 交互/脚本 shell(内建 cd/pwd/echo/exit/help)

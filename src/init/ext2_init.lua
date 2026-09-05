@@ -287,6 +287,55 @@ do
     if fs.exists("/home/alice/nonx") then pcall(fs.delete, "/home/alice/nonx") end
 end
 
+-- ═══════════ sed 真机自测(内存 stdio, 直接 spawn /bin/sed) ═══════════
+do
+    local sh = fs.open("/bin/sed", "r")
+    local sedSrc = sh and sh.readAll() or nil
+    if sh then sh.close() end
+    if not sedSrc then
+        print("ext2-init: /bin/sed not found")
+    else
+        local function runSed(argv)
+            -- 每次用独立内存 stdio; 子进程继承 init 的 stdio(set 后)。
+            local inH = { readLine = function() return nil end }
+            local outbuf = {}
+            local outH = {
+                write = function(self, s) outbuf[#outbuf + 1] = tostring(s); return #s end,
+                writeLine = function(self, s) outbuf[#outbuf + 1] = tostring(s) .. "\n"; return #s + 1 end,
+            }
+            syscalls["stdio.set"](inH, outH)
+            local pid = spawn(sedSrc, "sed", nil, nil, argv)
+            local tries = 0
+            while pid and tries < 30 do
+                local p = syscalls["proc.info"](pid)
+                if not p then break end
+                if p.status == "dead" or p.status == "error" then break end
+                sleep(0.1); tries = tries + 1
+            end
+            return table.concat(outbuf)
+        end
+
+        -- 输入文件(已知内容)
+        local tf = fs.open("/dbg_sed.txt", "w")
+        if tf then tf.write("foo 1\nbar 2\nbaz 3\n"); tf.close() end
+        -- 替换(全局 + p 标志)
+        print("ext2-init: sed sub=[" .. runSed({ [0] = "/bin/sed", "-n", "s/foo/F/gp", "/dbg_sed.txt" }) .. "]")
+        -- 行删除
+        print("ext2-init: sed del=[" .. runSed({ [0] = "/bin/sed", "2d", "/dbg_sed.txt" }) .. "]")
+        -- 行号
+        print("ext2-init: sed num=[" .. runSed({ [0] = "/bin/sed", "=", "/dbg_sed.txt" }) .. "]")
+        -- 就地改写(-i)
+        local tf2 = fs.open("/dbg_sed2.txt", "w")
+        if tf2 then tf2.write("foo\nbar\nfoo\n"); tf2.close() end
+        runSed({ [0] = "/bin/sed", "-i", "s/foo/F/", "/dbg_sed2.txt" })
+        local rf = fs.open("/dbg_sed2.txt", "r")
+        print("ext2-init: sed inplace=[" .. (rf and rf.readAll() or "") .. "]")
+        if rf then rf.close() end
+        if fs.exists("/dbg_sed.txt") then pcall(fs.delete, "/dbg_sed.txt") end
+        if fs.exists("/dbg_sed2.txt") then pcall(fs.delete, "/dbg_sed2.txt") end
+    end
+end
+
 -- ═══════════ 信号机制测试(内核信号/作业控制) ═══════════
 do
     print("ext2-init: signal tests start")
