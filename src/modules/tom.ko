@@ -13,16 +13,17 @@ return {
         if not side then kapi.log("tom: no tm_gpu peripheral"); return end
         gpu = peripheral.wrap(side)
 
-        -- 启动顺序(必须): refreshSize -> setSize -> getSize
+        -- 启动顺序(必须): refreshSize -> (让检测完成) -> setSize -> getSize
         gpu.refreshSize()
+        if sleep and type(sleep) == "function" then pcall(sleep, 0) end -- 等一个 tick, 让 GPU 完成检测
         gpu.setSize(64)
         local wPx, hPx, wBlk, hBlk, res = gpu.getSize()
+        kapi.log("tom: refreshSize+getSize -> " .. tostring(wPx) .. "x" .. tostring(hPx)
+            .. " px " .. tostring(wBlk) .. "x" .. tostring(hBlk) .. " blk res " .. tostring(res))
         if not wPx or wPx == 0 then
-            kapi.log("tom: getSize returned 0 (monitor arrangement?), using fallback")
-            wPx, hPx = 192, 128
+            kapi.log("tom: NO monitor detected by GPU (0 blocks). Is a Tom's Monitor arranged to the GPU's right/up?")
+            return -- 不注册; 没有可显示的屏幕
         end
-        kapi.log("tom: gpu " .. wPx .. "x" .. hPx .. " px (" .. (wBlk or "?") .. "x" .. (hBlk or "?")
-            .. (res and (" blk, res " .. res) or "") .. ")")
 
         -- Tom 的 drawText/filledRectangle 是 1-based; 统一层 0-based -> +1。
         -- line/rectangle/drawPixel 等基准存疑, 这里用 verified 的 filledRectangle 当像素/矩形。
