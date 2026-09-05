@@ -1,11 +1,22 @@
 -- Delin rm: 删除文件/目录。用法: rm <path>...
 local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
 local function stderr(s)
     local e = io.stderr()
     if e and e.write then e:write(s) end
 end
 
 for _, p in ipairs(args) do
+    p = resolve(p)
     if not fs.exists(p) then
         stderr("rm: " .. p .. ": No such file or directory\n")
     else

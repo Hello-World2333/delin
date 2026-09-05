@@ -172,7 +172,43 @@ if shHand then shHand.close() end
 if not shSrc then
     print("ext2-init: /bin/sh not found")
 else
-    local lines = { "pwd", "echo HELLO_SHELL", "ls /", "cat /etc/passwd", "exit" }
+    -- 清理上次残留的测试文件(在内存 stdio 里跑, 避免残留影响)。
+    for _, d in ipairs({ "/tfile.txt", "/tmoved.txt", "/tcopy.txt", "/tpasswd.txt", "/dbg_src.txt" }) do
+        if fs.exists(d) then pcall(fs.delete, d) end
+    end
+
+    -- 已知内容的源文件(避开 /etc/passwd 的 inode 状态, 便于逐字节比对)。
+    local dbgSrc = fs.open("/dbg_src.txt", "w")
+    if not dbgSrc then
+        print("ext2-init: cannot create /dbg_src.txt")
+    else
+        dbgSrc.write("AAA\nBBB\nCCC\n"); dbgSrc.close()
+    end
+
+    local lines = {
+        "pwd", "echo HELLO_SHELL", "ls /", "cat /etc/passwd",
+        -- 扩展 POSIX 工具 (根级文件操作, 最小化 fs 变动)
+        "touch /tfile.txt",
+        "wc -c /tfile.txt",
+        "cat /tfile.txt",
+        "cp /dbg_src.txt /tcopy.txt",
+        "wc -c /tcopy.txt",
+        "cat /tcopy.txt",
+        "cp /etc/passwd /tpasswd.txt",
+        "wc -c /tpasswd.txt",
+        "cat /tpasswd.txt",
+        "wc -l /etc/passwd",
+        "wc -w /etc/passwd",
+        "head -n 2 /etc/passwd",
+        "tail -n 2 /etc/passwd",
+        "grep root /etc/passwd",
+        "mv /tfile.txt /tmoved.txt",
+        "wc -c /tmoved.txt",
+        "cat /tmoved.txt",
+        "rm /tcopy.txt",
+        "rm /tpasswd.txt",
+        "exit",
+    }
     local li = 0
     local inH = { readLine = function(self) li = li + 1; return lines[li] end }
     local outbuf = {}
@@ -193,7 +229,11 @@ else
     end
     if code == nil then code = "TIMEOUT" end
     print("ext2-init: shell exited code=" .. tostring(code))
-    print("ext2-init: shell out=[" .. table.concat(outbuf) .. "]")
+    print("ext2-init: shell out=[" .. table.concat(outbuf, "|") .. "]")
+    -- 清理测试文件(避免 ext2 根污染)。
+    for _, d in ipairs({ "/dbg_src.txt", "/tfile.txt", "/tmoved.txt", "/tcopy.txt", "/tpasswd.txt" }) do
+        if fs.exists(d) then pcall(fs.delete, d) end
+    end
 end
 
 -- 3) 产品形态: 在每个 tty 上 spawn 一个 login 进程(登录到 sh)。init 保持存活。

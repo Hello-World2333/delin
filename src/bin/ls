@@ -1,9 +1,18 @@
 -- Delin ls: 列目录。用法: ls [dir]
 -- dir 缺省为 "/"。输出每行一个名字, 目录名带尾随 "/"。写入 io.stdout。
 local args = args or {}
-local path = args[1] or "/"
-path = path:gsub("/+$", "")
-if path == "" then path = "/" end
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+
+local path = resolve(args[1] or "/")
 
 local function stderr(s)
     local e = io.stderr()

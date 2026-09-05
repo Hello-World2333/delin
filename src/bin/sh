@@ -72,7 +72,7 @@ end
 builtins.help = function(args)
     outln("Delin sh v0.0.1")
     outln("builtins : cd pwd echo exit help")
-    outln("external : /bin/ls /bin/cat /bin/rm /bin/mkdir")
+    outln("external : ls cat rm mkdir cp mv touch head tail wc grep")
     outln("usage    : sh [script]  (no script => interactive on stdio)")
 end
 
@@ -98,21 +98,13 @@ local function runExternal(cmd, args)
     local src = f.readAll()
     f.close()
 
-    -- 相对路径参数按 cwd 解析成绝对(子进程各自独立的 cwd)。
-    local rfargs = {}
-    for i = 1, #args do
-        local a = args[i]
-        if a:sub(1, 1) == "/" or a:sub(1, 1) == "-" then
-            rfargs[i] = a
-        else
-            rfargs[i] = resolve(a)
-        end
-    end
-
+    -- 参数原样传给子进程(每个工具自行按 cwd 解析相对路径); shell 不再预解析。
+    -- 预解析会误伤 grep 的模式、head/tail 的 "-n 5" 里的 "5" 这类非路径参数。
+    -- 子进程的 cwd 由 opts.cwd 注入, 工具据此把相对路径解析成绝对。
     local argv = { [0] = path }
-    for i = 1, #rfargs do argv[i] = rfargs[i] end
+    for i = 1, #args do argv[i] = args[i] end
 
-    local child, cerr = spawn(src, cmd, nil, nil, argv)
+    local child, cerr = spawn(src, cmd, nil, nil, argv, { cwd = cwd })
     if not child then
         errln("sh: " .. cmd .. ": " .. tostring(cerr))
         lastExit = 126

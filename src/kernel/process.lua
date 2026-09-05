@@ -39,25 +39,30 @@ end
 ---@param uid integer|nil
 ---@param gid integer|nil
 ---@param argv table|nil  参数表 { [0]=程序名, [1..]=位置参数 } (可缺省)
+---@param opts table|nil  选项 { cwd= } (可缺省, 缺省继承父进程 cwd 或 "/")
 ---@return table
-local function buildEnv(pid, ppid, uid, gid, argv)
+local function buildEnv(pid, ppid, uid, gid, argv, opts)
     -- argv 约定: [0]=程序名/[1..]=位置参数。args = 只含位置参数(不含 [0]).
     argv = argv or {}
+    opts = opts or {}
     local args = {}
     for i = 1, #argv do args[i] = argv[i] end
+    -- 继承父进程 cwd(或默认 "/")。调用方(sh)用 opts.cwd 传自己的当前目录。
+    local parentCwd = registry[ppid] and registry[ppid].cwd or "/"
     ---@type table
     local env = setmetatable({
         pid   = pid,
         ppid  = ppid,
         uid   = uid or 0,
         gid   = gid or 0,
+        cwd   = opts.cwd or parentCwd or "/",
         argv  = argv,
         args  = args,
         argc  = #args,
         arg0  = argv[0] or args[1] or "",
         print = kprint,
-        spawn = function(src, name, childUid, childGid, childArgv)
-            return process.spawn(src, name, pid, childUid, childGid, childArgv)
+        spawn = function(src, name, childUid, childGid, childArgv, childOpts)
+            return process.spawn(src, name, pid, childUid, childGid, childArgv, childOpts)
         end,
     }, { __index = _G })
     vfs_api.installForEnv(env) -- 替换 fs/io 为 VFS
@@ -91,8 +96,9 @@ end
 ---@param uid integer|nil   uid(默认继承父/0)
 ---@param gid integer|nil   gid(默认继承父/0)
 ---@param argv table|nil    参数表 { [0]=程序名, [1..]=位置参数 } (可缺省)
+---@param opts table|nil    选项 { cwd= } (可缺省)
 ---@return integer|nil pid, table|nil proc, string|nil err
-function process.spawn(src, name, ppid, uid, gid, argv)
+function process.spawn(src, name, ppid, uid, gid, argv, opts)
     ppid = ppid or 0
     if type(src) ~= "string" then
         return nil, nil, "spawn expects a source string, got " .. type(src)
@@ -104,7 +110,7 @@ function process.spawn(src, name, ppid, uid, gid, argv)
     gid = gid or (parent and parent.gid) or 0
 
     local pid = nextPid()
-    local env = buildEnv(pid, ppid, uid, gid, argv)
+    local env = buildEnv(pid, ppid, uid, gid, argv, opts)
 
     -- 继承父进程 stdio(或 boot 默认终端)。每个进程独立 stdio, 子进程在 spawn 时刻
     -- 继承父进程当前的 stdin/stdout, 之后各自变化互不影响。
@@ -126,6 +132,7 @@ function process.spawn(src, name, ppid, uid, gid, argv)
         pid = pid, ppid = ppid, name = name or ("proc#" .. pid),
         co = co, status = "running", exitCode = nil,
         uid = uid, gid = gid,
+        cwd = env.cwd,
         stdio = env.__stdio,
     }
 

@@ -1,4 +1,5 @@
--- Delin mkdir: 建目录。用法: mkdir <dir>...
+-- Delin touch: 若文件不存在则创建空文件; 已存在则不动(CC fs 不支持设置 mtime)。
+-- 用法: touch <path>...
 local args = args or {}
 local cwd = (type(cwd) == "string" and cwd) or "/"
 local function resolve(p)
@@ -17,12 +18,10 @@ end
 
 for _, p in ipairs(args) do
     p = resolve(p)
-    if fs.exists(p) then
-        stderr("mkdir: " .. p .. ": File exists\n")
-    else
-        local ok, err = pcall(fs.makeDir, p)
+    if not fs.exists(p) then
+        local ok, err = pcall(function() local f = fs.open(p, "w"); f.close() end)
         if not ok then
-            stderr("mkdir: " .. p .. ": " .. tostring(err) .. "\n")
+            stderr("touch: " .. p .. ": " .. tostring(err) .. "\n")
         end
     end
 end

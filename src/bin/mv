@@ -1,0 +1,111 @@
+-- Delin mv: 移动/重命名文件或目录。用法: mv <src>... <dst>
+--   ext2 根无原子 rename, 用 "复制后删源" 模拟; 目录递归复制再整树删除。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+local srcs = {}
+for _, a in ipairs(args) do
+    if a:sub(1, 1) == "-" and a ~= "-" then
+        stderr("mv: invalid option -- " .. a .. "\n")
+        return
+    else
+        srcs[#srcs + 1] = a
+    end
+end
+if #srcs < 2 then
+    stderr("mv: missing destination file operand\n")
+    return
+end
+local destRaw = srcs[#srcs]
+local destHintIsDir = destRaw:sub(-1) == "/"
+local dest = resolve(destRaw)
+
+local function join(a, b)
+    return (a .. "/" .. b):gsub("/+", "/")
+end
+
+local function copyFile(src, dst)
+    local inF, ierr = fs.open(src, "r")
+    if not inF then return nil, (ierr or ("cannot open " .. src)) end
+    local outF, oerr = fs.open(dst, "w")
+    if not outF then inF.close(); return nil, (oerr or ("cannot write " .. dst)) end
+    while true do
+        local chunk = inF.read(4096)
+        if not chunk or chunk == "" then break end
+        outF.write(chunk)
+    end
+    inF.close()
+    outF.close()
+    return true
+end
+
+local function copyTree(src, dst)
+    if not fs.isDir(src) then
+        return copyFile(src, dst)
+    end
+    if not fs.exists(dst) then
+        local ok, err = pcall(fs.makeDir, dst)
+        if not ok then return nil, "mkdir " .. dst .. " failed: " .. tostring(err) end
+    end
+    local names = fs.list(src) or {}
+    for _, n in ipairs(names) do
+        local ok, err = copyTree(join(src, n), join(dst, n))
+        if not ok then return nil, err end
+    end
+    return true
+end
+
+local function removeTree(p)
+    if fs.isDir(p) then
+        local names = fs.list(p) or {}
+        for _, n in ipairs(names) do removeTree(join(p, n)) end
+        fs.delete(p)
+    else
+        fs.delete(p)
+    end
+end
+
+for si = 1, #srcs - 1 do
+    local src = resolve(srcs[si])
+    if not fs.exists(src) then
+        stderr("mv: " .. src .. ": No such file or directory\n")
+        return
+    end
+    local target
+    if fs.isDir(dest) or destHintIsDir then
+        target = join(dest, (src:gsub("/+$", ""):match("([^/]+)$")) or src)
+    else
+        target = dest
+    end
+    if src == target then
+        return -- 同路径, 无需动作
+    end
+    local ok, err
+    if fs.isDir(src) then
+        ok, err = copyTree(src, target)
+    else
+        ok, err = copyFile(src, target)
+    end
+    if not ok then
+        stderr("mv: " .. src .. ": " .. tostring(err) .. "\n")
+        return
+    end
+    local okDel, delErr = pcall(removeTree, src)
+    if not okDel then
+        stderr("mv: " .. src .. ": " .. tostring(delErr) .. "\n")
+        return
+    end
+end

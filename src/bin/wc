@@ -1,0 +1,68 @@
+-- Delin wc: 统计行/词/字节。用法: wc [-l|-w|-c] [file...]
+--   (-l 行 -w 词 -c 字节, 缺省三栏; 无 file 时读 stdin)
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+local l, w, b = false, false, false
+local files = {}
+for _, a in ipairs(args) do
+    if a:sub(1, 1) == "-" and a ~= "-" then
+        if a == "-l" then l = true
+        elseif a == "-w" then w = true
+        elseif a == "-c" then b = true
+        else stderr("wc: invalid option -- " .. a .. "\n"); return end
+    else
+        files[#files + 1] = a
+    end
+end
+if not (l or w or b) then l, w, b = true, true, true end
+
+local function newlines(s) local c = 0; for _ in s:gmatch("\n") do c = c + 1 end; return c end
+local function words(s) local c = 0; for _ in s:gmatch("%S+") do c = c + 1 end; return c end
+
+local function report(name, content)
+    local parts = {}
+    if l then parts[#parts + 1] = tostring(newlines(content)) end
+    if w then parts[#parts + 1] = tostring(words(content)) end
+    if b then parts[#parts + 1] = tostring(#content) end
+    if name then parts[#parts + 1] = name end
+    io.write(table.concat(parts, " ") .. "\n")
+end
+
+if #files == 0 then
+    local stdin = io.stdin()
+    if not stdin then return end
+    local buf = {}
+    while true do
+        local line = stdin.readLine()
+        if line == nil then break end
+        buf[#buf + 1] = line
+    end
+    report(nil, table.concat(buf, "\n"))
+    return
+end
+
+for _, p in ipairs(files) do
+    p = resolve(p)
+    local f = fs.open(p, "r")
+    if not f then
+        stderr("wc: " .. p .. ": No such file or directory\n")
+        return
+    end
+    local content = f.readAll() or ""
+    f.close()
+    report(p, content)
+end
