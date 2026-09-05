@@ -245,7 +245,8 @@ do
     local nx = fs.open("/home/alice/nonx", "w")
     if nx then nx.write("return 1"); nx.close() end
     -- 无参 ls 应列出当前目录(cwd=/home/alice → 含 x.txt), 而非 "/"(含 etc/)。
-    local lines = { "/home/alice/nonx", "ls", "echo AFTER" }
+    -- cat /secret(0600 root) 应报 Permission denied 而非 "No such file"(文件存在)。
+    local lines = { "/home/alice/nonx", "cat /secret", "ls", "echo AFTER" }
     local li = 0
     local inH = { readLine = function(self) li = li + 1; return lines[li] end }
     local outbuf = {}
@@ -267,6 +268,8 @@ do
     print("ext2-init: alice sh refuses non-exec=" .. tostring(out:find("Permission denied", 1, true) ~= nil))
     print("ext2-init: alice sh ls no-arg cwd=" .. tostring(out:find("x.txt", 1, true) ~= nil)
         .. "/not-root=" .. tostring(out:find("etc/", 1, true) == nil))
+    print("ext2-init: alice sh cat /secret msg=PermissionDenied="
+        .. tostring(out:find("cat: /secret: Permission denied", 1, true) ~= nil))
     if fs.exists("/home/alice/nonx") then pcall(fs.delete, "/home/alice/nonx") end
 end
 
