@@ -37,6 +37,11 @@ if not (syscalls and syscalls["user.verify"]) then
     return
 end
 
+-- 显示本 tty 名与切到本控制台的键(Ctrl+Alt+<index+1>: tty0->1, tty1->2, ...)。
+local idx = tonumber((ttyName or ""):match("^tty(%d+)$"))
+local swkey = idx and (idx + 1) or nil
+if not swkey then swkey = "?" end
+
 --- 隐藏回显读取一行(密码)。tty 行规程 setEcho(false) -> 输入不显示, 回车仅换行。
 local function readHidden(prompt)
     if stdout and stdout.write then stdout:write(prompt) end
@@ -48,7 +53,8 @@ end
 
 local function doLogin()
     while true do
-        outln("Delin OS login:")
+        outln("Delin OS " .. tostring(ttyName) .. " login:")
+        outln("  switch to this console: Ctrl+Alt+" .. tostring(swkey))
         if stdout and stdout.write then stdout:write("login: ") end
         local name = stdin:readLine()
         if name == nil then return end -- tty 关闭/EOF
