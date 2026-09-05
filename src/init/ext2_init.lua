@@ -98,5 +98,46 @@ local okDisp, dispErr = pcall(function()
 end)
 print("ext2-init: display test ok=" .. tostring(okDisp) .. (okDisp and "" or (" err=" .. tostring(dispErr))))
 
+-- /sys/class/display 配置文件接口(分辨率/位置等)。读=查当前值, 写=设值。
+local okCfg, cfgErr = pcall(function()
+    local function rd(p)
+        local f = fs.open(p, "r"); if not f then return "(none)" end
+        local s = f:readAll(); f:close(); return s
+    end
+    local function wrsys(p, v)
+        local f = fs.open(p, "w"); if not f then return "openerr" end
+        local ok, err = f:write(v); f:close(); return ok
+    end
+    local dlist = fs.list("/sys/class/display") or {}
+    print("ext2-init: /sys/class/display=[" .. table.concat(dlist, ",") .. "]")
+    for _, name in ipairs(dlist) do
+        local attrs = fs.list("/sys/class/display/" .. name) or {}
+        print("ext2-init: /sys/class/display/" .. name .. " attrs=[" .. table.concat(attrs, ",") .. "]")
+    end
+    print("ext2-init: right/resolution=" .. rd("/sys/class/display/right/resolution"))
+    print("ext2-init: back/offset=" .. rd("/sys/class/display/back/offset"))
+    print("ext2-init: back/scale=" .. rd("/sys/class/display/back/scale"))
+
+    -- Void 位置: 写 offset(投影变换, 不改变尺寸)
+    local woff = wrsys("/sys/class/display/back/offset", "5 6 7")
+    print("ext2-init: write back/offset='5 6 7' => " .. tostring(woff) .. " read-back=" .. rd("/sys/class/display/back/offset"))
+
+    -- Tom 分辨率: 写 32 -> 热重算 tty/fb 尺寸(getSize 变化)
+    local before = fs.open("/dev/tty1", "w")
+    local bsz = before and ({ before:getSize() }) or nil
+    if before then before:close() end
+    local wres = wrsys("/sys/class/display/right/resolution", "32")
+    print("ext2-init: write right/resolution='32' => " .. tostring(wres))
+    local after = fs.open("/dev/tty1", "w")
+    local asz = after and ({ after:getSize() }) or nil
+    if after then after:close() end
+    print("ext2-init: tty1 size before=" .. (bsz and (bsz[1] .. "x" .. bsz[2]) or "?")
+        .. " after=" .. (asz and (asz[1] .. "x" .. asz[2]) or "?")
+        .. " (resolution hot-resize)")
+    -- 恢复分辨率 64
+    print("ext2-init: restore resolution=64 => " .. tostring(wrsys("/sys/class/display/right/resolution", "64")))
+end)
+print("ext2-init: sysfs config test ok=" .. tostring(okCfg) .. (okCfg and "" or (" err=" .. tostring(cfgErr))))
+
 sleep(0.6)
 print("ext2-init: done pid=" .. pid)

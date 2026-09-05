@@ -46,6 +46,9 @@ return {
         pcall(hol.setColorMapping, 0, 90, 180, 255)
         kapi.log("void: hologram fb=" .. tostring(fb) .. " " .. w .. "x" .. h)
 
+        -- 投影配置状态(外设无 getter, 由驱动缓存)
+        local cfg = { offset = { x = 0, y = 0, z = 0 }, rotation = { yaw = 0, pitch = 0, roll = 0 }, scale = 1 }
+
         local dev = {
             id = "void:" .. side,
             type = "hologram",
@@ -62,6 +65,38 @@ return {
             setPixel = function(x, y, color) pcall(hol.drawPixel, x, y, toVoidColor(color or 0)) end,
             rect = function(x, y, w2, h2, color)
                 if w2 > 0 and h2 > 0 then pcall(hol.fill, x, y, w2, h2, toVoidColor(color or 0), 0) end
+            end,
+            -- 可配置项(sysfs): 投影位置/旋转/缩放
+            listConfig = function() return { "offset", "rotation", "scale" } end,
+            getConfig = function(attr)
+                if attr == "offset" then return string.format("%s %s %s", cfg.offset.x, cfg.offset.y, cfg.offset.z)
+                elseif attr == "rotation" then return string.format("%s %s %s", cfg.rotation.yaw, cfg.rotation.pitch, cfg.rotation.roll)
+                elseif attr == "scale" then return tostring(cfg.scale)
+                elseif attr == "size" then return w .. "x" .. h end
+                return nil
+            end,
+            setConfig = function(attr, value)
+                local v = (value or ""):gsub("^%s*(.-)%s*$", "%1")
+                if attr == "offset" then
+                    local x, y, z = v:match("^(%-?%d+%.?%d*)%s+(%-?%d+%.?%d*)%s+(%-?%d+%.?%d*)$")
+                    if not x then return nil, "bad offset (expected 'x y z')" end
+                    cfg.offset = { x = tonumber(x), y = tonumber(y), z = tonumber(z) }
+                    pcall(hol.setOffset, cfg.offset.x, cfg.offset.y, cfg.offset.z)
+                    return true
+                elseif attr == "rotation" then
+                    local yaw, pitch, roll = v:match("^(%-?%d+%.?%d*)%s+(%-?%d+%.?%d*)%s+(%-?%d+%.?%d*)$")
+                    if not yaw then return nil, "bad rotation (expected 'yaw pitch roll')" end
+                    cfg.rotation = { yaw = tonumber(yaw), pitch = tonumber(pitch), roll = tonumber(roll) }
+                    pcall(hol.setRotation, cfg.rotation.yaw, cfg.rotation.pitch, cfg.rotation.roll)
+                    return true
+                elseif attr == "scale" then
+                    local s = tonumber(v)
+                    if not s then return nil, "bad scale (expected number)" end
+                    cfg.scale = s
+                    pcall(hol.setScale, s)
+                    return true
+                end
+                return nil, "read-only or unknown config: " .. tostring(attr)
             end,
             flush = function() pcall(hol.sync) end,
             release = function() pcall(hol.releaseFrameBuffer, fb) end,

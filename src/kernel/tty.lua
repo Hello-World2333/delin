@@ -221,4 +221,40 @@ function tty.list()
     return out
 end
 
+--- 热重算: 设备尺寸改变后按新 getSize() 重建网格(保留重叠内容), 全部重画。
+function tty.resize(name)
+    local ctx = devices[name]
+    if not ctx then return end
+    local dev = ctx.dev
+    local w, h = dev.getSize()
+    local cols, rows
+    if dev.mode == "term" then
+        cols = math.max(1, math.floor(w or 1))
+        rows = math.max(1, math.floor(h or 1))
+    else
+        local cw = dev.cellW or 6
+        local ch = dev.cellH or 8
+        cols = math.max(1, math.floor((w or 1) / cw))
+        rows = math.max(1, math.floor((h or 1) / ch))
+    end
+    local oldCols, oldRows = ctx.cols, ctx.rows
+    local newGrid = {}
+    for i = 1, cols * rows do newGrid[i] = { ch = " ", fg = DEFAULT_FG, bg = DEFAULT_BG } end
+    for r = 0, math.min(rows, oldRows) - 1 do
+        for c = 0, math.min(cols, oldCols) - 1 do
+            newGrid[r * cols + c + 1] = ctx.grid[r * oldCols + c + 1]
+        end
+    end
+    ctx.grid = newGrid
+    ctx.cols, ctx.rows = cols, rows
+    if ctx.cursorX >= cols then ctx.cursorX = cols - 1 end
+    if ctx.cursorY >= rows then ctx.cursorY = rows - 1 end
+    -- 全部重画到新分辨率布局
+    ctx.dirty = {}
+    ctx.dirtyList = {}
+    for i = 1, cols * rows do markCell(ctx, i) end
+    flushDirty(ctx)
+    return true
+end
+
 return tty

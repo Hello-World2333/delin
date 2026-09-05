@@ -55,6 +55,25 @@ local function newCtx(dev)
     return ctx
 end
 
+--- 把脏矩形推到 ScreenDevice 像素层(供句柄 flush 与 resize 复用)。
+local function doFlush(ctx)
+    if ctx.closed or not ctx.hasDirty then return true end
+    local x0, y0 = ctx.dirtyX0, ctx.dirtyY0
+    local x1, y1 = ctx.dirtyX1, ctx.dirtyY1
+    ctx.hasDirty = false
+    -- 脏矩形重画(像素逐个写; 量小即可, 避免整屏刷屏)
+    for y = y0, y1 do
+        for x = x0, x1 do
+            local c = ctx.px[y * ctx.w + x + 1]
+            if c ~= DEFAULT_BG then
+                pcall(ctx.dev.setPixel, x, y, c)
+            end
+        end
+    end
+    if ctx.dev.flush then pcall(ctx.dev.flush) end
+    return true
+end
+
 --- 打开一个句柄(绑定到共享 ctx)。pos 为像素游标(0..w*h-1), write/read 以 4 字节像素为单位。
 local function openHandle(ctx, mode)
     return {
@@ -119,21 +138,7 @@ local function openHandle(ctx, mode)
         end,
         flush = function(self)
             if ctx.closed then return nil, "device closed" end
-            if not ctx.hasDirty then return true end
-            local x0, y0 = ctx.dirtyX0, ctx.dirtyY0
-            local x1, y1 = ctx.dirtyX1, ctx.dirtyY1
-            ctx.hasDirty = false
-            -- 脏矩形重画(像素逐个写; 量小即可, 避免整屏刷屏)
-            for y = y0, y1 do
-                for x = x0, x1 do
-                    local c = ctx.px[y * ctx.w + x + 1]
-                    if c ~= DEFAULT_BG then
-                        pcall(ctx.dev.setPixel, x, y, c)
-                    end
-                end
-            end
-            if ctx.dev.flush then pcall(ctx.dev.flush) end
-            return true
+            return doFlush(ctx)
         end,
         close = function(self)
             ctx.closed = true
@@ -169,6 +174,32 @@ function fb.list()
     local out = {}
     for n in pairs(devices) do out[#out + 1] = n end
     return out
+end
+
+--- 热重算: 设备尺寸改变后按新 getSize() 重建像素缓冲(保留重叠像素), 标记全脏等待下次 flush。
+function fb.resize(name)
+    local ctx = devices[name]
+    if not ctx then return end
+    local w, h = ctx.dev.getSize()
+    w = math.max(1, math.floor(w or 1))
+    h = math.max(1, math.floor(h or 1))
+    local oldW, oldH = ctx.w, ctx.h
+    local newPx = {}
+    for y = 0, h - 1 do
+        for x = 0, w - 1 do
+            if x < oldW and y < oldH then
+                newPx[y * w + x + 1] = ctx.px[y * oldW + x + 1]
+            else
+                newPx[y * w + x + 1] = DEFAULT_BG
+            end
+        end
+    end
+    ctx.px = newPx
+    ctx.w, ctx.h = w, h
+    ctx.pos = 0
+    ctx.hasDirty = true
+    ctx.dirtyX0, ctx.dirtyY0, ctx.dirtyX1, ctx.dirtyY1 = 0, 0, w - 1, h - 1
+    return true
 end
 
 return fb

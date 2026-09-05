@@ -39,6 +39,7 @@ local profiles = {
             ["kernel.display"]   = "src/kernel/display.lua",
             ["kernel.tty"]       = "src/kernel/tty.lua",
             ["kernel.fb"]        = "src/kernel/fb.lua",
+            ["kernel.sysfs"]     = "src/kernel/sysfs.lua",
         },
         assets = {
             ["init"]      = "src/init/init.lua",

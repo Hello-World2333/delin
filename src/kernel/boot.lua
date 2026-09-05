@@ -12,6 +12,7 @@ local modules    = require("kernel.modules")
 local ext2       = require("kernel.ext2")
 local tty        = require("kernel.tty")
 local fb         = require("kernel.fb")
+local sysfs      = require("kernel.sysfs")
 local INIT_SOURCE = require("kernel.init_src") -- 打包器注入的 init 源码字符串
 local EXT2_INIT_SOURCE = require("kernel.ext2_init_src") -- EXT2 根引导用最小 PID1
 
@@ -155,6 +156,7 @@ local function bootExt2(bi)
     end
 
     registerDisplaySyscalls()
+    sysfs.mount() -- /sys/class/display 虚拟配置 fs(display 已注册)
     launch(EXT2_INIT_SOURCE, "ext2")
 end
 
@@ -200,6 +202,7 @@ function boot.boot()
     kprint("syscalls=" .. table.concat(scNameList, ","))
 
     registerDisplaySyscalls()
+    sysfs.mount() -- /sys/class/display 虚拟配置 fs(display 已注册)
     launch(INIT_SOURCE, "")
 end
 

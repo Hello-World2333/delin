@@ -29,6 +29,7 @@ return {
 
         -- Tom 的 drawText/filledRectangle 是 1-based; 统一层 0-based -> +1。
         -- line/rectangle/drawPixel 等基准存疑, 这里用 verified 的 filledRectangle 当像素/矩形。
+        local currentRes = res or 64
         local dev = {
             id = "tom:" .. side,
             type = "gpu",
@@ -54,6 +55,25 @@ return {
             end,
             flush = function() if gpu.sync then pcall(gpu.sync) end end,
             release = function() end,
+            -- 可配置项(sysfs): resolution 改变会触发 tty/fb 热重算
+            listConfig = function() return { "resolution" } end,
+            getConfig = function(attr)
+                if attr == "resolution" then return tostring(currentRes)
+                elseif attr == "size" then return wPx .. "x" .. hPx end
+                return nil
+            end,
+            setConfig = function(attr, value)
+                if attr ~= "resolution" then return nil, "read-only or unknown config: " .. tostring(attr) end
+                local v = tonumber((value or ""):match("^%s*(.-)%s*$"))
+                if not v or v < 16 or v > 64 then return nil, "bad resolution (expected 16-64)" end
+                currentRes = v
+                local ok, err = pcall(gpu.setSize, v)
+                if not ok then return nil, "setSize failed: " .. tostring(err) end
+                -- 重查像素尺寸并更新缓存(wPx/hPx 为 getSize 的 upvalue)
+                local nw, nh = gpu.getSize()
+                if nw and nw > 0 then wPx, hPx = nw, nh end
+                return true
+            end,
         }
         kapi.registerDisplay(dev)
         kapi.log("tom: display '" .. dev.id .. "' registered (" .. wPx .. "x" .. hPx .. ")")

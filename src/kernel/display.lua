@@ -21,7 +21,7 @@ local nodeMap = {} -- id -> { tty=name, fb=name }
 ---@field device table  -- 底层外设句柄
 ---@field cellW number|nil  -- pixel 型字格宽(物理像素)
 ---@field cellH number|nil  -- pixel 型字格高(物理像素)
----@field getSize fun(x?:number): number, number  -- 逻辑宽度,高度(0-based; term=单元格, pixel=像素)
+---@field getSize fun(): number, number  -- 逻辑宽度,高度(0-based; term=单元格, pixel=像素)
 ---@field getTextWidth fun(s:string): number|nil  -- 字符/串的显示宽度(pixel 型比例字体用, tty 借此居中字元)
 ---@field blit fun(x:number,y:number,text:string,fg:any,bg:any)  -- 写文本单元格
 ---@field setPixel fun(x:number,y:number,color:any)
@@ -71,6 +71,24 @@ function display.list()
     local out = {}
     for id, dev in pairs(devices) do out[#out + 1] = id end
     return out
+end
+
+--- 按外设名(side)查一个显示设备(sysfs 用)。
+function display.byName(name)
+    for id, dev in pairs(devices) do
+        if dev.name == name then return dev end
+    end
+end
+
+--- 热重算: 设备尺寸改变后重建其派生 /dev/ttyN、/dev/fbN(用于分辨率/模式变更)。
+---@param id string
+---@return boolean
+function display.resize(id)
+    local nodes = nodeMap[id]
+    if not nodes then return false end
+    if nodes.tty then tty.resize(nodes.tty) end
+    if nodes.fb then fb.resize(nodes.fb) end
+    return true
 end
 
 return display
