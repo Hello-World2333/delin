@@ -94,6 +94,7 @@ function fsapi.delete(path) local b, r = dispatch(path); return b.delete(r) end
 function fsapi.open(path, mode) local b, r = dispatch(path); return b.open(r, mode) end
 function fsapi.chmod(path, mode) local b, r = dispatch(path); if b.chmod then return b.chmod(r, mode) end return nil, "chmod not supported" end
 function fsapi.chown(path, uid, gid) local b, r = dispatch(path); if b.chown then return b.chown(r, uid, gid) end return nil, "chown not supported" end
+function fsapi.canExecute(path) local b, r = dispatch(path); if b.canExecute then return b.canExecute(r) end return true end
 function fsapi.isFile(path)
     local b, r = dispatch(path)
     if b.isFile then return b.isFile(r) end

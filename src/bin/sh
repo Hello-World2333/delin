@@ -89,10 +89,21 @@ local function runExternal(cmd, args)
     else
         path = "/bin/" .. cmd
     end
-    local f = fs.open(path, "r")
-    if not f then
+    -- 命令须存在(→127)且有执行权限(→126); 两者都过才读源码去 spawn。
+    if not fs.exists(path) then
         errln("sh: " .. cmd .. ": command not found")
         lastExit = 127
+        return
+    end
+    if not fs.canExecute(path) then
+        errln("sh: " .. cmd .. ": Permission denied")
+        lastExit = 126
+        return
+    end
+    local f = fs.open(path, "r")
+    if not f then
+        errln("sh: " .. cmd .. ": Permission denied")
+        lastExit = 126
         return
     end
     local src = f.readAll()

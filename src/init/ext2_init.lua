@@ -37,6 +37,9 @@ if f2 then f2.close() end
 -- 写 0444 -> 拒绝
 local okw = pcall(function() local w = fs.open("/readonly", "w"); w.write("x"); w.close() end)
 try("write /readonly (0444) denied", okw == false)
+-- 执行权限: 有读无 x 不可启动, 有 x(0755)才可启动
+try("canExecute /pub (0644) false", fs.canExecute("/pub") == false)
+try("canExecute /bin/ls (0755) true", fs.canExecute("/bin/ls") == true)
 -- list alice-owned 0700 -> ok
 print("alice: list /home/alice => [" .. table.concat((fs.list("/home/alice") or {}), ",") .. "]")
 -- 在 /home/alice 里写文件(属主, 0700) -> ok
@@ -234,6 +237,35 @@ else
     for _, d in ipairs({ "/dbg_src.txt", "/tfile.txt", "/tmoved.txt", "/tcopy.txt", "/tpasswd.txt" }) do
         if fs.exists(d) then pcall(fs.delete, d) end
     end
+end
+
+-- 3a) 非 root 用户 sh 的执行权限: 运行一个"可读但不可执行"的文件 -> 拒绝(不启动)。
+--     通过 stdio 使 sh 以 alice(uid 1000)脚本模式跑; 输出经 print 记录到 /delin.log。
+do
+    local nx = fs.open("/home/alice/nonx", "w")
+    if nx then nx.write("return 1"); nx.close() end
+    local lines = { "/home/alice/nonx", "/bin/ls /bin", "echo AFTER" }
+    local li = 0
+    local inH = { readLine = function(self) li = li + 1; return lines[li] end }
+    local outbuf = {}
+    local outH = {
+        write = function(self, s) outbuf[#outbuf + 1] = tostring(s); return #s end,
+        writeLine = function(self, s) outbuf[#outbuf + 1] = tostring(s) .. "\n"; return #s + 1 end,
+    }
+    syscalls["stdio.set"](inH, outH)
+    local spid = spawn(shSrc, "sh-alice", 1000, 1000, { [0] = "/bin/sh" })
+    local tries = 0
+    while spid and tries < 30 do
+        local p = syscalls["proc.info"](spid)
+        if not p then break end
+        if p.status == "dead" or p.status == "error" then break end
+        sleep(0.1); tries = tries + 1
+    end
+    local out = table.concat(outbuf)
+    print("ext2-init: alice sh run nonx => [" .. out .. "]")
+    print("ext2-init: alice sh refuses non-exec=" .. tostring(out:find("Permission denied", 1, true) ~= nil))
+    print("ext2-init: alice sh runs executable=" .. tostring(out:find("cat", 1, true) ~= nil))
+    if fs.exists("/home/alice/nonx") then pcall(fs.delete, "/home/alice/nonx") end
 end
 
 -- 3) 产品形态: 在每个 tty 上 spawn 一个 login 进程(登录到 sh)。init 保持存活。

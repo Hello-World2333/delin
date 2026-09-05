@@ -735,6 +735,15 @@ function ext2.backend(fs)
         end,
         chmod = function(rel, mode) return ext2.chmod(fs, rel, mode) end,
         chown = function(rel, uid, gid) return ext2.chown(fs, rel, uid, gid) end,
+        -- 执行权限检查: 启动一个程序(普通文件/符号链接)必须对当前进程有 x 位。
+        -- 目录/设备等不可执行。符号链接按其 i_block 内联目标判定(本 FS 不用它执行)。
+        canExecute = function(rel)
+            local inode = ext2.lookup(fs, rel)
+            if not inode then return false end
+            if inode.type ~= T_REG and inode.type ~= T_SYM then return false end
+            local c = cred()
+            return hasPerm(inode, c.uid, c.gid, 1)
+        end,
     }
 end
 

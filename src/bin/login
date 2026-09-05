@@ -18,8 +18,13 @@ local function outln(s)
     if stdout and stdout.write then stdout:write((s or "") .. "\n") end
 end
 
--- 读 /bin/sh 源码(登录成功后启动用户 shell)
+-- 读 /bin/sh 源码(登录成功后启动用户 shell)。须可执行(仅能读不可执行的不算能启动)。
 local function readBin(p)
+    if not fs.exists(p) then return nil end
+    if not fs.canExecute(p) then
+        outln("login: " .. p .. ": Permission denied")
+        return nil
+    end
     local f = fs.open(p, "r")
     if not f then return nil end
     local s = f.readAll(); f.close()
