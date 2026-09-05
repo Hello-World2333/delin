@@ -4,15 +4,18 @@ local args = args or {}
 local cwd = (type(cwd) == "string" and cwd) or "/"
 local function resolve(p)
     p = p or ""
+    if p == "" or p == "." then
+        return (cwd == "/") and "/" or cwd
+    end
     if p:sub(1, 1) == "/" then
         if p == "/" then return "/" end
         return p:gsub("/+$", "")
     end
     local base = (cwd == "/") and "" or cwd
-    return (base .. "/" .. p):gsub("/+", "/")
+    return (base .. "/" .. p):gsub("/+", "/"):gsub("/+$", "")
 end
 
-local path = resolve(args[1] or "/")
+local path = resolve(args[1] or ".")
 
 local function stderr(s)
     local e = io.stderr()
