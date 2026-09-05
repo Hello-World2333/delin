@@ -92,13 +92,16 @@ function ext2.mount(bd)
         inodes = inodes,
         blocks = u32(sb, 4),
         rBlocks = u32(sb, 8),
+        firstDataBlock = u32(sb, 20),   -- s_first_data_block: blockSize==1024 时为 1(block0=boot), 否则 0
         inodesPerGroup = u32(sb, 40),
         blocksPerGroup = u32(sb, 32),
         inodeSize = u16(sb, 88) or 128,
         firstIno = u32(sb, 84),
         gdtOffset = (blockSize == 1024) and (2 * blockSize) or (1 * blockSize),
     }
-    fs.numGroups = math.ceil(inodes / fs.inodesPerGroup)
+    -- 块组数(权威: 由块布局决定; 与 inode 组数在合法 fs 上一致)
+    fs.numGroups = math.max(math.ceil((fs.blocks - fs.firstDataBlock) / fs.blocksPerGroup),
+                            math.ceil(inodes / fs.inodesPerGroup))
     return fs
 end
 
@@ -160,11 +163,12 @@ end
 function ext2.allocBlock(fs)
     if sbFreeBlocks(fs) <= fs.rBlocks then return nil end -- 保留区不分配
     local per = fs.blocksPerGroup
+    local base = fs.firstDataBlock
     for group = 0, fs.numGroups - 1 do
         local gd = readGroupDesc(fs, group)
         if gd.freeBlocks > 0 then
             local bitmap = readBlockStr(fs, gd.blockBitmap)
-            local start = group * per
+            local start = base + group * per
             local limit = math.min(per, fs.blocks - start) - 1
             for bit = 0, limit do
                 local v = bitmap:byte(math.floor(bit / 8) + 1) or 0
@@ -185,8 +189,10 @@ end
 
 --- 释放一个数据块。
 function ext2.freeBlock(fs, blk)
-    local group = math.floor(blk / fs.blocksPerGroup)
-    local bit = blk % fs.blocksPerGroup
+    if blk < fs.firstDataBlock then return end -- boot 块等元数据区, 不释放
+    local rel = blk - fs.firstDataBlock
+    local group = math.floor(rel / fs.blocksPerGroup)
+    local bit = rel % fs.blocksPerGroup
     local gd = readGroupDesc(fs, group)
     local bitmap = readBlockStr(fs, gd.blockBitmap)
     local pos = math.floor(bit / 8) + 1
