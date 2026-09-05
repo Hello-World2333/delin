@@ -14,7 +14,8 @@ local nextIndex = 0
 local devices = {} -- "ttyN" -> console ctx
 local focus = nil  -- 前台 tty 名(接收键盘输入)
 
--- CC 终端 16 色 -> ARGB(0xAARRGGBB)。索引为 blit 十六进制码 0-f。
+-- tty 逻辑 16 色 -> ARGB(0xAARRGGBB)。索引为 tty 内部色序(0=black..f=white), 供 pixel 型
+-- 设备渲染。注意这与 CC 的 blit 色码顺序相反(CC blit "0"=white.."f"=black), 见 TO_CC。
 local PALETTE = {
     [0x0] = 0x000000, -- black
     [0x1] = 0xB300B3, -- purple
@@ -32,6 +33,35 @@ local PALETTE = {
     [0xd] = 0xE64CE6, -- magenta
     [0xe] = 0x99CCFF, -- lightBlue
     [0xf] = 0xFFFFFF, -- white
+}
+
+-- tty 色索引(0=black..f=white) -> CC blit 色码序号(0=white..f=black)。CC 的 blit 十六进制码
+-- 顺序是 white..black, 与 PALETTE 相反; term 型设备的 dev.text/blit 用 hex() 生成 blit 码,
+-- 若直接喂 PALETTE 索引会把黑白颠倒(白底黑字)。
+local TO_CC = {
+    [0x0] = 0xf, [0x1] = 0xa, [0x2] = 0xb, [0x3] = 0x9,
+    [0x4] = 0xd, [0x5] = 0x5, [0x6] = 0xc, [0x7] = 0xe,
+    [0x8] = 0x7, [0x9] = 0x8, [0xa] = 0x6, [0xb] = 0x4,
+    [0xc] = 0x1, [0xd] = 0x2, [0xe] = 0x3, [0xf] = 0x0,
+}
+-- tty 色索引 -> CC colors.* 位掩码(term 型设备的 fill/setBackgroundColor 使用)。
+local COLOR_BIT = {
+    [0xf] = 0x1,    -- white
+    [0xc] = 0x2,    -- orange
+    [0xd] = 0x4,    -- magenta
+    [0xe] = 0x8,    -- lightBlue
+    [0xb] = 0x10,   -- yellow
+    [0x5] = 0x20,   -- lime
+    [0xa] = 0x40,   -- pink
+    [0x8] = 0x80,   -- grey
+    [0x9] = 0x100,  -- lightGrey
+    [0x3] = 0x200,  -- cyan
+    [0x1] = 0x400,  -- purple
+    [0x2] = 0x800,  -- blue
+    [0x6] = 0x1000, -- brown
+    [0x4] = 0x2000, -- green
+    [0x7] = 0x4000, -- red
+    [0x0] = 0x8000, -- black
 }
 
 local DEFAULT_FG, DEFAULT_BG = 0xf, 0x0
@@ -160,7 +190,8 @@ local function flushDirty(ctx)
         local fg, bg = cell.fg, cell.bg
         if ctx.cursorOn and cursorAt(ctx, idx) then fg, bg = bg, fg end -- 光标反显
         if ctx.mode == "term" then
-            dev.text(col, row, cell.ch, fg, bg)
+            -- term 型: 传给 dev.text 的是 CC blit 色码序号(hex() 会用), 需从 tty 色序换算。
+            dev.text(col, row, cell.ch, TO_CC[fg], TO_CC[bg])
         else
             -- pixel 型: 先用背景色填满整个字格, 再居中绘制字形。否则比例字体的字格左右
             -- 留白区不清, 换行/滚动时残留旧像素; 光标块也因此能整格填充。
@@ -327,7 +358,7 @@ local function openHandle(ctx, mode)
             end
             -- 用设备填充整屏背景, 避免逐格重画(慢)
             if ctx.mode == "term" then
-                ctx.dev.fill(ctx.bg)
+                ctx.dev.fill(COLOR_BIT[ctx.bg]) -- CC 位掩码(供 setBackgroundColor)
             else
                 ctx.dev.fill(PALETTE[ctx.bg])
             end
