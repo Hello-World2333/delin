@@ -94,6 +94,38 @@ local function registerDisplaySyscalls()
     sc["display.fill"]  = function(id, color) local d = display.get(id); if d and d.fill then return d.fill(color) end end
 end
 
+--- 装载内核模块: init(目录) -> loadAll -> loadAliases -> 按外设 autoload 驱动。
+--- @param reader table|nil 读模块文件的 fs 门面(默认真实 fs; EXT2 根引导传 vfs_api.fs)
+--- @param dir string 模块目录(reader 为真 fs 时是真实路径, 为 vfs 时是 VFS 路径)
+--- @return boolean, string|nil
+local function setupModules(reader, dir)
+    modules.log = kprint
+    if reader then modules.fs = reader end
+    modules.init(dir)
+    local okM, errM = modules.loadAll()
+    if not okM then return nil, errM end
+    kprint("modules loaded from " .. dir)
+
+    -- 别名 + 按外设自动加载驱动模块 (modprobe 风格, modules.use)
+    local okA, errA = modules.loadAliases()
+    if okA then
+        for _, name in ipairs(peripheral.getNames()) do
+            local typ = peripheral.getType(name)
+            if typ then
+                local okU, errU = modules.use(typ, name)
+                if not okU and errU and errU:find("no module for alias") then
+                    -- 无别名, 忽略(普通外设)
+                elseif not okU then
+                    kprint("autoload " .. typ .. ": " .. tostring(errU))
+                end
+            end
+        end
+    elseif errA and errA:find("no modules.alias") then
+        kprint("no modules.alias (drivers not auto-loaded)")
+    end
+    return true
+end
+
 --- EXT2 根引导: 挂根分区为 "/", 再跑最小 PID1。
 local function bootExt2(bi)
     kprint("EXT2 boot: root=" .. (bi.rootFstype or "?") .. " " .. (bi.rootPath or "?"))
@@ -110,6 +142,21 @@ local function bootExt2(bi)
     local db = user.init(vfs_api.fs)
     user.registerSyscalls(db)
     kprint("users loaded: " .. table.concat(user.list(db), ","))
+
+    -- 内核模块: 只从 ext2 根镜像自带的 /lib/modules/<version>/ 装载(自包含, fail-fast)。
+    -- 绝不回退到引导盘/CC fs 的 /lib —— 那上面本就不该有模块。
+    local mdir = "/lib/modules/" .. modules.version
+    if not vfs_api.fs.exists(mdir .. "/manifest") then
+        kprint("FATAL: ext2 root has no module dir " .. mdir)
+        return
+    end
+    -- 关闭任意别处回退: 显式以 vfs(fs) 作为读模块文件的门面, 只读 ext2 根。
+    local okMod, errMod = setupModules(vfs_api.fs, mdir)
+    if not okMod then
+        kprint("FATAL: module load failed: " .. tostring(errMod))
+        return
+    end
+
     registerDisplaySyscalls()
     launch(EXT2_INIT_SOURCE, "ext2")
 end
@@ -138,36 +185,15 @@ function boot.boot()
     end
     kprint("vfs ready")
 
-    modules.log = kprint
     local mdir = findModuleDir()
     if mdir then
-        modules.init(mdir)
-        local okM, errM = modules.loadAll()
+        local okM, errM = setupModules(nil, mdir)
         if not okM then
             kprint("FATAL: module load failed: " .. tostring(errM))
             return
         end
-        kprint("modules loaded from " .. mdir)
     else
         kprint("no module dir found (modules skipped)")
-    end
-
-    -- 别名 + 按外设自动加载驱动模块 (modprobe 风格, modules.use)
-    local okA, errA = modules.loadAliases()
-    if okA then
-        for _, name in ipairs(peripheral.getNames()) do
-            local typ = peripheral.getType(name)
-            if typ then
-                local okU, errU = modules.use(typ, name)
-                if not okU and errU and errU:find("no module for alias") then
-                    -- 无别名, 忽略(普通外设)
-                elseif not okU then
-                    kprint("autoload " .. typ .. ": " .. tostring(errU))
-                end
-            end
-        end
-    elseif errA and errA:find("no modules.alias") then
-        kprint("no modules.alias (drivers not auto-loaded)")
     end
 
     local devNameList = table.concat(vfs_api.devices(), ",")

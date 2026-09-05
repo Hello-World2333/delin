@@ -13,6 +13,7 @@ local modules = {}
 
 modules.version = "0.0.2"
 modules.log = print   -- boot 可替换为 kprint
+modules.fs = fs       -- 读模块文件的 fs 门面(默认 CC 真实 fs; EXT2 根引导时 boot 换成 vfs_api.fs)
 
 ---@class DelinModule
 ---@field name string
@@ -57,8 +58,9 @@ local function parseMeta(src)
     return meta
 end
 
-local function readAll(realPath)
-    local f = fs.open(realPath, "r")
+local function readAll(path)
+    local openFn = modules.fs and modules.fs.open or fs.open
+    local f = openFn(path, "r")
     if not f then return nil end
     local c = f.readAll()
     f.close()
@@ -87,7 +89,7 @@ end
 -- ---------------------------------------------------------------
 local loadDir = nil  -- 真实 fs 目录, 由 boot 初始化
 
----@param dir string 真实 fs 目录(如 "disk/lib/modules/0.0.2")
+---@param dir string 模块目录(modules.fs 是真 fs 时为真实路径, 如 "disk/lib/modules/0.0.2"; 为 vfs 时为 VFS 路径, 如 "/lib/modules/0.0.2")
 function modules.init(dir)
     loadDir = dir
 end
