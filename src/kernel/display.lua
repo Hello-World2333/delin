@@ -21,7 +21,8 @@ local nodeMap = {} -- id -> { tty=name, fb=name }
 ---@field device table  -- 底层外设句柄
 ---@field cellW number|nil  -- pixel 型字格宽(物理像素)
 ---@field cellH number|nil  -- pixel 型字格高(物理像素)
----@field getSize fun(): number, number  -- 逻辑宽度,高度(0-based; term=单元格, pixel=像素)
+---@field getSize fun(x?:number): number, number  -- 逻辑宽度,高度(0-based; term=单元格, pixel=像素)
+---@field getTextWidth fun(s:string): number|nil  -- 字符/串的显示宽度(pixel 型比例字体用, tty 借此居中字元)
 ---@field blit fun(x:number,y:number,text:string,fg:any,bg:any)  -- 写文本单元格
 ---@field setPixel fun(x:number,y:number,color:any)
 ---@field fill fun(color:any)

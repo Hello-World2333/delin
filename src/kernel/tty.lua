@@ -130,7 +130,14 @@ local function flushDirty(ctx)
         if ctx.mode == "term" then
             pcall(dev.text, col, row, cell.ch, cell.fg, cell.bg)
         else
-            pcall(dev.text, col * ctx.cellW, row * ctx.cellH, cell.ch,
+            -- pixel 型: 字符在自己的字格里水平居中(字体是比例字体, 左对齐会窄字贴边/字距怪异)
+            local x = col * ctx.cellW
+            if dev.getTextWidth then
+                local cw = dev.getTextWidth(cell.ch)
+                local off = math.floor((ctx.cellW - cw) / 2)
+                if off > 0 then x = x + off end
+            end
+            pcall(dev.text, x, row * ctx.cellH, cell.ch,
                 PALETTE[cell.fg] or 0xFFFFFF, PALETTE[cell.bg] or 0x000000)
         end
     end

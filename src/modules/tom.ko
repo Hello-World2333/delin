@@ -38,6 +38,7 @@ return {
             device = gpu,
             width = wPx, height = hPx,
             getSize = function() return wPx, hPx end,
+            getTextWidth = function(s) return gpu.getTextLength(s) end, -- 比例字体宽度(供 tty 居中字元)
             blit = function(x, y, text, fg, bg)
                 gpu.drawText(x + 1, y + 1, text, fg or -1, bg or -1)
             end,
