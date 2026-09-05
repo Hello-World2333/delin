@@ -1,7 +1,10 @@
 --[[ Delin kernel scheduler.
      Owns the os.pullEventRaw loop and drives every process coroutine.
      Processes yield via CC's raw API (os.sleep, os.pullEvent, ...); the
-     scheduler resumes a process when the event it is filtering for arrives. ]]
+     scheduler resumes a process when the event it is filtering for arrives.
+
+     信号投递: 由 process.lua 经 scheduler.setSignalCheck 注入一个检查函数,
+     在 resume 前处理进程的 pending 信号(dead->移除 / stop->本轮跳过 / run->继续)。 ]]
 
 ---@class DelinProc
 ---@field pid integer
@@ -21,6 +24,13 @@ local scheduler = {}
 ---@type DelinProc[]
 local procs = {}
 
+--- 信号检查函数(process.lua 注入): (proc) -> "run"|"stop"|"dead"。
+local signalCheck = nil
+
+function scheduler.setSignalCheck(fn)
+    signalCheck = fn
+end
+
 --- 向调度器注册一个进程协程。
 ---@param proc DelinProc
 function scheduler.addProcess(proc)
@@ -36,38 +46,49 @@ function scheduler.run()
         while i <= #procs do
             local proc = procs[i]
 
-            -- 新进程用空事件启动；已启动进程仅在 filter 匹配(或 terminate)时恢复。
-            local shouldRun = (not proc.started)
-                or proc.filter == nil
-                or proc.filter == event[1]
-                or event[1] == "terminate"
+            -- 1) 投递信号: dead -> 移除; stop -> 暂停(本轮不 resume); run -> 继续。
+            local state = "run"
+            if signalCheck then state = signalCheck(proc) end
+            if state == "dead" then
+                proc.status = "dead"; proc.dead = true
+                if proc.onExit then proc.onExit(proc, "dead", nil) end
+                table.remove(procs, i)
+            elseif state == "stop" then
+                i = i + 1
+            else
+                -- 2) 新进程用空事件启动；已启动进程仅在 filter 匹配(或 terminate)时恢复。
+                local shouldRun = (not proc.started)
+                    or proc.filter == nil
+                    or proc.filter == event[1]
+                    or event[1] == "terminate"
 
-            if shouldRun then
-                local ok, param
-                if not proc.started then
-                    proc.started = true
-                    ok, param = coroutine.resume(proc.co)
-                else
-                    ok, param = coroutine.resume(proc.co, table.unpack(event, 1, event.n))
-                end
+                if shouldRun then
+                    local ok, param
+                    if not proc.started then
+                        proc.started = true
+                        ok, param = coroutine.resume(proc.co)
+                    else
+                        ok, param = coroutine.resume(proc.co, table.unpack(event, 1, event.n))
+                    end
 
-                if not ok then
-                    -- 进程出错。
-                    proc.status = "error"; proc.error = param; proc.dead = true
-                    if proc.onExit then proc.onExit(proc, "error", param) end
-                    table.remove(procs, i)
-                elseif coroutine.status(proc.co) == "dead" then
-                    -- 进程正常结束。
-                    proc.status = "dead"; proc.dead = true
-                    if proc.onExit then proc.onExit(proc, "dead", nil) end
-                    table.remove(procs, i)
+                    if not ok then
+                        -- 进程出错。
+                        proc.status = "error"; proc.error = param; proc.dead = true
+                        if proc.onExit then proc.onExit(proc, "error", param) end
+                        table.remove(procs, i)
+                    elseif coroutine.status(proc.co) == "dead" then
+                        -- 进程正常结束。
+                        proc.status = "dead"; proc.dead = true
+                        if proc.onExit then proc.onExit(proc, "dead", nil) end
+                        table.remove(procs, i)
+                    else
+                        -- 进程让出：param 即其 filter。
+                        proc.filter = param
+                        i = i + 1
+                    end
                 else
-                    -- 进程让出：param 即其 filter。
-                    proc.filter = param
                     i = i + 1
                 end
-            else
-                i = i + 1
             end
         end
 
@@ -80,7 +101,7 @@ function scheduler.run()
                 event = { n = 0 }
             end
             -- 键盘事件路由给前台 tty(canonical 行规程: 缓冲+回显)。
-            -- key/key_up 走 routeKey(跟踪修饰键 + Ctrl+Alt+数字切换前台 tty)。
+            -- key/key_up 走 routeKey(跟踪修饰键 + Ctrl+Alt+数字切换前台 tty + ^C/^D/^Z)。
             if event[1] == "char" or event[1] == "paste" then
                 tty.feedInput(event)
             elseif event[1] == "key" or event[1] == "key_up" then

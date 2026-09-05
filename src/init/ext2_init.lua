@@ -287,6 +287,132 @@ do
     if fs.exists("/home/alice/nonx") then pcall(fs.delete, "/home/alice/nonx") end
 end
 
+-- ═══════════ 信号机制测试(内核信号/作业控制) ═══════════
+do
+    print("ext2-init: signal tests start")
+    local function kill(pid, sig) return syscalls["signal.kill"](pid, sig) end
+    local function info(pid) return syscalls["proc.info"](pid) end
+    local sleeper = "while true do sleep(0.2) end"
+
+    -- 1) SIGSTOP / SIGCONT / SIGTERM 默认动作
+    local p1 = spawn(sleeper, "sigloop1")
+    sleep(0.1)
+    print("ext2-init: spawn sigloop1 pid=" .. tostring(p1))
+    kill(p1, 19) -- SIGSTOP
+    sleep(0.1)
+    local i1 = info(p1)
+    print("ext2-init: sigloop1 after SIGSTOP status=" .. (i1 and i1.status or "?") .. " (expect stopped)")
+    kill(p1, 18) -- SIGCONT
+    sleep(0.1)
+    local i2 = info(p1)
+    print("ext2-init: sigloop1 after SIGCONT status=" .. (i2 and i2.status or "?") .. " (expect running)")
+    kill(p1, 15) -- SIGTERM
+    sleep(0.1)
+    local i3 = info(p1)
+    print("ext2-init: sigloop1 after SIGTERM status=" .. (i3 and i3.status or "?")
+        .. " termsig=" .. (i3 and i3.termSig or "-") .. " (expect dead,15)")
+
+    -- 2) SIGKILL 不可捕获
+    local p2 = spawn(sleeper, "sigloop2")
+    sleep(0.1)
+    kill(p2, 9) -- SIGKILL
+    sleep(0.1)
+    local j2 = info(p2)
+    print("ext2-init: sigloop2 after SIGKILL status=" .. (j2 and j2.status or "?")
+        .. " termsig=" .. (j2 and j2.termSig or "-") .. " (expect dead,9)")
+
+    -- 3) SIGINT 无 handler -> 默认终止
+    local p3 = spawn(sleeper, "sigloop3")
+    sleep(0.1)
+    kill(p3, 2) -- SIGINT
+    sleep(0.1)
+    local k3 = info(p3)
+    print("ext2-init: sigloop3 SIGINT(no handler) status=" .. (k3 and k3.status or "?")
+        .. " termsig=" .. (k3 and k3.termSig or "-") .. " (expect dead,2)")
+
+    -- 4) SIGINT 带 handler -> 存活, handler 打印到 log(SIGINT_CAUGHT)
+    local hsrc = [[
+syscalls["signal.install"](2, function() print("SIGINT_CAUGHT") end)
+while true do sleep(0.2) end
+]]
+    local p4 = spawn(hsrc, "sigint-handler")
+    sleep(0.1)
+    kill(p4, 2)
+    sleep(0.1)
+    local i4 = info(p4)
+    print("ext2-init: sigint-handler after SIGINT status=" .. (i4 and i4.status or "?") .. " (expect running)")
+    kill(p4, 15) -- 清理
+    sleep(0.1)
+
+    -- 5) 无效 pid 报错
+    local ok5, e5 = syscalls["signal.kill"](999999, 15)
+    print("ext2-init: kill invalid pid ok=" .. tostring(ok5) .. " err=" .. tostring(e5) .. " (expect nil)")
+
+    -- 6) 会话(setsid)+进程组(killpg): leader 建会话, spawn worker, killpg 全组终止。
+    local lsrc = [[
+local sid = syscalls["job.setsid"]()
+spawn("while true do sleep(0.2) end", "worker")
+local pg, sid2 = syscalls["job.group"]()
+print("LEADER sid=" .. tostring(sid) .. " pg=" .. tostring(pg))
+while true do sleep(0.2) end
+]]
+    local lp = spawn(lsrc, "leader")
+    sleep(0.2)
+    local linfo = syscalls["proc.info"](lp)
+    print("ext2-init: leader pid=" .. tostring(lp) .. " pgrp=" .. tostring(linfo and linfo.pgrp)
+        .. " sid=" .. tostring(linfo and linfo.sid) .. " (expect pgrp==sid==pid)")
+    local killpgRes = syscalls["signal.killpg"](lp, 15) -- SIGTERM 整个进程组
+    sleep(0.1)
+    local ldead = syscalls["proc.info"](lp)
+    print("ext2-init: killpg(leader,TERM) n=" .. tostring(killpgRes)
+        .. " leader status=" .. (ldead and ldead.status or "?") .. " termsig=" .. (ldead and ldead.termSig or "-")
+        .. " (expect n>=1, dead,15)")
+
+    -- 7) setpgid 自建进程组(交互 sh 用: sh 把自己移出自己的组为前台)。
+    local sgsrc = [[
+local before, _ = syscalls["job.group"]()
+syscalls["job.setpgid"](pid, 0)
+local after, _ = syscalls["job.group"]()
+print("SETPGID before=" .. tostring(before) .. " after=" .. tostring(after))
+while true do sleep(0.2) end
+]]
+    local spid = spawn(sgsrc, "sgchild")
+    sleep(0.2)
+    local sp = syscalls["proc.info"](spid)
+    print("ext2-init: setpgid child pgrp=" .. tostring(sp and sp.pgrp)
+        .. " (expect ==pid " .. tostring(spid) .. ")")
+    syscalls["signal.kill"](spid, 9)
+    sleep(0.1)
+end
+
+-- ═══════════ tty ^C / ^D 行规程 ═══════════
+-- 用一个 reader 子进程真正阻塞在 tty readLine 上(置 ctx.reading), 再喂 ^C/^D 控制键。
+do
+    local rsrc = [[
+local c = syscalls["tty.console"]()
+local t = fs.open("/dev/" .. tostring(c), "rw")
+local line = t:readLine()
+print("READER_GOT=[" .. tostring(line) .. "]")
+]]
+    -- ^C(空缓冲): 取消行 -> readLine 返回 ""
+    spawn(rsrc, "reader-ctrl-c")
+    sleep(0.15)
+    os.queueEvent("key", keys.leftCtrl, false)
+    os.queueEvent("key", keys.c, false)
+    os.queueEvent("key_up", keys.leftCtrl, false)
+    sleep(0.2)
+    print("ext2-init: ^C test queued (read READER_GOT=[] in log)")
+
+    -- ^D(空缓冲): EOF -> readLine 返回 nil
+    spawn(rsrc, "reader-ctrl-d")
+    sleep(0.15)
+    os.queueEvent("key", keys.leftCtrl, false)
+    os.queueEvent("key", keys.d, false)
+    os.queueEvent("key_up", keys.leftCtrl, false)
+    sleep(0.2)
+    print("ext2-init: ^D test queued (read READER_GOT=[nil] in log)")
+end
+
 -- 3) 产品形态: 在每个 tty 上 spawn 一个 login 进程(登录到 sh)。init 保持存活。
 --    login 各自绑定自己的 tty(per-process stdio), 经 Ctrl+Alt+数字切换前台焦点共用一把键盘。
 local loginSrc

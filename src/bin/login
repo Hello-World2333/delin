@@ -11,6 +11,13 @@ if not t then
 end
 -- 绑定本进程 stdio 到该 tty(per-process stdio, 不与其他 tty 的 login 互扰)
 syscalls["stdio.set"](t, t)
+-- 创建会话: login 成为会话首进程, 把该 tty 设为控制终端, 前台进程组 = login 自身。
+syscalls["job.setsid"]()
+local loginPg = syscalls["job.group"]()
+syscalls["job.tcsetpgrp"](ttyName, loginPg)
+-- 忽略前台信号: ^C(SIGINT) / ^Z(SIGTSTP), 否则 login 会被前台信号杀死。
+syscalls["signal.install"](2, function() end)
+syscalls["signal.install"](20, function() end)
 local stdin  = io.stdin()
 local stdout = io.stdout()
 
@@ -77,6 +84,8 @@ local function doLogin()
                     outln("login: failed to start shell for " .. name)
                 else
                     syscalls["proc.wait"](child)
+                    -- sh 退出, 前台收回归 login(会话首进程)。
+                    syscalls["job.tcsetpgrp"](ttyName, loginPg)
                 end
                 outln("") -- sh 退出 -> 回到登录
             else

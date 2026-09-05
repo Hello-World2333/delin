@@ -42,7 +42,8 @@ lua5.1 tools/bundle.lua          # 生成 dist/delin-0.0.1.lua
 
 ```
 src/kernel/scheduler.lua   协程调度器(事件循环)
-src/kernel/process.lua     进程表/pid/spawn(source)/隔离 env(+cwd 注入)
+src/kernel/process.lua     进程表/pid/spawn(source)/隔离 env(+cwd 注入)+ 信号/作业控制
+src/kernel/signal.lua      POSIX 信号编号/默认动作/可捕获表
 src/kernel/boot.lua        入口: 日志→spawn PID1(init)→run
 src/kernel/tty.lua         字符终端(/dev/ttyN): 行规程+回显+焦点切换
 src/kernel/user.lua        用户库(/etc/passwd|shadow|group, salt+hash)
@@ -58,6 +59,7 @@ src/bin/head               打印前 N 行 (-n N|-N)
 src/bin/tail               打印后 N 行 (-n N|-N)
 src/bin/wc                 统计行/词/字节 (-l|-w|-c)
 src/bin/grep               按 Lua 模式查找行 (-n|-i|-v)
+src/bin/kill               发送信号到进程/进程组 (kill [-SIG] pid|-pgid; kill -l)
 src/bin/login              getty/login: 登录提示→验证→启动 sh→循环
 src/bin/sh                 交互/脚本 shell(内建 cd/pwd/echo/exit/help)
 tools/bundle.lua           打包 src/ → dist/delin-*.lua

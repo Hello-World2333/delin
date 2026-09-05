@@ -1,0 +1,54 @@
+-- Delin kill: 发送信号到进程/进程组。用法:
+--   kill [-SIG] pid...     默认 SIGTERM; pid 前加 - 表示进程组(-pgid)
+--   kill -l                列出信号名
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+local sig = 15 -- SIGTERM
+local targets = {}
+for i = 1, #args do
+    local a = args[i]
+    if a == "-l" or a == "-L" then
+        local nums = syscalls["signal.list"]()
+        local t = {}
+        for _, s in ipairs(nums) do t[#t + 1] = syscalls["signal.name"](s) end
+        io.write(table.concat(t, " ") .. "\n")
+        return
+    elseif a:match("^%-%d+$") then
+        sig = tonumber(a:sub(2))
+    elseif a:match("^%-[A-Za-z]+$") then
+        sig = syscalls["signal.number"](a)
+        if not sig then
+            stderr("kill: unknown signal " .. a .. "\n")
+            return
+        end
+    else
+        targets[#targets + 1] = a
+    end
+end
+
+if #targets == 0 then
+    stderr("usage: kill [-SIG] pid...\n")
+    return
+end
+
+for _, tgt in ipairs(targets) do
+    local n = tonumber(tgt)
+    if not n then
+        stderr("kill: invalid pid " .. tostring(tgt) .. "\n")
+    else
+        local ok, e
+        if n < 0 then
+            ok, e = syscalls["signal.killpg"](-n, sig)
+        else
+            ok, e = syscalls["signal.kill"](n, sig)
+        end
+        if not ok then
+            stderr("kill: (" .. tostring(tgt) .. ") " .. tostring(e) .. "\n")
+        end
+    end
+end

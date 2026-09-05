@@ -1,7 +1,7 @@
 -- Delin sh: 极简 POSIX shell。
--- 交互模式(stdin 是 tty): 显示提示符, 读命令行, 执行, 循环。
+-- 交互模式(stdin 是 tty): 显示提示符, 读命令行, 执行, 循环。带作业控制(& jobs fg bg kill)。
 -- 脚本模式(stdin 是文件): 逐行读 stdin, 执行, 到 EOF 为止。
--- 内建: cd pwd echo exit help。外部命令: /bin 下的独立工具(当子进程 spawn, 传 argv, wait)。
+-- 内建: cd pwd echo exit help jobs fg bg kill。外部命令: /bin 下的独立工具(当子进程 spawn, 传 argv, wait)。
 -- 输出走 io.stdout(父进程把它指向控制台 tty 或文件), 绝不 print(kprint 走日志+term)。
 
 local stdin  = io.stdin()
@@ -48,6 +48,73 @@ local function tokenize(line)
     return toks
 end
 
+-- ---------------------------------------------------------------
+-- 作业控制(仅交互模式且 stdin 是 tty)
+-- ---------------------------------------------------------------
+local ttyName = (stdin and stdin.getDeviceName) and stdin:getDeviceName() or nil
+local shPg = nil
+local jobs = {}        -- { jid, pgid, pid, cmd, status }
+local nextJid = 0
+local sigintPending = false
+local hasJobCtl = interactive and ttyName and syscalls and syscalls["job.setpgid"]
+
+if hasJobCtl then
+    -- 交互 sh 自建进程组(不与 login 同组, ^C 只打 sh 不打 login), 并把自己置为前台。
+    syscalls["job.setpgid"](pid, 0)
+    shPg = syscalls["job.group"]()
+    syscalls["job.tcsetpgrp"](ttyName, shPg)
+    -- ^Z(SIGTSTP): sh 不停止; ^C(SIGINT): 置标志以便回到提示符。
+    syscalls["signal.install"](20, function() end)
+    syscalls["signal.install"](2, function() sigintPending = true end)
+end
+
+--- 极简等待: 轮询 proc.info 状态; 返回 (reason, code) reason=exited|stopped|error。
+local function pollWait(pidIn)
+    while true do
+        local p = syscalls["proc.info"](pidIn)
+        if not p then return "exited", -1 end
+        if p.status == "dead" then
+            return "exited", (p.termSig and -p.termSig) or (p.exitCode or 0)
+        elseif p.status == "error" then
+            return "error", p.error
+        elseif p.status == "stopped" then
+            return "stopped", p
+        end
+        if os.sleep then os.sleep(0.05) end
+    end
+end
+
+--- 按引用找作业: %N | N | pid | 缺省(最近一个)。
+local function resolveJob(ref)
+    if not ref then return jobs[#jobs] end
+    if type(ref) == "number" then
+        for _, j in ipairs(jobs) do if j.jid == ref then return j end end
+    else
+        local n = tonumber(tostring(ref):match("^%%(%d+)$"))
+        if n then
+            for _, j in ipairs(jobs) do if j.jid == n then return j end end
+        elseif tonumber(ref) then
+            local pn = tonumber(ref)
+            for _, j in ipairs(jobs) do if j.pid == pn then return j end end
+        end
+    end
+    return nil
+end
+
+--- 清理已结束的作业(dead/error), 返回是否还有作业。
+local function pruneJobs()
+    local keep = {}
+    for _, j in ipairs(jobs) do
+        local p = syscalls and syscalls["proc.info"] and syscalls["proc.info"](j.pid)
+        if p and (p.status == "dead" or p.status == "error") then
+            -- 作业已结束, 从列表移除(不做留痕)
+        else
+            keep[#keep + 1] = j
+        end
+    end
+    jobs = keep
+end
+
 local builtins = {}
 
 builtins.pwd = function(args)
@@ -69,9 +136,90 @@ builtins.cd = function(args)
     end
 end
 
+builtins.jobs = function(args)
+    if not hasJobCtl then return end
+    pruneJobs()
+    if #jobs == 0 then return end
+    for _, j in ipairs(jobs) do
+        outln(string.format("[%d]+ %-8s %s", j.jid, j.status, j.cmd))
+    end
+end
+
+builtins.fg = function(args)
+    if not hasJobCtl then errln("fg: not a job-control shell"); lastExit = 1; return end
+    pruneJobs()
+    local j = resolveJob(args[1])
+    if not j then errln("fg: no such job"); lastExit = 1; return end
+    syscalls["job.tcsetpgrp"](ttyName, j.pgid)
+    if j.status == "stopped" then
+        syscalls["signal.killpg"](j.pgid, 18) -- SIGCONT
+        j.status = "running"
+    end
+    local reason, code = pollWait(j.pid)
+    syscalls["job.tcsetpgrp"](ttyName, shPg)
+    if reason == "stopped" then
+        j.status = "stopped"
+        outln("[" .. j.jid .. "]+ Stopped " .. j.cmd)
+        return
+    end
+    for i, x in ipairs(jobs) do if x == j then table.remove(jobs, i); break end end
+    lastExit = (reason == "exited") and (code or 0) or 1
+    if lastExit > 0 then
+        errln("sh: " .. j.cmd .. ": exit " .. tostring(lastExit))
+    end
+end
+
+builtins.bg = function(args)
+    if not hasJobCtl then errln("bg: not a job-control shell"); lastExit = 1; return end
+    pruneJobs()
+    local j = resolveJob(args[1])
+    if not j then errln("bg: no such job"); lastExit = 1; return end
+    syscalls["signal.killpg"](j.pgid, 18) -- SIGCONT
+    j.status = "running"
+    outln("[" .. j.jid .. "] " .. j.cmd .. " &")
+end
+
+builtins.kill = function(args)
+    -- kill [-SIG] pid|%job ...
+    local sig = 15 -- SIGTERM
+    local targets = {}
+    for i = 1, #args do
+        local a = args[i]
+        if a == "-l" or a == "-L" then
+            local nums = (syscalls and syscalls["signal.list"] and syscalls["signal.list"]()) or {}
+            local t = {}
+            for _, s in ipairs(nums) do t[#t + 1] = syscalls["signal.name"](s) end
+            outln(table.concat(t, " "))
+            return
+        elseif a:match("^-%d+$") then
+            sig = tonumber(a:sub(2))
+        elseif a:match("^%-[A-Za-z]+$") then
+            sig = (syscalls and syscalls["signal.number"] and syscalls["signal.number"](a)) or nil
+            if not sig then errln("kill: unknown signal " .. a); lastExit = 1; return end
+        else
+            targets[#targets + 1] = a
+        end
+    end
+    if #targets == 0 then errln("usage: kill [-SIG] pid|%job ..."); lastExit = 1; return end
+    for _, tgt in ipairs(targets) do
+        if tostring(tgt):match("^%%") then
+            local j = resolveJob(tgt)
+            if not j then
+                errln("kill: no such job " .. tgt); lastExit = 1
+            elseif syscalls and syscalls["signal.killpg"] then
+                local ok, e = syscalls["signal.killpg"](j.pgid, sig)
+                if not ok then errln("kill: " .. tgt .. ": " .. tostring(e)); lastExit = 1 end
+            end
+        else
+            local ok, e = syscalls["signal.kill"](tonumber(tgt), sig)
+            if not ok then errln("kill: " .. tostring(tgt) .. ": " .. tostring(e)); lastExit = 1 end
+        end
+    end
+end
+
 builtins.help = function(args)
     outln("Delin sh v0.0.1")
-    outln("builtins : cd pwd echo exit help")
+    outln("builtins : cd pwd echo exit help jobs fg bg kill")
     outln("external : ls cat rm mkdir cp mv touch head tail wc grep")
     outln("usage    : sh [script]  (no script => interactive on stdio)")
 end
@@ -82,7 +230,7 @@ builtins.exit = function(args)
 end
 
 --- 外部命令: 在 /bin 下找, 读源码, spawn 子进程(传 argv), wait 等退出。
-local function runExternal(cmd, args)
+local function runExternal(cmd, args, bg)
     local path
     if cmd:sub(1, 1) == "/" then
         path = cmd
@@ -121,10 +269,40 @@ local function runExternal(cmd, args)
         lastExit = 126
         return
     end
-    local code = syscalls["proc.wait"](child)
-    lastExit = code or 0
-    if lastExit ~= 0 then
-        errln("sh: " .. cmd .. ": exit " .. tostring(lastExit))
+
+    if hasJobCtl then
+        -- 新进程组(作业) & 控制终端前台组交给它(前台作业)。
+        syscalls["job.setpgid"](child, 0)
+        local cmdline = cmd .. ((#args > 0) and (" " .. table.concat(args, " ")) or "")
+        if bg then
+            nextJid = nextJid + 1
+            jobs[#jobs + 1] = { jid = nextJid, pgid = child, pid = child, cmd = cmdline, status = "running" }
+            outln("[" .. nextJid .. "] " .. tostring(child) .. " " .. cmdline)
+            return
+        end
+        syscalls["job.tcsetpgrp"](ttyName, child)
+        local reason, code = pollWait(child)
+        syscalls["job.tcsetpgrp"](ttyName, shPg)
+        if reason == "stopped" then
+            nextJid = nextJid + 1
+            jobs[#jobs + 1] = { jid = nextJid, pgid = child, pid = child, cmd = cmdline, status = "stopped" }
+            outln("[" .. nextJid .. "]+ Stopped " .. cmdline)
+            return
+        elseif reason == "error" then
+            lastExit = 1
+            errln("sh: " .. cmd .. ": " .. tostring(code))
+            return
+        end
+        lastExit = code or 0
+        if lastExit > 0 then
+            errln("sh: " .. cmd .. ": exit " .. tostring(lastExit))
+        end
+    else
+        local code = syscalls["proc.wait"](child)
+        lastExit = code or 0
+        if lastExit > 0 then
+            errln("sh: " .. cmd .. ": exit " .. tostring(lastExit))
+        end
     end
 end
 
@@ -138,18 +316,27 @@ local function execLine(line)
     local cmd = toks[1]
     local args = {}
     for i = 2, #toks do args[#args + 1] = toks[i] end
+    -- 行尾单个 "&" => 后台作业(仅作业控制 shell; 脚本模式忽略)。
+    local bg = false
+    if #args > 0 and args[#args] == "&" then
+        bg = hasJobCtl
+        table.remove(args)
+    elseif cmd == "&" then
+        return
+    end
     if builtins[cmd] then
         return builtins[cmd](args)
     end
-    runExternal(cmd, args)
+    runExternal(cmd, args, bg)
 end
 
 if interactive then
     while true do
         local prompt = uname .. "@delin:" .. (cwd == "/" and "/" or cwd) .. "# "
         if stdout and stdout.write then stdout:write(prompt) end
+        sigintPending = false
         local line = stdin:readLine()
-        if line == nil then break end -- EOF
+        if line == nil then break end -- EOF(^D)
         local r = execLine(line)
         if r == "EXIT" then break end
     end

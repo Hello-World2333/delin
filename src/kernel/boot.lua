@@ -101,7 +101,10 @@ local function registerRuntimeSyscalls()
         while true do
             local p = process.info(pid)
             if not p then return -1 end
-            if p.status == "dead" or p.status == "error" then return p.exitCode or 0 end
+            if p.status == "dead" or p.status == "error" then
+                if p.termSig then return -p.termSig end
+                return p.exitCode or 0
+            end
             if os.sleep then os.sleep(0.05) end
         end
     end
@@ -109,6 +112,11 @@ local function registerRuntimeSyscalls()
     sc["stdio.set"] = function(input, output) return process.setStdio(input, output) end
     sc["tty.setFocus"] = function(name) return tty.setFocus(name) end
     sc["tty.console"] = function() return tty.getFocus() end
+    -- 终端信号路由: ^C(SIGINT)/^Z(SIGTSTP) 发给 tty 前台进程组。
+    tty.onSignal = function(sig)
+        local fg = process.tcgetpgrp(tty.getFocus())
+        if fg then process.signalGroup(fg, sig) end
+    end
 end
 
 --- 注册电脑自身 term 作为 /dev/ttyN 控制台(console)。

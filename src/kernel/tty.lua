@@ -8,7 +8,12 @@
      事件经 tty.feedInput 路由给焦点 tty, 由它做行缓冲 + 回显(经典 canonical
      行规程); 句柄的 readLine()/read() 阻塞调用进程直到拿到一整行。 ]]
 
+local signal = require("kernel.signal")
+
 local tty = {}
+
+-- ^C/^Z 信号路由回调(boot 注入): (sig) -> nil。避免 tty 依赖 process 造成循环。
+tty.onSignal = nil
 
 local nextIndex = 0
 local devices = {} -- "ttyN" -> console ctx
@@ -97,6 +102,10 @@ local function newCtx(dev)
     ctx.inputBuffer = ""
     ctx.lineQueue = {}
     ctx.echo = true -- 回显开(密码时 login 置 false)
+    -- ^C/^D 中断状态: eof(^D 行首) / intr(^C/^Z 取消行) 由 readLine 消费。
+    ctx.eof = false
+    ctx.intr = false
+    ctx.reading = false -- 是否有进程正阻塞在 readLine 上(判断 ^C 是否要打断读)
     -- 光标: cursorOn 当前是否显示(闪烁 tick 翻转); cursorRenderedIdx 已按光标反显渲染的单元格。
     ctx.cursorOn = true
     ctx.cursorRenderedIdx = nil
@@ -242,8 +251,32 @@ local function finalizeLine(ctx)
     ctx.inputBuffer = ""
 end
 
+--- 不 echo 换行地冲刷当前行(^D 行中=返回部分行)。
+local function flushLine(ctx)
+    ctx.lineQueue[#ctx.lineQueue + 1] = ctx.inputBuffer
+    ctx.inputBuffer = ""
+end
+
+--- 直接把一串字符写进 tty(回显 ^C/^Z 用)。
+local function writeStr(ctx, s)
+    for i = 1, #s do putChar(ctx, s:sub(i, i)) end
+    flushDirty(ctx)
+end
+
+--- 取消当前行(^C/^Z): 丢弃正在编辑的输入, 若有进程阻塞在读, 置 intr 打断它。
+local function abortLine(ctx)
+    ctx.inputBuffer = ""
+    ctx.eof = false
+    if ctx.reading then ctx.intr = true end
+end
+
 --- 喂一个字符(可打印 / 换行 / 退格)。无回显(echo=false)时缓冲但不绘制。
+--- 原始控制字符(如 ^C 的 \3)不入行缓冲(控制组合由 routeKey 处理)。
 local function feedChar(ctx, ch)
+    local b = string.byte(ch or "", 1)
+    if b and b < 0x20 and b ~= 0x0A and b ~= 0x0D and b ~= 0x08 and b ~= 0x09 then
+        return
+    end
     if ch == "\n" or ch == "\r" then
         finalizeLine(ctx)
     elseif ch == "\b" then
@@ -296,6 +329,21 @@ function tty.routeKey(event)
             return
         end
     end
+    -- 控制字符: ctrl + c/d/z (无 alt) -> 信号 / EOF / 停止。其余 ctrl+键忽略(不入行)。
+    if ctrlDown and not altDown then
+        if name == "c" then
+            if focus and devices[focus] then tty.ctrlC(devices[focus]) end
+            return
+        elseif name == "d" then
+            if focus and devices[focus] then tty.ctrlD(devices[focus]) end
+            return
+        elseif name == "z" then
+            if focus and devices[focus] then tty.ctrlZ(devices[focus]) end
+            return
+        else
+            return
+        end
+    end
     local ctx = focus and devices[focus]
     if ctx then feedKey(ctx, key, event[3] or false) end
 end
@@ -307,8 +355,8 @@ function tty.feedInput(event)
     if not ctx then return end
     local ev = event[1]
     if ev == "char" then
-        -- Ctrl+Alt 组合(如 tty 切换)期间抑制字符落屏
-        if ctrlDown and altDown then return end
+        -- Ctrl(+Alt) 组合(如 ^C/^D/^Z/tty 切换)期间抑制字符落屏。
+        if ctrlDown then return end
         feedChar(ctx, tostring(event[2] or ""))
     elseif ev == "key" then
         feedKey(ctx, event[2], event[3])
@@ -316,6 +364,34 @@ function tty.feedInput(event)
         local text = tostring(event[2] or "")
         for i = 1, #text do feedChar(ctx, text:sub(i, i)) end
     end
+end
+
+--- 发送一个终端信号给前台会话(经 boot 注入的 tty.onSignal; 无则忽略)。
+function tty.raiseSignal(sig)
+    if tty.onSignal then tty.onSignal(sig) end
+end
+
+--- ^C: 发送 SIGINT 给 tty 前台进程组 + 取消当前行 + 回显 "^C"。
+function tty.ctrlC(ctx)
+    if ctx.echo then writeStr(ctx, "^C\n") end
+    abortLine(ctx)
+    tty.raiseSignal(signal.SIGINT)
+end
+
+--- ^D: POSIX canonical。行首(缓冲区空)=EOF; 行中有字符=冲刷部分行。
+function tty.ctrlD(ctx)
+    if #ctx.inputBuffer > 0 then
+        flushLine(ctx)
+    else
+        ctx.eof = true
+    end
+end
+
+--- ^Z: 发送 SIGTSTP 给 tty 前台进程组 + 取消当前行 + 回显 "^Z"。
+function tty.ctrlZ(ctx)
+    if ctx.echo then writeStr(ctx, "^Z\n") end
+    abortLine(ctx)
+    tty.raiseSignal(signal.SIGTSTP)
 end
 
 --- 设置前台 tty(接收键盘输入)。"console" 别名 => 第一个已注册 tty。
@@ -385,18 +461,33 @@ local function openHandle(ctx, mode)
         setEcho = function(self, enable) ctx.echo = (enable ~= false); return true end,
         getCursor = function() return ctx.cursorX, ctx.cursorY end,
         getSize = function() return ctx.cols, ctx.rows end,
+        getDeviceName = function() return ctx.name end,
         flush = function() flushDirty(ctx); return true end,
         -- 字符设备: 打开多个句柄共享同一 ctx, close 不真正关闭设备(可重开)。
         close = function() return true end,
     }
 
     --- 阻塞读取一整行。调度器把键盘事件喂进 ctx.lineQueue; 这里轮询队列。
+    --- 也消费 ^D(EOF) 与 ^C/^Z(中断) 标志。
     handle.readLine = function()
         if ctx.closed then return nil, "device closed" end
+        ctx.reading = true
         while true do
+            if ctx.eof then
+                ctx.eof = false
+                ctx.reading = false
+                return nil
+            end
+            if ctx.intr then
+                ctx.intr = false
+                ctx.inputBuffer = ""
+                ctx.reading = false
+                return ""
+            end
             if #ctx.lineQueue > 0 then
                 local line = table.remove(ctx.lineQueue, 1)
                 ctx.inputBuffer = ""
+                ctx.reading = false
                 return line
             end
             -- 阻塞进程直到有事件; feedInput 已处理缓冲+回显。忽略非键盘事件。
@@ -420,6 +511,7 @@ function tty.registerDevice(dev)
     local name = "tty" .. nextIndex
     nextIndex = nextIndex + 1
     local ctx = newCtx(dev)
+    ctx.name = name
     devices[name] = ctx
     if not focus then focus = name end -- 第一个 tty 成为默认前台
     local handler = {
