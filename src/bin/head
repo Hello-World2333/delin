@@ -15,6 +15,12 @@ local function stderr(s)
     local e = io.stderr()
     if e and e.write then e:write(s) end
 end
+-- 把 fs.open 错误映射为 POSIX 风格: 不存在 / 无权限 / 是目录。
+local function ioeMsg(err)
+    if err and (err:find("permission") or err:find("denied")) then return "Permission denied" end
+    if err and err:find("directory") then return "Is a directory" end
+    return "No such file or directory"
+end
 
 local n = 10
 local files = {}
@@ -60,9 +66,9 @@ end
 
 for _, p in ipairs(files) do
     p = resolve(p)
-    local f = fs.open(p, "r")
+    local f, err = fs.open(p, "r")
     if not f then
-        stderr("head: " .. p .. ": No such file or directory\n")
+        stderr("head: " .. p .. ": " .. ioeMsg(err) .. "\n")
         return
     end
     emit(f)

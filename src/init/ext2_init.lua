@@ -245,8 +245,17 @@ do
     local nx = fs.open("/home/alice/nonx", "w")
     if nx then nx.write("return 1"); nx.close() end
     -- 无参 ls 应列出当前目录(cwd=/home/alice → 含 x.txt), 而非 "/"(含 etc/)。
-    -- cat /secret(0600 root) 应报 Permission denied 而非 "No such file"(文件存在)。
-    local lines = { "/home/alice/nonx", "cat /secret", "ls", "echo AFTER" }
+    -- 读工具对 0600 root 的 /secret 应报 Permission denied 而非 "No such file"(文件存在)。
+    local lines = {
+        "/home/alice/nonx",
+        "cat /secret",
+        "grep root /secret",
+        "head /secret",
+        "tail /secret",
+        "wc /secret",
+        "ls",
+        "echo AFTER",
+    }
     local li = 0
     local inH = { readLine = function(self) li = li + 1; return lines[li] end }
     local outbuf = {}
@@ -264,12 +273,17 @@ do
         sleep(0.1); tries = tries + 1
     end
     local out = table.concat(outbuf)
+    local function has(s) return out:find(s, 1, true) ~= nil end
     print("ext2-init: alice sh run nonx => [" .. out .. "]")
-    print("ext2-init: alice sh refuses non-exec=" .. tostring(out:find("Permission denied", 1, true) ~= nil))
-    print("ext2-init: alice sh ls no-arg cwd=" .. tostring(out:find("x.txt", 1, true) ~= nil)
-        .. "/not-root=" .. tostring(out:find("etc/", 1, true) == nil))
-    print("ext2-init: alice sh cat /secret msg=PermissionDenied="
-        .. tostring(out:find("cat: /secret: Permission denied", 1, true) ~= nil))
+    print("ext2-init: alice sh refuses non-exec=" .. tostring(has("Permission denied")))
+    print("ext2-init: alice sh ls no-arg cwd=" .. tostring(has("x.txt"))
+        .. "/not-root=" .. tostring(not has("etc/")))
+    print("ext2-init: alice sh err-msgs cat/grep/head/tail/wc="
+        .. tostring(has("cat: /secret: Permission denied"))
+        .. "," .. tostring(has("grep: /secret: Permission denied"))
+        .. "," .. tostring(has("head: /secret: Permission denied"))
+        .. "," .. tostring(has("tail: /secret: Permission denied"))
+        .. "," .. tostring(has("wc: /secret: Permission denied")))
     if fs.exists("/home/alice/nonx") then pcall(fs.delete, "/home/alice/nonx") end
 end
 

@@ -21,6 +21,11 @@ local function stderr(s)
     local e = io.stderr()
     if e and e.write then e:write(s) end
 end
+-- 把 fs.list 错误映射为 POSIX 风格: 不存在 / 无权限。
+local function ioeMsg(err)
+    if err and (err:find("permission") or err:find("denied")) then return "Permission denied" end
+    return "No such file or directory"
+end
 
 if not fs.exists(path) then
     stderr("ls: " .. (args[1] or "") .. ": No such file or directory\n")
@@ -28,7 +33,11 @@ if not fs.exists(path) then
 end
 
 if fs.isDir(path) then
-    local names = fs.list(path) or {}
+    local names, lerr = fs.list(path)
+    if not names then
+        stderr("ls: " .. (args[1] or "") .. ": " .. ioeMsg(lerr) .. "\n")
+        return
+    end
     table.sort(names)
     for _, name in ipairs(names) do
         local full = (path == "/") and ("/" .. name) or (path .. "/" .. name)
