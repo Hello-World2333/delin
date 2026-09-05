@@ -162,14 +162,18 @@ local function flushDirty(ctx)
         if ctx.mode == "term" then
             dev.text(col, row, cell.ch, fg, bg)
         else
-            -- pixel 型: 字符在自己的字格里水平居中(字体是比例字体, 左对齐会窄字贴边/字距怪异)
-            local x = col * ctx.cellW
+            -- pixel 型: 先用背景色填满整个字格, 再居中绘制字形。否则比例字体的字格左右
+            -- 留白区不清, 换行/滚动时残留旧像素; 光标块也因此能整格填充。
+            local px = col * ctx.cellW
+            local py = row * ctx.cellH
+            dev.rect(px, py, ctx.cellW, ctx.cellH, PALETTE[bg])
+            local x = px
             if dev.getTextWidth then
                 local cw = dev.getTextWidth(cell.ch)
                 local off = math.floor((ctx.cellW - cw) / 2)
                 if off > 0 then x = x + off end
             end
-            dev.text(x, row * ctx.cellH, cell.ch, PALETTE[fg], PALETTE[bg])
+            dev.text(x, py, cell.ch, PALETTE[fg], PALETTE[bg])
         end
     end
     ctx.dirty = {}
