@@ -1,37 +1,99 @@
 # Delin OS
 
-适用于 **CC: Tweaked (ComputerCraft)** 的操作系统。目标：**在尽可能模仿 Linux 的同时不过度设计。**
+适用于 **CC: Tweaked (ComputerCraft)** 的操作系统。
 
-## v0.0.1 — 协程调度内核 + PID 1
+## 设计目标
 
-一个自持事件循环的**协程调度器**内核，引导后 spawn 出 **PID 1（init）** 作为第一个进程，
-各进程跑在**隔离的 `_ENV`** 里，形成进程树。源码结构化放在 `src/`，经 `tools/bundle.lua`
-打包成单个自包含 Lua 文件部署到磁盘 `/boot`。
+项目设计目标：**目录结构尽可能符合 Unix 标准；系统接口与 shell 工具尽可能符合 POSIX 标准 + GNU 扩展。**
+目的是让一个习惯 Linux 的人来到 Delin 不会遇到很明显的阻碍——看到一个 `/dev`、一个 `/proc`、一个
+`/etc/passwd`、一个 `kill -l`、一个 `sed -i` 就能直接上手，而不用先学一套新的约定。
+
+实现细节一律对照真实 Linux 的 man 手册与命令行为来定，可在本机 `man(1)` / `man(5)` / `man(7)` 核对。
+
+### 目录约定（FHS 风格）
+
+| 路径 | 作用 |
+|---|---|
+| `/bin/` | 用户工具：`cat ls mkdir rm cp mv touch head tail wc grep sed kill login sh` |
+| `/dev/` | 设备文件：`/dev/ttyN`（字符终端，全类型显示）、`/dev/fbN`（像素帧缓冲，pixel 型显示） |
+| `/etc/` | 用户/组配置：`passwd` `shadow` `group` |
+| `/proc/` | 虚拟进程/系统信息 fs（由模块提供） |
+| `/sys/class/display/` | 显示设备虚拟配置 fs：每设备一个目录，`name/type/size` 只读，分辨率/位置/旋转/缩放 可读写 |
+| `/lib/modules/<version>/` | 内核模块目录：`.ko` 模块 + 纯文本 `manifest` + `modules.alias` |
+| `/mnt/` | 挂载点（磁盘驱动、ext2 分区） |
+| `/parts/` | 引导盘分区清单 `manifest`（`<role> <path> <fstype>`，`#` 为注释） |
+| `/boot/` | 内核镜像 |
+
+### 接口与工具（POSIX + GNU 子集）
+
+**进程模型**：`pid/ppid/uid/gid`；`argv`（`[0]`=程序名，`[1..]`=位置参数）；会话（`sid`）与进程组
+（`pgrp`）；`tcgetpgrp` 前台进程组；作业控制（`&` `jobs` `fg` `bg` `kill`）。
+
+**信号**：POSIX 信号编号（`SIGHUP..SIGTTOU`，取 Linux x86-64 编号与默认动作/可捕获表）；
+`kill [-SIG] pid|-pgid`、`kill -l`；终端 `^C`（`SIGINT`）/`^Z`（`SIGTSTP`）路由到前台进程组。
+
+**文件系统**：进程所见 `fs/io` 走内核 VFS（真实磁盘 + 虚拟 `/dev` `/proc` `/sys` 同一命名空间）；
+权限用 `mode`（八进制）+ `uid/gid`，`chmod`/`chown`，启动外部程序强制检查执行（`x`）位。
+
+**用户**：`/etc/passwd` `name:x:uid:gid:fullname:home:shell`、`/etc/shadow` `name:salt$hash`、
+`/etc/group`；`login` 提示用户名/密码（隐藏回显），验证通过后按该用户 `uid/gid` 起 `sh`。
+
+**显示抽象**：进程面向设备文件而非库接口——`/dev/ttyN`（控制台）、`/dev/fbN`（帧缓冲）。
+
+**工具**：`ls`、`cat`、`mkdir`、`rm`、`cp (-r)`、`mv`、`touch`、`head (-n)`、`tail (-n)`、
+`wc (-l|-w|-c)`、`grep (-n|-i|-v)`、`sed`（GNU 子集：`s/y/d/p/q/a/i/c/=`、行号/`$`/正则地址与区间、
+`!` 取反、`-n -s -e -f -i`）、`kill`、`login`、`sh`（内建 `cd/pwd/echo/exit/help/jobs/fg/bg/kill`）。
+
+**已知偏离**：`grep`/`sed` 的正则用 **Lua pattern**（`%` 为转义符、`()` 为捕获）而非 POSIX ERE/BRE；
+替换区用 `&`=整串匹配、`\1..\9`=捕获组、`\n/\t`，不支持 BRE 风格 `\(...\)` 与模式内逆引用。
+因 CC 5.2 无位运算，`/etc/shadow` 哈希用盐+密码的 32 位滚动哈希（djb2）替代传统 `crypt`。
+
+## 当前状态
+
+v0.0.1 的协程调度内核 + 进程树之后，已扩展为具备 VFS、块设备、EXT2 读写、显示抽象、模块系统与
+用户/权限的迷你系统。所有子系统自持事件循环，由内核调度器驱动；进程跑在隔离 `_ENV` 里，经注入的
+内核上下文（`spawn`/`pid`/`ppid`/`uid`/`gid`/`syscalls`）访问内核能力，其余原始 CC API 直用。
+
+### 引导
+
+代码经 `tools/bundle.lua` 打包成自包含 Lua 文件部署。两条引导路径：
+
+- **CC-fs 引导**（默认）：`kernel.lua` 直接跑 `boot.boot()`——`setupVfs` 挂根 hdd + 各磁盘驱动到
+  `/mnt/<side>` → `registerConsole` 把电脑自身 `term` 注册为 `/dev/ttyN` 控制台 → `setupModules`
+  从 `/lib/modules/<version>/` 装模块（`loadAll` + `loadAliases` + 按外设 autoload 驱动，
+  modprobe 风格 `modules.use`）→ `sysfs.mount` 挂 `/sys/class/display` → `launch` 出 PID 1（init）。
+- **EXT2 根引导**（GRUB 风格，DLUB 独立文件）：先由 `dlub.lua` 找带 `/parts/manifest` 的引导盘，
+  按清单把 root 分区开成块设备、挂 ext2、读内核镜像并设 `_G.__boot_info`；`boot.boot()` 检测到
+  `__boot_info` 即走 `bootExt2`——挂 ext2 根为 `/`，读 `/etc/passwd` 建用户库，模块只从 ext2 根镜像
+  自带的 `/lib/modules/<version>/` 装载（自包含，fail-fast，绝不回退到引导盘/CC fs 的 `/lib`）。
 
 ### 设计要点
 
-- **并发**：内核自持 `os.pullEventRaw` 循环，`coroutine.create/resume` + 按协程 yield 的
-  filter 分发事件（与 `parallel` 同源，但由内核完全掌控任务生命周期）。
-- **原始 API 直用**：任务体内直接用 `os.sleep`/`os.pullEvent`/`fs`…… 调度器驱动，不包 `ctx.sleep`。
-- **隔离环境**：每个进程用自己的 `_ENV`（`load(src, name, "t", env)`）；`env` 里注入内核上下文
-  `spawn`/`pid`/`ppid`/`print`，并通过 `__index = _G` 兜底原始 API。
-- **`spawn` 只收源码字符串**：`spawn(src, name?)` 在独立 `_ENV` 里建子进程；要跑文件由程序
-  自己用 `fs` 读、把内容当字符串传给 `spawn`。
-- **进程树**：`{ pid, ppid, status, children }`；父死子并入 init。
-- **print 覆盖**：内核自供 `print`（写日志 + 终端），因为 CC 自带 `print` 不走 `io.stdout`。
+- **并发**：内核自持 `os.pullEventRaw` 循环，`coroutine.create/resume` + 按协程 yield 的 filter
+  分发事件；进程经原始 API（`os.sleep`/`os.pullEvent`/`fs`……）yield，调度器驱动。
+- **隔离环境**：每个进程有自己的 `_ENV`（`load(src, name, "t", env)`），注入内核上下文
+  `spawn`/`pid`/`ppid`/`uid`/`gid`/`syscalls`，`__index = _G` 兜底原始 API。
+- **`spawn` 只收源码字符串**：`spawn(src, name?, uid?, gid?, argv?, opts?)` 在隔离 `_ENV` 里建子进程；
+  读文件由程序自己做；`argv`（`[0]`=程序名）与 `arg0`/`args`/`argc` 直接注入子进程环境。
+- **进程树 + 会话/进程组**：`{ pid, ppid, status, children, pgrp, sid, sig }`；父死子并入 init；
+  信号经调度器在 resume 前投递（`setSignalCheck`）。
+- **print 覆盖**：内核自供 `print`（写日志 + 终端），因 CC 自带 `print` 不走 `io.stdout`。
 - **stdio 按进程隔离**：每个进程有自己的 `stdin/stdout`；spawn 时从父进程继承（或 boot 默认终端），
-  `stdio.set` 只改当前进程。这样多个 tty 的 login 各自绑定自己的 tty，互不覆盖。
-- **getty/login**：开机后 init 在每个 `/dev/ttyN` 上 spawn 一个 `login` 进程；login 提示用户名/密码
-  （密码隐藏回显），验证通过后用该用户的 uid/gid spawn `sh`（同 tty stdio），`sh` 退出后回到 login 循环。
-- **tty 焦点切换**：只有前台 tty 接收键盘。`Ctrl+Alt+1..0` 切换前台 tty，让多个 tty 共用一把键盘。
+  `stdio.set` 只改当前进程；`io.write/read` 经 `vfs_api.setStdio` 兜底到终端。
+- **tty 焦点切换**：只有前台 tty 接收键盘。`Ctrl+Alt+1..0` 切换前台 tty，多 tty 共用一把键盘；
+  行缓冲 + 回显（canonical 行规程），焦点 tty 收到 `^C`/`^Z` 时把信号投给其前台进程组。
+- **getty/login**：init 在每个 `/dev/ttyN` 上起 `login`；login 验证后按用户 `uid/gid` 起 `sh`
+  （同 tty stdio），`sh` 退出后回到 login 循环。
 
-### 构建
+## 构建
 
 ```bash
-lua5.1 tools/bundle.lua          # 生成 dist/delin-0.0.1.lua
+lua5.1 tools/bundle.lua kernel   # 生成 dist/kernel.lua（内核 bundle）
+lua5.1 tools/bundle.lua dlub     # 生成 dist/dlub.lua（DLUB 引导装载器，独立文件）
 ```
 
-产物复制到 CC 电脑磁盘 `/boot/delin-0.0.1.lua`，`/boot/.boot` 指向它，重启即引导。
+内核 bundle 复制到引导盘 `bootPath`（manifest 的 `boot` 行，默认 `/boot/delin.lua`）；DLUB 复制到
+引导盘的引导脚本入口。产物均以 Lua 5.2+ `_ENV` 技巧打包，每个模块包一层 `__require` 到内部 shim。
 
 ## 约定
 
@@ -41,13 +103,24 @@ lua5.1 tools/bundle.lua          # 生成 dist/delin-0.0.1.lua
 ## 目录
 
 ```
-src/kernel/scheduler.lua   协程调度器(事件循环)
-src/kernel/process.lua     进程表/pid/spawn(source)/隔离 env(+cwd 注入)+ 信号/作业控制
-src/kernel/signal.lua      POSIX 信号编号/默认动作/可捕获表
-src/kernel/boot.lua        入口: 日志→spawn PID1(init)→run
-src/kernel/tty.lua         字符终端(/dev/ttyN): 行规程+回显+焦点切换
-src/kernel/user.lua        用户库(/etc/passwd|shadow|group, salt+hash)
-src/init/ext2_init.lua     EXT2 根引导的 PID 1: 在每个 tty spawn login
+src/kernel/scheduler.lua   协程调度器(事件循环) + resume 前信号投递
+src/kernel/process.lua     进程表/进程树/spawn/隔离 env + cwd + argv + 会话/进程组/信号/作业控制
+src/kernel/signal.lua      POSIX 信号编号/默认动作/可捕获表/名字表
+src/kernel/vfs.lua         虚拟文件系统: 挂载表 + resolve + real/virtual 后端
+src/kernel/vfs_api.lua     VFS 门面(fs/io) + /dev 设备注册表 + stdio
+src/kernel/modules.lua     内核模块系统: .ko 解析(注释头)/依赖拓扑/装载/alias(use)
+src/kernel/blockdev.lua    块设备层: 文件块设备(/parts/*.img, seek+read/write)
+src/kernel/ext2.lua        EXT2 读写: 超级块/inode(uid/gid/mode/硬链接/符号链接)/间接块/多块组
+src/kernel/user.lua        用户库: /etc/passwd|shadow|group, salt+hash, chmod/chown 权限
+src/kernel/display.lua     显示设备注册表: 统一 ScreenDevice -> /dev/ttyN + /dev/fbN
+src/kernel/tty.lua         字符终端(/dev/ttyN): 行规程+回显+光标+滚动+焦点切换
+src/kernel/fb.lua          软件帧缓冲(/dev/fbN): 32 位 ARGB 像素缓冲+脏矩形 flush
+src/kernel/sysfs.lua       /sys/class/display 虚拟配置 fs(sysfs 风格, 读=查/写=设)
+src/kernel/manifest.lua    /parts/manifest 解析器(root/boot 行 + 分区表)
+src/kernel/dlub.lua        DLUB 引导装载器(GRUB 风格): 找盘->清单->开区->挂 ext2->载内核
+src/kernel/boot.lua        入口: 日志->kprint->setupVfs/registerConsole->装模块->sysfs->launch init
+src/init/init.lua          CC-fs 引导的 PID 1(init)
+src/init/ext2_init.lua     EXT2 根引导的最小 PID 1(权限/显示/键盘/shell 自检)
 src/bin/cat                连接文件到 stdout
 src/bin/ls                 列目录
 src/bin/mkdir              建目录
@@ -59,10 +132,14 @@ src/bin/head               打印前 N 行 (-n N|-N)
 src/bin/tail               打印后 N 行 (-n N|-N)
 src/bin/wc                 统计行/词/字节 (-l|-w|-c)
 src/bin/grep               按 Lua 模式查找行 (-n|-i|-v)
-src/bin/sed                流式文本编辑器 (s/y/d/p/q/a/i/c/=, 地址区间, -n -s -e -f -i)
+src/bin/sed                流式文本编辑器 (GNU 子集: s/y/d/p/q/a/i/c/=, 地址区间, -n -s -e -f -i)
 src/bin/kill               发送信号到进程/进程组 (kill [-SIG] pid|-pgid; kill -l)
-src/bin/login              getty/login: 登录提示→验证→启动 sh→循环
-src/bin/sh                 交互/脚本 shell(内建 cd/pwd/echo/exit/help)
-tools/bundle.lua           打包 src/ → dist/delin-*.lua
+src/bin/login              getty/login: 登录提示->验证->启动 sh->循环
+src/bin/sh                 交互/脚本 shell(内建 cd/pwd/echo/exit/help/jobs/fg/bg/kill)
+src/modules/*.ko           内核模块: ccdisk(CC 原生 fs) ccmonitor(CC 显示器驱动) demo(演示)
+                           ext2(ext2 挂载) tom(Tom GPU 驱动) void(Void 全息驱动)
+src/modules/modules.alias  驱动别名(modprobe 风格): tm_gpu->tom hologram->void monitor->ccmonitor
+src/modules/manifest       默认装载模块清单: demo ext2 ccdisk
+tools/bundle.lua           打包 src/ -> dist/kernel.lua 或 dist/dlub.lua
 dist/                      生成物(不提交)
 ```
