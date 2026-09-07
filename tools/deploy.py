@@ -2,11 +2,20 @@
 # Delin rootfs deploy: 用基础镜像(能启动的旧 root.img)+ 更新后的内核/bin/脚本,
 # 重建一个干净的 ext2 镜像(避免 debugfs 在原镜像上叠加写导致的元数据损坏)。
 # 用法: python3 tools/deploy.py  <base_root.img>  <out.img>
-import os, sys, subprocess, tempfile, shutil, stat
+import os, sys, subprocess, tempfile, shutil, stat, re
 
 DBG = "/usr/sbin/debugfs"
 MKFS = "/usr/sbin/mkfs.ext2"
 REPO = "/home/worker/delin"
+
+def _module_version():
+    # 从 src/kernel/modules.lua 读 modules.version = "x.y.z"
+    with open(os.path.join(REPO, "src/kernel/modules.lua"), "r", encoding="utf-8") as f:
+        for line in f:
+            m = re.search(r'modules\.version\s*=\s*"([^"]+)"', line)
+            if m:
+                return m.group(1)
+    return "0.0.2"
 
 def run(*a, **kw):
     p = subprocess.run(a, capture_output=True, text=True, **kw)
@@ -45,6 +54,16 @@ def main():
         os.makedirs(os.path.join(rootfs, "tmp"),  exist_ok=True)
         shutil.copy(os.path.join(REPO, "scripts/posix_test.sh"), os.path.join(rootfs, "root/posix_test.sh"))
         shutil.copy(os.path.join(REPO, "scripts/sysinfo.sh"),    os.path.join(rootfs, "root/sysinfo.sh"))
+        # 安装内核模块(src/modules -> /lib/modules/<version>/):
+        # 基镜像的 /lib 可能因 debugfs 元数据损坏而无法 rdump, 且模块应始终取当前 src。
+        ver = _module_version()
+        moddir = os.path.join(rootfs, "lib", "modules", ver)
+        os.makedirs(moddir, exist_ok=True)
+        for f in sorted(os.listdir(os.path.join(REPO, "src/modules"))):
+            p = os.path.join(REPO, "src/modules", f)
+            if os.path.isfile(p):
+                shutil.copy(p, os.path.join(moddir, f))
+                os.chmod(os.path.join(moddir, f), 0o755)
         # 3) 建全新 ext2 镜像
         run(MKFS, "-q", "-t", "ext2", "-b", "1024", out, "2048")
         # 4) 写回目录 + 文件

@@ -1,9 +1,16 @@
--- Delin tail: 打印文件末尾 N 行。用法: tail [-n N|-N] [file...]
---   缺省 N=10。无 file 时读 stdin。
+-- Delin tail: 打印文件末尾 (GNU 子集)。用法: tail [OPTION]... [FILE]...
+-- 选项:
+--   -n N, --lines=N    打印末尾 N 行(缺省 10)
+--   -c N, --bytes=N    打印末尾 N 字节
+--   -q, --quiet        多文件时不打印文件名头
+--   -v, --verbose      总是打印文件名头
+--   -N / -nN / -cN     粘连形式亦支持; 无 FILE 或 FILE 为 "-" 时读 stdin。
+--   说明: `-f`(follow)暂未实现(会无限等待)。
 local args = args or {}
 local cwd = (type(cwd) == "string" and cwd) or "/"
 local function resolve(p)
     p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
     if p:sub(1, 1) == "/" then
         if p == "/" then return "/" end
         return p:gsub("/+$", "")
@@ -15,16 +22,22 @@ local function stderr(s)
     local e = io.stderr()
     if e and e.write then e:write(s) end
 end
--- 把 fs.open 错误映射为 POSIX 风格: 不存在 / 无权限 / 是目录。
 local function ioeMsg(err)
     if err and (err:find("permission") or err:find("denied")) then return "Permission denied" end
     if err and err:find("directory") then return "Is a directory" end
     return "No such file or directory"
 end
 
-local n = 10
+local n, mode = 10, "lines"
 local files = {}
+local quiet, verbose = false, false
 local noMoreOpts = false
+
+local function setCount(val, m)
+    local c = tonumber((val:match("%s*%-?(%d+)")) or val)
+    if c and c >= 0 then n = c; mode = m end
+end
+
 local i = 1
 while i <= #args do
     local a = args[i]
@@ -32,27 +45,57 @@ while i <= #args do
         files[#files + 1] = a
     elseif a == "--" then
         noMoreOpts = true
+    elseif a == "--quiet" or a == "--silent" then quiet = true
+    elseif a == "--verbose" then verbose = true
+    elseif a == "-q" then quiet = true
+    elseif a == "-v" then verbose = true
+    elseif a:sub(1, 2) == "--" and a:match("^%-%-lines=") then
+        setCount(a:sub(9), "lines")
+    elseif a:sub(1, 2) == "--" and a:match("^%-%-bytes=") then
+        setCount(a:sub(9), "bytes")
     elseif a:sub(1, 1) == "-" and a ~= "-" then
-        if a == "-n" then
-            i = i + 1
-            if not args[i] then stderr("tail: option requires an argument -- n\n"); return end
-            n = tonumber(args[i]) or 10
-        else
-            local glued = a:match("^%-n(%d+)$") or a:match("^%-(%d+)$")
-            if glued then
-                n = tonumber(glued)
+        local optn = a:match("^%-n(.*)$")
+        local optc = a:match("^%-c(.*)$")
+        local optglued = a:match("^%-(%d+)$")
+        if optn then
+            if optn == "" then
+                i = i + 1
+                if not args[i] then stderr("tail: option requires an argument -- 'n'\n"); return end
+                setCount(args[i], "lines")
             else
-                stderr("tail: invalid option -- " .. a .. "\n")
-                return
+                setCount(optn, "lines")
             end
+        elseif optc then
+            if optc == "" then
+                i = i + 1
+                if not args[i] then stderr("tail: option requires an argument -- 'c'\n"); return end
+                setCount(args[i], "bytes")
+            else
+                setCount(optc, "bytes")
+            end
+        elseif optglued then
+            setCount(optglued, "lines")
+        else
+            stderr("tail: invalid option -- '" .. a .. "'\n")
+            return
         end
     else
         files[#files + 1] = a
     end
     i = i + 1
 end
+if #files == 0 then files = { "-" } end
 
-local function emit(fh)
+local total = #files
+local showHeader = (not quiet) and (total > 1 or verbose)
+
+local function header(name)
+    if not showHeader then return end
+    local disp = (name == "-") and "standard input" or name
+    io.write("==> " .. disp .. " <==\n")
+end
+
+local function emitLines(fh)
     local lines = {}
     while true do
         local line = fh.readLine()
@@ -60,25 +103,46 @@ local function emit(fh)
         lines[#lines + 1] = line
     end
     local start = math.max(1, #lines - n + 1)
+    if n == 0 then return end
     for k = start, #lines do
         io.write(lines[k] .. "\n")
     end
 end
 
-if #files == 0 then
-    local stdin = io.stdin()
-    if not stdin then return end
-    emit(stdin)
-    return
-end
-
-for _, p in ipairs(files) do
-    p = resolve(p)
-    local f, err = fs.open(p, "r")
-    if not f then
-        stderr("tail: " .. p .. ": " .. ioeMsg(err) .. "\n")
+local function emitBytes(fh)
+    if fh.readAll then
+        local s = fh.readAll() or ""
+        io.write((n == 0) and "" or s:sub(-n))
         return
     end
-    emit(f)
-    f.close()
+    local buf = {}
+    while true do
+        local line = fh.readLine()
+        if line == nil then break end
+        buf[#buf + 1] = line
+    end
+    local s = table.concat(buf, "\n")
+    io.write((n == 0) and "" or s:sub(-n))
+end
+
+local function emit(fh)
+    if mode == "bytes" then emitBytes(fh) else emitLines(fh) end
+end
+
+for idx, raw in ipairs(files) do
+    if raw == "-" then
+        header("-")
+        local stdin = io.stdin()
+        if stdin then emit(stdin) end
+    else
+        local p = resolve(raw)
+        local f, err = fs.open(p, "r")
+        if not f then
+            stderr("tail: " .. p .. ": " .. ioeMsg(err) .. "\n")
+            return
+        end
+        header(raw)
+        emit(f)
+        f.close()
+    end
 end

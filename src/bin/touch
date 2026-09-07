@@ -1,9 +1,16 @@
--- Delin touch: 若文件不存在则创建空文件; 已存在则不动(CC fs 不支持设置 mtime)。
--- 用法: touch <path>...
+-- Delin touch: 创建文件并更新时间戳 (GNU 子集)。用法: touch [OPTION]... FILE...
+-- 说明: CC fs / 本内核目前不持久化 mtime/atime, 故时间选项(-a -m -r -t -d)被接受但仅作 no-op;
+--       真正的可观察行为是 `-c`/`--no-create`(不存在时不创建也不报错)。
+-- 选项:
+--   -c, --no-create            文件不存在时不创建
+--   -a / -m                    仅更新访问/修改时间(no-op)
+--   -r FILE, --reference=FILE  以 FILE 的时间为基准(no-op)
+--   -t STAMP, -d STRING        设置时间(no-op)
 local args = args or {}
 local cwd = (type(cwd) == "string" and cwd) or "/"
 local function resolve(p)
     p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
     if p:sub(1, 1) == "/" then
         if p == "/" then return "/" end
         return p:gsub("/+$", "")
@@ -16,26 +23,67 @@ local function stderr(s)
     if e and e.write then e:write(s) end
 end
 
-local function touchFile(fp)
-    local p = resolve(fp)
-    if not fs.exists(p) then
-        local ok, err = pcall(function() local f = fs.open(p, "w"); f.close() end)
-        if not ok then
-            stderr("touch: " .. p .. ": " .. tostring(err) .. "\n")
-        end
-    end
-end
-
+local noCreate = false
+local rest = {}
 local noMoreOpts = false
-for _, a in ipairs(args) do
+local i = 1
+-- 需要带参数的短选项
+local needsArg = { ["r"] = true, ["t"] = true, ["d"] = true }
+while i <= #args do
+    local a = args[i]
     if noMoreOpts then
-        touchFile(a)
+        rest[#rest + 1] = a
     elseif a == "--" then
         noMoreOpts = true
-    elseif a:sub(1, 1) == "-" and a ~= "-" then
-        stderr("touch: invalid option -- " .. a .. "\n")
-        return
+    elseif a == "--no-create" then noCreate = true
+    elseif a == "--reference" or a == "--date" or a == "--time" then
+        i = i + 1
+        if not args[i] then stderr("touch: option requires an argument -- '" .. a .. "'\n"); return end
+    elseif a:sub(1, 2) == "--" and a:find("=", 1, true) then
+        -- --reference=..., --date=..., --time=... 只消费, no-op
+    elseif a:sub(1, 1) == "-" and a ~= "-" and #a > 1 then
+        for k = 2, #a do
+            local ch = a:sub(k, k)
+            if ch == "c" then noCreate = true
+            elseif ch == "a" or ch == "m" then -- no-op
+            elseif needsArg[ch] then
+                -- 粘连形式如 -tSTAMP 或独立参数
+                if k < #a then
+                    -- 已内联参数, 消费剩余
+                    break
+                else
+                    i = i + 1
+                    if not args[i] then stderr("touch: option requires an argument -- '" .. ch .. "'\n"); return end
+                    break
+                end
+            else
+                stderr("touch: invalid option -- '" .. ch .. "'\n"); return
+            end
+        end
     else
-        touchFile(a)
+        rest[#rest + 1] = a
+    end
+    i = i + 1
+end
+
+if #rest == 0 then
+    stderr("touch: missing file operand\n")
+    return
+end
+
+for _, fp in ipairs(rest) do
+    local p = resolve(fp)
+    if not fs.exists(p) then
+        if noCreate then
+            -- -c: 不创建, 静默
+        else
+            local ok, err = pcall(function()
+                local f = fs.open(p, "w")
+                if f then f.close() end
+            end)
+            if not ok then
+                stderr("touch: " .. fp .. ": " .. tostring(err) .. "\n")
+            end
+        end
     end
 end

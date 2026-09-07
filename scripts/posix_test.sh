@@ -181,6 +181,97 @@ grep "a.txt" "$T/lsout.txt" > "$T/l1.txt"
 chk tool_ls [ -s "$T/l1.txt" ]
 
 # ---------------------------------------------------------------
+# 5c. GNU 选项扩展 (host 与 Delin 输出一致才纳入检查)
+#     放在独立目录 $G, 避免撑大 $T 而让 5b 的 ls 输出过大(真机 ls 重定向刷盘有量级的脆弱性)。
+# ---------------------------------------------------------------
+G=/tmp/gnu_self
+rm -rf "$G"
+mkdir -p "$G"
+
+# cat -n: 给第一行编号 "1"
+echo "beta" > "$G/n.txt"
+cat -n "$G/n.txt" > "$G/cn.txt"
+grep "^[ ]*1" "$G/cn.txt" > "$G/cn1.txt"
+chk gnu_cat_n [ -s "$G/cn1.txt" ]
+
+# cat -b: 非空行编号; 空行不编号
+echo "x" > "$G/nb0.txt"
+echo "" >> "$G/nb0.txt"
+echo "y" >> "$G/nb0.txt"
+cat -b "$G/nb0.txt" > "$G/cnb.txt"
+grep "^[ ]*1" "$G/cnb.txt" > "$G/cnb1.txt"
+grep "^[ ]*2" "$G/cnb.txt" > "$G/cnb2.txt"
+chk gnu_cat_b [ -s "$G/cnb1.txt" ]
+chk gnu_cat_b2 [ -s "$G/cnb2.txt" ]
+
+# wc -m: 字符数 (ASCII 下 == 字节数)
+wc -m "$G/n.txt" > "$G/wcm.txt"
+grep "^5 " "$G/wcm.txt" > "$G/wcm1.txt"
+chk gnu_wc_m [ -s "$G/wcm1.txt" ]
+
+# wc -L: 最长行长度
+wc -L "$G/n.txt" > "$G/wclen.txt"
+grep "^4 " "$G/wclen.txt" > "$G/wclen1.txt"
+chk gnu_wc_L [ -s "$G/wclen1.txt" ]
+
+# head -c 3: 只取前 3 字节
+head -c 3 "$G/n.txt" > "$G/hc.txt"
+wc -c "$G/hc.txt" > "$G/hcw.txt"
+grep "^3 " "$G/hcw.txt" > "$G/hcw1.txt"
+chk gnu_head_c [ -s "$G/hcw1.txt" ]
+
+# tail -c 3: 只取末尾 3 字节
+tail -c 3 "$G/n.txt" > "$G/tc.txt"
+wc -c "$G/tc.txt" > "$G/tcw.txt"
+grep "^3 " "$G/tcw.txt" > "$G/tcw1.txt"
+chk gnu_tail_c [ -s "$G/tcw1.txt" ]
+
+# grep -c: 计数 (单文件只输出数字)
+grep -c beta "$G/n.txt" > "$G/gc.txt"
+grep "^1$" "$G/gc.txt" > "$G/gc1.txt"
+chk gnu_grep_c [ -s "$G/gc1.txt" ]
+
+# grep -l: 只输出文件名
+grep -l beta "$G/n.txt" > "$G/gl.txt"
+grep "n.txt" "$G/gl.txt" > "$G/gl1.txt"
+chk gnu_grep_l [ -s "$G/gl1.txt" ]
+
+# grep -x: 整行匹配
+grep -x beta "$G/n.txt" > "$G/gx.txt"
+chk gnu_grep_x [ -s "$G/gx.txt" ]
+
+# touch -c: 不创建不存在的文件
+touch -c "$G/does_not_exist.txt"
+chk gnu_touch_c [ ! -e "$G/does_not_exist.txt" ]
+
+# mkdir -v: 打印创建信息 (语言无关: 有输出即表示 -v 被接受且打印)
+mkdir -v "$G/vd" > "$G/mkv.txt"
+chk gnu_mkdir_v [ -s "$G/mkv.txt" ]
+
+# cp -v: 打印源 -> 目标
+cp -v "$G/n.txt" "$G/cpv.txt" > "$G/cpvout.txt"
+chk gnu_cp_v [ -s "$G/cpvout.txt" ]
+
+# rm -v: 打印 "removed" (语言无关: 有输出即表示 -v 被接受且打印)
+rm -v "$G/cpv.txt" > "$G/rmv.txt"
+chk gnu_rm_v [ -s "$G/rmv.txt" ]
+
+# ls -a: 显示隐藏文件
+echo "h" > "$G/.hidden"
+ls -a "$G" > "$G/lsa.txt"
+grep "^[.]hidden$" "$G/lsa.txt" > "$G/lsa1.txt"
+chk gnu_ls_a [ -s "$G/lsa1.txt" ]
+
+# ls -l: 长格式有权限列
+ls -l "$G/n.txt" > "$G/lsl.txt"
+grep "^[dl-]" "$G/lsl.txt" > "$G/lsl1.txt"
+chk gnu_ls_l [ -s "$G/lsl1.txt" ]
+
+rm -rf "$G"
+
+rm -rf "$G"
+
+# ---------------------------------------------------------------
 # 5b. `--` 结束选项: 处理以 - / -- 开头的文件名 (POSIX Guideline 10)。
 #      host 与 Delin 都应支持 touch -- --name / rm -- --name 等。
 #      注: grep 用 Lua pattern(`-` 是量词), 这里用不含连字符的模式。

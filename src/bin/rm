@@ -1,11 +1,15 @@
--- Delin rm: 删除文件/目录(GNU 子集)。用法: rm [-r|-R] [-f] <path>...
---   -r/-R  递归删除目录
---   -f     忽略不存在的文件/目录, 不报错
--- 组合选项如 -rf 亦可。
+-- Delin rm: 删除文件/目录 (GNU 子集)。用法: rm [OPTION]... <path>...
+-- 选项:
+--   -r/-R, --recursive  递归删除目录
+--   -f, --force         忽略不存在的文件/目录, 不询问、不报错
+--   -i, --interactive   删除前逐个询问
+--   -v, --verbose       打印每个 "removed 'x'"
+-- 组合短选项(-rf)与 -- 结束选项亦支持。
 local args = args or {}
 local cwd = (type(cwd) == "string" and cwd) or "/"
 local function resolve(p)
     p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
     if p:sub(1, 1) == "/" then
         if p == "/" then return "/" end
         return p:gsub("/+$", "")
@@ -18,21 +22,30 @@ local function stderr(s)
     if e and e.write then e:write(s) end
 end
 
-local recursive, force = false, false
+local recursive, force, interactive, verbose = false, false, false, false
 local rest = {}
 local noMoreOpts = false
+
+local function setShort(ch)
+    if ch == "r" or ch == "R" then recursive = true
+    elseif ch == "f" then force = true
+    elseif ch == "i" then interactive = true
+    elseif ch == "v" then verbose = true
+    else stderr("rm: invalid option -- '" .. ch .. "'\n"); return false end
+    return true
+end
+
 for _, a in ipairs(args) do
     if noMoreOpts then
         rest[#rest + 1] = a
     elseif a == "--" then
         noMoreOpts = true
+    elseif a == "--recursive" then recursive = true
+    elseif a == "--force" then force = true
+    elseif a == "--interactive" then interactive = true
+    elseif a == "--verbose" then verbose = true
     elseif a:sub(1, 1) == "-" and a ~= "-" then
-        for k = 2, #a do
-            local c = a:sub(k, k)
-            if c == "r" or c == "R" then recursive = true
-            elseif c == "f" then force = true
-            else stderr("rm: invalid option -- " .. c .. "\n"); return end
-        end
+        for k = 2, #a do if not setShort(a:sub(k, k)) then return end end
     else
         rest[#rest + 1] = a
     end
@@ -42,14 +55,31 @@ if #rest == 0 then
     return
 end
 
+-- 删除前询问(仅在 -i 且非 -f 时)。
+local function askRemove(p, isDir)
+    io.write("rm: remove " .. (isDir and "directory " or "regular file ") .. "'" .. p .. "'? ")
+    io.flush()
+    local s = io.stdin()
+    local line = s and s.readLine and s:readLine() or nil
+    return line and line:match("^[yY]")
+end
+
 local function rmTree(p)
-    if fs.isDir(p) then
+    local isDir = fs.isDir(p)
+    if isDir then
         for _, n in ipairs(fs.list(p) or {}) do
             rmTree(fs.combine(p, n))
         end
     end
+    if interactive and not force then
+        if not askRemove(p, isDir) then return end
+    end
     local ok, err = pcall(fs.delete, p)
-    if not ok then stderr("rm: " .. p .. ": " .. tostring(err) .. "\n") end
+    if not ok then
+        stderr("rm: " .. p .. ": " .. tostring(err) .. "\n")
+    elseif verbose then
+        io.write("removed '" .. p .. "'\n")
+    end
 end
 
 for _, p in ipairs(rest) do

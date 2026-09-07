@@ -1,8 +1,19 @@
--- Delin cat: 连接并打印文件。用法: cat <file>...
+-- Delin cat: 连接并打印文件 (GNU 子集)。用法: cat [OPTION]... [FILE]...
+-- 选项:
+--   -n, --number          对所有输出行编号
+--   -b, --number-nonblank 对非空行编号(空行不编号)
+--   -s, --squeeze-blank   连续多个空行压缩为一个
+--   -E, --show-ends       每行末尾显示 $
+--   -T, --show-tabs       制表符显示为 ^I
+--   -A, --show-all        等价于 -vET
+--   -v, --show-nonprinting 以 ^ 与 M- 记号显示不可打印字符
+--   -u                    忽略(无缓冲)
+-- FILE 为 "-" 或缺省时读 stdin。支持组合短选项与 --。
 local args = args or {}
 local cwd = (type(cwd) == "string" and cwd) or "/"
 local function resolve(p)
     p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
     if p:sub(1, 1) == "/" then
         if p == "/" then return "/" end
         return p:gsub("/+$", "")
@@ -15,35 +26,117 @@ local function stderr(s)
     if e and e.write then e:write(s) end
 end
 
+local optNum, optNumNb, optSqueeze, optEnds, optTabs, optShowAll, optNonprint = false, false, false, false, false, false, false
+local files = {}
+local noMoreOpts = false
+
+local function setShort(ch)
+    if ch == "n" then optNum = true
+    elseif ch == "b" then optNumNb = true
+    elseif ch == "s" then optSqueeze = true
+    elseif ch == "E" then optEnds = true
+    elseif ch == "T" then optTabs = true
+    elseif ch == "A" then optShowAll = true; optNonprint = true; optEnds = true; optTabs = true
+    elseif ch == "v" then optNonprint = true
+    elseif ch == "e" then optNonprint = true; optEnds = true
+    elseif ch == "t" then optNonprint = true; optTabs = true
+    elseif ch == "u" then -- 忽略
+    else stderr("cat: invalid option -- '" .. ch .. "'\n"); return false end
+    return true
+end
+
+for _, a in ipairs(args) do
+    if noMoreOpts then
+        files[#files + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "--number" then optNum = true
+    elseif a == "--number-nonblank" then optNumNb = true
+    elseif a == "--squeeze-blank" then optSqueeze = true
+    elseif a == "--show-ends" then optEnds = true
+    elseif a == "--show-tabs" then optTabs = true
+    elseif a == "--show-all" then optShowAll, optNonprint, optEnds, optTabs = true, true, true, true
+    elseif a == "--show-nonprinting" then optNonprint = true
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        for k = 2, #a do if not setShort(a:sub(k, k)) then return end end
+    else
+        files[#files + 1] = a
+    end
+end
+if #files == 0 then files = { "-" } end
+
+-- 渲染一行。
+local function showLine(s)
+    if not (optNonprint or optEnds or optTabs) then return s end
+    local out = {}
+    for i = 1, #s do
+        local b = s:byte(i)
+        if b == 9 then
+            out[#out + 1] = (optTabs and "^I") or "\t"
+        elseif b < 32 then
+            out[#out + 1] = "^" .. string.char(b + 64)
+        elseif b == 127 then
+            out[#out + 1] = "^?"
+        elseif b >= 128 then
+            out[#out + 1] = "M-" .. showLine(string.char(b - 128))
+        else
+            out[#out + 1] = s:sub(i, i)
+        end
+    end
+    return table.concat(out)
+end
+
+local nLine, nNb, blankRun = 0, 0, 0
+
+local function emit(fh)
+    while true do
+        local line = fh.readLine()
+        if line == nil then break end
+        nLine = nLine + 1
+        local isBlank = (line == "")
+        if isBlank then
+            blankRun = blankRun + 1
+        else
+            blankRun = 0
+            nNb = nNb + 1
+        end
+        -- -s: 连续空行只打第一个
+        if optSqueeze and isBlank and blankRun > 1 then
+            -- 跳过该空行
+        else
+            local prefix = ""
+            if optNum then
+                prefix = string.format("%6d\t", nLine)
+            elseif optNumNb then
+                if not isBlank then prefix = string.format("%6d\t", nNb) end
+            end
+            local body = showLine(line)
+            if optEnds then body = body .. "$" end
+            io.write(prefix .. body .. "\n")
+        end
+    end
+end
+
 local function catFile(p)
+    if p == "-" then
+        local stdin = io.stdin()
+        if stdin then emit(stdin) else return true end
+        return true
+    end
     p = resolve(p)
     local f, err = fs.open(p, "r")
     if not f then
-        -- 区分"不存在"(ENOENT)、"无读权限"(EACCES)、"是目录"(EISDIR)。
         local msg = "No such file or directory"
-        if err and (err:find("permission") or err:find("denied")) then
-            msg = "Permission denied"
-        elseif err and err:find("directory") then
-            msg = "Is a directory"
-        end
+        if err and (err:find("permission") or err:find("denied")) then msg = "Permission denied"
+        elseif err and err:find("directory") then msg = "Is a directory" end
         stderr("cat: " .. p .. ": " .. msg .. "\n")
         return false
     end
-    io.write(f.readAll())
+    emit(f)
     f.close()
     return true
 end
 
-local noMoreOpts = false
-for _, a in ipairs(args) do
-    if noMoreOpts then
-        if not catFile(a) then return end
-    elseif a == "--" then
-        noMoreOpts = true
-    elseif a:sub(1, 1) == "-" and a ~= "-" then
-        stderr("cat: invalid option -- " .. a .. "\n")
-        return
-    else
-        if not catFile(a) then return end
-    end
+for _, a in ipairs(files) do
+    if not catFile(a) then return end
 end

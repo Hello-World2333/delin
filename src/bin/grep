@@ -1,9 +1,25 @@
--- Delin grep: 按 Lua 模式查找行。用法: grep [-n|-i|-v] <pattern> [file...]
---   -n 显示行号, -i 忽略大小写, -v 反转(打印不匹配行)。无 file 时读 stdin。
+-- Delin grep: 按 Lua 模式查找行 (GNU 子集)。用法: grep [OPTION]... PATTERN [FILE]...
+-- 选项:
+--   -n, --line-number     显示行号
+--   -i, --ignore-case     忽略大小写
+--   -v, --invert-match    反转(打印不匹配行)
+--   -e PAT, --regexp=PAT  指定匹配模式(可多次, OR); 此时无位置 PATTERN, 全部为 FILE
+--   -w, --word-regexp     整词匹配
+--   -x, --line-regexp     整行匹配
+--   -c, --count           只打印每个文件匹配行数
+--   -l, --files-with-matches 只打印含匹配行的文件名
+--   -r/-R, --recursive    递归搜索目录
+--   -q, --quiet           静默(有匹配即返回)
+--   -o, --only-matching   只打印匹配部分
+--   -H/-h, [--]with/--no-filename 文件名前缀开关
+--   -s, --no-messages     抑制错误信息
+--   -F, --fixed-strings   PATTERN 按字面匹配(转义 Lua pattern 元字符)
+--   正则为 Lua pattern(与 GNU BRE/ERE 不同)。无 FILE 或 FILE 为 "-" 时读 stdin。
 local args = args or {}
 local cwd = (type(cwd) == "string" and cwd) or "/"
 local function resolve(p)
     p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
     if p:sub(1, 1) == "/" then
         if p == "/" then return "/" end
         return p:gsub("/+$", "")
@@ -15,72 +31,251 @@ local function stderr(s)
     local e = io.stderr()
     if e and e.write then e:write(s) end
 end
--- 把 fs.open 错误映射为 POSIX 风格: 不存在 / 无权限 / 是目录。
 local function ioeMsg(err)
     if err and (err:find("permission") or err:find("denied")) then return "Permission denied" end
     if err and err:find("directory") then return "Is a directory" end
     return "No such file or directory"
 end
 
-local withNum, ci, invert = false, false, false
+local withNum, ci, invert, wordBoundary, wholeLine = false, false, false, false, false
+local doCount, doFiles, recursive, quiet, onlyMatch, withFilename, noFilename, noMessages = false, false, false, false, false, false, false, false
+local fixed = false
+local patternArgs = {}       -- 来自 -e
 local rest = {}
 local noMoreOpts = false
-for _, a in ipairs(args) do
+
+local function setShort(ch)
+    if ch == "n" then withNum = true
+    elseif ch == "i" then ci = true
+    elseif ch == "v" then invert = true
+    elseif ch == "w" then wordBoundary = true
+    elseif ch == "x" then wholeLine = true
+    elseif ch == "c" then doCount = true
+    elseif ch == "l" then doFiles = true
+    elseif ch == "r" or ch == "R" then recursive = true
+    elseif ch == "q" then quiet = true
+    elseif ch == "o" then onlyMatch = true
+    elseif ch == "H" then withFilename = true
+    elseif ch == "h" then noFilename = true
+    elseif ch == "s" then noMessages = true
+    elseif ch == "F" then fixed = true
+    elseif ch == "e" then -- 需带参数, 由调用方消费
+    else stderr("grep: invalid option -- '" .. ch .. "'\n"); return false end
+    return true
+end
+
+local i = 1
+while i <= #args do
+    local a = args[i]
     if noMoreOpts then
         rest[#rest + 1] = a
     elseif a == "--" then
         noMoreOpts = true
+    elseif a == "--line-number" then withNum = true
+    elseif a == "--ignore-case" then ci = true
+    elseif a == "--invert-match" then invert = true
+    elseif a == "--word-regexp" then wordBoundary = true
+    elseif a == "--line-regexp" then wholeLine = true
+    elseif a == "--count" then doCount = true
+    elseif a == "--files-with-matches" then doFiles = true
+    elseif a == "--recursive" then recursive = true
+    elseif a == "--quiet" or a == "--silent" then quiet = true
+    elseif a == "--only-matching" then onlyMatch = true
+    elseif a == "--with-filename" then withFilename = true
+    elseif a == "--no-filename" then noFilename = true
+    elseif a == "--no-messages" then noMessages = true
+    elseif a == "--fixed-strings" then fixed = true
+    elseif a:sub(1, 2) == "--" and a:match("^%-%-regexp=") then
+        patternArgs[#patternArgs + 1] = a:sub(10)
+    elseif a:sub(1, 2) == "--" and a:match("^%-%-[a-z][a-z-]+$") then
+        stderr("grep: unrecognized option '" .. a .. "'\n"); return
     elseif a:sub(1, 1) == "-" and a ~= "-" then
-        if a == "-n" then withNum = true
-        elseif a == "-i" then ci = true
-        elseif a == "-v" then invert = true
-        else stderr("grep: invalid option -- " .. a .. "\n"); return end
+        local handledE = false
+        for k = 2, #a do
+            local ch = a:sub(k, k)
+            if ch == "e" then
+                local inline = a:sub(k + 1)
+                if inline ~= "" then
+                    patternArgs[#patternArgs + 1] = inline
+                else
+                    i = i + 1
+                    if not args[i] then stderr("grep: option requires an argument -- 'e'\n"); return end
+                    patternArgs[#patternArgs + 1] = args[i]
+                end
+                handledE = true
+                break
+            else
+                if not setShort(ch) then return end
+            end
+        end
+        if handledE then end
     else
         rest[#rest + 1] = a
     end
+    i = i + 1
 end
-if #rest < 1 then
-    stderr("grep: missing pattern\n")
-    return
+
+-- 决定 pattern 与 files
+local pats = {}
+if #patternArgs > 0 then
+    for _, p in ipairs(patternArgs) do pats[#pats + 1] = p end
+    -- rest 全部为 FILE
+else
+    if #rest < 1 then stderr("grep: missing pattern\n"); return end
+    pats[#pats + 1] = rest[1]
+    table.remove(rest, 1)
 end
-local pat = rest[1]
-if ci then pat = pat:lower() end
+if fixed then
+    for idx, p in ipairs(pats) do pats[idx] = p:gsub("([^%w])", "%%%1") end
+end
 local files = {}
-for j = 2, #rest do files[#files + 1] = rest[j] end
+for _, f in ipairs(rest) do files[#files + 1] = f end
 
-local function test(line)
-    local hay = ci and line:lower() or line
-    local hit = hay:find(pat, 1) ~= nil
-    return invert and (not hit) or hit
+-- 整词匹配: 模式匹配处前后均非词字符([%w_] 之外的边界)。
+local function isWordChar(c) return c ~= "" and c:match("[%w_]") ~= nil end
+local function hasWordMatch(hay, p)
+    local pos = 1
+    while true do
+        local s, e = hay:find(p, pos)
+        if not s then return false end
+        local before = (s > 1) and hay:sub(s - 1, s - 1) or ""
+        local after = (e < #hay) and hay:sub(e + 1, e + 1) or ""
+        if not isWordChar(before) and not isWordChar(after) then return true end
+        pos = e + 1
+    end
 end
 
-local function emit(fh)
+local function lineMatches(hay)
+    for _, p in ipairs(pats) do
+        local ok
+        if wholeLine then
+            ok = hay:match("^" .. p .. "$") ~= nil
+        elseif wordBoundary then
+            ok = hasWordMatch(hay, p)
+        else
+            ok = hay:find(p, 1) ~= nil
+        end
+        if ok then return true end
+    end
+    return false
+end
+
+-- 收集 -o 匹配的片段(整行/整词时仍按整行整词语义, 输出对应区间)。
+local function collectMatches(hay)
+    local out = {}
+    local pos = 1
+    while pos <= #hay + 1 do
+        local bestS, bestE
+        for _, p in ipairs(pats) do
+            local s, e = hay:find(p, pos)
+            if s then
+                if (not bestS) or s < bestS then bestS, bestE = s, e end
+            end
+        end
+        if not bestS then break end
+        out[#out + 1] = { bestS, bestE }
+        pos = bestE + 1
+    end
+    return out
+end
+
+-- 总文件列表(含 -r 递归展开)。
+local function expandFiles(list)
+    local res = {}
+    local function walk(p)
+        if fs.isDir(p) then
+            local names = fs.list(p) or {}
+            table.sort(names)
+            for _, n in ipairs(names) do
+                if n ~= "." and n ~= ".." then
+                    local full = (p == "/") and ("/" .. n) or (p .. "/" .. n)
+                    walk(full)
+                end
+            end
+        else
+            res[#res + 1] = p
+        end
+    end
+    for _, f in ipairs(list) do walk(resolve(f)) end
+    return res
+end
+
+local allFiles = files
+if recursive then
+    local exp = {}
+    for _, f in ipairs(files) do exp[#exp + 1] = f end
+    allFiles = expandFiles(exp)
+end
+
+local many = #allFiles > 1
+local showName = (not noFilename) and (withFilename or many or recursive)
+
+local function search(fh, label)
+    local count = 0
     local n = 0
     while true do
         local line = fh.readLine()
         if line == nil then break end
         n = n + 1
-        if test(line) then
-            local prefix = withNum and (n .. ":") or ""
-            io.write(prefix .. line .. "\n")
+        local hay = ci and line:lower() or line
+        local m = lineMatches(hay)
+        if invert then m = not m end
+        if m then
+            count = count + 1
+            if quiet then return count, n end
+            if doFiles then
+                io.write((label or "") .. "\n")
+                return count, n
+            elseif not doCount then
+                local prefix = ""
+                if showName and label then prefix = label .. ":" end
+                if withNum then prefix = prefix .. tostring(n) .. ":" end
+                if onlyMatch then
+                    for _, span in ipairs(collectMatches(hay)) do
+                        io.write(prefix .. line:sub(span[1], span[2]) .. "\n")
+                    end
+                else
+                    io.write(prefix .. line .. "\n")
+                end
+            end
         end
     end
+    return count, n
 end
 
-if #files == 0 then
-    local stdin = io.stdin()
-    if not stdin then return end
-    emit(stdin)
-    return
-end
-
-for _, p in ipairs(files) do
-    p = resolve(p)
-    local f, err = fs.open(p, "r")
-    if not f then
-        stderr("grep: " .. p .. ": " .. ioeMsg(err) .. "\n")
-        return
+local atLeastOne = false
+local function processOne(label, fh)
+    local c = search(fh, label)
+    if c > 0 then atLeastOne = true end
+    if doCount then
+        if showName and label then io.write(label .. ":") end
+        io.write(tostring(c) .. "\n")
     end
-    emit(f)
-    f.close()
+end
+
+if #allFiles == 0 then
+    local stdin = io.stdin()
+    if stdin then processOne("standard input", stdin) end
+else
+    for _, f in ipairs(allFiles) do
+        if f == "-" then
+            local stdin = io.stdin()
+            if stdin then processOne("standard input", stdin) end
+        else
+            local p = resolve(f)
+            if not fs.exists(p) then
+                if not noMessages then stderr("grep: " .. p .. ": No such file or directory\n") end
+                if doCount then io.write("0\n") end
+            else
+                local fh, err = fs.open(p, "r")
+                if not fh then
+                    if not noMessages then stderr("grep: " .. p .. ": " .. ioeMsg(err) .. "\n") end
+                    if doCount then io.write("0\n") end
+                else
+                    processOne(p, fh)
+                    fh.close()
+                end
+            end
+        end
+    end
 end

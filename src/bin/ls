@@ -1,5 +1,14 @@
--- Delin ls: 列目录。用法: ls [dir]
--- dir 缺省为 "/"。输出每行一个名字, 目录名带尾随 "/"。写入 io.stdout。
+-- Delin ls: 列目录 (GNU 子集)。用法: ls [OPTION]... [FILE]...
+-- 选项:
+--   -a, --all            显示所有条目, 含 . 与 ..
+--   -A, --almost-all     显示所有条目, 但不含 . 与 ..
+--   -l, --long           长格式: 权限 链接 属主 组 大小 时间 名字
+--   -h, --human-readable 与 -l 配合, 大小用 K/M/G
+--   -d, --directory      仅列出目录本身, 不进入其内容
+--   -R, --recursive      递归列出子目录
+--   -t                  按修改时间排序(新的在前)
+--   -r, --reverse        逆序输出
+-- 支持短选项组合(-la)与 -- 结束选项。FILE 缺省为当前目录。
 local args = args or {}
 local cwd = (type(cwd) == "string" and cwd) or "/"
 local function resolve(p)
@@ -19,28 +28,172 @@ local function stderr(s)
     local e = io.stderr()
     if e and e.write then e:write(s) end
 end
--- 把 fs.list 错误映射为 POSIX 风格: 不存在 / 无权限。
 local function ioeMsg(err)
     if err and (err:find("permission") or err:find("denied")) then return "Permission denied" end
     return "No such file or directory"
 end
 
--- 解析: 支持 `--` 结束选项; 识别到的 `-` 开头的未知选项报错。其余为路径。
+-- 读 fs.attributes, 兼容 ext2(mode/uid/gid/mtime/links)与 CC 原生(modificationTime)。
+local function attrs(p)
+    if fs.attributes then
+        local a = fs.attributes(p)
+        if a then
+            if not a.mtime and a.modificationTime then a.mtime = a.modificationTime end
+            return a
+        end
+    end
+    return { size = (fs.getSize and fs.getSize(p)) or 0, isDir = fs.isDir(p), isReadOnly = false }
+end
+
+-- ---------------------------------------------------------------
+-- 选项解析
+-- ---------------------------------------------------------------
+local optAll, optAlmost, optLong, optHuman = false, false, false, false
+local optDir, optRecursive, optReverse, optTime = false, false, false, false
 local paths = {}
 local noMoreOpts = false
+
+local function setShort(ch)
+    if ch == "a" then optAll = true
+    elseif ch == "A" then optAlmost = true
+    elseif ch == "l" then optLong = true
+    elseif ch == "h" then optHuman = true
+    elseif ch == "d" then optDir = true
+    elseif ch == "R" then optRecursive = true
+    elseif ch == "r" then optReverse = true
+    elseif ch == "t" then optTime = true
+    elseif ch == "1" then optLong = false
+    else stderr("ls: invalid option -- '" .. ch .. "'\n"); return false end
+    return true
+end
+
 for _, a in ipairs(args) do
     if noMoreOpts then
         paths[#paths + 1] = a
     elseif a == "--" then
         noMoreOpts = true
+    elseif a == "--all" then optAll = true
+    elseif a == "--almost-all" then optAlmost = true
+    elseif a == "--long" then optLong = true
+    elseif a == "--human-readable" then optHuman = true
+    elseif a == "--directory" then optDir = true
+    elseif a == "--recursive" then optRecursive = true
+    elseif a == "--reverse" then optReverse = true
+    elseif a == "--sort=time" then optTime = true
     elseif a:sub(1, 1) == "-" and a ~= "-" then
-        stderr("ls: invalid option -- " .. a .. "\n")
-        return
+        for k = 2, #a do if not setShort(a:sub(k, k)) then return end end
     else
         paths[#paths + 1] = a
     end
 end
 if #paths == 0 then paths = { "." } end
+
+-- ---------------------------------------------------------------
+-- 长格式辅助
+-- ---------------------------------------------------------------
+local function rwx(b)
+    local r = (math.floor(b / 4) % 2 == 1) and "r" or "-"
+    local w = (math.floor(b / 2) % 2 == 1) and "w" or "-"
+    local x = (b % 2 == 1) and "x" or "-"
+    return r .. w .. x
+end
+local function modeStr(a)
+    local tchar = (a.kind == "symlink") and "l" or (a.isDir and "d" or "-")
+    local perm
+    if a.mode then
+        local bits = a.mode % 512
+        perm = rwx(math.floor(bits / 64) % 8) .. rwx(math.floor(bits / 8) % 8) .. rwx(bits % 8)
+    elseif a.isDir then
+        perm = "rwxr-xr-x"
+    else
+        perm = "rw-r--r--"
+    end
+    return tchar .. perm
+end
+local function ownerName(uid)
+    if not uid then return "0" end
+    -- 先试按 uid 反查(ext2 有 uid; CC 原生无), 失败则显示数字。
+    if syscalls and syscalls["user.byUid"] then
+        local u = syscalls["user.byUid"](uid)
+        if u and u.name then return u.name end
+    end
+    return tostring(uid)
+end
+local function human(n)
+    n = tonumber(n) or 0
+    local units = { "", "K", "M", "G", "T" }
+    local i, v = 1, n
+    while v >= 1024 and i < #units do v = v / 1024; i = i + 1 end
+    if i == 1 then return tostring(n) end
+    return string.format("%.1f%s", v, units[i])
+end
+local function fmtTime(t)
+    if not t or t <= 0 then return "             " end
+    local ok, mon = pcall(os.date, "%b", t)
+    if not ok or not mon then return "             " end
+    local day = os.date("%d", t)
+    if day:sub(1, 1) == "0" then day = " " .. day:sub(2) end
+    local y, curY = os.date("%Y", t), os.date("%Y")
+    local hhmm = os.date("%H:%M", t)
+    if y == curY then
+        return mon .. " " .. day .. " " .. hhmm
+    end
+    return mon .. " " .. day .. "  " .. y
+end
+local function classify(a, name)
+    if a.isDir then return name .. "/" end
+    if a.kind == "symlink" then return name .. "@" end
+    return name
+end
+local function lineLong(a, name)
+    local s = modeStr(a)
+    s = s .. " " .. string.format("%2d", a.links or 1)
+    s = s .. " " .. ownerName(a.uid)
+    s = s .. " " .. tostring(a.gid or 0)
+    s = s .. " " .. string.format("%8s", optHuman and human(a.size) or tostring(a.size or 0))
+    s = s .. " " .. fmtTime(a.mtime)
+    s = s .. " " .. classify(a, name)
+    io.write(s .. "\n")
+end
+
+-- ---------------------------------------------------------------
+-- 目录扫描与渲染
+-- ---------------------------------------------------------------
+local function entry(p)
+    local a = attrs(p)
+    return { isDir = a.isDir, size = a.size, mode = a.mode, uid = a.uid, gid = a.gid,
+             mtime = a.mtime, links = a.links, kind = a.kind, isReadOnly = a.isReadOnly }
+end
+local function classifyHidden(name)
+    return name:sub(1, 1) == "."
+end
+
+local function renderOne(full, name)
+    local a = entry(full)
+    if optLong then
+        lineLong(a, name)
+    else
+        io.write(name .. (a.isDir and "/" or "") .. "\n")
+    end
+end
+
+local function sortNames(out, dir)
+    if optTime then
+        table.sort(out, function(x, y)
+            local ax = entry(dir == "/" and ("/" .. x) or (dir .. "/" .. x))
+            local ay = entry(dir == "/" and ("/" .. y) or (dir .. "/" .. y))
+            return (ax.mtime or 0) > (ay.mtime or 0)
+        end)
+    else
+        table.sort(out)
+    end
+    if optReverse then
+        local rev = {}
+        for i = #out, 1, -1 do rev[#rev + 1] = out[i] end
+        return rev
+    end
+    return out
+end
 
 local function printDir(p)
     local names, lerr = fs.list(p)
@@ -48,23 +201,56 @@ local function printDir(p)
         stderr("ls: " .. p .. ": " .. ioeMsg(lerr) .. "\n")
         return false
     end
-    table.sort(names)
+    local hideAll = not (optAll or optAlmost)
+    local out = {}
+    if optAll then out[#out + 1] = "."; out[#out + 1] = ".." end
     for _, name in ipairs(names) do
+        if not (hideAll and classifyHidden(name)) then out[#out + 1] = name end
+    end
+    out = sortNames(out, p)
+    for _, name in ipairs(out) do
         local full = (p == "/") and ("/" .. name) or (p .. "/" .. name)
-        io.write(name .. (fs.isDir(full) and "/" or "") .. "\n")
+        renderOne(full, name)
     end
     return true
 end
 
+-- 递归进入子目录(跳过隐藏目录, 除非 -a/-A; 永不进入 . / ..)。
+local function recurse(p)
+    local names = fs.list(p) or {}
+    table.sort(names)
+    for _, name in ipairs(names) do
+        if (not classifyHidden(name)) or (optAll or optAlmost) then
+            if name ~= "." and name ~= ".." then
+                local full = (p == "/") and ("/" .. name) or (p .. "/" .. name)
+                if fs.isDir(full) then
+                    io.write("\n" .. full .. ":\n")
+                    printDir(full)
+                    recurse(full)
+                end
+            end
+        end
+    end
+end
+
+-- ---------------------------------------------------------------
+-- 主循环
+-- ---------------------------------------------------------------
 for pi, raw in ipairs(paths) do
     local path = resolve(raw)
     if not fs.exists(path) then
         stderr("ls: " .. raw .. ": No such file or directory\n")
-    elseif fs.isDir(path) then
+    elseif fs.isDir(path) and not optDir then
         if #paths > 1 then io.write(path .. ":\n") end
         printDir(path)
+        if optRecursive then recurse(path) end
         if pi < #paths then io.write("\n") end
     else
-        io.write(path .. "\n")
+        local a = entry(path)
+        if optLong then
+            lineLong(a, raw)
+        else
+            io.write(raw .. (a.isDir and "/" or "") .. "\n")
+        end
     end
 end

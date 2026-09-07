@@ -1,9 +1,17 @@
--- Delin cp: 复制文件/目录。用法: cp [-r] <src>... <dst>
---   -r/-R/--recursive: 递归复制目录。单文件复制走流式 read/write (不经 fs.copy)。
+-- Delin cp: 复制文件/目录 (GNU 子集)。用法: cp [OPTION]... <src>... <dst>
+-- 选项:
+--   -r/-R/-a, --recursive  递归复制目录
+--   -i, --interactive      覆盖前询问
+--   -f, --force            覆盖(不询问)
+--   -n, --no-clobber       不覆盖已存在文件(优先于 -i/-f)
+--   -v, --verbose          打印每个复制的 'src' -> 'dst'
+--   -p, --preserve         保留模式/时间(尽力而为)
+-- 支持组合短选项(-ri)与 --。单文件复制走流式 read/write。
 local args = args or {}
 local cwd = (type(cwd) == "string" and cwd) or "/"
 local function resolve(p)
     p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
     if p:sub(1, 1) == "/" then
         if p == "/" then return "/" end
         return p:gsub("/+$", "")
@@ -16,23 +24,37 @@ local function stderr(s)
     if e and e.write then e:write(s) end
 end
 
--- 解析选项: 收集 -r/-R/--recursive, 其余为源 + 末尾目标。
-local recursive = false
+local recursive, interactive, force, noClobber, verbose, preserve = false, false, false, false, false, false
 local srcs = {}
 local noMoreOpts = false
--- args 形如 { "-r", "/a", "/b", "/dst" }
+
+local function setShort(ch)
+    if ch == "r" or ch == "R" then recursive = true
+    elseif ch == "a" then recursive = true; preserve = true
+    elseif ch == "i" then interactive = true
+    elseif ch == "f" then force = true
+    elseif ch == "n" then noClobber = true
+    elseif ch == "v" then verbose = true
+    elseif ch == "p" then preserve = true
+    elseif ch == "d" then preserve = true
+    else stderr("cp: invalid option -- '" .. ch .. "'\n"); return false end
+    return true
+end
+
 for _, a in ipairs(args) do
     if noMoreOpts then
         srcs[#srcs + 1] = a
     elseif a == "--" then
         noMoreOpts = true
+    elseif a == "--recursive" then recursive = true
+    elseif a == "--interactive" then interactive = true
+    elseif a == "--force" then force = true
+    elseif a == "--no-clobber" then noClobber = true
+    elseif a == "--verbose" then verbose = true
+    elseif a == "--preserve" then preserve = true
+    elseif a == "--archive" then recursive = true; preserve = true
     elseif a:sub(1, 1) == "-" and a ~= "-" then
-        if a == "-r" or a == "-R" or a == "--recursive" then
-            recursive = true
-        else
-            stderr("cp: invalid option -- " .. a .. "\n")
-            return
-        end
+        for k = 2, #a do if not setShort(a:sub(k, k)) then return end end
     else
         srcs[#srcs + 1] = a
     end
@@ -52,25 +74,52 @@ local function basename(p)
     p = p:gsub("/+$", "")
     return (p:match("([^/]+)$")) or p
 end
-
 local function join(a, b)
     return (a .. "/" .. b):gsub("/+", "/")
 end
 
--- 流式复制单个文件: 读 src, 写 dst。
+-- 覆盖判断: -n 决定不覆盖; 否则 -f 直接覆盖, -i 询问, 默认覆盖。
+local function shouldOverwrite(dst)
+    if noClobber then return false end
+    if not fs.exists(dst) then return true end
+    if force then return true end
+    if interactive then
+        io.write("cp: overwrite '" .. dst .. "'? ")
+        io.flush()
+        local s = io.stdin()
+        local line = s and s.readLine and s:readLine() or nil
+        if line and line:match("^[yY]") then return true end
+        return false
+    end
+    return true
+end
+
+-- 流式复制单个文件。
 local function copyFile(src, dst)
+    if src == dst then return nil, "`" .. src .. "' and `" .. dst .. "' are the same file" end
     local inF, ierr = fs.open(src, "r")
     if not inF then return nil, (ierr or ("cannot open " .. src)) end
+    if not shouldOverwrite(dst) then inF.close(); return true end
     local outF, oerr = fs.open(dst, "w")
     if not outF then inF.close(); return nil, (oerr or ("cannot write " .. dst)) end
     while true do
-        local chunk = inF.read(4096)  -- 每次最多读 4096 字节
+        local chunk = inF.read(4096)
         if not chunk or chunk == "" then break end
         outF.write(chunk)
     end
     inF.close()
     outF.close()
+    if preserve then
+        local a = attrsOrNil(src)
+        if a and a.mode and fs.chmod then pcall(fs.chmod, dst, a.mode) end
+    end
+    if verbose then io.write("'" .. src .. "' -> '" .. dst .. "'\n") end
     return true
+end
+
+local function attrsOrNil(p)
+    if fs.attributes then return fs.attributes(p) end
+    return nil
 end
 
 -- 递归复制目录树。
@@ -80,12 +129,18 @@ local function copyTree(src, dst)
     end
     if not fs.exists(dst) then
         local ok, err = pcall(fs.makeDir, dst)
-        if not ok then return nil, "mkdir " .. dst .. " failed: " .. tostring(err) end
+        if not ok then return nil, "mkdir '" .. dst .. "' failed: " .. tostring(err) end
     end
     local names = fs.list(src) or {}
     for _, n in ipairs(names) do
-        local ok, err = copyTree(join(src, n), join(dst, n))
-        if not ok then return nil, err end
+        if n ~= "." and n ~= ".." then
+            local ok, err = copyTree(join(src, n), join(dst, n))
+            if not ok then return nil, err end
+        end
+    end
+    if preserve then
+        local a = attrsOrNil(src)
+        if a and a.mode and fs.chmod then pcall(fs.chmod, dst, a.mode) end
     end
     return true
 end
@@ -99,6 +154,10 @@ for _, src in ipairs(sources) do
     if fs.isDir(dest) or destHintIsDir then
         target = join(dest, basename(src))
     else
+        if #sources > 1 then
+            stderr("cp: target '" .. destRaw .. "' is not a directory\n")
+            return
+        end
         target = dest
     end
     if fs.isDir(src) then

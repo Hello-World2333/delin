@@ -1,6 +1,7 @@
--- Delin kill: 发送信号到进程/进程组。用法:
---   kill [-SIG] pid...     默认 SIGTERM; pid 前加 - 表示进程组(-pgid)
---   kill -l                列出信号名
+-- Delin kill: 发送信号到进程/进程组 (GNU 子集)。用法:
+--   kill [-s SIGNAL | -SIGNAL] pid...     默认 SIGTERM; pid 前加 - 表示进程组(-pgid)
+--   kill -l [SIGNAL]                      列出信号名, 或 -l N/-l NAME 输出另一表示
+-- 支持 --signal=SIG 与 -- 结束选项。
 local args = args or {}
 
 local function stderr(s)
@@ -9,24 +10,61 @@ local function stderr(s)
 end
 
 local sig = 15 -- SIGTERM
+local listMode = false
 local targets = {}
 local noMoreOpts = false
-for i = 1, #args do
+
+local function signalName(n)
+    return syscalls["signal.name"](n)
+end
+local function signalNumber(name)
+    return syscalls["signal.number"](name)
+end
+
+local function parseSig(val)
+    -- 接受数字或名字(可带 - 前缀, 可带 SIG 前缀)
+    local t = tostring(val)
+    t = t:gsub("^%-", "")
+    if t:match("^%d+$") then return tonumber(t) end
+    if t:match("^SIG") then t = t:sub(4) end
+    return signalNumber(t)
+end
+
+local i = 1
+while i <= #args do
     local a = args[i]
     if noMoreOpts then
         targets[#targets + 1] = a
     elseif a == "--" then
         noMoreOpts = true
     elseif a == "-l" or a == "-L" then
-        local nums = syscalls["signal.list"]()
-        local t = {}
-        for _, s in ipairs(nums) do t[#t + 1] = syscalls["signal.name"](s) end
-        io.write(table.concat(t, " ") .. "\n")
-        return
+        listMode = true
+        -- 可选的下一个参数为信号(非数字 pid 形式): kill -l N / kill -l NAME
+        local nxt = args[i + 1]
+        if nxt and nxt:match("^%-?%d+$") then
+            i = i + 1
+            local name = signalName(tonumber(nxt))
+            io.write((name or "?") .. "\n")
+            return
+        elseif nxt and not nxt:match("^%-") then
+            i = i + 1
+            local num = signalNumber(nxt:gsub("^SIG", ""))
+            io.write((num and tostring(num)) or "?")
+            io.write("\n")
+            return
+        end
+    elseif a == "-s" or a == "--signal" then
+        i = i + 1
+        if not args[i] then stderr("kill: option requires an argument -- 's'\n"); return end
+        sig = parseSig(args[i])
+        if not sig then stderr("kill: unknown signal " .. args[i] .. "\n"); return end
+    elseif a:match("^%-%-signal=") then
+        sig = parseSig(a:sub(10))
+        if not sig then stderr("kill: unknown signal " .. a:sub(10) .. "\n"); return end
     elseif a:match("^%-%d+$") then
         sig = tonumber(a:sub(2))
     elseif a:match("^%-[A-Za-z]+$") then
-        sig = syscalls["signal.number"](a)
+        sig = parseSig(a)
         if not sig then
             stderr("kill: unknown signal " .. a .. "\n")
             return
@@ -34,6 +72,15 @@ for i = 1, #args do
     else
         targets[#targets + 1] = a
     end
+    i = i + 1
+end
+
+if listMode then
+    local nums = syscalls["signal.list"]()
+    local t = {}
+    for _, s in ipairs(nums) do t[#t + 1] = signalName(s) end
+    io.write(table.concat(t, " ") .. "\n")
+    return
 end
 
 if #targets == 0 then
