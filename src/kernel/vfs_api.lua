@@ -34,7 +34,11 @@ local devBackend = vfs.virtual({
         for n in pairs(devices) do out[#out + 1] = n end
         return out
     end,
-    exists = function(rel) return devices[strip(rel)] ~= nil end,
+    exists = function(rel)
+        rel = strip(rel)
+        if rel == "" then return true end -- /dev 自身是一个目录
+        return devices[rel] ~= nil
+    end,
     isDir = function(rel) return strip(rel) == "" end,
     attributes = function(rel)
         if strip(rel) == "" then return { size = 0, isDir = true, isReadOnly = true, name = "dev", created = 0, modified = 0 } end
