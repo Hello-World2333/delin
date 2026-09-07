@@ -119,7 +119,7 @@ end
 ---@param uid integer|nil   uid(默认继承父/0)
 ---@param gid integer|nil   gid(默认继承父/0)
 ---@param argv table|nil    参数表 { [0]=程序名, [1..]=位置参数 } (可缺省)
----@param opts table|nil    选项 { cwd= } (可缺省)
+---@param opts table|nil    选项 { cwd=, stdio={input=,output=} } (可缺省)
 ---@return integer|nil pid, table|nil proc, string|nil err
 function process.spawn(src, name, ppid, uid, gid, argv, opts)
     ppid = ppid or 0
@@ -147,11 +147,19 @@ function process.spawn(src, name, ppid, uid, gid, argv, opts)
 
     -- 继承父进程 stdio(或 boot 默认终端)。每个进程独立 stdio, 子进程在 spawn 时刻
     -- 继承父进程当前的 stdin/stdout, 之后各自变化互不影响。
+    -- 子进程 stdio: 默认继承父进程(或 boot 默认终端); 调用方可用 opts.stdio 显式覆盖
+    -- (shell 重定向: 把子进程的 stdin/stdout 指向文件)。每个进程 stdio 彼此独立。
     local parentProc = registry[ppid]
-    local inherit = (parentProc and parentProc.stdio) or vfs_api.getStdio()
-    if inherit then
-        env.__stdio.input = inherit.input
-        env.__stdio.output = inherit.output
+    local want = opts and opts.stdio
+    if want then
+        env.__stdio.input  = want.input
+        env.__stdio.output = want.output
+    else
+        local inherit = (parentProc and parentProc.stdio) or vfs_api.getStdio()
+        if inherit then
+            env.__stdio.input = inherit.input
+            env.__stdio.output = inherit.output
+        end
     end
 
     local chunk, loadErr = load(src, name or ("proc#" .. pid), "t", env)

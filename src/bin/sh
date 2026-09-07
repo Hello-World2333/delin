@@ -1,34 +1,38 @@
--- Delin sh: 极简 POSIX shell。
--- 交互模式(stdin 是 tty): 显示提示符, 读命令行, 执行, 循环。带作业控制(& jobs fg bg kill)。
--- 脚本模式(stdin 是文件): 逐行读 stdin, 执行, 到 EOF 为止。
--- 内建: cd pwd echo exit help jobs fg bg kill。外部命令: /bin 下的独立工具(当子进程 spawn, 传 argv, wait)。
+-- Delin sh: POSIX-ish shell (core subset).
+-- 交互/脚本模式; 内建 cd pwd echo exit help jobs fg bg kill test [ true false :.
+-- 支持: 变量与展开($x/${x}/$?/$#/$@/$*/$1..), 单/双引号, if/elif/else, for/while/until,
+--       case, 函数, [ ] 与 test, &&/||/;, 文件重定向(> >> <), 命令后台(& + 作业控制)。
+-- 不支持: 管道(|)、命令替换($() 与反引号)、算术 $(( ))。 正则用 Lua pattern(见 grep/sed)。
 -- 输出走 io.stdout(父进程把它指向控制台 tty 或文件), 绝不 print(kprint 走日志+term)。
 
 local stdin  = io.stdin()
 local stdout = io.stdout()
 local interactive = stdin and stdin.isTTY
 
--- 当前用户(登录后由 login spawn; 依据 uid 查 /etc/passwd) -> 起始目录 + 提示符名。
 local uname = "root"
-local cwd = "/"
 if syscalls and syscalls["user.byUid"] then
     local u = syscalls["user.byUid"](uid)
-    if u then
-        uname = u.name
-        if u.home and fs.isDir(u.home) then cwd = u.home end
-    end
+    if u then uname = u.name end
 end
 local lastExit = 0
 
-local function outln(s)
-    if stdout and stdout.write then stdout:write((s or "") .. "\n") end
-end
-local function errln(s)
-    local e = io.stderr()
-    if e and e.write then e:write((s or "") .. "\n") end
+local cwd = "/"
+if syscalls and syscalls["user.byUid"] then
+    local u = syscalls["user.byUid"](uid)
+    if u and u.home and fs.isDir(u.home) then cwd = u.home end
 end
 
--- 相对路径 -> 绝对(基于 cwd; 不展开 .. )。fail-fast: 不做多余回退。
+-- 位置参数(顶层脚本 argv; 函数体用独立 pos 表)。
+local posArgs, posArg0 = {}, "sh"
+local function setPos(argv)
+    posArg0 = (argv and argv[0]) or "sh"
+    posArgs = {}
+    if argv then for i = 1, #argv do posArgs[i] = argv[i] end end
+end
+if argv then setPos(argv) end
+
+local vars = {}
+
 local function resolve(p)
     p = p or ""
     if p:sub(1, 1) == "/" then
@@ -36,180 +40,613 @@ local function resolve(p)
         return p:gsub("/+$", "")
     end
     local base = (cwd == "/") and "" or cwd
-    local joined = base .. "/" .. p
-    -- 折叠重复斜杠
-    return (joined:gsub("/+", "/")):gsub("/+$", "")
+    return (base .. "/" .. p):gsub("/+", "/"):gsub("/+$", "")
 end
 
---- 拆一行为 { cmd, args... }。极简: 按空白切分, 不处理引号/宏/管道/重定向。
-local function tokenize(line)
-    local toks = {}
-    for tok in line:gmatch("%S+") do toks[#toks + 1] = tok end
+local outH, inH = stdout, stdin
+local function outln(s)
+    if outH and outH.write then outH:write(tostring(s or "") .. "\n") end
+end
+local function errln(s)
+    local e = io.stderr()
+    if e and e.write then e:write(tostring(s or "") .. "\n") end
+end
+
+local IFS = " \t\n"
+local function isIfs(c) return IFS:find(c, 1, true) ~= nil end
+local function splitIfs(s)
+    if not s or s == "" then return {} end
+    local out, cur, started = {}, "", false
+    for k = 1, #s do
+        local c = s:sub(k, k)
+        if isIfs(c) then if started then out[#out + 1] = cur; cur = ""; started = false end
+        else cur = cur .. c; started = true end
+    end
+    if started then out[#out + 1] = cur end
+    return out
+end
+
+local function getVarVal(name)
+    if name == "?" then return tostring(lastExit) end
+    if name == "#" then return tostring(#posArgs) end
+    if name == "$" then return tostring(pid) end
+    if name == "0" then return posArg0 end
+    if name == "*" then return table.concat(posArgs, " ") end
+    local n = tonumber(name)
+    if n then return posArgs[n] or "" end
+    return vars[name] or ""
+end
+
+-- ---------------------------------------------------------------
+-- 词法
+-- ---------------------------------------------------------------
+local operatorChars = { ["&"]=true, [";"]=true, ["|"]=true, ["("]=true, [")"]=true, [">"]=true, ["<"]=true }
+local function readVarName(src, i)
+    local c = src:sub(i, i)
+    if c == "{" then
+        local j, name = i + 1, ""
+        while j <= #src and src:sub(j, j) ~= "}" do name = name .. src:sub(j, j); j = j + 1 end
+        if j > #src then return nil, i end
+        return name, j + 1
+    end
+    if c == "?" then return "?", i + 1 end
+    if c == "#" then return "#", i + 1 end
+    if c == "@" then return "@", i + 1 end
+    if c == "*" then return "*", i + 1 end
+    if c == "$" then return "$", i + 1 end
+    if c:match("[%d]") then return c, i + 1 end
+    if c:match("[%a_]") then
+        local j, name = i, ""
+        while j <= #src and src:sub(j, j):match("[%w_]") do name = name .. src:sub(j, j); j = j + 1 end
+        return name, j
+    end
+    return nil, i
+end
+
+local function lex(src)
+    local toks, i, n = {}, 1, #src
+    while i <= n do
+        local c = src:sub(i, i)
+        if c == " " or c == "\t" or c == "\r" then
+            i = i + 1
+        elseif c == "\n" then
+            toks[#toks + 1] = { t = "nl" }; i = i + 1
+        elseif c == "&" and src:sub(i + 1, i + 1) == "&" then
+            toks[#toks + 1] = { t = "op", op = "&&" }; i = i + 2
+        elseif c == "|" and src:sub(i + 1, i + 1) == "|" then
+            toks[#toks + 1] = { t = "op", op = "||" }; i = i + 2
+        elseif c == ">" and src:sub(i + 1, i + 1) == ">" then
+            toks[#toks + 1] = { t = "op", op = ">>" }; i = i + 2
+        elseif c == ";" and src:sub(i + 1, i + 1) == ";" then
+            toks[#toks + 1] = { t = "op", op = ";;" }; i = i + 2
+        elseif c == "#" then
+            -- 行注释: 跳到行尾(保留换行交给下一轮)。
+            while i <= n and src:sub(i, i) ~= "\n" do i = i + 1 end
+        elseif operatorChars[c] then
+            toks[#toks + 1] = { t = "op", op = c }; i = i + 1
+        else
+            local segs, raw, rawbuf = {}, "", ""
+            local function flushRaw()
+                if rawbuf ~= "" then segs[#segs + 1] = { raw = rawbuf }; rawbuf = "" end
+            end
+            while i <= n do
+                local cc = src:sub(i, i)
+                if cc == " " or cc == "\t" or cc == "\r" or cc == "\n" then break end
+                if cc == "&" and src:sub(i + 1, i + 1) == "&" then break end
+                if cc == "|" and src:sub(i + 1, i + 1) == "|" then break end
+                if operatorChars[cc] then break end
+                if cc == "'" then
+                    flushRaw()
+                    local j = i + 1
+                    while j <= n and src:sub(j, j) ~= "'" do j = j + 1 end
+                    segs[#segs + 1] = { sq = src:sub(i + 1, j - 1) }; raw = raw .. src:sub(i + 1, j - 1)
+                    i = (j <= n) and (j + 1) or j
+                elseif cc == '"' then
+                    flushRaw()
+                    local j, dqsegs = i + 1, {}
+                    while j <= n and src:sub(j, j) ~= '"' do
+                        local dc = src:sub(j, j)
+                        if dc == "\\" and src:sub(j + 1, j + 1) == '"' then
+                            dqsegs[#dqsegs + 1] = { raw = '"' }; raw = raw .. '"'; j = j + 2
+                        elseif dc == "$" then
+                            local name, ni = readVarName(src, j + 1)
+                            if name then
+                                dqsegs[#dqsegs + 1] = { var = name }; raw = raw .. tostring(getVarVal(name)); j = ni
+                            else dqsegs[#dqsegs + 1] = { raw = "$" }; raw = raw .. "$"; j = j + 1 end
+                        else
+                            dqsegs[#dqsegs + 1] = { raw = dc }; raw = raw .. dc; j = j + 1
+                        end
+                    end
+                    segs[#segs + 1] = { dq = dqsegs }
+                    i = (j <= n) and (j + 1) or j
+                elseif cc == "$" then
+                    flushRaw()
+                    local name, ni = readVarName(src, i + 1)
+                    if name then segs[#segs + 1] = { var = name }; raw = raw .. tostring(getVarVal(name)); i = ni
+                    else rawbuf = rawbuf .. "$"; raw = raw .. "$"; i = i + 1 end
+                else
+                    rawbuf = rawbuf .. cc; raw = raw .. cc; i = i + 1
+                end
+            end
+            flushRaw()
+            toks[#toks + 1] = { t = "word", segs = segs, raw = raw }
+        end
+    end
     return toks
 end
 
--- ---------------------------------------------------------------
--- 作业控制(仅交互模式且 stdin 是 tty)
--- ---------------------------------------------------------------
-local ttyName = (stdin and stdin.getDeviceName) and stdin:getDeviceName() or nil
-local shPg = nil
-local jobs = {}        -- { jid, pgid, pid, cmd, status }
-local nextJid = 0
-local sigintPending = false
-local hasJobCtl = interactive and ttyName and syscalls and syscalls["job.setpgid"]
+local function expandGlue(segs)
+    local s = ""
+    for _, seg in ipairs(segs) do
+        if seg.raw then s = s .. seg.raw
+        elseif seg.sq then s = s .. seg.sq
+        elseif seg.dq then
+            for _, d in ipairs(seg.dq) do s = s .. (d.var and getVarVal(d.var) or d.raw) end
+        elseif seg.var then s = s .. getVarVal(seg.var) end
+    end
+    return s
+end
 
+local function expandSegs(segs)
+    local words = { { s = "", alive = false } }
+    for _, seg in ipairs(segs) do
+        if seg.raw then for _, w in ipairs(words) do w.s = w.s .. seg.raw; w.alive = true end
+        elseif seg.sq then for _, w in ipairs(words) do w.s = w.s .. seg.sq; w.alive = true end
+        elseif seg.dq then
+            -- "$@" 特殊: 每个位置参数作为一个词(常见于 "for x in \"$@\"" / 透传参数)。
+            if #seg.dq == 1 and seg.dq[1].var == "@" then
+                local parts = {}
+                for k = 1, #posArgs do parts[k] = posArgs[k] end
+                if #parts > 0 then
+                    local new = {}
+                    for _, w in ipairs(words) do
+                        for _, p in ipairs(parts) do new[#new + 1] = { s = w.s .. p, alive = true } end
+                    end
+                    words = new
+                end
+            else
+                local ds = ""
+                for _, d in ipairs(seg.dq) do ds = ds .. (d.var and getVarVal(d.var) or d.raw) end
+                for _, w in ipairs(words) do w.s = w.s .. ds; w.alive = true end
+            end
+        elseif seg.var then
+            local name = seg.var
+            local parts
+            if name == "@" then
+                parts = {}
+                for k = 1, #posArgs do parts[k] = posArgs[k] end
+            else parts = splitIfs(getVarVal(name)) end
+            if #parts > 0 then
+                local new = {}
+                for _, w in ipairs(words) do
+                    for _, p in ipairs(parts) do new[#new + 1] = { s = w.s .. p, alive = true } end
+                end
+                words = new
+            end
+        end
+    end
+    local out = {}
+    for _, w in ipairs(words) do if w.alive then out[#out + 1] = w.s end end
+    return out
+end
+local function wordToStr(segs) return expandGlue(segs) end
+
+-- ---------------------------------------------------------------
+-- 解析器
+-- ---------------------------------------------------------------
+local kw = { ["if"]=true, ["then"]=true, ["elif"]=true, ["else"]=true, ["fi"]=true, ["for"]=true,
+    ["in"]=true, ["do"]=true, ["done"]=true, ["while"]=true, ["until"]=true, ["case"]=true,
+    ["esac"]=true, ["function"]=true, ["!"]=true }
+
+local T, ti
+local function peek() return T[ti] end
+local function adv() local t = T[ti]; ti = ti + 1; return t end
+local function isKw(t, w) return t and t.t == "word" and t.raw == w and #t.segs == 1 and t.segs[1].raw ~= nil end
+local function skipNl() while true do local t = T[ti]; if t and t.t == "nl" then ti = ti + 1 else return end end end
+local function skipSep() while true do local t = T[ti]; if t and (t.t == "nl" or (t.t == "op" and t.op == ";")) then ti = ti + 1 else return end end end
+local function isStop(t, stop)
+    if not t or not stop then return false end
+    if t.t == "word" and stop[t.raw] then return true end
+    if t.t == "op" and stop[t.op] then return true end
+    return false
+end
+
+local parseList, parseCommand, parseSimple, parseAndOr, parseParse
+parseSimple = function()
+    local assigns, argvSegs, redirects = {}, {}, {}
+    local onlyAssign = true
+    while true do
+        local t = T[ti]
+        if not t then break end
+        if t.t == "nl" then break end
+        if t.t == "op" then
+            if t.op == ">" or t.op == ">>" or t.op == "<" then
+                ti = ti + 1
+                local tgt = T[ti]
+                if not tgt or tgt.t ~= "word" then break end
+                ti = ti + 1
+                redirects[#redirects + 1] = { fd = 0, op = t.op, target = tgt.segs }
+            else break end
+        else
+            -- word: assignment or arg
+            local nm
+            if onlyAssign and t.raw and t.raw:match("^[%a_][%w_]*=") and t.segs[1] and t.segs[1].raw then
+                nm = t.raw:match("^([%a_][%w_]*)=(.*)$")
+            end
+            if nm then
+                -- 值 segs = 去掉 "name=" 前缀后的 t.segs
+                local valsegs = {}
+                local rest = t.segs[1].raw:sub(#nm + 2)
+                if rest ~= "" then valsegs[#valsegs + 1] = { raw = rest } end
+                for k = 2, #t.segs do valsegs[#valsegs + 1] = t.segs[k] end
+                assigns[#assigns + 1] = { name = nm, value = valsegs }
+                ti = ti + 1
+            else
+                onlyAssign = false
+                argvSegs[#argvSegs + 1] = t.segs
+                ti = ti + 1
+            end
+        end
+    end
+    return { kind = "simple", assigns = assigns, argv = argvSegs, redirects = redirects }
+end
+
+-- 函数定义检测: name () { ... } 或 function name { ... } (t 处为 name/function)
+local function tryFuncDef()
+    -- 形式 "name ( ) {": 
+    local a, b, c = T[ti], T[ti + 1], T[ti + 2]
+    if a and a.t == "word" and b and b.t == "op" and b.op == "(" and c and c.t == "op" and c.op == ")" then
+        local fname = a.raw
+        ti = ti + 3
+        skipNl()
+        local bt = T[ti]
+        if not (bt and isKw(bt, "{")) then return nil, "function body expected" end
+        ti = ti + 1
+        local body, err, inc = parseList({ ["}"] = true })
+        if body == nil then return nil, err, inc end
+        if isKw(T[ti], "}") then ti = ti + 1 end
+        return { kind = "funcdef", name = fname, body = body }
+    end
+    return false
+end
+
+local function parseFuncKeyword()
+    -- 已看到 'function'
+    local nameTok = T[ti]
+    if not nameTok or nameTok.t ~= "word" then return nil, "function name expected" end
+    ti = ti + 1
+    if T[ti] and T[ti].t == "op" and T[ti].op == "(" then ti = ti + 1
+        if T[ti] and T[ti].t == "op" and T[ti].op == ")" then ti = ti + 1 end end
+    skipNl()
+    if not isKw(T[ti], "{") then return nil, "function body expected" end
+    ti = ti + 1
+    local body, err, inc = parseList({ ["}"] = true })
+    if body == nil then return nil, err, inc end
+    if isKw(T[ti], "}") then ti = ti + 1 end
+    return { kind = "funcdef", name = nameTok.raw, body = body }
+end
+
+parseCommand = function()
+    local t = T[ti]
+    if not t then return nil end
+    if isKw(t, "if") then
+        ti = ti + 1
+        local cond, err, inc = parseList({ ["then"] = true })
+        if cond == nil then return nil, err, inc end
+        skipNl()
+        if not isKw(T[ti], "then") then return nil, "then expected", nil end
+        ti = ti + 1
+        local thenb, e2, i2 = parseList({ ["elif"] = true, ["else"] = true, ["fi"] = true })
+        if thenb == nil then return nil, e2, i2 end
+        local elifs = {}
+        while isKw(T[ti], "elif") do
+            ti = ti + 1
+            local ec, e3, i3 = parseList({ ["then"] = true })
+            if ec == nil then return nil, e3, i3 end
+            skipNl()
+            ti = ti + 1
+            local eb, e4, i4 = parseList({ ["elif"] = true, ["else"] = true, ["fi"] = true })
+            if eb == nil then return nil, e4, i4 end
+            elifs[#elifs + 1] = { cond = ec, body = eb }
+        end
+        local elseb
+        if isKw(T[ti], "else") then ti = ti + 1; elseb = parseList({ ["fi"] = true }) end
+        if not isKw(T[ti], "fi") then return nil, "fi expected", nil end
+        ti = ti + 1
+        return { kind = "if", cond = cond, thenb = thenb, elifs = elifs, elseb = elseb }
+    elseif isKw(t, "for") then
+        ti = ti + 1
+        local v = T[ti]
+        if not v or v.t ~= "word" then return nil, "for variable expected" end
+        local var = v.raw; ti = ti + 1
+        local items
+        if isKw(T[ti], "in") then
+            ti = ti + 1
+            items = {}
+            while true do
+                local w = T[ti]
+                if not w or w.t ~= "word" then break end
+                if isKw(w, "do") then break end
+                items[#items + 1] = w.segs; ti = ti + 1
+            end
+        end
+        skipSep()
+        if not isKw(T[ti], "do") then return nil, "do expected", nil end
+        ti = ti + 1
+        local body, err, inc = parseList({ ["done"] = true })
+        if body == nil then return nil, err, inc end
+        if not isKw(T[ti], "done") then return nil, "done expected", nil end
+        ti = ti + 1
+        return { kind = "for", var = var, items = items, body = body }
+    elseif isKw(t, "while") or isKw(t, "until") then
+        local isWhile = isKw(T[ti], "while"); ti = ti + 1
+        local cond, err, inc = parseList({ ["do"] = true })
+        if cond == nil then return nil, err, inc end
+        skipSep()
+        if not isKw(T[ti], "do") then return nil, "do expected", nil end
+        ti = ti + 1
+        local body, e2, i2 = parseList({ ["done"] = true })
+        if body == nil then return nil, e2, i2 end
+        if not isKw(T[ti], "done") then return nil, "done expected", nil end
+        ti = ti + 1
+        return { kind = isWhile and "while" or "until", cond = cond, body = body }
+    elseif isKw(t, "case") then
+        ti = ti + 1
+        local w = T[ti]
+        if not w or w.t ~= "word" then return nil, "case word expected" end
+        local word = w.segs; ti = ti + 1
+        skipNl()
+        if not isKw(T[ti], "in") then return nil, "in expected", nil end
+        ti = ti + 1
+        local cases = {}
+        while true do
+            skipNl()
+            if isKw(T[ti], "esac") then break end
+            local pats, okPat = {}, false
+            while true do
+                local p = T[ti]
+                if not p then break end
+                if p.t == "op" and p.op == ")" then ti = ti + 1; okPat = true; break end
+                if p.t == "op" and p.op == "|" then ti = ti + 1 -- pattern 分隔符, 继续
+                elseif p.t == "op" then break
+                elseif isKw(p, "esac") then break
+                else pats[#pats + 1] = p.segs; ti = ti + 1 end
+            end
+            if not okPat then break end
+            skipNl()
+            local body, err, inc = parseList({ [";;"] = true, ["esac"] = true })
+            if body == nil then return nil, err, inc end
+            cases[#cases + 1] = { pats = pats, body = body }
+            if T[ti] and T[ti].t == "op" and T[ti].op == ";;" then ti = ti + 1 end
+        end
+        if not isKw(T[ti], "esac") then return nil, "esac expected", nil end
+        ti = ti + 1
+        return { kind = "case", word = word, cases = cases }
+    elseif isKw(t, "function") then
+        ti = ti + 1
+        return parseFuncKeyword()
+    elseif isKw(t, "{") then
+        ti = ti + 1
+        local body, err, inc = parseList({ ["}"] = true })
+        if body == nil then return nil, err, inc end
+        if isKw(T[ti], "}") then ti = ti + 1 end
+        return { kind = "brace", body = body }
+    else
+        local fd, ferr, finc = tryFuncDef()
+        if fd == false then return parseSimple() end
+        return fd, ferr, finc
+    end
+end
+
+parseAndOr = function()
+    local node, err, inc = parseCommand()
+    if node == nil then return nil, err, inc end
+    -- 若后面紧跟 && 或 ||, 归成一个 chain(&&/|| 短路只在 chain 内生效, 不影响外层 ; 列表)。
+    if T[ti] and T[ti].t == "op" and (T[ti].op == "&&" or T[ti].op == "||") then
+        local items = { { node = node, op = "" } }
+        while T[ti] and T[ti].t == "op" and (T[ti].op == "&&" or T[ti].op == "||") do
+            local op = T[ti].op; ti = ti + 1
+            local n2, e2, i2 = parseCommand()
+            if n2 == nil then return nil, e2, i2 end
+            items[#items + 1] = { node = n2, op = op }
+        end
+        return { kind = "chain", items = items }
+    end
+    return node
+end
+
+parseList = function(stop)
+    local items = {}
+    while true do
+        skipNl()
+        local t = T[ti]
+        if not t then break end
+        if isStop(t, stop) then break end
+        if t.t == "op" then
+            if t.op == ";" or t.op == "&" then ti = ti + 1 else break end
+        end
+        local node, err, inc = parseAndOr()
+        if node == nil then
+            if inc then return nil, nil, true end
+            return nil, err or "parse error"
+        end
+        local op = ""
+        local sep = T[ti]
+        if sep and sep.t == "op" and (sep.op == ";" or sep.op == "&") then
+            op = sep.op; ti = ti + 1
+        end
+        items[#items + 1] = { node = node, op = op }
+        if op == "" and (isStop(T[ti], stop) or not T[ti]) then break end
+        if isStop(T[ti], stop) then break end
+        if not T[ti] then break end
+    end
+    return items
+end
+
+-- ---------------------------------------------------------------
+-- 求值
+-- ---------------------------------------------------------------
+local builtins = {}
+local evalNode, evalList, evalSimple, restoreRedir, matchGlob
+
+local function expandWords(words)
+    local out = {}
+    for _, w in ipairs(words) do
+        for _, s in ipairs(expandSegs(w)) do out[#out + 1] = s end
+    end
+    return out
+end
+local function tail(t) local r = {}; for i = 2, #t do r[#r + 1] = t[i] end return r end
+
+builtins.pwd = function(args) outln(cwd) end
+builtins.echo = function(args) outln(table.concat(args, " ")) end
+builtins["true"] = function() end
+builtins["false"] = function() lastExit = 1 end
+builtins[":"] = function() end
+builtins.cd = function(args)
+    local target = resolve(args[1] or "/")
+    if not fs.isDir(target) then errln("cd: " .. (args[1] or "") .. ": No such directory"); lastExit = 1
+    else cwd = target; lastExit = 0 end
+end
+
+local function testEval(a)
+    if #a == 0 then return false end
+    if a[1] == "!" then return not testEval(tail(a)) end
+    if #a == 1 then return a[1] ~= "" end
+    if #a == 2 then
+        local op = a[1]
+        if op == "-n" then return a[2] ~= "" end
+        if op == "-z" then return a[2] == "" end
+        if fs.exists then
+            if op == "-e" then return fs.exists(a[2]) end
+            if op == "-f" then return fs.exists(a[2]) and fs.isFile and fs.isFile(a[2]) end
+            if op == "-d" then return fs.isDir(a[2]) end
+            if op == "-s" then return fs.exists(a[2]) and fs.getSize and fs.getSize(a[2]) > 0 end
+            if op == "-x" then return (fs.canExecute and fs.canExecute(a[2])) or fs.exists(a[2]) end
+            if op == "-r" then return fs.exists(a[2]) end
+            if op == "-w" then return fs.exists(a[2]) end
+        end
+    end
+    if #a == 3 then
+        if a[2] == "=" then return a[1] == a[3] end
+        if a[2] == "!=" then return a[1] ~= a[3] end
+        local n1, n2 = tonumber(a[1]), tonumber(a[3])
+        if n1 and n2 then
+            if a[2] == "-eq" then return n1 == n2 end
+            if a[2] == "-ne" then return n1 ~= n2 end
+            if a[2] == "-lt" then return n1 < n2 end
+            if a[2] == "-le" then return n1 <= n2 end
+            if a[2] == "-gt" then return n1 > n2 end
+            if a[2] == "-ge" then return n1 >= n2 end
+        end
+        if a[2] == "-a" then return testEval({ a[1] }) and testEval({ a[3] }) end
+        if a[2] == "-o" then return testEval({ a[1] }) or testEval({ a[3] }) end
+    end
+    return false
+end
+builtins.test = function(args) lastExit = testEval(args) and 0 or 1 end
+builtins["["] = function(args)
+    if args[#args] == "]" then
+        local t = {}
+        for i = 1, #args - 1 do t[i] = args[i] end
+        lastExit = testEval(t) and 0 or 1
+    else
+        lastExit = testEval(args) and 0 or 1
+    end
+end
+builtins.exit = function(args) lastExit = tonumber(args[1]) or 0; return "exit" end
+builtins["break"] = function(args) return "break" end
+builtins.continue = function(args) return "continue" end
+builtins["return"] = function(args) lastExit = tonumber(args[1]) or 0; return "return" end
+builtins.shift = function(args)
+    local n = tonumber(args[1]) or 1
+    local np = {}
+    for i = n + 1, #posArgs do np[#np + 1] = posArgs[i] end
+    posArgs = np
+end
+builtins.help = function(args)
+    outln("Delin sh (POSIX core subset)")
+    outln("builtins : cd pwd echo exit help jobs fg bg kill test [ true false :")
+    outln("external : ls cat rm mkdir cp mv touch head tail wc grep sed login")
+    outln("usage    : sh [script] [args...]   (no script => interactive/stdin)")
+end
+
+local ttyName = (stdin and stdin.getDeviceName) and stdin:getDeviceName() or nil
+local shPg, jobs, nextJid, sigintPending = nil, {}, 0, false
+local hasJobCtl = interactive and ttyName and syscalls and syscalls["job.setpgid"]
 if hasJobCtl then
-    -- 交互 sh 自建进程组(不与 login 同组, ^C 只打 sh 不打 login), 并把自己置为前台。
     syscalls["job.setpgid"](pid, 0)
     shPg = syscalls["job.group"]()
     syscalls["job.tcsetpgrp"](ttyName, shPg)
-    -- ^Z(SIGTSTP): sh 不停止; ^C(SIGINT): 置标志以便回到提示符。
     syscalls["signal.install"](20, function() end)
     syscalls["signal.install"](2, function() sigintPending = true end)
 end
-
---- 极简等待: 轮询 proc.info 状态; 返回 (reason, code) reason=exited|stopped|error。
 local function pollWait(pidIn)
     while true do
         local p = syscalls["proc.info"](pidIn)
         if not p then return "exited", -1 end
-        if p.status == "dead" then
-            return "exited", (p.termSig and -p.termSig) or (p.exitCode or 0)
-        elseif p.status == "error" then
-            return "error", p.error
-        elseif p.status == "stopped" then
-            return "stopped", p
-        end
+        if p.status == "dead" then return "exited", (p.termSig and -p.termSig) or (p.exitCode or 0)
+        elseif p.status == "error" then return "error", p.error
+        elseif p.status == "stopped" then return "stopped", p end
         if os.sleep then os.sleep(0.05) end
     end
 end
-
---- 按引用找作业: %N | N | pid | 缺省(最近一个)。
 local function resolveJob(ref)
     if not ref then return jobs[#jobs] end
-    if type(ref) == "number" then
-        for _, j in ipairs(jobs) do if j.jid == ref then return j end end
-    else
-        local n = tonumber(tostring(ref):match("^%%(%d+)$"))
-        if n then
-            for _, j in ipairs(jobs) do if j.jid == n then return j end end
-        elseif tonumber(ref) then
-            local pn = tonumber(ref)
-            for _, j in ipairs(jobs) do if j.pid == pn then return j end end
-        end
-    end
-    return nil
+    local n = tonumber(tostring(ref):match("^%%(%d+)$"))
+    if n then for _, j in ipairs(jobs) do if j.jid == n then return j end end end
+    if tonumber(ref) then local pn = tonumber(ref); for _, j in ipairs(jobs) do if j.pid == pn then return j end end end
 end
-
---- 清理已结束的作业(dead/error), 返回是否还有作业。
 local function pruneJobs()
     local keep = {}
     for _, j in ipairs(jobs) do
         local p = syscalls and syscalls["proc.info"] and syscalls["proc.info"](j.pid)
-        if p and (p.status == "dead" or p.status == "error") then
-            -- 作业已结束, 从列表移除(不做留痕)
-        else
-            keep[#keep + 1] = j
-        end
+        if p and (p.status == "dead" or p.status == "error") then else keep[#keep + 1] = j end
     end
     jobs = keep
 end
-
-local builtins = {}
-
-builtins.pwd = function(args)
-    outln(cwd)
-end
-
-builtins.echo = function(args)
-    outln(table.concat(args, " "))
-end
-
-builtins.cd = function(args)
-    local target = resolve(args[1] or "/")
-    if not fs.isDir(target) then
-        errln("cd: " .. (args[1] or "") .. ": No such directory")
-        lastExit = 1
-    else
-        cwd = target
-        lastExit = 0
-    end
-end
-
-builtins.jobs = function(args)
-    if not hasJobCtl then return end
-    pruneJobs()
-    if #jobs == 0 then return end
-    for _, j in ipairs(jobs) do
-        outln(string.format("[%d]+ %-8s %s", j.jid, j.status, j.cmd))
-    end
-end
-
+builtins.jobs = function(args) if not hasJobCtl then return end; pruneJobs(); for _, j in ipairs(jobs) do outln(string.format("[%d]+ %-8s %s", j.jid, j.status, j.cmd)) end end
 builtins.fg = function(args)
     if not hasJobCtl then errln("fg: not a job-control shell"); lastExit = 1; return end
     pruneJobs()
     local j = resolveJob(args[1])
     if not j then errln("fg: no such job"); lastExit = 1; return end
     syscalls["job.tcsetpgrp"](ttyName, j.pgid)
-    if j.status == "stopped" then
-        syscalls["signal.killpg"](j.pgid, 18) -- SIGCONT
-        j.status = "running"
-    end
+    if j.status == "stopped" then syscalls["signal.killpg"](j.pgid, 18); j.status = "running" end
     local reason, code = pollWait(j.pid)
     syscalls["job.tcsetpgrp"](ttyName, shPg)
-    if reason == "stopped" then
-        j.status = "stopped"
-        outln("[" .. j.jid .. "]+ Stopped " .. j.cmd)
-        return
-    end
+    if reason == "stopped" then j.status = "stopped"; outln("[" .. j.jid .. "]+ Stopped " .. j.cmd); return end
     for i, x in ipairs(jobs) do if x == j then table.remove(jobs, i); break end end
     lastExit = (reason == "exited") and (code or 0) or 1
-    if lastExit > 0 then
-        errln("sh: " .. j.cmd .. ": exit " .. tostring(lastExit))
-    end
+    if lastExit > 0 then errln("sh: " .. j.cmd .. ": exit " .. tostring(lastExit)) end
 end
-
 builtins.bg = function(args)
     if not hasJobCtl then errln("bg: not a job-control shell"); lastExit = 1; return end
     pruneJobs()
     local j = resolveJob(args[1])
     if not j then errln("bg: no such job"); lastExit = 1; return end
-    syscalls["signal.killpg"](j.pgid, 18) -- SIGCONT
-    j.status = "running"
+    syscalls["signal.killpg"](j.pgid, 18); j.status = "running"
     outln("[" .. j.jid .. "] " .. j.cmd .. " &")
 end
-
 builtins.kill = function(args)
-    -- kill [-SIG] pid|%job ...
-    local sig = 15 -- SIGTERM
-    local targets = {}
+    local sig, targets = 15, {}
     for i = 1, #args do
         local a = args[i]
         if a == "-l" or a == "-L" then
             local nums = (syscalls and syscalls["signal.list"] and syscalls["signal.list"]()) or {}
             local t = {}
             for _, s in ipairs(nums) do t[#t + 1] = syscalls["signal.name"](s) end
-            outln(table.concat(t, " "))
-            return
-        elseif a:match("^-%d+$") then
-            sig = tonumber(a:sub(2))
-        elseif a:match("^%-[A-Za-z]+$") then
-            sig = (syscalls and syscalls["signal.number"] and syscalls["signal.number"](a)) or nil
-            if not sig then errln("kill: unknown signal " .. a); lastExit = 1; return end
-        else
-            targets[#targets + 1] = a
-        end
+            outln(table.concat(t, " ")); return
+        elseif a:match("^-%d+$") then sig = tonumber(a:sub(2))
+        elseif a:match("^%-[%a]+$") then sig = (syscalls and syscalls["signal.number"] and syscalls["signal.number"](a)) or 15
+        else targets[#targets + 1] = a end
     end
     if #targets == 0 then errln("usage: kill [-SIG] pid|%job ..."); lastExit = 1; return end
     for _, tgt in ipairs(targets) do
         if tostring(tgt):match("^%%") then
             local j = resolveJob(tgt)
-            if not j then
-                errln("kill: no such job " .. tgt); lastExit = 1
-            elseif syscalls and syscalls["signal.killpg"] then
-                local ok, e = syscalls["signal.killpg"](j.pgid, sig)
-                if not ok then errln("kill: " .. tgt .. ": " .. tostring(e)); lastExit = 1 end
-            end
+            if not j then errln("kill: no such job " .. tgt); lastExit = 1
+            elseif syscalls and syscalls["signal.killpg"] then local ok, e = syscalls["signal.killpg"](j.pgid, sig); if not ok then errln("kill: " .. tgt .. ": " .. tostring(e)); lastExit = 1 end end
         else
             local ok, e = syscalls["signal.kill"](tonumber(tgt), sig)
             if not ok then errln("kill: " .. tostring(tgt) .. ": " .. tostring(e)); lastExit = 1 end
@@ -217,139 +654,219 @@ builtins.kill = function(args)
     end
 end
 
-builtins.help = function(args)
-    outln("Delin sh v0.0.1")
-    outln("builtins : cd pwd echo exit help jobs fg bg kill")
-    outln("external : ls cat rm mkdir cp mv touch head tail wc grep sed")
-    outln("usage    : sh [script]  (no script => interactive on stdio)")
-end
-
-builtins.exit = function(args)
-    lastExit = tonumber(args[1]) or 0
-    return "EXIT"
-end
-
---- 外部命令: 在 /bin 下找, 读源码, spawn 子进程(传 argv), wait 等退出。
-local function runExternal(cmd, args, bg)
-    local path
-    if cmd:sub(1, 1) == "/" then
-        path = cmd
-    else
-        path = "/bin/" .. cmd
-    end
-    -- 命令须存在(→127)且有执行权限(→126); 两者都过才读源码去 spawn。
-    if not fs.exists(path) then
-        errln("sh: " .. cmd .. ": command not found")
-        lastExit = 127
-        return
-    end
-    if not fs.canExecute(path) then
-        errln("sh: " .. cmd .. ": Permission denied")
-        lastExit = 126
-        return
-    end
+local function runExternal(cmd, argv, stdio)
+    local path = (cmd:sub(1, 1) == "/") and cmd or ("/bin/" .. cmd)
+    if not fs.exists(path) then errln("sh: " .. cmd .. ": command not found"); lastExit = 127; return end
+    if not fs.canExecute(path) then errln("sh: " .. cmd .. ": Permission denied"); lastExit = 126; return end
     local f = fs.open(path, "r")
-    if not f then
-        errln("sh: " .. cmd .. ": Permission denied")
-        lastExit = 126
-        return
-    end
-    local src = f.readAll()
-    f.close()
-
-    -- 参数原样传给子进程(每个工具自行按 cwd 解析相对路径); shell 不再预解析。
-    -- 预解析会误伤 grep 的模式、head/tail 的 "-n 5" 里的 "5" 这类非路径参数。
-    -- 子进程的 cwd 由 opts.cwd 注入, 工具据此把相对路径解析成绝对。
-    local argv = { [0] = path }
-    for i = 1, #args do argv[i] = args[i] end
-
-    local child, cerr = spawn(src, cmd, nil, nil, argv, { cwd = cwd })
-    if not child then
-        errln("sh: " .. cmd .. ": " .. tostring(cerr))
-        lastExit = 126
-        return
-    end
-
-    if hasJobCtl then
-        -- 新进程组(作业) & 控制终端前台组交给它(前台作业)。
-        syscalls["job.setpgid"](child, 0)
-        local cmdline = cmd .. ((#args > 0) and (" " .. table.concat(args, " ")) or "")
-        if bg then
-            nextJid = nextJid + 1
-            jobs[#jobs + 1] = { jid = nextJid, pgid = child, pid = child, cmd = cmdline, status = "running" }
-            outln("[" .. nextJid .. "] " .. tostring(child) .. " " .. cmdline)
-            return
-        end
-        syscalls["job.tcsetpgrp"](ttyName, child)
-        local reason, code = pollWait(child)
-        syscalls["job.tcsetpgrp"](ttyName, shPg)
-        if reason == "stopped" then
-            nextJid = nextJid + 1
-            jobs[#jobs + 1] = { jid = nextJid, pgid = child, pid = child, cmd = cmdline, status = "stopped" }
-            outln("[" .. nextJid .. "]+ Stopped " .. cmdline)
-            return
-        elseif reason == "error" then
-            lastExit = 1
-            errln("sh: " .. cmd .. ": " .. tostring(code))
-            return
-        end
-        lastExit = code or 0
-        if lastExit > 0 then
-            errln("sh: " .. cmd .. ": exit " .. tostring(lastExit))
-        end
-    else
-        local code = syscalls["proc.wait"](child)
-        lastExit = code or 0
-        if lastExit > 0 then
-            errln("sh: " .. cmd .. ": exit " .. tostring(lastExit))
-        end
-    end
+    if not f then errln("sh: " .. cmd .. ": Permission denied"); lastExit = 126; return end
+    local src = f.readAll(); f.close()
+    local cargv = { [0] = path }
+    for i = 1, #argv do cargv[i] = argv[i] end
+    local opts = { cwd = cwd }
+    if stdio then opts.stdio = stdio end
+    local child, cerr = spawn(src, cmd, nil, nil, cargv, opts)
+    if not child then errln("sh: " .. cmd .. ": " .. tostring(cerr)); lastExit = 126; return end
+    local code = syscalls["proc.wait"](child)
+    lastExit = code or 0
+    if lastExit > 0 then errln("sh: " .. cmd .. ": exit " .. tostring(lastExit)) end
 end
 
---- 执行一行命令。内建优先; 否则外部。返回 "EXIT" 表示退出 shell。
-local function execLine(line)
-    if not line then return end
-    line = line:match("^%s*(.-)%s*$")
-    if line == "" then return end
-    local toks = tokenize(line)
-    if #toks == 0 then return end
-    local cmd = toks[1]
-    local args = {}
-    for i = 2, #toks do args[#args + 1] = toks[i] end
-    -- 行尾单个 "&" => 后台作业(仅作业控制 shell; 脚本模式忽略)。
-    local bg = false
-    if #args > 0 and args[#args] == "&" then
-        bg = hasJobCtl
-        table.remove(args)
-    elseif cmd == "&" then
-        return
+restoreRedir = function(out, inp)
+    if out then outH = stdout end
+    if inp then inH = stdin end
+end
+
+evalSimple = function(node)
+    for _, a in ipairs(node.assigns) do vars[a.name] = expandGlue(a.value) end
+    local needOut, needIn = false, false
+    for _, r in ipairs(node.redirects) do
+        local abs = resolve(wordToStr(r.target))
+        if r.op == "<" then
+            local h = fs.open(abs, "r")
+            if not h then errln("sh: " .. abs .. ": cannot open"); lastExit = 1; restoreRedir(needOut, needIn); return lastExit end
+            inH = h; needIn = true
+        elseif r.op == ">" then
+            local h = fs.open(abs, "w")
+            if not h then errln("sh: " .. abs .. ": cannot open"); lastExit = 1; restoreRedir(needOut, needIn); return lastExit end
+            outH = h; needOut = true
+        elseif r.op == ">>" then
+            local h = fs.open(abs, "a")
+            if not h then errln("sh: " .. abs .. ": cannot open"); lastExit = 1; restoreRedir(needOut, needIn); return lastExit end
+            outH = h; needOut = true
+        end
     end
-    if builtins[cmd] then
-        return builtins[cmd](args)
+    local ctrl
+    if #node.argv == 0 then
+        lastExit = 0
+    else
+        -- 先展开 argv($? 等用上一条命令的退出码), 再为本命令重置 lastExit。
+        local argvs = expandWords(node.argv)
+        lastExit = 0
+        local cmd, rest = argvs[1], {}
+        for i = 2, #argvs do rest[#rest + 1] = argvs[i] end
+        if builtins[cmd] then
+            ctrl = builtins[cmd](rest)
+        else
+            local s = (needOut or needIn) and { input = inH, output = outH } or nil
+            runExternal(cmd, rest, s)
+        end
     end
-    runExternal(cmd, args, bg)
+    restoreRedir(needOut, needIn)
+    return lastExit or 0, ctrl
+end
+
+matchGlob = function(s, pat)
+    if pat == "*" then return true end
+    if not pat:find("*") then return s == pat end
+    if pat:sub(1, 1) == "*" and pat:sub(-1) == "*" then return s:find(pat:sub(2, -2), 1, true) ~= nil end
+    if pat:sub(-1) == "*" then return s:sub(1, #pat - 1) == pat:sub(1, -2) end
+    if pat:sub(1, 1) == "*" then return s:sub(-(#pat - 1)) == pat:sub(2) end
+    return s == pat
+end
+
+evalNode = function(node)
+    if node.kind == "simple" then return evalSimple(node) end
+    if node.kind == "chain" then
+        local lastst = 0
+        for idx, it in ipairs(node.items) do
+            local rt, c = evalNode(it.node)
+            if c == "exit" then return rt, "exit" end
+            if c == "break" then return rt, "break" end
+            if c == "continue" then return rt, "continue" end
+            if c == "return" then return rt, "return" end
+            lastExit = rt or 0; lastst = rt or 0
+            local nxt = node.items[idx + 1]
+            -- 连接符存于下一个 item 的 op: item[i+1].op 是 i 与 i+1 之间的 &&/||。
+            if nxt and nxt.op == "&&" and lastExit ~= 0 then return lastst end
+            if nxt and nxt.op == "||" and lastExit == 0 then return lastst end
+        end
+        return lastst
+    end
+    if node.kind == "brace" then return evalList(node.body) end
+    if node.kind == "if" then
+        local c = evalList(node.cond)
+        if type(c) == "string" then return c end
+        if c == 0 then return evalList(node.thenb) end
+        for _, e in ipairs(node.elifs) do
+            local ec = evalList(e.cond)
+            if type(ec) == "string" then return ec end
+            if ec == 0 then return evalList(e.body) end
+        end
+        if node.elseb then return evalList(node.elseb) end
+        return c
+    end
+    if node.kind == "for" then
+        local items
+        if node.items then items = expandWords(node.items)
+        else items = {}; for i = 1, #posArgs do items[i] = posArgs[i] end end
+        local lastst = 0
+        for _, it in ipairs(items) do
+            vars[node.var] = it
+            local rt, c = evalList(node.body)
+            if c == "exit" then return rt end
+            if c == "break" then break end
+            lastst = rt  -- continue: 走到下一个迭代即可
+        end
+        return lastst
+    end
+    if node.kind == "while" or node.kind == "until" then
+        local lastst = 0
+        while true do
+            local c = evalList(node.cond)
+            if type(c) == "string" then return c end
+            local take = (node.kind == "while") and (c == 0) or (node.kind == "until" and c ~= 0)
+            if not take then break end
+            local rt, cc = evalList(node.body)
+            if cc == "exit" then return rt end
+            if cc == "break" then break end
+            lastst = rt
+        end
+        return lastst
+    end
+    if node.kind == "case" then
+        local w = wordToStr(node.word)
+        for _, cs in ipairs(node.cases) do
+            for _, pat in ipairs(cs.pats) do
+                if matchGlob(w, wordToStr(pat)) then
+                    local rt, c = evalList(cs.body)
+                    if c == "exit" then return rt end
+                    return rt
+                end
+            end
+        end
+        return 0
+    end
+    if node.kind == "funcdef" then
+        local fname, fbody = node.name, node.body
+        builtins[fname] = function(args)
+            local saveArgs, saveArg0 = posArgs, posArg0
+            posArg0 = fname
+            posArgs = {}
+            for i = 1, #args do posArgs[i] = args[i] end
+            local rt, c = evalList(fbody)
+            posArgs, posArg0 = saveArgs, saveArg0
+            lastExit = rt or 0
+            if c == "exit" then return "exit" end
+            -- c == "return" 或 nil: 函数正常返回, 已设置 lastExit
+        end
+        return 0
+    end
+    return 0
+end
+
+evalList = function(items)
+    local lastst = 0
+    for idx, it in ipairs(items) do
+        local rt, c = evalNode(it.node)
+        if c == "exit" then lastExit = rt or lastExit; return rt or 0, "exit" end
+        if c == "break" then return rt or 0, "break" end
+        if c == "continue" then return rt or 0, "continue" end
+        if c == "return" then lastExit = rt or lastExit; return rt or 0, "return" end
+        lastExit = rt or 0
+        lastst = rt or 0
+        local nxt = items[idx + 1]
+        if nxt and it.op == "&&" and lastExit ~= 0 then return lastst end
+        if nxt and it.op == "||" and lastExit == 0 then return lastst end
+    end
+    return lastst
+end
+
+local function evalProgram(src)
+    T = lex(src)
+    ti = 1
+    local items, err, inc = parseList(nil)
+    if items == nil then
+        if inc then return nil, true end
+        return nil, false, err
+    end
+    if inc then return nil, true end
+    evalList(items)
+    return true
 end
 
 if interactive then
+    local buf = ""
     while true do
         local prompt = uname .. "@delin:" .. (cwd == "/" and "/" or cwd) .. "# "
         if stdout and stdout.write then stdout:write(prompt) end
-        sigintPending = false
-        local line = stdin:readLine()
-        if line == nil then break end -- EOF(^D)
-        local r = execLine(line)
-        if r == "EXIT" then break end
+        local line = stdin and stdin.readLine and stdin:readLine()
+        if line == nil then break end
+        buf = buf .. line .. "\n"
+        local ok, inc, err = evalProgram(buf)
+        if ok and not inc then buf = "" end
+        if ok == nil and not inc and err then errln("sh: " .. tostring(err)); buf = "" end
     end
 else
-    -- 脚本模式: 逐行读 stdin 直到 EOF(结果写到 stdout)。整行以 # 开头视为注释。
+    local src = ""
     while true do
-        local line = stdin:readLine()
+        local line = stdin and stdin.readLine and stdin:readLine()
         if line == nil then break end
-        local trimmed = (line or ""):match("^%s*(.-)%s*$")
-        if trimmed ~= "" and trimmed:sub(1, 1) ~= "#" then
-            local r = execLine(trimmed)
-            if r == "EXIT" then break end
-        end
+        src = src .. line .. "\n"
+    end
+    if src ~= "" then
+        local ok, inc, err = evalProgram(src)
+        if ok == nil and not inc and err then errln("sh: " .. tostring(err)) end
     end
 end
 

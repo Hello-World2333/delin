@@ -1,4 +1,7 @@
--- Delin rm: 删除文件/目录。用法: rm <path>...
+-- Delin rm: 删除文件/目录(GNU 子集)。用法: rm [-r|-R] [-f] <path>...
+--   -r/-R  递归删除目录
+--   -f     忽略不存在的文件/目录, 不报错
+-- 组合选项如 -rf 亦可。
 local args = args or {}
 local cwd = (type(cwd) == "string" and cwd) or "/"
 local function resolve(p)
@@ -15,14 +18,42 @@ local function stderr(s)
     if e and e.write then e:write(s) end
 end
 
-for _, p in ipairs(args) do
+local recursive, force = false, false
+local rest = {}
+for _, a in ipairs(args) do
+    if a:sub(1, 1) == "-" and a ~= "-" then
+        for k = 2, #a do
+            local c = a:sub(k, k)
+            if c == "r" or c == "R" then recursive = true
+            elseif c == "f" then force = true
+            else stderr("rm: invalid option -- " .. c .. "\n"); return end
+        end
+    else
+        rest[#rest + 1] = a
+    end
+end
+if #rest == 0 then
+    stderr("rm: missing operand\n")
+    return
+end
+
+local function rmTree(p)
+    if fs.isDir(p) then
+        for _, n in ipairs(fs.list(p) or {}) do
+            rmTree(fs.combine(p, n))
+        end
+    end
+    local ok, err = pcall(fs.delete, p)
+    if not ok then stderr("rm: " .. p .. ": " .. tostring(err) .. "\n") end
+end
+
+for _, p in ipairs(rest) do
     p = resolve(p)
     if not fs.exists(p) then
-        stderr("rm: " .. p .. ": No such file or directory\n")
+        if not force then stderr("rm: " .. p .. ": No such file or directory\n") end
+    elseif fs.isDir(p) and not recursive then
+        stderr("rm: " .. p .. ": Is a directory\n")
     else
-        local ok, err = pcall(fs.delete, p)
-        if not ok then
-            stderr("rm: " .. p .. ": " .. tostring(err) .. "\n")
-        end
+        rmTree(p)
     end
 end
