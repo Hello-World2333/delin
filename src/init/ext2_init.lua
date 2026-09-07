@@ -462,6 +462,52 @@ print("READER_GOT=[" .. tostring(line) .. "]")
     print("ext2-init: ^D test queued (read READER_GOT=[nil] in log)")
 end
 
+-- ═══════════ 真机 sh 自检 + sysinfo: 把脚本内容喂给 sh, 输出捕获到 log ═══════════
+do
+    local shHand = fs.open("/bin/sh", "r")
+    local shSrc = shHand and shHand.readAll() or nil
+    if shHand then shHand.close() end
+    if not shSrc then
+        print("ext2-init: /bin/sh not found (scripts skipped)")
+    else
+        local function runScript(path, label)
+            if not fs.exists(path) then
+                print("ext2-init: " .. label .. ": script missing " .. path)
+                return
+            end
+            local f = fs.open(path, "r")
+            local lines = {}
+            while true do
+                local l = f and f.readLine and f.readLine()
+                if l == nil then break end
+                lines[#lines + 1] = l
+            end
+            if f then f.close() end
+            local li = 0
+            local inH = { readLine = function(self) li = li + 1; return lines[li] end }
+            local outbuf = {}
+            local outH = {
+                write = function(self, s) outbuf[#outbuf + 1] = tostring(s); return #s end,
+                writeLine = function(self, s) outbuf[#outbuf + 1] = tostring(s) .. "\n"; return #s + 1 end,
+            }
+            syscalls["stdio.set"](inH, outH)
+            local spid = spawn(shSrc, "sh-" .. label, nil, nil, { [0] = "/bin/sh" })
+            print("ext2-init: running " .. label .. " (pid " .. tostring(spid) .. ")")
+            local tries = 0
+            while spid and tries < 80 do
+                local p = syscalls["proc.info"](spid)
+                if not p then break end
+                if p.status == "dead" or p.status == "error" then break end
+                sleep(0.1); tries = tries + 1
+            end
+            print("ext2-init: " .. label .. " output:")
+            for _, s in ipairs(outbuf) do print("  " .. s) end
+        end
+        runScript("/root/posix_test.sh", "posix-test")
+        runScript("/root/sysinfo.sh", "sysinfo")
+    end
+end
+
 -- 3) 产品形态: 在每个 tty 上 spawn 一个 login 进程(登录到 sh)。init 保持存活。
 --    login 各自绑定自己的 tty(per-process stdio), 经 Ctrl+Alt+数字切换前台焦点共用一把键盘。
 local loginSrc

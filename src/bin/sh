@@ -680,20 +680,21 @@ end
 evalSimple = function(node)
     for _, a in ipairs(node.assigns) do vars[a.name] = expandGlue(a.value) end
     local needOut, needIn = false, false
+    local openOut, openIn = {}, {}
     for _, r in ipairs(node.redirects) do
         local abs = resolve(wordToStr(r.target))
         if r.op == "<" then
             local h = fs.open(abs, "r")
             if not h then errln("sh: " .. abs .. ": cannot open"); lastExit = 1; restoreRedir(needOut, needIn); return lastExit end
-            inH = h; needIn = true
+            inH = h; needIn = true; openIn[#openIn + 1] = h
         elseif r.op == ">" then
             local h = fs.open(abs, "w")
             if not h then errln("sh: " .. abs .. ": cannot open"); lastExit = 1; restoreRedir(needOut, needIn); return lastExit end
-            outH = h; needOut = true
+            outH = h; needOut = true; openOut[#openOut + 1] = h
         elseif r.op == ">>" then
             local h = fs.open(abs, "a")
             if not h then errln("sh: " .. abs .. ": cannot open"); lastExit = 1; restoreRedir(needOut, needIn); return lastExit end
-            outH = h; needOut = true
+            outH = h; needOut = true; openOut[#openOut + 1] = h
         end
     end
     local ctrl
@@ -712,6 +713,9 @@ evalSimple = function(node)
             runExternal(cmd, rest, s)
         end
     end
+    -- 关闭重定向打开的句柄(真正落盘): CC 句柄写入可能缓冲, 需 flush/close 才提交。
+    for _, h in ipairs(openOut) do if h.close then pcall(h.close) end end
+    for _, h in ipairs(openIn) do if h.close then pcall(h.close) end end
     restoreRedir(needOut, needIn)
     return lastExit or 0, ctrl
 end

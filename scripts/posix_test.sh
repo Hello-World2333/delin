@@ -50,8 +50,8 @@ chk num_eq [ 5 -eq 5 ]
 chk num_lt [ 3 -lt 5 ]
 chk num_gt [ 5 -gt 3 ]
 chk file_d [ -d /etc ]
-chk file_f [ -f /etc/hostname ]
-chk file_e [ -e /etc/hostname ]
+chk file_f [ -f /etc/passwd ]
+chk file_e [ -e /etc/passwd ]
 chk not_neg [ ! -d /nonexistent ]
 
 # ---------------------------------------------------------------
@@ -124,22 +124,25 @@ echo "gamma" > "$T/c.txt"
 echo "more" >> "$T/a.txt"
 chk redirect_append [ -f "$T/a.txt" ]
 
-# cat
-cat "$T/a.txt" > "$T/catout.txt"
-grep "^alpha$" "$T/catout.txt" > "$T/c1.txt"
-chk tool_cat_alpha [ -s "$T/c1.txt" ]
-grep "^more$" "$T/catout.txt" > "$T/c2.txt"
-chk tool_cat_tail [ -s "$T/c2.txt" ]
+# cat（读 b.txt）
+cat "$T/b.txt" > "$T/catout.txt"
+grep "^beta$" "$T/catout.txt" > "$T/c1.txt"
+chk tool_cat [ -s "$T/c1.txt" ]
 
-# head
-head -n 1 "$T/a.txt" > "$T/headout.txt"
-grep "^alpha$" "$T/headout.txt" > "$T/h1.txt"
+# head / tail（读 b.txt）
+head -n 1 "$T/b.txt" > "$T/headout.txt"
+grep "^beta$" "$T/headout.txt" > "$T/h1.txt"
 chk tool_head [ -s "$T/h1.txt" ]
-
-# tail
-tail -n 1 "$T/a.txt" > "$T/tailout.txt"
-grep "^more$" "$T/tailout.txt" > "$T/t1.txt"
+tail -n 1 "$T/b.txt" > "$T/tailout.txt"
+grep "^beta$" "$T/tailout.txt" > "$T/t1.txt"
 chk tool_tail [ -s "$T/t1.txt" ]
+
+# 追加（>> 应保留原有内容并加上新行）
+echo "more" >> "$T/b.txt"
+grep "^more$" "$T/b.txt" > "$T/app.txt"
+chk redirect_append_content [ -s "$T/app.txt" ]
+grep "^beta$" "$T/b.txt" > "$T/app2.txt"
+chk redirect_append_preserves [ -s "$T/app2.txt" ]
 
 # wc -l / -c (把 wc 输出落盘, 再检查首列计数)
 wc -l "$T/c.txt" > "$T/wcl.txt"

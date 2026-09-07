@@ -184,7 +184,10 @@ function process.spawn(src, name, ppid, uid, gid, argv, opts)
     proc.onExit = function(_, status, err)
         proc.status = status
         proc.exitCode = (status == "dead") and 0 or nil
-        if status == "error" then proc.error = err end
+        if status == "error" then
+            proc.error = err
+            if process.log then pcall(process.log, "[proc " .. pid .. " " .. tostring(name) .. "] ERROR: " .. tostring(err)) end
+        end
         reparentOrphans(pid)
     end
 

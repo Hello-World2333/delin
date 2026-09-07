@@ -669,11 +669,34 @@ function ext2.backend(fs)
                 if not hasPerm(i, c.uid, c.gid, 2) then return nil, "permission denied (file)" end
                 ext2.writeFile(fs, i.ino, "")
                 local parts = {}
+                -- 句柄方法同时支持 `.method(s)` 与 `:method(s)`(CC 原生句柄两者皆可)。
                 return {
-                    write = function(s) parts[#parts + 1] = s; return #s end,
-                    writeLine = function(s) parts[#parts + 1] = s .. "\n"; return #s + 1 end,
+                    write = function(self, s) if s == nil then s = self end; parts[#parts + 1] = s; return #s end,
+                    writeLine = function(self, s) if s == nil then s = self end; parts[#parts + 1] = s .. "\n"; return #s + 1 end,
                     flush = function() return true end,
                     close = function() ext2.writeFile(fs, i.ino, table.concat(parts)); return true end,
+                    seek = function() return 0 end,
+                }
+            end
+            if mode and mode:find("a") then
+                -- 追加: 若不存在则创建; close 时写"原内容 + 新内容"。
+                if not i then
+                    local pdir = rel:match("^(.*)/[^/]*$") or "/"
+                    local pname = rel:match("([^/]*)$") or rel
+                    if not checkDirWrite(pdir) then return nil, "permission denied (dir)" end
+                    local ino, err = ext2.create(fs, pdir, pname, 0x81A4)
+                    if not ino then return nil, err end
+                    i = ext2.readInode(fs, ino)
+                end
+                if i.type == T_DIR then return nil, "is a directory" end
+                if not hasPerm(i, c.uid, c.gid, 2) then return nil, "permission denied (file)" end
+                local existing = ext2.readFile(fs, i)
+                local parts = {}
+                return {
+                    write = function(self, s) if s == nil then s = self end; parts[#parts + 1] = s; return #s end,
+                    writeLine = function(self, s) if s == nil then s = self end; parts[#parts + 1] = s .. "\n"; return #s + 1 end,
+                    flush = function() return true end,
+                    close = function() ext2.writeFile(fs, i.ino, existing .. table.concat(parts)); return true end,
                     seek = function() return 0 end,
                 }
             end
@@ -684,7 +707,10 @@ function ext2.backend(fs)
             local pos = 0 -- 字节读偏移
             return {
                 readAll = function() pos = #content; return content end,
-                read = function(n)
+                read = function(a, b)
+                    local n
+                    if type(a) == "number" then n = a
+                    elseif type(a) == "table" and type(b) == "number" then n = b end
                     if n == nil then
                         local r = content:sub(pos + 1); pos = #content; return r
                     end

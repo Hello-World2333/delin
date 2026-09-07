@@ -1,4 +1,5 @@
--- Delin mkdir: 建目录。用法: mkdir <dir>...
+-- Delin mkdir: 建目录(GNU 子集)。用法: mkdir [-p] <dir>...
+--   -p  递归创建父目录(已存在不报错)。
 local args = args or {}
 local cwd = (type(cwd) == "string" and cwd) or "/"
 local function resolve(p)
@@ -15,14 +16,40 @@ local function stderr(s)
     if e and e.write then e:write(s) end
 end
 
-for _, p in ipairs(args) do
-    p = resolve(p)
-    if fs.exists(p) then
-        stderr("mkdir: " .. p .. ": File exists\n")
+local parents = false
+local rest = {}
+for _, a in ipairs(args) do
+    if a == "-p" then parents = true
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        stderr("mkdir: invalid option -- " .. a .. "\n"); return
     else
-        local ok, err = pcall(fs.makeDir, p)
-        if not ok then
-            stderr("mkdir: " .. p .. ": " .. tostring(err) .. "\n")
-        end
+        rest[#rest + 1] = a
     end
 end
+
+local function mk(p)
+    if fs.exists(p) then
+        return (not parents) and stderr("mkdir: " .. p .. ": File exists\n") or nil
+    end
+    -- -p: 递归建父
+    if parents then
+        local ok = pcall(function()
+            local parts = {}
+            local t = p
+            while t and t ~= "/" and t ~= "" do
+                parts[#parts + 1] = t
+                local nt = t:match("^(.*)/[^/]+$")
+                t = nt or "/"
+            end
+            for i = #parts, 1, -1 do
+                if not fs.exists(parts[i]) then fs.makeDir(parts[i]) end
+            end
+        end)
+        if not ok then stderr("mkdir: " .. p .. ": cannot create\n") end
+    else
+        local ok, err = pcall(fs.makeDir, p)
+        if not ok then stderr("mkdir: " .. p .. ": " .. tostring(err) .. "\n") end
+    end
+end
+
+for _, p in ipairs(rest) do mk(resolve(p)) end
