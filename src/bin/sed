@@ -518,6 +518,8 @@ local function process(lines, source)
         local pattern = lines[ln]
         local deleted = false
         local skipRest = false
+        -- a 命令排队要追加的文本, 等本行输出后再写 (GNU sed: append after line)。
+        local appends = {}
         for ci = 1, #cmds do
             local cmd = cmds[ci]
             if skipRest then break end
@@ -541,17 +543,11 @@ local function process(lines, source)
                 elseif t == "y" then
                     pattern = translit(pattern, cmd)
                 elseif t == "a" then
-                    if cmd.addr and cmd.addr.kind == "range" then
-                        if cmd.atEnd then wline(cmd.text) end
-                    else
-                        wline(cmd.text)
-                    end
+                    -- 命中即排队(含区间内每一行), 在本行(或整段)输出后才写。
+                    appends[#appends + 1] = cmd.text
                 elseif t == "i" then
-                    if cmd.addr and cmd.addr.kind == "range" then
-                        if cmd.atStart then wline(cmd.text) end
-                    else
-                        wline(cmd.text)
-                    end
+                    -- 命中即写(含区间内每一行), 在本行输出前插入。
+                    wline(cmd.text)
                 elseif t == "c" then
                     if cmd.addr and cmd.addr.kind == "range" then
                         deleted = true; skipRest = true
@@ -566,6 +562,8 @@ local function process(lines, source)
         if not quit and not deleted and not quiet then
             wline(pattern)
         end
+        -- append 文本总是写在本行之后: 无论 -n、被 d 删除还是被 q 退出。
+        for ai = 1, #appends do wline(appends[ai]) end
     end
     return quit, quitCode
 end
