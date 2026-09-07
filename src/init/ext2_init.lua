@@ -8,6 +8,9 @@ fs.chmod("/pub", 0x81A4)        -- reg 0644
 fs.chmod("/home", 0x41ED)       -- dir 0755
 fs.chmod("/home/alice", 0x41C0) -- dir 0700 alice
 fs.chown("/home/alice", 1000, 1000)
+-- 清理上次同一测试残留的 /home/alice/x.txt: 它可能被持久化成 root 属主。
+-- 删除只要求父目录的写+执行权限(root uid0 恒过), 不依赖文件本身属主。
+if fs.exists("/home/alice/x.txt") then pcall(fs.delete, "/home/alice/x.txt") end
 local w1 = fs.open("/secret", "w"); w1.write("top secret content"); w1.close()
 local w2 = fs.open("/pub", "w"); w2.write("public data"); w2.close()
 
@@ -34,22 +37,29 @@ if f then f.close() end
 local f2 = fs.open("/secret", "r")
 try("read /secret (0600) denied", f2 == nil)
 if f2 then f2.close() end
--- 写 0444 -> 拒绝
-local okw = pcall(function() local w = fs.open("/readonly", "w"); w.write("x"); w.close() end)
-try("write /readonly (0444) denied", okw == false)
+-- 写 0444 -> 拒绝(open 即被权限检查拒绝, 而非拿到 nil 句柄后再崩溃)
+local wr = fs.open("/readonly", "w")
+try("write /readonly (0444) denied", wr == nil)
+if wr then wr.close() end
 -- 执行权限: 有读无 x 不可启动, 有 x(0755)才可启动
 try("canExecute /pub (0644) false", fs.canExecute("/pub") == false)
 try("canExecute /bin/ls (0755) true", fs.canExecute("/bin/ls") == true)
 -- list alice-owned 0700 -> ok
 print("alice: list /home/alice => [" .. table.concat((fs.list("/home/alice") or {}), ",") .. "]")
--- 在 /home/alice 里写文件(属主, 0700) -> ok
-local okw, errw = pcall(function() local w = fs.open("/home/alice/x.txt", "w"); w.write("alice file"); w.close() end)
-print("alice: write /home/alice/x.txt ok=" .. tostring(okw) .. (okw and "" or (" err=" .. tostring(errw))))
-if okw then
-    print("alice: exists=" .. tostring(fs.exists("/home/alice/x.txt")))
-    local rf = fs.open("/home/alice/x.txt", "r")
-    print("alice: read x.txt=[" .. (rf and rf.readAll() or "(none)") .. "]")
-    if rf then rf.close() end
+-- 在 /home/alice 里写文件(属主, 0700) -> ok。open 失败时透出真实原因,
+-- 而不是对 nil 句柄取下标变成无意义的 "attempt to index local 'w'"。
+local w, wopenerr = fs.open("/home/alice/x.txt", "w")
+if not w then
+    print("alice: write /home/alice/x.txt open-failed err=" .. tostring(wopenerr))
+else
+    local okw, errw = pcall(function() w.write("alice file"); w.close() end)
+    print("alice: write /home/alice/x.txt ok=" .. tostring(okw) .. (okw and "" or (" err=" .. tostring(errw))))
+    if okw then
+        print("alice: exists=" .. tostring(fs.exists("/home/alice/x.txt")))
+        local rf = fs.open("/home/alice/x.txt", "r")
+        print("alice: read x.txt=[" .. (rf and rf.readAll() or "(none)") .. "]")
+        if rf then rf.close() end
+    end
 end
 sleep(0.4)
 print("alice: done")
