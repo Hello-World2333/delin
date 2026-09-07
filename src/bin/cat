@@ -15,7 +15,7 @@ local function stderr(s)
     if e and e.write then e:write(s) end
 end
 
-for _, p in ipairs(args) do
+local function catFile(p)
     p = resolve(p)
     local f, err = fs.open(p, "r")
     if not f then
@@ -27,8 +27,23 @@ for _, p in ipairs(args) do
             msg = "Is a directory"
         end
         stderr("cat: " .. p .. ": " .. msg .. "\n")
-        return
+        return false
     end
     io.write(f.readAll())
     f.close()
+    return true
+end
+
+local noMoreOpts = false
+for _, a in ipairs(args) do
+    if noMoreOpts then
+        if not catFile(a) then return end
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        stderr("cat: invalid option -- " .. a .. "\n")
+        return
+    else
+        if not catFile(a) then return end
+    end
 end

@@ -37,9 +37,10 @@ def main():
         rdump(base, rootfs)
         # 2) 更新文件
         shutil.copy(os.path.join(REPO, "dist/kernel.lua"), os.path.join(rootfs, "boot/delin.lua"))
-        shutil.copy(os.path.join(REPO, "src/bin/sh"),    os.path.join(rootfs, "bin/sh"))
-        shutil.copy(os.path.join(REPO, "src/bin/rm"),    os.path.join(rootfs, "bin/rm"))
-        shutil.copy(os.path.join(REPO, "src/bin/mkdir"), os.path.join(rootfs, "bin/mkdir"))
+        # 部署全部 bin 工具, 保证真机与 src/bin 一致。
+        for f in sorted(os.listdir(os.path.join(REPO, "src/bin"))):
+            shutil.copy(os.path.join(REPO, "src/bin", f), os.path.join(rootfs, "bin", f))
+            os.chmod(os.path.join(rootfs, "bin", f), 0o755)
         os.makedirs(os.path.join(rootfs, "root"), exist_ok=True)
         os.makedirs(os.path.join(rootfs, "tmp"),  exist_ok=True)
         shutil.copy(os.path.join(REPO, "scripts/posix_test.sh"), os.path.join(rootfs, "root/posix_test.sh"))

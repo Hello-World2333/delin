@@ -15,8 +15,6 @@ local function resolve(p)
     return (base .. "/" .. p):gsub("/+", "/"):gsub("/+$", "")
 end
 
-local path = resolve(args[1] or ".")
-
 local function stderr(s)
     local e = io.stderr()
     if e and e.write then e:write(s) end
@@ -27,23 +25,46 @@ local function ioeMsg(err)
     return "No such file or directory"
 end
 
-if not fs.exists(path) then
-    stderr("ls: " .. (args[1] or "") .. ": No such file or directory\n")
-    return
-end
-
-if fs.isDir(path) then
-    local names, lerr = fs.list(path)
-    if not names then
-        stderr("ls: " .. (args[1] or "") .. ": " .. ioeMsg(lerr) .. "\n")
+-- 解析: 支持 `--` 结束选项; 识别到的 `-` 开头的未知选项报错。其余为路径。
+local paths = {}
+local noMoreOpts = false
+for _, a in ipairs(args) do
+    if noMoreOpts then
+        paths[#paths + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        stderr("ls: invalid option -- " .. a .. "\n")
         return
+    else
+        paths[#paths + 1] = a
+    end
+end
+if #paths == 0 then paths = { "." } end
+
+local function printDir(p)
+    local names, lerr = fs.list(p)
+    if not names then
+        stderr("ls: " .. p .. ": " .. ioeMsg(lerr) .. "\n")
+        return false
     end
     table.sort(names)
     for _, name in ipairs(names) do
-        local full = (path == "/") and ("/" .. name) or (path .. "/" .. name)
+        local full = (p == "/") and ("/" .. name) or (p .. "/" .. name)
         io.write(name .. (fs.isDir(full) and "/" or "") .. "\n")
     end
-else
-    -- 单文件
-    io.write(path .. "\n")
+    return true
+end
+
+for pi, raw in ipairs(paths) do
+    local path = resolve(raw)
+    if not fs.exists(path) then
+        stderr("ls: " .. raw .. ": No such file or directory\n")
+    elseif fs.isDir(path) then
+        if #paths > 1 then io.write(path .. ":\n") end
+        printDir(path)
+        if pi < #paths then io.write("\n") end
+    else
+        io.write(path .. "\n")
+    end
 end

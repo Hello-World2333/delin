@@ -732,18 +732,26 @@ end
 evalNode = function(node)
     if node.kind == "simple" then return evalSimple(node) end
     if node.kind == "chain" then
+        -- 连接符存于下一个 item 的 op: item[i].op 是 item[i-1] 与 item[i] 之间的 &&/||。
+        -- 用布尔"最近一条已执行命令是否成功"做左结合短路:
+        --   A && B : A 失败则跳过 B;  A || B : A 成功则跳过 B。
+        -- 但短路只在当步生效, 不中断整条链, 使 `A && B || C` 在 A 失败时仍执行 C。
         local lastst = 0
+        local ok = nil -- nil=尚未执行任何命令
         for idx, it in ipairs(node.items) do
-            local rt, c = evalNode(it.node)
-            if c == "exit" then return rt, "exit" end
-            if c == "break" then return rt, "break" end
-            if c == "continue" then return rt, "continue" end
-            if c == "return" then return rt, "return" end
-            lastExit = rt or 0; lastst = rt or 0
-            local nxt = node.items[idx + 1]
-            -- 连接符存于下一个 item 的 op: item[i+1].op 是 i 与 i+1 之间的 &&/||。
-            if nxt and nxt.op == "&&" and lastExit ~= 0 then return lastst end
-            if nxt and nxt.op == "||" and lastExit == 0 then return lastst end
+            local run = true
+            if ok ~= nil then
+                if (it.op == "&&" and not ok) or (it.op == "||" and ok) then run = false end
+            end
+            if run then
+                local rt, c = evalNode(it.node)
+                if c == "exit" then return rt, "exit" end
+                if c == "break" then return rt, "break" end
+                if c == "continue" then return rt, "continue" end
+                if c == "return" then return rt, "return" end
+                lastExit = rt or 0; lastst = rt or 0
+                ok = (lastExit == 0)
+            end
         end
         return lastst
     end

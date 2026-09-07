@@ -10,9 +10,14 @@ end
 
 local sig = 15 -- SIGTERM
 local targets = {}
+local noMoreOpts = false
 for i = 1, #args do
     local a = args[i]
-    if a == "-l" or a == "-L" then
+    if noMoreOpts then
+        targets[#targets + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "-l" or a == "-L" then
         local nums = syscalls["signal.list"]()
         local t = {}
         for _, s in ipairs(nums) do t[#t + 1] = syscalls["signal.name"](s) end

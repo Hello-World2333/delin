@@ -18,8 +18,13 @@ end
 
 local parents = false
 local rest = {}
+local noMoreOpts = false
 for _, a in ipairs(args) do
-    if a == "-p" then parents = true
+    if noMoreOpts then
+        rest[#rest + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "-p" then parents = true
     elseif a:sub(1, 1) == "-" and a ~= "-" then
         stderr("mkdir: invalid option -- " .. a .. "\n"); return
     else

@@ -17,8 +17,13 @@ local function stderr(s)
 end
 
 local srcs = {}
+local noMoreOpts = false
 for _, a in ipairs(args) do
-    if a:sub(1, 1) == "-" and a ~= "-" then
+    if noMoreOpts then
+        srcs[#srcs + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
         stderr("mv: invalid option -- " .. a .. "\n")
         return
     else

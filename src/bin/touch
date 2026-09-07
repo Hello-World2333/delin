@@ -16,12 +16,26 @@ local function stderr(s)
     if e and e.write then e:write(s) end
 end
 
-for _, p in ipairs(args) do
-    p = resolve(p)
+local function touchFile(fp)
+    local p = resolve(fp)
     if not fs.exists(p) then
         local ok, err = pcall(function() local f = fs.open(p, "w"); f.close() end)
         if not ok then
             stderr("touch: " .. p .. ": " .. tostring(err) .. "\n")
         end
+    end
+end
+
+local noMoreOpts = false
+for _, a in ipairs(args) do
+    if noMoreOpts then
+        touchFile(a)
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        stderr("touch: invalid option -- " .. a .. "\n")
+        return
+    else
+        touchFile(a)
     end
 end

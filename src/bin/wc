@@ -24,8 +24,13 @@ end
 
 local l, w, b = false, false, false
 local files = {}
+local noMoreOpts = false
 for _, a in ipairs(args) do
-    if a:sub(1, 1) == "-" and a ~= "-" then
+    if noMoreOpts then
+        files[#files + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
         if a == "-l" then l = true
         elseif a == "-w" then w = true
         elseif a == "-c" then b = true

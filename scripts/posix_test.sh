@@ -74,6 +74,9 @@ chk for_loop [ "$s" = "123" ]
 [ "$n" = "7" ] && chk and_short true || chk and_short false
 [ "$n" = "999" ] || chk or_short true
 [ "$n" = "7" ] && [ -d /etc ] && chk and_chain true
+# `A && B || C` 左结合: A 失败时 C 仍应执行 (曾误作 A && (B || C) 导致 C 不跑)。
+[ "$n" = "999" ] && chk andor_false_then_c true || chk andor_c_runs true
+[ "$n" = "7" ] && chk andor_true_then_b true || chk andor_skip false
 
 c=go
 while [ "$c" = "go" ]; do
@@ -176,6 +179,34 @@ chk tool_rm [ ! -e "$T/bc.txt" ]
 ls "$T" > "$T/lsout.txt"
 grep "a.txt" "$T/lsout.txt" > "$T/l1.txt"
 chk tool_ls [ -s "$T/l1.txt" ]
+
+# ---------------------------------------------------------------
+# 5b. `--` 结束选项: 处理以 - / -- 开头的文件名 (POSIX Guideline 10)。
+#      host 与 Delin 都应支持 touch -- --name / rm -- --name 等。
+#      注: grep 用 Lua pattern(`-` 是量词), 这里用不含连字符的模式。
+# ---------------------------------------------------------------
+touch -- "$T/--dash.txt"
+chk dash_touch [ -f "$T/--dash.txt" ]
+echo "dash-line" > "$T/--dash.txt"
+cat -- "$T/--dash.txt" > "$T/dc.txt"
+grep "dash" "$T/dc.txt" > "$T/dc1.txt"
+chk dash_cat [ -s "$T/dc1.txt" ]
+wc -- "$T/--dash.txt" > "$T/dw.txt"
+grep "dash" "$T/dw.txt" > "$T/dw1.txt"
+chk dash_wc [ -s "$T/dw1.txt" ]
+grep -- "dash" "$T/--dash.txt" > "$T/dg.txt"
+chk dash_grep [ -s "$T/dg.txt" ]
+ls -- "$T" > "$T/dl.txt"
+grep "dash" "$T/dl.txt" > "$T/dl1.txt"
+chk dash_ls [ -s "$T/dl1.txt" ]
+cp -- "$T/--dash.txt" "$T/dash_copy.txt"
+chk dash_cp [ -f "$T/dash_copy.txt" ]
+mv -- "$T/dash_copy.txt" "$T/dash_moved.txt"
+chk dash_mv [ -f "$T/dash_moved.txt" ]
+rm -- "$T/dash_moved.txt"
+chk dash_rm [ ! -e "$T/dash_moved.txt" ]
+rm -- "$T/--dash.txt"
+chk dash_rm_cleanup [ ! -e "$T/--dash.txt" ]
 
 # 清理
 rm -rf "$T"

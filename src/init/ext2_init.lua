@@ -249,6 +249,46 @@ else
     end
 end
 
+-- 3a') POSIX `--` 结束选项: 以 -/-- 开头的文件名可被 touch/cat/rm/ls 操作 (真机验证)。
+--      sh 以内存 stdio 跑, 但 fs 操作命中真实 ext2 根; 结果经 print 记录到 /delin.log。
+do
+    local dash = "/t--dash.txt"
+    if fs.exists(dash) then pcall(fs.delete, dash) end
+    local lines = {
+        "touch -- " .. dash,
+        "echo DASHLINE > " .. dash,
+        "cat -- " .. dash,
+        "[ -e " .. dash .. " ] && echo EXISTS_BEFORE || echo NO_BEFORE",
+        "ls -- /",
+        "rm -- " .. dash,
+        "[ ! -e " .. dash .. " ] && echo GONE_AFTER_RM",
+        "exit",
+    }
+    local li = 0
+    local inH = { readLine = function(self) li = li + 1; return lines[li] end }
+    local outbuf = {}
+    local outH = {
+        write = function(self, s) outbuf[#outbuf + 1] = tostring(s); return #s end,
+        writeLine = function(self, s) outbuf[#outbuf + 1] = tostring(s) .. "\n"; return #s + 1 end,
+    }
+    syscalls["stdio.set"](inH, outH)
+    local spid = spawn(shSrc, "sh-dash", nil, nil, { [0] = "/bin/sh" })
+    local tries = 0
+    while spid and tries < 30 do
+        local p = syscalls["proc.info"](spid)
+        if not p then break end
+        if p.status == "dead" or p.status == "error" then break end
+        sleep(0.1); tries = tries + 1
+    end
+    local out = table.concat(outbuf)
+    local function has(s) return out:find(s, 1, true) ~= nil end
+    print("ext2-init: dash touch+cat+ls+rm out=[" .. out .. "]")
+    print("ext2-init: dash cat-ok=" .. tostring(has("DASHLINE"))
+        .. " exists-before=" .. tostring(has("EXISTS_BEFORE"))
+        .. " gone-after-rm=" .. tostring(has("GONE_AFTER_RM")))
+    if fs.exists(dash) then pcall(fs.delete, dash) end
+end
+
 -- 3a) 非 root 用户 sh 的执行权限: 运行一个"可读但不可执行"的文件 -> 拒绝(不启动)。
 --     通过 stdio 使 sh 以 alice(uid 1000)脚本模式跑; 输出经 print 记录到 /delin.log。
 do

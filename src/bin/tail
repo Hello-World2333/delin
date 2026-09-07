@@ -24,10 +24,15 @@ end
 
 local n = 10
 local files = {}
+local noMoreOpts = false
 local i = 1
 while i <= #args do
     local a = args[i]
-    if a:sub(1, 1) == "-" and a ~= "-" then
+    if noMoreOpts then
+        files[#files + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
         if a == "-n" then
             i = i + 1
             if not args[i] then stderr("tail: option requires an argument -- n\n"); return end
