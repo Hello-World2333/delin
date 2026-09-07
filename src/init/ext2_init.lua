@@ -381,8 +381,24 @@ do
         local rf = fs.open("/dbg_sed2.txt", "r")
         print("ext2-init: sed inplace=[" .. (rf and rf.readAll() or "") .. "]")
         if rf then rf.close() end
+        -- a 追加: 写在该行之后(stdout 与 -i 就地) + 区间追加 (GNU sed 语义回归)。
+        local tfa = fs.open("/dbg_sed_a.txt", "w")
+        if tfa then tfa.write("Alice file\n"); tfa.close() end
+        print("ext2-init: sed append=[" .. runSed({ [0] = "/bin/sed", "1a Hello", "/dbg_sed_a.txt" }) .. "] (expect Alice file\\nHello)")
+        local tfa2 = fs.open("/dbg_sed_a2.txt", "w")
+        if tfa2 then tfa2.write("Alice file\n"); tfa2.close() end
+        runSed({ [0] = "/bin/sed", "-i", "1a Hello", "/dbg_sed_a2.txt" })
+        local rfa = fs.open("/dbg_sed_a2.txt", "r")
+        print("ext2-init: sed append-inplace=[" .. (rfa and rfa.readAll() or "") .. "] (expect Alice file\\nHello)")
+        if rfa then rfa.close() end
+        local tfa3 = fs.open("/dbg_sed_a3.txt", "w")
+        if tfa3 then tfa3.write("a\nb\nc\n"); tfa3.close() end
+        print("ext2-init: sed range-append=[" .. runSed({ [0] = "/bin/sed", "2,3a X", "/dbg_sed_a3.txt" }) .. "] (expect a\\nb\\nX\\nc\\nX)")
         if fs.exists("/dbg_sed.txt") then pcall(fs.delete, "/dbg_sed.txt") end
         if fs.exists("/dbg_sed2.txt") then pcall(fs.delete, "/dbg_sed2.txt") end
+        if fs.exists("/dbg_sed_a.txt") then pcall(fs.delete, "/dbg_sed_a.txt") end
+        if fs.exists("/dbg_sed_a2.txt") then pcall(fs.delete, "/dbg_sed_a2.txt") end
+        if fs.exists("/dbg_sed_a3.txt") then pcall(fs.delete, "/dbg_sed_a3.txt") end
     end
 end
 
