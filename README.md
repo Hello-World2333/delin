@@ -40,12 +40,19 @@
 
 **显示抽象**：进程面向设备文件而非库接口——`/dev/ttyN`（控制台）、`/dev/fbN`（帧缓冲）。
 
-**工具**：`ls`、`cat`、`mkdir`、`rm`、`cp (-r)`、`mv`、`touch`、`head (-n)`、`tail (-n)`、
+**工具**：`ls`、`cat`、`mkdir (-p)`、`rm (-r|-f)`、`cp (-r)`、`mv`、`touch`、`head (-n)`、`tail (-n)`、
 `wc (-l|-w|-c)`、`grep (-n|-i|-v)`、`sed`（GNU 子集：`s/y/d/p/q/a/i/c/=`、行号/`$`/正则地址与区间、
-`!` 取反、`-n -s -e -f -i`）、`kill`、`login`、`sh`（内建 `cd/pwd/echo/exit/help/jobs/fg/bg/kill`）。
+`!` 取反、`-n -s -e -f -i`）、`kill`、`login`、`sh`。
+
+**sh（POSIX 核心子集）**：变量与展开（`$x`/`${x}`/`$?`/`$#`/`$@`/`$*`/`$1..`）；单/双引号；
+`if/elif/else`、`for`、`while`、`case`、函数（位置参数）、`[ ]`/`test`（`=` `!=` `-n` `-z` `-eq/-ne/-lt/-le/-gt/-ge`
+`-e/-f/-d/-s/-x/-r/-w`、`!`）；`&&`/`||`/`;`；文件重定向（`>` `>>` `<`）；内建
+`cd pwd echo exit help jobs fg bg kill test [ true false : break continue return shift`。
+`>>`/`>` 写文件在命令结束后 `close` 提交到 ext2（handle 写入可能缓冲，需关闭才落盘）。
 
 **已知偏离**：`grep`/`sed` 的正则用 **Lua pattern**（`%` 为转义符、`()` 为捕获）而非 POSIX ERE/BRE；
 替换区用 `&`=整串匹配、`\1..\9`=捕获组、`\n/\t`，不支持 BRE 风格 `\(...\)` 与模式内逆引用。
+不支持**管道 `|`**、**命令替换 `$()`/反引号**、**算术 `$(( ))`**（暂未实现）。
 因 CC 5.2 无位运算，`/etc/shadow` 哈希用盐+密码的 32 位滚动哈希（djb2）替代传统 `crypt`。
 
 ## 当前状态
@@ -53,6 +60,11 @@
 v0.0.1 的协程调度内核 + 进程树之后，已扩展为具备 VFS、块设备、EXT2 读写、显示抽象、模块系统与
 用户/权限的迷你系统。所有子系统自持事件循环，由内核调度器驱动；进程跑在隔离 `_ENV` 里，经注入的
 内核上下文（`spawn`/`pid`/`ppid`/`uid`/`gid`/`syscalls`）访问内核能力，其余原始 CC API 直用。
+
+`src/bin/sh` 已升级为 POSIX 核心子集（变量/引号/if/for/while/case/函数/test/[ ]/&&/|| /文件重定向，无管道
+`|`、命令替换 `$()`、算术 `$(( ))`），`rm`/`mkdir` 补了 GNU `-r/-f`/`-p`；`scripts/posix_test.sh` 在宿主
+与 Delin 上各跑一次逐项比对（51 项全过），`scripts/sysinfo.sh` 演示实用用法。可经
+`tools/harness.lua`（宿主）或 `tools/deploy.py`（真机）验证。
 
 ### 引导
 
@@ -123,8 +135,8 @@ src/init/init.lua          CC-fs 引导的 PID 1(init)
 src/init/ext2_init.lua     EXT2 根引导的最小 PID 1(权限/显示/键盘/shell 自检)
 src/bin/cat                连接文件到 stdout
 src/bin/ls                 列目录
-src/bin/mkdir              建目录
-src/bin/rm                 删文件/目录
+src/bin/mkdir              建目录 (-p 递归建父)
+src/bin/rm                 删文件/目录 (-r|-R 递归, -f 忽略不存在)
 src/bin/cp                 复制文件/目录(-r 递归)
 src/bin/mv                 移动/重命名(复制后删源)
 src/bin/touch              创建空文件
@@ -135,11 +147,15 @@ src/bin/grep               按 Lua 模式查找行 (-n|-i|-v)
 src/bin/sed                流式文本编辑器 (GNU 子集: s/y/d/p/q/a/i/c/=, 地址区间, -n -s -e -f -i)
 src/bin/kill               发送信号到进程/进程组 (kill [-SIG] pid|-pgid; kill -l)
 src/bin/login              getty/login: 登录提示->验证->启动 sh->循环
-src/bin/sh                 交互/脚本 shell(内建 cd/pwd/echo/exit/help/jobs/fg/bg/kill)
+src/bin/sh                 交互/脚本 shell(POSIX 核心子集: 变量/引号/if/for/while/case/函数/test/[ ]/&&/|| /重定向)
 src/modules/*.ko           内核模块: ccdisk(CC 原生 fs) ccmonitor(CC 显示器驱动) demo(演示)
                            ext2(ext2 挂载) tom(Tom GPU 驱动) void(Void 全息驱动)
 src/modules/modules.alias  驱动别名(modprobe 风格): tm_gpu->tom hologram->void monitor->ccmonitor
 src/modules/manifest       默认装载模块清单: demo ext2 ccdisk
+scripts/posix_test.sh      可移植 POSIX 自检(host 与 Delin 各跑一次比对, 51 项全过)
+scripts/sysinfo.sh         实用小工具: 系统信息(变量/函数/for/case/if/重定向/工具)
 tools/bundle.lua           打包 src/ -> dist/kernel.lua 或 dist/dlub.lua
+tools/harness.lua          host 测试台: 用真实 Delin 工具源码在宿主跑(fs/io/syscalls/spawn 桩)
+tools/deploy.py            重建干净 ext2 根镜像并部署到 disk(基镜像+更新后的内核/bin/脚本)
 dist/                      生成物(不提交)
 ```
