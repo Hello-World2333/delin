@@ -853,7 +853,12 @@ local function evalProgram(src)
         return nil, false, err
     end
     if inc then return nil, true end
-    evalList(items)
+    local rt, c = evalList(items)
+    -- 把 "exit" 控制信号透传给顶层调用者(交互循环靠它终止 shell)。
+    if c == "exit" then
+        lastExit = rt or lastExit
+        return true, nil, nil, "exit"
+    end
     return true
 end
 
@@ -865,7 +870,8 @@ if interactive then
         local line = stdin and stdin.readLine and stdin:readLine()
         if line == nil then break end
         buf = buf .. line .. "\n"
-        local ok, inc, err = evalProgram(buf)
+        local ok, inc, err, ctrl = evalProgram(buf)
+        if ctrl == "exit" then break end
         if ok and not inc then buf = "" end
         if ok == nil and not inc and err then errln("sh: " .. tostring(err)); buf = "" end
     end
@@ -877,7 +883,8 @@ else
         src = src .. line .. "\n"
     end
     if src ~= "" then
-        local ok, inc, err = evalProgram(src)
+        -- 非交互下 exit 已使 evalList 提前终止后续命令; 这里无需再 break。
+        local ok, inc, err, ctrl = evalProgram(src)
         if ok == nil and not inc and err then errln("sh: " .. tostring(err)) end
     end
 end
