@@ -48,14 +48,15 @@
 
 **sh（POSIX 核心子集）**：变量与展开（`$x`/`${x}`/`$?`/`$#`/`$@`/`$*`/`$1..`）；单/双引号；
 `if/elif/else`、`for`、`while`、`case`、函数（位置参数）、`[ ]`/`test`（`=` `!=` `-n` `-z` `-eq/-ne/-lt/-le/-gt/-ge`
-`-e/-f/-d/-s/-x/-r/-w`、`!`）；`&&`/`||`/`;`；文件重定向（`>` `>>` `<`）；内建
+`-e/-f/-d/-s/-x/-r/-w`、`!`）；`&&`/`||`/`;`；文件重定向（`>` `>>` `<`）；管道（`|`，每元素一个进程/内建，
+经内核 pipe 缓冲传递，`$?`=末元素退出码，生产端写满/消费端读空时让出调度器，broken pipe 中止写端）；内建
 `cd pwd echo exit help jobs fg bg kill test [ true false : break continue return shift`。
 `>>`/`>` 写文件在命令结束后 `close` 提交到 ext2（handle 写入可能缓冲，需关闭才落盘）。
 
 **已知偏离**：`grep`/`sed` 的正则用 **Lua pattern**（`%` 为转义符、`()` 为捕获）而非 POSIX ERE/BRE；
 替换区用 `&`=整串匹配、`\1..\9`=捕获组、`\n/\t`，不支持 BRE 风格 `\(...\)` 与模式内逆引用。
 注意 Lua pattern 里 `-` 是量词（非贪婪），要匹配字面连字符需 `%-`，与 GNU grep 的 `-`（字面）不同。
-不支持**管道 `|`**、**命令替换 `$()`/反引号**、**算术 `$(( ))`**（暂未实现）。
+不支持**命令替换 `$()`/反引号**、**算术 `$(( ))`**（暂未实现）。
 因 CC 5.2 无位运算，`/etc/shadow` 哈希用盐+密码的 32 位滚动哈希（djb2）替代传统 `crypt`。
 
 ## 当前状态
@@ -64,9 +65,9 @@ v0.0.1 的协程调度内核 + 进程树之后，已扩展为具备 VFS、块设
 用户/权限的迷你系统。所有子系统自持事件循环，由内核调度器驱动；进程跑在隔离 `_ENV` 里，经注入的
 内核上下文（`spawn`/`pid`/`ppid`/`uid`/`gid`/`syscalls`）访问内核能力，其余原始 CC API 直用。
 
-`src/bin/sh` 已升级为 POSIX 核心子集（变量/引号/if/for/while/case/函数/test/[ ]/&&/|| /文件重定向，无管道
-`|`、命令替换 `$()`、算术 `$(( ))`），`rm`/`mkdir` 补了 GNU `-r/-f`/`-p`；`scripts/posix_test.sh` 在宿主
-与 Delin 上各跑一次逐项比对（51 项全过），`scripts/sysinfo.sh` 演示实用用法。可经
+`src/bin/sh` 已升级为 POSIX 核心子集（变量/引号/if/for/while/case/函数/test/[ ]/&&/|| /文件重定向/管道
+`|`，无命令替换 `$()`、算术 `$(( ))`），`rm`/`mkdir` 补了 GNU `-r/-f`/`-p`；`scripts/posix_test.sh` 在宿主
+与 Delin 上各跑一次逐项比对（全部通过），`scripts/sysinfo.sh` 演示实用用法。可经
 `tools/harness.lua`（宿主）或 `tools/deploy.py`（真机）验证。
 
 ### 引导

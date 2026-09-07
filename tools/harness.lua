@@ -7,6 +7,10 @@
 
 local ROOT = "/tmp/delinhost"
 
+-- pipe 内核模块用 os.sleep 做协作式阻塞; 在宿主上把它改成 yield 给调度器
+-- (宿主 lua5.1 的 os 没有 sleep, 且这里必须能让出当前协程让调度器切走)。
+os.sleep = function() coroutine.yield() end
+
 local function cmd(...) return { ... } end
 
 -- 文件系统门面(基于 HOST 真实文件)。
@@ -158,12 +162,27 @@ end
 local procs = {}
 local users = {}
 local syscalls = {}
+local PIPE = nil -- 内核 pipe 模块(lazy require), 提供 pipe.create
+local function pipeCreate()
+    if not PIPE then
+        package.path = "/home/worker/delin/src/?.lua;" .. package.path
+        PIPE = require("kernel.pipe")
+    end
+    return PIPE.create()
+end
 syscalls["proc.info"] = function(pid) return procs[pid] end
 syscalls["proc.wait"] = function(pid)
-    local p = procs[pid]
-    if not p or (p.status == "dead" or p.status == "error") then return (p and p.exitCode) or 0 end
-    return 0
+    -- 阻塞等待子进程退出(通过 os.sleep 让出调度器, 轮询)。
+    while true do
+        local p = procs[pid]
+        if not p then return -1 end
+        if p.status == "dead" or p.status == "error" then
+            return (p.status == "error" and 1) or (p.exitCode or 0)
+        end
+        os.sleep(0.01)
+    end
 end
+syscalls["pipe.create"] = function() return pipeCreate() end
 syscalls["signal.list"] = function() return { 1, 2, 3, 9, 15 } end
 syscalls["signal.name"] = function(n) return ({ [1]="HUP", [2]="INT", [3]="QUIT", [9]="KILL", [15]="TERM" })[n] or "?" end
 syscalls["signal.number"] = function(name) return ({ ["HUP"]=1, ["INT"]=2, ["QUIT"]=3, ["KILL"]=9, ["TERM"]=15 })[name] end
@@ -189,11 +208,13 @@ end
 syscalls["user.register"] = function() end
 
 -- ---------------------------------------------------------------
--- spawn: 同步跑一个 Delin 工具源码(在独立 env 跑)
+-- spawn: 以协程起一个 Delin 工具源码(独立 env), 由顶层的协作式调度器驱动。
+--        os.sleep 会 yield 给调度器, 使阻塞(管道/proc.wait)能并发进展。
 -- ---------------------------------------------------------------
 local nextPid = 0
 local curStdio = nil
 local REAL_G = _G
+local running = {} -- 调度器进程队列 { pid, co, status }
 local function spawn(src, name, ppid, uid, gid, argv, opts)
     nextPid = nextPid + 1
     local pid = nextPid
@@ -204,7 +225,8 @@ local function spawn(src, name, ppid, uid, gid, argv, opts)
         argv = argv or {}, args = {}, argc = 0, arg0 = "",
         fs = F, io = makeIo(stdio), syscalls = syscalls,
         print = function(...) end,
-        os = setmetatable({ sleep = function() end }, { __index = REAL_G.os or {} }),
+        -- os.sleep 让出当前协程(调度器据此切换进程), 模拟内核按事件驱动恢复。
+        os = setmetatable({ sleep = function() coroutine.yield() end }, { __index = REAL_G.os or {} }),
     }, { __index = REAL_G })
     if argv then
         env.argv = argv
@@ -214,16 +236,55 @@ local function spawn(src, name, ppid, uid, gid, argv, opts)
     end
     env.spawn = function(s, n, cu, cg, ca, co) return spawn(s, n, pid, cu, cg, ca, co) end
     env._G = env
-    local chunk, lerr = load(src, name or ("proc" .. pid), "t", env)
-    procs[pid] = { pid = pid, name = name, status = "running", exitCode = 0 }
-    local ok, err = xpcall(function() return chunk() end, function(e) return debug.traceback(tostring(e)) end)
-    if not ok then
-        procs[pid].status = "error"; procs[pid].error = err; procs[pid].exitCode = 1
-        io.stderr:write("[harness] " .. name .. " error: " .. tostring(err) .. "\n")
+    -- Lua 5.1: load 收函数, loadstring 收字符串; 5.2: load 亦可收字符串。统一用 compat。
+    local loadcompat = _G.load
+    local chunk, lerr
+    if _VERSION == "Lua 5.1" then
+        chunk, lerr = loadstring(src, name or ("proc" .. pid))
+        if chunk then setfenv(chunk, env) end
     else
-        procs[pid].status = "dead"; procs[pid].exitCode = procs[pid].exitCode or 0
+        chunk, lerr = loadcompat(src, name or ("proc" .. pid), "t", env)
     end
+    if not chunk then
+        procs[pid] = { pid = pid, name = name, status = "error", error = lerr, exitCode = 1 }
+        return nil, "load failed: " .. tostring(lerr)
+    end
+    procs[pid] = { pid = pid, name = name, status = "running", exitCode = 0, stdio = stdio }
+    running[#running + 1] = { pid = pid, co = coroutine.create(chunk), status = "running" }
     return pid
+end
+
+-- 进程退出时释放其 stdio 管道端(与内核 process.onExit 一致), 使下游读到 EOF。
+-- 只关带 .pipe 标记的句柄, 避免误关宿主 stdout 文件句柄。
+local function closeProcPipes(pid)
+    local stdio = procs[pid] and procs[pid].stdio
+    if not stdio then return end
+    if stdio.output and stdio.output.pipe and stdio.output.close then pcall(stdio.output.close) end
+    if stdio.input  and stdio.input.pipe  and stdio.input.close  then pcall(stdio.input.close)  end
+end
+
+-- 协作式调度器: 轮流 resume 每个未退出进程; 进程 yield(os.sleep)则让位, 下轮再恢复。
+local function schedulerRun()
+    while true do
+        local anyAlive = false
+        for _, pr in ipairs(running) do
+            if pr.status ~= "dead" and pr.status ~= "error" then
+                anyAlive = true
+                local ok, err = coroutine.resume(pr.co)
+                if not ok then
+                    pr.status = "error"
+                    procs[pr.pid].status = "error"; procs[pr.pid].error = err; procs[pr.pid].exitCode = 1
+                    io.stderr:write("[harness] " .. (procs[pr.pid].name or pr.pid) .. " error: " .. tostring(err) .. "\n")
+                    closeProcPipes(pr.pid)
+                elseif coroutine.status(pr.co) == "dead" then
+                    pr.status = "dead"
+                    procs[pr.pid].status = "dead"
+                    closeProcPipes(pr.pid)
+                end
+            end
+        end
+        if not anyAlive then break end
+    end
 end
 
 -- ---------------------------------------------------------------
@@ -287,6 +348,9 @@ local src = tsrc:readAll(); tsrc:close()
 local argv0 = { [0] = toolPath }
 for i = 1, #toolArgs do argv0[i] = toolArgs[i] end
 spawn(src, toolPath, nil, nil, nil, argv0, { cwd = "/" })
+
+-- 运行协作式调度器, 驱动顶层进程及其 spawn 出的子进程(管道/作业控制)。
+schedulerRun()
 
 -- flush
 io.stdout:flush()

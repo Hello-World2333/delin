@@ -33,6 +33,7 @@ local profiles = {
             ["kernel.boot"]      = "src/kernel/boot.lua",
             ["kernel.vfs"]       = "src/kernel/vfs.lua",
             ["kernel.vfs_api"]   = "src/kernel/vfs_api.lua",
+            ["kernel.pipe"]      = "src/kernel/pipe.lua",
             ["kernel.modules"]   = "src/kernel/modules.lua",
             ["kernel.blockdev"]  = "src/kernel/blockdev.lua",
             ["kernel.ext2"]      = "src/kernel/ext2.lua",

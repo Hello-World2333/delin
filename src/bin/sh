@@ -1,8 +1,8 @@
 -- Delin sh: POSIX-ish shell (core subset).
 -- 交互/脚本模式; 内建 cd pwd echo exit help jobs fg bg kill test [ true false :.
 -- 支持: 变量与展开($x/${x}/$?/$#/$@/$*/$1..), 单/双引号, if/elif/else, for/while/until,
---       case, 函数, [ ] 与 test, &&/||/;, 文件重定向(> >> <), 命令后台(& + 作业控制)。
--- 不支持: 管道(|)、命令替换($() 与反引号)、算术 $(( ))。 正则用 Lua pattern(见 grep/sed)。
+--       case, 函数, [ ] 与 test, &&/||/;, 文件重定向(> >> <), 管道(|), 命令后台(& + 作业控制)。
+-- 不支持: 命令替换($() 与反引号)、算术 $(( ))。 正则用 Lua pattern(见 grep/sed)。
 -- 输出走 io.stdout(父进程把它指向控制台 tty 或文件), 绝不 print(kprint 走日志+term)。
 
 local stdin  = io.stdin()
@@ -251,7 +251,7 @@ local function isStop(t, stop)
     return false
 end
 
-local parseList, parseCommand, parseSimple, parseAndOr, parseParse
+local parseList, parseCommand, parseSimple, parseAndOr, parsePipeline, parseParse
 parseSimple = function()
     local assigns, argvSegs, redirects = {}, {}, {}
     local onlyAssign = true
@@ -438,15 +438,32 @@ parseCommand = function()
     end
 end
 
-parseAndOr = function()
+parsePipeline = function()
     local node, err, inc = parseCommand()
+    if node == nil then return nil, err, inc end
+    -- 管道: command ( | command )*, 优先级高于 &&/||。
+    if T[ti] and T[ti].t == "op" and T[ti].op == "|" then
+        local items = { node }
+        while T[ti] and T[ti].t == "op" and T[ti].op == "|" do
+            ti = ti + 1
+            local n2, e2, i2 = parseCommand()
+            if n2 == nil then return nil, e2, i2 end
+            items[#items + 1] = n2
+        end
+        return { kind = "pipe", items = items }
+    end
+    return node
+end
+
+parseAndOr = function()
+    local node, err, inc = parsePipeline()
     if node == nil then return nil, err, inc end
     -- 若后面紧跟 && 或 ||, 归成一个 chain(&&/|| 短路只在 chain 内生效, 不影响外层 ; 列表)。
     if T[ti] and T[ti].t == "op" and (T[ti].op == "&&" or T[ti].op == "||") then
         local items = { { node = node, op = "" } }
         while T[ti] and T[ti].t == "op" and (T[ti].op == "&&" or T[ti].op == "||") do
             local op = T[ti].op; ti = ti + 1
-            local n2, e2, i2 = parseCommand()
+            local n2, e2, i2 = parsePipeline()
             if n2 == nil then return nil, e2, i2 end
             items[#items + 1] = { node = n2, op = op }
         end
@@ -487,7 +504,7 @@ end
 -- 求值
 -- ---------------------------------------------------------------
 local builtins = {}
-local evalNode, evalList, evalSimple, restoreRedir, matchGlob
+local evalNode, evalList, evalSimple, restoreRedir, matchGlob, evalPipe
 
 local function expandWords(words)
     local out = {}
@@ -654,19 +671,30 @@ builtins.kill = function(args)
     end
 end
 
-local function runExternal(cmd, argv, stdio)
+-- 定位并 spawn 一个外部程序(不等待)。返回 pid, err。
+local function spawnChild(cmd, argv, stdio)
     local path = (cmd:sub(1, 1) == "/") and cmd or ("/bin/" .. cmd)
-    if not fs.exists(path) then errln("sh: " .. cmd .. ": command not found"); lastExit = 127; return end
-    if not fs.canExecute(path) then errln("sh: " .. cmd .. ": Permission denied"); lastExit = 126; return end
+    if not fs.exists(path) then return nil, "command not found" end
+    if not fs.canExecute(path) then return nil, "permission denied" end
     local f = fs.open(path, "r")
-    if not f then errln("sh: " .. cmd .. ": Permission denied"); lastExit = 126; return end
+    if not f then return nil, "permission denied" end
     local src = f.readAll(); f.close()
     local cargv = { [0] = path }
     for i = 1, #argv do cargv[i] = argv[i] end
     local opts = { cwd = cwd }
     if stdio then opts.stdio = stdio end
     local child, cerr = spawn(src, cmd, nil, nil, cargv, opts)
-    if not child then errln("sh: " .. cmd .. ": " .. tostring(cerr)); lastExit = 126; return end
+    if not child then return nil, tostring(cerr) end
+    return child
+end
+
+local function runExternal(cmd, argv, stdio)
+    local child, cerr = spawnChild(cmd, argv, stdio)
+    if not child then
+        errln("sh: " .. cmd .. ": " .. tostring(cerr))
+        lastExit = (cerr == "command not found") and 127 or 126
+        return
+    end
     local code = syscalls["proc.wait"](child)
     lastExit = code or 0
     if lastExit > 0 then errln("sh: " .. cmd .. ": exit " .. tostring(lastExit)) end
@@ -720,6 +748,111 @@ evalSimple = function(node)
     return lastExit or 0, ctrl
 end
 
+-- 关闭某管道元素负责的管道端: i>1 关闭其输入读端, i<n 关闭其输出写端(让下游读到 EOF)。
+local function closePipeEl(i, n, pipes)
+    if i > 1 then local r = pipes[i - 1].read; if r and r.close then pcall(r.close) end end
+    if i < n then local w = pipes[i].write;  if w and w.close then pcall(w.close) end end
+end
+
+-- 求值一个管道 a|b|c:
+--   - 每个元素是一个进程/内建; 元素 i 的 stdin=pipe[i-1].read, stdout=pipe[i].write
+--     (两端元素分别用 sh 当前的 stdin/stdout)。
+--   - 先 spawn 全部外部元素(并发跑, 使后续内置元素阻塞时调度器能驱动它们腾缓冲),
+--     再运行内置元素(设其 inH/outH 后调用, 运行完关闭其管道端)。
+--   - 退出码 = 最后一个元素; 管道建不起/某元素不可用时分段容错。
+evalPipe = function(node)
+    local items = node.items
+    local n = #items
+    if n <= 1 then return evalNode(items[1]) end
+    local pipes = {}
+    for i = 1, n - 1 do
+        local r, w = syscalls["pipe.create"]()
+        if not r then errln("pipe: create failed"); lastExit = 1; return 1 end
+        pipes[i] = { read = r, write = w }
+    end
+    local savedOut, savedIn = outH, inH
+    local info, spawned, codes, openedRedirs = {}, {}, {}, {}
+    -- Pass A: 展开每个元素 argv, 判定内置/外部, 计算各自 stdio 句柄。
+    -- 元素自身重定向(> >> <)覆盖该元素 fd0/fd1; 被覆盖而作废的管道端立即 close(让对端读到 EOF)。
+    for i = 1, n do
+        local defIn  = (i == 1) and savedIn or pipes[i - 1].read
+        local defOut = (i == n) and savedOut or pipes[i].write
+        local inp, outp = defIn, defOut
+        for _, r in ipairs(items[i].redirects or {}) do
+            local abs = resolve(wordToStr(r.target))
+            if r.op == "<" then
+                local h = fs.open(abs, "r")
+                if h then inp = h; openedRedirs[#openedRedirs + 1] = h
+                else errln("sh: " .. abs .. ": cannot open"); lastExit = 1 end
+            elseif r.op == ">" then
+                local h = fs.open(abs, "w")
+                if h then outp = h; openedRedirs[#openedRedirs + 1] = h
+                else errln("sh: " .. abs .. ": cannot open"); lastExit = 1 end
+            elseif r.op == ">>" then
+                local h = fs.open(abs, "a")
+                if h then outp = h; openedRedirs[#openedRedirs + 1] = h
+                else errln("sh: " .. abs .. ": cannot open"); lastExit = 1 end
+            end
+        end
+        if defIn  and defIn.pipe  and defIn ~= inp   then pcall(defIn.close)   end
+        if defOut and defOut.pipe and defOut ~= outp then pcall(defOut.close) end
+        local node = items[i]
+        if node.kind == "simple" then
+            local argvs = expandWords(node.argv)
+            local cmd, rest = argvs[1], {}
+            for k = 2, #argvs do rest[#rest + 1] = argvs[k] end
+            info[i] = { cmd = cmd, rest = rest, inH = inp, outH = outp, builtin = builtins[cmd] ~= nil, kind = "simple" }
+        else
+            -- 复合命令(if/for/while/case/funcdef/brace)作为管道元素: 内联运行, 经 inH/outH 连通管道。
+            info[i] = { node = node, inH = inp, outH = outp, kind = "compound" }
+        end
+    end
+    -- Pass B: spawn 全部外部元素。
+    for i = 1, n do
+        local it = info[i]
+        if it.cmd and not it.builtin then
+            local pid, cerr = spawnChild(it.cmd, it.rest, { input = it.inH, output = it.outH })
+            if pid then spawned[i] = pid
+            else
+                codes[i] = (cerr == "command not found") and 127 or 126
+                errln("sh: " .. it.cmd .. ": " .. tostring(cerr))
+                closePipeEl(i, n, pipes) -- 元素未起进程, 必须自行释放其管道端让下游读到 EOF。
+            end
+        end
+    end
+    -- Pass C: 运行内置/复合命令元素。
+    for i = 1, n do
+        local it = info[i]
+        if it.cmd and it.builtin then
+            inH, outH = it.inH, it.outH
+            lastExit = 0
+            local ctrl = builtins[it.cmd](it.rest)
+            inH, outH = savedIn, savedOut
+            closePipeEl(i, n, pipes)
+            if ctrl == "exit" then return lastExit, "exit" end
+            codes[i] = lastExit
+        elseif it.kind == "compound" then
+            inH, outH = it.inH, it.outH
+            local rt, ctrl = evalNode(it.node)
+            inH, outH = savedIn, savedOut
+            closePipeEl(i, n, pipes)
+            if ctrl == "exit" then return rt, "exit" end
+            codes[i] = rt or 0
+        end
+    end
+    -- Pass D: 等待外部元素退出。
+    for i = 1, n do
+        if spawned[i] then codes[i] = syscalls["proc.wait"](spawned[i]) or 0 end
+    end
+    -- 清理: 重定向打开的句柄(flush/close) + 剩余管道端(close 幂等)。
+    for _, h in ipairs(openedRedirs) do if h.close then pcall(h.close) end end
+    for i = 1, n - 1 do
+        if pipes[i] then pcall(pipes[i].read.close); pcall(pipes[i].write.close) end
+    end
+    lastExit = codes[n] or 0
+    return lastExit
+end
+
 matchGlob = function(s, pat)
     if pat == "*" then return true end
     if not pat:find("*") then return s == pat end
@@ -731,6 +864,7 @@ end
 
 evalNode = function(node)
     if node.kind == "simple" then return evalSimple(node) end
+    if node.kind == "pipe" then return evalPipe(node) end
     if node.kind == "chain" then
         -- 连接符存于下一个 item 的 op: item[i].op 是 item[i-1] 与 item[i] 之间的 &&/||。
         -- 用布尔"最近一条已执行命令是否成功"做左结合短路:

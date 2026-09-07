@@ -184,6 +184,12 @@ function process.spawn(src, name, ppid, uid, gid, argv, opts)
     proc.onExit = function(_, status, err)
         proc.status = status
         proc.exitCode = (status == "dead") and 0 or nil
+        -- 释放进程持有的 stdio 句柄: 对管道端会递减 writer/reader 计数, 使对端读到 EOF
+        -- 或在 broken pipe 时中止; 对 tty/file 句柄 close 是幂等/无效的(pcall 兜底)。
+        if proc.stdio then
+            if proc.stdio.output and proc.stdio.output.close then pcall(proc.stdio.output.close) end
+            if proc.stdio.input  and proc.stdio.input.close  then pcall(proc.stdio.input.close)  end
+        end
         if status == "error" then
             proc.error = err
             if process.log then pcall(process.log, "[proc " .. pid .. " " .. tostring(name) .. "] ERROR: " .. tostring(err)) end

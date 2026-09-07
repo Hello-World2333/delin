@@ -14,6 +14,7 @@ local tty        = require("kernel.tty")
 local fb         = require("kernel.fb")
 local display    = require("kernel.display")
 local sysfs      = require("kernel.sysfs")
+local pipe       = require("kernel.pipe")
 local INIT_SOURCE = require("kernel.init_src") -- 打包器注入的 init 源码字符串
 local EXT2_INIT_SOURCE = require("kernel.ext2_init_src") -- EXT2 根引导用最小 PID1
 
@@ -109,6 +110,7 @@ local function registerRuntimeSyscalls()
         end
     end
     sc["proc.info"] = function(pid) return process.info(pid) end
+    sc["pipe.create"] = function() return pipe.create() end
     sc["stdio.set"] = function(input, output) return process.setStdio(input, output) end
     sc["tty.setFocus"] = function(name) return tty.setFocus(name) end
     sc["tty.console"] = function() return tty.getFocus() end

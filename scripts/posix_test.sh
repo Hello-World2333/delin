@@ -1,7 +1,7 @@
 #!/bin/sh
 # Delin POSIX self-test (portable).
 # 可移植 POSIX sh; 既能在宿主( dash/bash )跑, 也能在 Delin sh 跑。
-# 只用 Delin 支持的子集: 无管道(|)、无命令替换($()/``)、无算术 $(( ))。
+# 只用 Delin 支持的子集: 无命令替换($()/``)、无算术 $(( ))。支持管道(|)。
 # 每个检查输出一行 "ok <name>" 或 "ng <name>"; 全部 ok 退出码 0。
 # 用途: 在 host 与 Delin 各跑一次, 比对输出(应一致)。
 
@@ -298,6 +298,23 @@ rm -- "$T/dash_moved.txt"
 chk dash_rm [ ! -e "$T/dash_moved.txt" ]
 rm -- "$T/--dash.txt"
 chk dash_rm_cleanup [ ! -e "$T/--dash.txt" ]
+
+# ---------------------------------------------------------------
+# 5c. 管道 | (host bash/dash 与 Delin sh 均支持)
+# ---------------------------------------------------------------
+echo "alpha" > "$T/p1.txt"
+echo "beta" >> "$T/p1.txt"
+# 单段管道: 左端输出喂给右端
+cat "$T/p1.txt" | wc -l > "$T/pl.txt"
+grep "^2$" "$T/pl.txt" > "$T/pl1.txt"
+chk pipe_wc_l [ -s "$T/pl1.txt" ]
+# 内容经管道喂给右端匹配
+echo "beta" | grep "^beta$" > "$T/pp.txt"
+chk pipe_grep [ -s "$T/pp.txt" ]
+# 三段管道: cat | grep | wc -l
+cat "$T/p1.txt" | grep beta | wc -l > "$T/p3.txt"
+grep "^1$" "$T/p3.txt" > "$T/p31.txt"
+chk pipe_3stage [ -s "$T/p31.txt" ]
 
 # 清理
 rm -rf "$T"

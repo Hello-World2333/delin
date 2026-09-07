@@ -120,13 +120,20 @@ for _, a in ipairs(files) do
     if a == "-" then
         local stdin = io.stdin()
         if not stdin then return end
-        local lines = {}
-        while true do
-            local line = stdin.readLine()
-            if line == nil then break end
-            lines[#lines + 1] = line
+        -- 优先整块读取(管道/文件重定向有 EOF): 精确统计字节/行/词(与 GNU 一致)。
+        -- 回退到逐行(交互 tty 无 EOF/readAll): 行统计, 字节数按行重构(末行换行不计)。
+        if stdin.readAll then
+            local content = stdin.readAll() or ""
+            st = statsContent(content)
+        else
+            local lines = {}
+            while true do
+                local line = stdin.readLine()
+                if line == nil then break end
+                lines[#lines + 1] = line
+            end
+            st = statsLines(lines)
         end
-        st = statsLines(lines)
         name = nil
     else
         local p = resolve(a)
