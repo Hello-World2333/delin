@@ -455,7 +455,10 @@ function ext2.addDirEntry(fs, dirIno, name, childIno, fileType)
                     -- 新条目必须占满被拆出来的整个 slack 区域(rec_len = slack),
                     -- 否则会在块内留下无 rec_len 的间隙, readDir 视其为坏目录项。
                     local entry = w32(childIno) .. w16(slack) .. string.char(nameLen, fileType) .. name .. string.rep("\0", slack - (8 + nameLen))
-                    data = data:sub(1, newOff) .. entry .. data:sub(newOff + 1)
+                    -- 拆分: 新条目占满整个 slack 区(长度为 slack), 其后才是块内本该跟上的内容。
+                    -- 若用 data:sub(newOff+1) 会把旧项的 slack 区再叠加一次, 使 data 长度膨胀
+                    -- (1024 -> 2000), 一次写入越界到相邻数据块(如 /lib), 把它清零。
+                    data = data:sub(1, newOff) .. entry .. data:sub(newOff + slack + 1)
                     writeBlockStr(fs, blockNum, data)
                     return true
                 end
