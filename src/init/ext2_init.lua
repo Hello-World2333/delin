@@ -137,6 +137,13 @@ local okCfg, cfgErr = pcall(function()
         local f = fs.open(p, "w"); if not f then return "openerr" end
         local ok, err = f:write(v); f:close(); return ok
     end
+    -- 挂载点是 /sys 本身: /sys 与 /sys/class 必须是可列出的目录(回归: 曾报 No such file)。
+    print("ext2-init: /sys exists=" .. tostring(fs.exists("/sys"))
+        .. " isDir=" .. tostring(fs.isDir("/sys"))
+        .. " list=[" .. table.concat(fs.list("/sys") or {}, ",") .. "]")
+    print("ext2-init: /sys/class exists=" .. tostring(fs.exists("/sys/class"))
+        .. " isDir=" .. tostring(fs.isDir("/sys/class"))
+        .. " list=[" .. table.concat(fs.list("/sys/class") or {}, ",") .. "]")
     local dlist = fs.list("/sys/class/display") or {}
     print("ext2-init: /sys/class/display=[" .. table.concat(dlist, ",") .. "]")
     for _, name in ipairs(dlist) do
@@ -278,7 +285,8 @@ else
     end
 
     local lines = {
-        "pwd", "echo HELLO_SHELL", "ls /", "cat /etc/passwd",
+        "pwd", "echo HELLO_SHELL", "ls /", "ls /sys", "ls /sys/class", "ls /sys/class/display",
+        "cat /etc/passwd",
         -- 扩展 POSIX 工具 (根级文件操作, 最小化 fs 变动)
         "touch /tfile.txt",
         "wc -c /tfile.txt",

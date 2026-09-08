@@ -18,7 +18,7 @@
 | `/dev/` | 设备文件：`/dev/ttyN`（字符终端）、`/dev/fbN`（像素帧缓冲）、`/dev/sdX`（磁盘，见下） |
 | `/etc/` | 用户/组配置：`passwd` `shadow` `group` |
 | `/proc/` | 虚拟进程/系统信息 fs（由模块提供） |
-| `/sys/class/display/` | 显示设备虚拟配置 fs：每设备一个目录，`name/type/size` 只读，分辨率/位置/旋转/缩放 可读写 |
+| `/sys/` | sysfs 挂载点（虚拟）；`/sys/class/display/` 下每设备一个目录，`name/type/size` 只读，分辨率/位置/旋转/缩放 可读写 |
 | `/lib/modules/<version>/` | 内核模块目录：`.ko` 模块 + 纯文本 `manifest` + `modules.alias` |
 | `/mnt/` | 挂载点（`mount /dev/sdXN /mnt` 显式挂载；启动时不自动挂载任何磁盘） |
 | `/parts/` | 引导盘分区清单 `manifest`（`<role> <path> <fstype>`，`#` 为注释） |
@@ -112,7 +112,7 @@ v0.0.1 的协程调度内核 + 进程树之后，已扩展为具备 VFS、块设
   `setupDevices` 扫描磁盘驱动器注册 `/dev/sdX` 节点（不自动挂载）→ `registerConsole` 把电脑自身
   `term` 注册为 `/dev/ttyN` 控制台 → `setupModules`
   从 `/lib/modules/<version>/` 装模块（`loadAll` + `loadAliases` + 按外设 autoload 驱动，
-  modprobe 风格 `modules.use`）→ `sysfs.mount` 挂 `/sys/class/display` → `launch` 出 PID 1（init）。
+  modprobe 风格 `modules.use`）→ `sysfs.mount` 挂 `/sys` → `launch` 出 PID 1（init）。
 - **EXT2 根引导**（GRUB 风格，DLUB 独立文件）：先由 `dlub.lua` 读**电脑自身 FS** 的 `/dlub.cfg`
   （`bootdisk <外设名>`，如 `bootdisk left`）锁定引导盘——多磁盘时 `peripheral.getNames()` 顺序
   不可靠（数据盘可能先被枚举到），因此**不扫描、不回退**：配置缺失/语法错误/该外设不是磁盘驱动/
@@ -181,7 +181,7 @@ src/kernel/user.lua        用户库: /etc/passwd|shadow|group, salt+hash, chmod
 src/kernel/display.lua     显示设备注册表: 统一 ScreenDevice -> /dev/ttyN + /dev/fbN
 src/kernel/tty.lua         字符终端(/dev/ttyN): 行规程+回显+光标+滚动+焦点切换
 src/kernel/fb.lua          软件帧缓冲(/dev/fbN): 32 位 ARGB 像素缓冲+脏矩形 flush
-src/kernel/sysfs.lua       /sys/class/display 虚拟配置 fs(sysfs 风格, 读=查/写=设)
+src/kernel/sysfs.lua       /sys 虚拟配置 fs(sysfs 风格, class/display 子树, 读=查/写=设)
 src/kernel/manifest.lua    /parts/manifest 解析器(root/boot 行 + 分区表)
 src/kernel/dlubcfg.lua     /dlub.cfg 解析器(bootdisk 行; 语法/未知键/重复键 fail-fast)
 src/kernel/dlub.lua        DLUB 引导装载器(GRUB 风格): /dlub.cfg 锁盘->清单->开区->挂 ext2->载内核
