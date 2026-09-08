@@ -243,10 +243,23 @@ syscalls["user.groupByName"] = function(name) return groups[name] end
 syscalls["user.register"] = function() end
 
 -- 挂载/卸载桩: 记录到内存表, 供 `mount`/`umount` 命令在宿主上验证参数与列表。
+-- 行为对齐内核 devdisk: 按节点名/UUID 解析设备, 未知设备或 fstype 不符即报错。
 local mountTable = {}
+local function blkFind(spec)
+    local byUuid = spec:sub(1, 5) == "UUID="
+    local want = byUuid and spec:sub(6) or spec:gsub("^/dev/", "")
+    for _, e in ipairs(syscalls["blkdev.list"]()) do
+        if (byUuid and e.uuid == want) or (not byUuid and e.name == want) then return e end
+    end
+    return nil
+end
 syscalls["fs.mount"] = function(device, dir, fstype)
-    mountTable[#mountTable + 1] = { device = device, dir = dir, fstype = fstype or "ext2" }
-    return true
+    local e = blkFind(device)
+    if not e then return nil, device .. ": no such device" end
+    local fst = fstype or e.fstype
+    if fst ~= e.fstype then return nil, e.node .. " is " .. e.fstype .. ", not " .. fst end
+    mountTable[#mountTable + 1] = { device = e.node, dir = dir, fstype = fst, uuid = e.uuid }
+    return true, { device = e.node, fstype = fst, uuid = e.uuid }
 end
 syscalls["fs.umount"] = function(dir)
     for i = #mountTable, 1, -1 do if mountTable[i].dir == dir then table.remove(mountTable, i) end end
@@ -254,7 +267,29 @@ syscalls["fs.umount"] = function(dir)
 end
 syscalls["fs.mounts"] = function()
     local out = {}
-    for _, m in ipairs(mountTable) do out[#out + 1] = { root = m.dir, device = m.device, fstype = m.fstype } end
+    for _, m in ipairs(mountTable) do out[#out + 1] = { root = m.dir, device = m.device, fstype = m.fstype, uuid = m.uuid } end
+    return out
+end
+
+-- 块设备桩: 两个磁盘(整盘 ccdisk + 各自 manifest 分区 ext2), 与真机 devdisk 的字段一致。
+-- mounted 由当前挂载表算出, 使 lsblk 的 MOUNTPOINT 列可验证。
+local blkDevices = {
+    { name = "sda",  node = "/dev/sda",  type = "disk", fstype = "ccdisk", uuid = "0",   size = 128000,  label = "BOOT" },
+    { name = "sda1", node = "/dev/sda1", type = "part", fstype = "ext2",   uuid = "0-1", size = 2097152, role = "root" },
+    { name = "sdb",  node = "/dev/sdb",  type = "disk", fstype = "ccdisk", uuid = "1",   size = 128000 },
+    { name = "sdb1", node = "/dev/sdb1", type = "part", fstype = "ext2",   uuid = "1-1", size = 2097152, role = "data" },
+}
+syscalls["blkdev.list"] = function()
+    local out = {}
+    for _, e in ipairs(blkDevices) do
+        local copy = {}
+        for k, v in pairs(e) do copy[k] = v end
+        copy.mounted = {}
+        for _, m in ipairs(mountTable) do
+            if m.device == e.node then copy.mounted[#copy.mounted + 1] = m.dir end
+        end
+        out[#out + 1] = copy
+    end
     return out
 end
 
@@ -344,8 +379,8 @@ end
 local SRCBIN = "/home/worker/delin/src/bin"
 local function setupRoot()
     os.execute("rm -rf " .. ROOT .. " && mkdir -p " .. ROOT)
-    os.execute("mkdir -p " .. ROOT .. "/bin " .. ROOT .. "/etc " .. ROOT .. "/home/alice " .. ROOT .. "/root " .. ROOT .. "/tmp")
-    for _, f in ipairs({ "cat","cp","ed","grep","head","kill","login","ls","mkdir","mv","rm","sed","sh","tail","touch","wc","chmod","chown","mount","umount" }) do
+    os.execute("mkdir -p " .. ROOT .. "/bin " .. ROOT .. "/etc " .. ROOT .. "/home/alice " .. ROOT .. "/root " .. ROOT .. "/tmp " .. ROOT .. "/mnt/cc")
+    for _, f in ipairs({ "cat","cp","ed","grep","head","kill","login","ls","mkdir","mv","rm","sed","sh","tail","touch","wc","chmod","chown","mount","umount","blkid","lsblk" }) do
         os.execute("cp -f " .. SRCBIN .. "/" .. f .. " " .. ROOT .. "/bin/" .. f)
         os.execute("chmod 755 " .. ROOT .. "/bin/" .. f)
     end

@@ -1,49 +1,25 @@
 --@name ext2
---@version 0.1.0
---@description EXT2 filesystem module (read-only in phase A). Mounts the boot disk's first /parts/*.img onto the VFS.
+--@version 0.2.0
+--@description EXT2 filesystem driver: registers the ext2 fstype for `mount -t ext2 /dev/sdXN DIR` (a partition is a /parts/*.img image on the disk).
 --@deps
 
 local blockdev = require("kernel.blockdev")
-local ext2      = require("kernel.ext2")
-
-local function findDiskImg()
-    for _, name in ipairs(peripheral.getNames()) do
-        if disk.hasData(name) then
-            local mp = disk.getMountPath(name)
-            if mp then
-                local partsDir = mp .. "/parts"
-                if fs.isDir(partsDir) then
-                    for _, fi in ipairs(fs.list(partsDir)) do
-                        if fi:match("%.img$") then
-                            return partsDir .. "/" .. fi, mp
-                        end
-                    end
-                end
-            end
-        end
-    end
-    return nil, nil
-end
+local ext2     = require("kernel.ext2")
 
 return {
     init = function(kapi)
-        local imgPath = findDiskImg()
-        if not imgPath then
-            kapi.log("ext2: no /parts/*.img found on any disk")
-            return
-        end
-        local bd, err = blockdev.file(imgPath)
-        if not bd then
-            kapi.log("ext2: blockdev failed for " .. imgPath .. ": " .. tostring(err))
-            return
-        end
-        local fs, ferr = ext2.mount(bd)
-        if not fs then
-            kapi.log("ext2: mount failed: " .. tostring(ferr))
-            return
-        end
-        -- 只读挂到 /mnt/ext2 (phase A; 后续由挂载系统决定根)
-        kapi.registerFS("/mnt/ext2", ext2.backend(fs))
-        kapi.log("ext2: mounted " .. imgPath .. " at /mnt/ext2 (blockSize=" .. fs.blockSize .. ")")
+        -- fstype 处理器: source.img = 分区镜像的真实路径(由 devdisk 给出)。
+        kapi.registerFstype("ext2", function(source, dir)
+            local bd, err = blockdev.file(source.img)
+            if not bd then return nil, tostring(err) end
+            local rfs, ferr = ext2.mount(bd)
+            if not rfs then
+                bd.close()
+                return nil, tostring(ferr)
+            end
+            -- 卸载时关闭块设备句柄(否则每次 mount 泄漏一个文件句柄)。
+            return ext2.backend(rfs), { cleanup = function() bd.close() end }
+        end)
+        kapi.log("ext2: fstype registered (mount -t ext2 /dev/sdXN DIR)")
     end,
 }

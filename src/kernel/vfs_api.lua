@@ -32,6 +32,7 @@ local devBackend = vfs.virtual({
     list = function(rel)
         local out = {}
         for n in pairs(devices) do out[#out + 1] = n end
+        table.sort(out)
         return out
     end,
     exists = function(rel)
@@ -193,7 +194,7 @@ end
 
 --- 挂载 /dev 虚拟文件系统。
 function vfsapi.mountDev()
-    vfs.mount("/dev", devBackend)
+    vfs.mount("/dev", devBackend, { device = "devtmpfs", fstype = "devtmpfs" })
 end
 
 --- 暴露 fs 门面(供内核/模块/cat 使用)。

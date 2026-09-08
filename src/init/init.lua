@@ -1,4 +1,4 @@
--- Delin OS PID 1 (init)
+-- Delin OS PID 1 (init) —— CC-fs 引导路径的演示/自检
 -- 运行在隔离进程环境中(pid/ppid/spawn/print/syscalls 由内核注入, 其余原始 API 直用)。
 
 print("init: hello, pid=" .. pid .. " ppid=" .. ppid)
@@ -25,30 +25,40 @@ print("init: /proc/cpu exists=" .. tostring(fs.exists("/proc/cpu")))
 local pf = fs.open("/proc/cpu", "r")
 print("init: /proc/cpu content=" .. (pf and ("[" .. pf.readAll() .. "]") or "(none)"))
 if pf then pf.close() end
-print("init: /proc list=" .. table.concat(fs.list("/proc"), ","))
 
--- 模块装的 EXT2 只读挂载(phase A) + 现在写(phase B)
-print("init: /mnt/ext2 list=" .. table.concat(fs.list("/mnt/ext2") or {}, ","))
-local h2 = fs.open("/mnt/ext2/etc/hostname", "r")
-print("init: hostname=[" .. (h2 and h2.readAll() or "(none)") .. "]")
-if h2 then h2.close() end
-local ea = fs.attributes("/mnt/ext2/etc/hostname")
-print("init: hostname attrs mode=" .. (ea and string.format("%o", ea.mode) or "?")
-    .. " uid=" .. (ea and tostring(ea.uid) or "?")
-    .. " gid=" .. (ea and tostring(ea.gid) or "?")
-    .. " size=" .. (ea and tostring(ea.size) or "?"))
+-- 磁盘设备抽象: /dev/sdX (整盘 = CC 原生 fs / ccdisk; /dev/sdXN = manifest 分区 / ext2)。
+-- 磁盘不再自动挂到 /mnt/<side>, 一律经 `mount` 显式挂载。
+local devs = (syscalls and syscalls["blkdev.list"] and syscalls["blkdev.list"]()) or {}
+print("init: blkdevs=" .. #devs)
+for _, e in ipairs(devs) do
+    print(string.format("init: %s uuid=%s type=%s size=%s mounted=%s",
+        e.node, tostring(e.uuid), e.fstype, tostring(e.size), table.concat(e.mounted or {}, ",")))
+end
 
--- phase B: EXT2 写
-local wf = fs.open("/mnt/ext2/etc/delin-test.txt", "w")
-wf.writeLine("written from Delin EXT2 write (pid " .. pid .. ")")
-wf.close()
-local rf = fs.open("/mnt/ext2/etc/delin-test.txt", "r")
-print("init: delin-test.txt=[" .. (rf and rf.readAll() or "(none)") .. "]")
-if rf then rf.close() end
-print("init: mkdir /mnt/ext2/newdir -> " .. tostring((fs.makeDir("/mnt/ext2/newdir") or true)))
-print("init: delete /mnt/ext2/etc/hostname -> " .. tostring(fs.delete("/mnt/ext2/etc/hostname")))
-print("init: /mnt/ext2/etc list=" .. table.concat(fs.list("/mnt/ext2/etc") or {}, ","))
-print("init: /mnt/ext2 list=" .. table.concat(fs.list("/mnt/ext2") or {}, ","))
+-- 挂载第一个 ext2 分区, 读 /etc/hostname 再卸载。
+local part
+for _, e in ipairs(devs) do
+    if e.type == "part" then part = e; break end
+end
+if not part then
+    print("init: no ext2 partition on any disk (skip mount test)")
+else
+    if not fs.exists("/mnt") then fs.makeDir("/mnt") end
+    local ok, info = syscalls["fs.mount"](part.node, "/mnt")
+    print("init: mount " .. part.node .. " /mnt -> " .. tostring(ok) .. " type=" .. tostring(info and info.fstype or info))
+    local h = fs.open("/mnt/etc/hostname", "r")
+    print("init: /mnt/etc/hostname=[" .. (h and h.readAll() or "(none)") .. "]")
+    if h then h.close() end
+    print("init: /mnt list=" .. table.concat(fs.list("/mnt") or {}, ","))
+    print("init: umount /mnt -> " .. tostring(syscalls["fs.umount"]("/mnt")))
+    -- UUID 解析: 按 UUID 再挂一次, 然后卸载。
+    if part.uuid then
+        local ok2, info2 = syscalls["fs.mount"]("UUID=" .. part.uuid, "/mnt")
+        print("init: mount UUID=" .. part.uuid .. " -> " .. tostring(ok2)
+            .. " dev=" .. tostring(info2 and info2.device or info2))
+        if ok2 then print("init: umount by device -> " .. tostring(syscalls["fs.umount"](part.node))) end
+    end
+end
 
 -- 子进程经 VFS 读回 + 看 syscalls
 local childSrc = "local fd = fs.open('/hello-vfs.txt','r')\n"

@@ -1,18 +1,21 @@
 --@name ccdisk
---@version 0.1.0
---@description CC native filesystem compat. Not auto-mounted on the Delin VFS; exposes mount.ccdisk syscall to mount a CC fs on demand.
+--@version 0.2.0
+--@description CC native filesystem driver: registers the ccdisk fstype (whole disk /dev/sda, or any CC fs path) plus the legacy mount.ccdisk syscall.
 --@deps
 
 local vfs = require("kernel.vfs")
 
 return {
     init = function(kapi)
-        kapi.log("ccdisk: registered (CC native fs) — not auto-mounted on VFS")
-        -- 按需把某个 CC fs 路径挂到 VFS 挂载点
+        -- fstype 处理器: source.ccpath = CC fs 真实路径(整盘设备 /dev/sda 的 mount path)。
+        kapi.registerFstype("ccdisk", function(source)
+            return vfs.real(source.ccpath)
+        end)
+        -- 兼容旧接口: 把任意 CC fs 路径挂到 VFS 目录。
         kapi.registerSyscall("mount.ccdisk", function(realPath, mountPath)
-            if not vfs.real then return nil, "vfs missing" end
             vfs.mount(mountPath, vfs.real(realPath))
             return true
         end)
+        kapi.log("ccdisk: fstype registered (mount -t ccdisk /dev/sda DIR)")
     end,
 }

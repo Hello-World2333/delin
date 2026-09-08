@@ -15,15 +15,37 @@
 | 路径 | 作用 |
 |---|---|
 | `/bin/` | 用户工具：`cat ls mkdir rm cp mv touch head tail wc grep sed kill login sh` |
-| `/dev/` | 设备文件：`/dev/ttyN`（字符终端，全类型显示）、`/dev/fbN`（像素帧缓冲，pixel 型显示） |
+| `/dev/` | 设备文件：`/dev/ttyN`（字符终端）、`/dev/fbN`（像素帧缓冲）、`/dev/sdX`（磁盘，见下） |
 | `/etc/` | 用户/组配置：`passwd` `shadow` `group` |
 | `/proc/` | 虚拟进程/系统信息 fs（由模块提供） |
 | `/sys/class/display/` | 显示设备虚拟配置 fs：每设备一个目录，`name/type/size` 只读，分辨率/位置/旋转/缩放 可读写 |
 | `/lib/modules/<version>/` | 内核模块目录：`.ko` 模块 + 纯文本 `manifest` + `modules.alias` |
-| `/mnt/` | 挂载点（磁盘驱动、ext2 分区） |
+| `/mnt/` | 挂载点（`mount /dev/sdXN /mnt` 显式挂载；启动时不自动挂载任何磁盘） |
 | `/parts/` | 引导盘分区清单 `manifest`（`<role> <path> <fstype>`，`#` 为注释） |
 | `/boot/` | 内核镜像 |
 | `/dlub.cfg` | DLUB 引导配置（电脑自身 FS）：`bootdisk <外设名>` 显式指定引导盘 |
+
+### 磁盘设备（`/dev/sdX`）
+
+CC 没有裸块 API：磁盘驱动器只提供「盘上的 CC 原生文件系统」和「盘上的 `/parts/*.img` 文件」两样东西。
+内核把它们抽象成 Linux 风格的设备节点，**磁盘不自动挂载**，一律由 `mount` 显式挂载：
+
+| 节点 | 含义 | fstype |
+|---|---|---|
+| `/dev/sda`、`/dev/sdb` … | 整盘：该驱动器的 CC 原生文件系统 | `ccdisk` |
+| `/dev/sda1` … `/dev/sdaN` | 分区：该盘 `/parts/manifest` 第 N 个分区行指向的镜像 | `ext2` |
+| `/dev/ccdisk0`、`/dev/ccdisk1` … | 整盘 CC 原生 fs 的别名节点（N 从 0 起，同 `sda`、`sdb`） | `ccdisk` |
+
+- **命名**：磁盘按 `disk.getID()` 升序编成 `sda`、`sdb`、…（与 `peripheral.getNames()` 顺序、槽位无关，
+  重启后同一块盘仍是同一个字母）；分区号取该盘 `/parts/manifest` 分区行的序号（1 起，`root` 行在前）。
+- **UUID**：CC 没有文件系统 UUID，用**磁盘 ID 模拟**——整盘为 `<磁盘ID>`，分区为 `<磁盘ID>-<分区号>`
+  （如磁盘 ID 1 的第一个分区是 `1-1`）；无 ID 的介质（电脑盘/海龟盘）没有 UUID，不能用 `UUID=` 挂载。
+- **挂载**：`mount /dev/sda1 /mnt`（无 `-t` 时按节点自带类型）、`mount -t ccdisk /dev/sda /mnt`、
+  `mount UUID=1-1 /mnt`；`umount` 接受挂载点或设备节点。`mount` 无参列出挂载（含设备节点与 uuid），
+  `blkid` 列出设备的 UUID/TYPE/LABEL，`lsblk` 以树状列出设备与挂载点。
+- **原始字节**：分区节点可当字节设备打开（`fs.open("/dev/sda1","r")` 读镜像原始字节）；整盘是 CC 原生
+  文件系统（目录树，不是字节流），打开会被拒绝，只能挂载。
+- 磁盘插入/弹出（CC `disk` / `disk_eject` 事件）时内核重新扫描并刷新 `/dev` 节点。
 
 ### 接口与工具（POSIX + GNU 子集）
 
@@ -45,7 +67,8 @@
 `wc (-l|-w|-c)`、`grep (-n|-i|-v)`、`sed`（GNU 子集：`s/y/d/p/q/a/i/c/=`、行号/`$`/正则地址与区间、
 `!` 取反、`-n -s -e -f -i`）、`ed`（POSIX 子集：`a/i/c/d/p/n/l/s/t/m/r/w/q/u/g/v/=`、地址 `.` `$` n `/re/` `+n` `-n`、输入模式以 `.` 结束）、`kill`、`login`、
 `chmod`（八进制 + 符号模式 `[ugoa]*[+-=][rwx]*` + `-R` 递归）、`chown`（`[OWNER][:[GROUP]]` + `-R`）、
-`mount`（挂载 ext2 块设备镜像，无参列出已挂载）、`umount`、
+`mount`（挂载 `/dev/sdX`、`UUID=<uuid>` 或镜像路径；无 `-t` 时按设备类型；无参列出挂载）、`umount`、
+`blkid`（列出设备 UUID/TYPE/LABEL）、`lsblk`（树状列出设备/大小/类型/挂载点）、
 `sh`。
 各工具支持 POSIX 的 **`--` 结束选项** 标记：`rm -- --help`、`touch -- -file`、`ls -- --ff` 等，用于操作以
 `-`/`--` 开头的文件名；单独的 `-` 视为普通操作数。
@@ -75,7 +98,9 @@ v0.0.1 的协程调度内核 + 进程树之后，已扩展为具备 VFS、块设
 `src/bin/sh` 已升级为 POSIX 核心子集（变量/引号/if/for/while/case/函数/test/[ ]/&&/|| /文件重定向/管道
 `|`，无命令替换 `$()`、算术 `$(( ))`），支持脚本执行（`sh script.sh` / `./script.sh`，`#!` shebang）、
 `rm`/`mkdir` 补了 GNU `-r/-f`/`-p`；新增 `chmod`（八进制 + 符号模式 + `-R`）、`chown`（`owner:group` + `-R`）、
-`mount`（挂载 ext2 块设备镜像 / 无参列出）/ `umount`；`scripts/posix_test.sh` 在宿主
+`mount`（挂载 `/dev/sdX`、`UUID=` 或镜像路径 / 无参列出）/ `umount` / `blkid` / `lsblk`；磁盘驱动器
+经 `devdisk` 抽象为 `/dev/sda`（整盘 ccdisk）与 `/dev/sdaN`（manifest 分区 ext2）设备节点，UUID 用磁盘 ID
+模拟，启动时不再自动挂载磁盘。`scripts/posix_test.sh` 在宿主
 与 Delin 上各跑一次逐项比对（92 项全过），`scripts/sysinfo.sh` 演示实用用法。可经
 `tools/harness.lua`（宿主）或 `tools/deploy.py`（真机）验证。
 
@@ -83,8 +108,9 @@ v0.0.1 的协程调度内核 + 进程树之后，已扩展为具备 VFS、块设
 
 代码经 `tools/bundle.lua` 打包成自包含 Lua 文件部署。两条引导路径：
 
-- **CC-fs 引导**（默认）：`kernel.lua` 直接跑 `boot.boot()`——`setupVfs` 挂根 hdd + 各磁盘驱动到
-  `/mnt/<side>` → `registerConsole` 把电脑自身 `term` 注册为 `/dev/ttyN` 控制台 → `setupModules`
+- **CC-fs 引导**（默认）：`kernel.lua` 直接跑 `boot.boot()`——`setupVfs` 挂根 hdd 到 `/` →
+  `setupDevices` 扫描磁盘驱动器注册 `/dev/sdX` 节点（不自动挂载）→ `registerConsole` 把电脑自身
+  `term` 注册为 `/dev/ttyN` 控制台 → `setupModules`
   从 `/lib/modules/<version>/` 装模块（`loadAll` + `loadAliases` + 按外设 autoload 驱动，
   modprobe 风格 `modules.use`）→ `sysfs.mount` 挂 `/sys/class/display` → `launch` 出 PID 1（init）。
 - **EXT2 根引导**（GRUB 风格，DLUB 独立文件）：先由 `dlub.lua` 读**电脑自身 FS** 的 `/dlub.cfg`
@@ -92,7 +118,8 @@ v0.0.1 的协程调度内核 + 进程树之后，已扩展为具备 VFS、块设
   不可靠（数据盘可能先被枚举到），因此**不扫描、不回退**：配置缺失/语法错误/该外设不是磁盘驱动/
   盘上无 `/parts/manifest` 一律 fail-fast 报错。再读该盘 `/parts/manifest`，按清单把 root 分区开成
   块设备、挂 ext2、读内核镜像并设 `_G.__boot_info`；`boot.boot()` 检测到
-  `__boot_info` 即走 `bootExt2`——挂 ext2 根为 `/`，读 `/etc/passwd` 建用户库，模块只从 ext2 根镜像
+  `__boot_info` 即走 `bootExt2`——挂 ext2 根为 `/`（挂载表里显示为对应的 `/dev/sdXN`），读
+  `/etc/passwd` 建用户库，模块只从 ext2 根镜像
   自带的 `/lib/modules/<version>/` 装载（自包含，fail-fast，绝不回退到引导盘/CC fs 的 `/lib`）。
 
 ### 设计要点
@@ -117,6 +144,9 @@ v0.0.1 的协程调度内核 + 进程树之后，已扩展为具备 VFS、块设
   行缓冲 + 回显（canonical 行规程），焦点 tty 收到 `^C`/`^Z` 时把信号投给其前台进程组。
 - **getty/login**：init 在每个 `/dev/ttyN` 上起 `login`；login 验证后按用户 `uid/gid` 起 `sh`
   （同 tty stdio），`sh` 退出后回到 login 循环。
+- **设备与文件系统分层**：`devdisk` 只负责「有哪些设备」（枚举磁盘 → `/dev/sdX` + UUID 解析 + 挂载表），
+  文件系统实现由模块用 `kapi.registerFstype(name, fn)` 注册（`ext2.ko` → `ext2`，`ccdisk.ko` → `ccdisk`）；
+  `mount -t <type>` 找不到处理器即报错（fail-fast，无回退）。
 
 ## 构建
 
@@ -143,8 +173,9 @@ src/kernel/process.lua     进程表/进程树/spawn/隔离 env + cwd + argv + �
 src/kernel/signal.lua      POSIX 信号编号/默认动作/可捕获表/名字表
 src/kernel/vfs.lua         虚拟文件系统: 挂载表 + resolve + real/virtual 后端
 src/kernel/vfs_api.lua     VFS 门面(fs/io) + /dev 设备注册表 + stdio
-src/kernel/modules.lua     内核模块系统: .ko 解析(注释头)/依赖拓扑/装载/alias(use)
+src/kernel/modules.lua     内核模块系统: .ko 解析(注释头)/依赖拓扑/装载/alias(use) + fstype 注册
 src/kernel/blockdev.lua    块设备层: 文件块设备(/parts/*.img, seek+read/write)
+src/kernel/devdisk.lua     磁盘设备抽象: CC 磁盘 -> /dev/sdX 节点 + UUID(磁盘 ID 模拟) + fstype 挂载/卸载
 src/kernel/ext2.lua        EXT2 读写: 超级块/inode(uid/gid/mode/硬链接/符号链接)/间接块/多块组
 src/kernel/user.lua        用户库: /etc/passwd|shadow|group, salt+hash, chmod/chown 权限
 src/kernel/display.lua     显示设备注册表: 统一 ScreenDevice -> /dev/ttyN + /dev/fbN
@@ -154,7 +185,7 @@ src/kernel/sysfs.lua       /sys/class/display 虚拟配置 fs(sysfs 风格, 读=
 src/kernel/manifest.lua    /parts/manifest 解析器(root/boot 行 + 分区表)
 src/kernel/dlubcfg.lua     /dlub.cfg 解析器(bootdisk 行; 语法/未知键/重复键 fail-fast)
 src/kernel/dlub.lua        DLUB 引导装载器(GRUB 风格): /dlub.cfg 锁盘->清单->开区->挂 ext2->载内核
-src/kernel/boot.lua        入口: 日志->kprint->setupVfs/registerConsole->装模块->sysfs->launch init
+src/kernel/boot.lua        入口: 日志->kprint->setupVfs/setupDevices/registerConsole->装模块->sysfs->launch init
 src/init/init.lua          CC-fs 引导的 PID 1(init)
 src/init/ext2_init.lua     EXT2 根引导的最小 PID 1(权限/显示/键盘/shell 自检)
 src/bin/cat                连接文件到 stdout
@@ -173,12 +204,14 @@ src/bin/ed                 行编辑器 (POSIX 子集: a/i/c/d/p/n/l/s/t/m/r/w/q
 src/bin/kill               发送信号到进程/进程组 (kill [-SIG] pid|-pgid; kill -l)
 src/bin/chmod              修改文件权限 (八进制+符号模式 [ugoa]*[+-=][rwx]*, -R 递归)
 src/bin/chown              修改文件属主/属组 ([OWNER][:[GROUP]], -R 递归)
-src/bin/mount              挂载 ext2 块设备镜像; 无参列出已挂载 (mount [-t ext2] device dir)
-src/bin/umount             卸载已挂载文件系统 (umount dir)
+src/bin/mount              挂载 /dev/sdX、UUID=<uuid> 或镜像路径 (无 -t 按设备类型; 无参列出挂载)
+src/bin/umount             卸载文件系统 (umount <dir>|<-device>)
+src/bin/blkid              列出块设备的 UUID/TYPE/LABEL (util-linux blkid 子集)
+src/bin/lsblk              树状列出块设备: NAME/SIZE/TYPE/MOUNTPOINT (util-linux lsblk 子集)
 src/bin/login              getty/login: 登录提示->验证->启动 sh->循环
 src/bin/sh                 交互/脚本 shell(POSIX 核心子集: 变量/引号/if/for/while/case/函数/test/[ ]/&&/|| /重定向, 支持 shebang 脚本执行)
-src/modules/*.ko           内核模块: ccdisk(CC 原生 fs) ccmonitor(CC 显示器驱动) cc_hse(HSE 时钟拉模式
-                           os.msleep) demo(演示) ext2(ext2 挂载) tom(Tom GPU 驱动) void(Void 全息驱动)
+src/modules/*.ko           内核模块: ccdisk(ccdisk fstype) ccmonitor(CC 显示器驱动) cc_hse(HSE 时钟拉模式
+                           os.msleep) demo(演示) ext2(ext2 fstype) tom(Tom GPU 驱动) void(Void 全息驱动)
 src/modules/modules.alias  驱动别名(modprobe 风格): tm_gpu->tom hologram->void monitor->ccmonitor
 src/modules/manifest       默认装载模块清单: demo ext2 ccdisk
 scripts/posix_test.sh      可移植 POSIX 自检(host 与 Delin 各跑一次比对, 92 项全过)

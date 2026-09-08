@@ -702,6 +702,96 @@ do
     end
 end
 
+-- ═══════════ 磁盘设备抽象: /dev/sdX + UUID 真机自检 ═══════════
+-- 内核把每个磁盘驱动暴露为 /dev/sda(整盘 CC 原生 fs, fstype ccdisk)与
+-- /dev/sdaN(该盘 /parts/manifest 的分区镜像, fstype ext2), 另有别名 /dev/ccdiskN;
+-- UUID 用磁盘 ID 模拟(整盘 <磁盘ID>, 分区 <磁盘ID>-<分区号>)。
+do
+    local devs = (syscalls and syscalls["blkdev.list"] and syscalls["blkdev.list"]()) or {}
+    print("ext2-init: blkdev count=" .. #devs .. " /dev=[" .. table.concat(fs.list("/dev") or {}, ",") .. "]")
+    for _, e in ipairs(devs) do
+        print(string.format("ext2-init: dev %s uuid=%s fstype=%s type=%s role=%s size=%s mounted=%s",
+            e.node, tostring(e.uuid), e.fstype, e.type, tostring(e.role), tostring(e.size),
+            table.concat(e.mounted or {}, ",")))
+    end
+
+    -- 选一个当前未挂载的分区(根分区已挂在 /, 不重复挂)及其所属整盘。
+    local part, whole
+    for _, e in ipairs(devs) do
+        if e.type == "part" and #(e.mounted or {}) == 0 then part = e; break end
+    end
+    for _, e in ipairs(devs) do
+        if part and e.type == "disk" and e.index == part.index then whole = e; break end
+    end
+    if not (part and whole) then
+        print("ext2-init: no spare partition/disk for blkdev tests (skip)")
+    else
+        -- 原始字节设备: 分区可读(前 16 字节), 整盘是 CC 原生 fs -> 只能挂载。
+        local raw = fs.open(part.node, "r")
+        local chunk = raw and raw.read(16)
+        print("ext2-init: raw read " .. part.node .. " 16B ok=" .. tostring(chunk ~= nil and #chunk == 16))
+        if raw then raw.close() end
+        local dh = fs.open(whole.node, "r")
+        print("ext2-init: open " .. whole.node .. " refused(no byte stream)=" .. tostring(dh == nil))
+        if dh then dh.close() end
+
+        for _, d in ipairs({ "/mnt", "/mnt/data", "/mnt/cc" }) do
+            if not fs.exists(d) then fs.makeDir(d) end
+        end
+
+        local shHand = fs.open("/bin/sh", "r")
+        local shSrc = shHand and shHand.readAll() or nil
+        if shHand then shHand.close() end
+        if not shSrc then
+            print("ext2-init: /bin/sh not found (blkdev shell tests skipped)")
+        else
+            local lines = {
+                "blkid",
+                "lsblk",
+                "mount " .. part.node .. " /mnt/data",
+                "ls /mnt/data",
+                "mount",
+                "umount " .. part.node,
+                "mount UUID=" .. tostring(part.uuid) .. " /mnt/data",
+                "mount",
+                "umount /mnt/data",
+                "mount -t ccdisk " .. whole.node .. " /mnt/cc",
+                "ls /mnt/cc",
+                "umount " .. whole.node,
+                "mount UUID=" .. tostring(whole.uuid) .. " /mnt/cc",
+                "umount /mnt/cc",
+                "mount -t ext2 " .. whole.node .. " /mnt/cc",
+                "mount /dev/sdZZ /mnt/cc",
+                "mount UUID=999 /mnt/cc",
+                "exit",
+            }
+            local li = 0
+            local inH = { readLine = function(self) li = li + 1; return lines[li] end }
+            local outbuf = {}
+            local outH = {
+                write = function(self, s) outbuf[#outbuf + 1] = tostring(s); return #s end,
+                writeLine = function(self, s) outbuf[#outbuf + 1] = tostring(s) .. "\n"; return #s + 1 end,
+            }
+            syscalls["stdio.set"](inH, outH)
+            local spid = spawn(shSrc, "sh-blkdev", nil, nil, { [0] = "/bin/sh" })
+            if spid then waitExit(spid, 30000) end
+            local out = table.concat(outbuf)
+            local function has(s) return out:find(s, 1, true) ~= nil end
+            print("ext2-init: blkdev out=[" .. out .. "]")
+            print("ext2-init: blkdev blkid_uuid=" .. tostring(has('UUID="' .. tostring(part.uuid) .. '"'))
+                .. " blkid_ccdisk=" .. tostring(has('TYPE="ccdisk"'))
+                .. " lsblk_part=" .. tostring(has("  " .. part.name))
+                .. " mount_node=" .. tostring(has("mounted " .. part.node .. " on /mnt/data"))
+                .. " mount_uuid=" .. tostring(has("mounted " .. part.node .. " on /mnt/data type ext2"))
+                .. " mount_list_uuid=" .. tostring(has("uuid=" .. tostring(part.uuid)))
+                .. " ccdisk_ls=" .. tostring(has("parts"))
+                .. " type_mismatch=" .. tostring(has("is ccdisk, not ext2"))
+                .. " unknown_dev=" .. tostring(has("no such device"))
+                .. " umount=" .. tostring(has("unmounted")))
+        end
+    end
+end
+
 -- ═══════════ 产品形态 ═══════════
 -- 3) 产品形态: 在每个 tty 上 spawn 一个 login 进程(登录到 sh)。init 保持存活。
 --    login 各自绑定自己的 tty(per-process stdio), 经 Ctrl+Alt+数字切换前台焦点共用一把键盘。

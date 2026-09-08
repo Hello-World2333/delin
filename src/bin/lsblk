@@ -1,0 +1,85 @@
+-- Delin lsblk: 以树状列出块设备 (util-linux lsblk 子集)。
+-- 用法: lsblk [-n|--noheadings] [device...]
+-- 输出: NAME  SIZE TYPE MOUNTPOINT
+--       sda   125K disk
+--         sda1  2M part /mnt
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+local noheadings, operands, noMoreOpts = false, {}, false
+for _, a in ipairs(args) do
+    if noMoreOpts then
+        operands[#operands + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "-n" or a == "--noheadings" then
+        noheadings = true
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        stderr("lsblk: invalid option -- '" .. a:sub(2, 2) .. "'\n")
+        return
+    else
+        operands[#operands + 1] = a
+    end
+end
+
+local list = syscalls and syscalls["blkdev.list"] and syscalls["blkdev.list"]()
+if not list then
+    stderr("lsblk: blkdev.list syscall not available\n")
+    return
+end
+
+--- 字节数 -> lsblk 风格的人类可读值 (2M / 125K / 1.5M)。
+local function human(n)
+    if not n or n == 0 then return "-" end
+    local units = { "B", "K", "M", "G", "T" }
+    local i = 1
+    while n >= 1024 and i < #units do
+        n = n / 1024
+        i = i + 1
+    end
+    if i == 1 then return n .. "B" end
+    return (string.format("%.1f", n):gsub("%.0$", "")) .. units[i]
+end
+
+--- 组装输出行: NAME 带分区缩进, MOUNTPOINT 多个挂载点用逗号连接。
+local rows = {}
+for _, e in ipairs(list) do
+    local name = (e.type == "part") and ("  " .. e.name) or e.name
+    local mp = table.concat(e.mounted or {}, ",")
+    rows[#rows + 1] = { name = name, size = human(e.size), type = e.type, mp = mp }
+end
+
+if #operands > 0 then
+    local keep = {}
+    for _, spec in ipairs(operands) do
+        local want = spec:gsub("^/dev/", "")
+        for _, e in ipairs(list) do
+            if e.name == want then keep[e.name] = true end
+        end
+    end
+    local filtered = {}
+    for _, r in ipairs(rows) do
+        if keep[r.name:gsub("^%s+", "")] then filtered[#filtered + 1] = r end
+    end
+    rows = filtered
+end
+
+local wName, wSize, wType = #"NAME", #"SIZE", #"TYPE"
+for _, r in ipairs(rows) do
+    wName = math.max(wName, #r.name)
+    wSize = math.max(wSize, #r.size)
+    wType = math.max(wType, #r.type)
+end
+
+if not noheadings then
+    io.write((string.format("%-" .. wName .. "s %-" .. wSize .. "s %-" .. wType .. "s %s\n",
+        "NAME", "SIZE", "TYPE", "MOUNTPOINT"):gsub("%s+\n$", "\n")))
+end
+for _, r in ipairs(rows) do
+    io.write((string.format("%-" .. wName .. "s %-" .. wSize .. "s %-" .. wType .. "s %s\n",
+        r.name, r.size, r.type, r.mp):gsub("%s+\n$", "\n")))
+end

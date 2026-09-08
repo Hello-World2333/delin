@@ -34,6 +34,13 @@ function scheduler.setSignalCheck(fn)
     signalCheck = fn
 end
 
+--- 磁盘事件钩子(devdisk 注入): 盘插入/弹出时刷新 /dev 设备节点。
+local diskHook = nil
+
+function scheduler.setDiskHook(fn)
+    diskHook = fn
+end
+
 --- 向调度器注册一个进程协程。
 ---@param proc DelinProc
 function scheduler.addProcess(proc)
@@ -47,6 +54,9 @@ local function routeEvent(event)
         tty.feedInput(event)
     elseif event[1] == "key" or event[1] == "key_up" then
         tty.routeKey(event)
+    elseif (event[1] == "disk" or event[1] == "disk_eject") and diskHook then
+        -- 在被该事件唤醒的进程 resume 之前刷新, 保证它看到的 /dev 已是最新。
+        diskHook(event)
     end
 end
 

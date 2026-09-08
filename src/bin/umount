@@ -1,5 +1,7 @@
 -- Delin umount: 卸载一个已挂载的文件系统 (POSIX 子集)。
--- 用法: umount <dir>   (dir 为挂载点)
+-- 用法: umount <dir>|<-device>
+--   dir     挂载点
+--   device  设备节点(如 /dev/sda1 或 sda1) —— 按挂载表反查其挂载点
 local args = args or {}
 
 local function stderr(s)
@@ -28,19 +30,24 @@ elseif #operands > 1 then
     return
 end
 
-local dir = operands[1]
+local what = operands[1]
 local list = (syscalls and syscalls["fs.mounts"] and syscalls["fs.mounts"]()) or {}
-local found = false
+local target
 for _, mt in ipairs(list) do
-    if mt.root == dir then found = true; break end
+    if mt.root == what then target = mt.root; break end
 end
-if not found then
-    stderr("umount: " .. dir .. ": not mounted\n")
+if not target then
+    for _, mt in ipairs(list) do
+        if mt.device and (mt.device == what or mt.device == "/dev/" .. what) then target = mt.root; break end
+    end
+end
+if not target then
+    stderr("umount: " .. what .. ": not mounted\n")
     return
 end
-local ok, err = syscalls["fs.umount"](dir)
+local ok, err = syscalls["fs.umount"](target)
 if not ok then
     stderr("umount: " .. tostring(err) .. "\n")
     return
 end
-io.write("unmounted " .. dir .. "\n")
+io.write("unmounted " .. target .. "\n")

@@ -28,7 +28,7 @@ return {
         })
 
         -- fs: /proc (虚拟)
-        kapi.registerFS("/proc", {
+        local procBackend = {
             kind = "virtual",
             list = function() return { "cpu", "mem" } end,
             exists = function(rel)
@@ -61,6 +61,7 @@ return {
             move = function() error("read-only fs", 2) end,
             copy = function() error("read-only fs", 2) end,
             delete = function() error("read-only fs", 2) end,
-        })
+        }
+        kapi.registerFS("/proc", procBackend, { device = "proc", fstype = "proc" })
     end,
 }

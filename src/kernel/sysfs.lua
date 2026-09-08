@@ -149,7 +149,7 @@ local backend = {
 
 --- 挂载 /sys/class/display。
 function sysfs.mount()
-    vfs.mount("/sys/class/display", backend)
+    vfs.mount("/sys/class/display", backend, { device = "sysfs", fstype = "sysfs" })
     return true
 end
 

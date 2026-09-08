@@ -1,9 +1,14 @@
--- Delin mount: 把块设备镜像挂为 ext2 到 VFS 目录 (POSIX 子集)。
+-- Delin mount: 挂载文件系统到 VFS 目录 (POSIX 子集)。
 -- 用法:
---   mount                        列出当前挂载
---   mount [-t fstype] device dir 挂载; 仅支持 ext2
--- device 是落在真实后端(hdd/磁盘)上的块设备镜像(VFS 路径, 如 /parts/root.img 或
---   /mnt/left/parts/root.img)。内核把它开成块设备, 以 ext2 挂到 dir; 挂载点须为已存在目录。
+--   mount                          列出当前挂载
+--   mount [-t fstype] device dir   挂载
+-- device 可为:
+--   /dev/sda      整盘: 盘上的 CC 原生文件系统 (fstype ccdisk)
+--   /dev/sda1     分区: 盘上 /parts/manifest 列出的镜像 (fstype ext2)
+--   /dev/ccdisk0  整盘 CC 原生 fs 的别名节点
+--   UUID=<uuid>   按 UUID 挂载 (UUID 由磁盘 ID 模拟: 整盘 <id>, 分区 <id>-<n>)
+--   其他路径      真实后端上的块设备镜像/CC fs 路径 (兼容旧式)
+-- 省略 -t 时按设备条目自带的 fstype; 显式 -t 与设备类型不符即报错。
 local args = args or {}
 
 local function stderr(s)
@@ -11,18 +16,22 @@ local function stderr(s)
     if e and e.write then e:write(s) end
 end
 
-local fstype = nil
-local operands, noMoreOpts = {}, false
-for _, a in ipairs(args) do
+local fstype, operands, noMoreOpts = nil, {}, false
+local i = 1
+while i <= #args do
+    local a = args[i]
     if noMoreOpts then
         operands[#operands + 1] = a
     elseif a == "--" then
         noMoreOpts = true
     elseif a == "-t" then
-        fstype = nil
-        operands[#operands + 1] = "@t"
+        if not args[i + 1] then stderr("mount: option requires an argument -- 't'\n"); return end
+        fstype = args[i + 1]
+        i = i + 1
+    elseif a:match("^%-t.+") then
+        fstype = a:sub(3)
     elseif a:match("^%-%-type=") then
-        fstype = a:sub(#"--type=" + 1)
+        fstype = a:sub(8)
     elseif a:sub(1, 1) == "-" and a ~= "-" then
         for k = 2, #a do
             local ch = a:sub(k, k)
@@ -31,24 +40,7 @@ for _, a in ipairs(args) do
     else
         operands[#operands + 1] = a
     end
-end
-
--- 把 "-t"'@t' 标记替换为其后参数(fstype/操作数)。
-local clean = {}
-local i = 1
-while i <= #operands do
-    local a = operands[i]
-    if a == "@t" then
-        if operands[i + 1] and operands[i + 1]:sub(1, 1) ~= "-" then
-            fstype = operands[i + 1]
-            i = i + 2
-        else
-            stderr("mount: option requires an argument -- 't'\n"); return
-        end
-    else
-        clean[#clean + 1] = a
-        i = i + 1
-    end
+    i = i + 1
 end
 
 local function listMounts()
@@ -58,7 +50,9 @@ local function listMounts()
     local lines = {}
     for _, mt in ipairs(list) do
         local dev = mt.device or ((mt.root == "/") and "rootfs" or "-")
-        lines[#lines + 1] = dev .. " on " .. mt.root .. " type " .. (mt.fstype or "?") .. " (rw)"
+        local line = dev .. " on " .. mt.root .. " type " .. (mt.fstype or "?") .. " (rw)"
+        if mt.uuid then line = line .. " uuid=" .. mt.uuid end
+        lines[#lines + 1] = line
     end
     if #lines == 0 then lines[#lines + 1] = "(nothing mounted)" end
     io.write(table.concat(lines, "\n") .. "\n")
@@ -73,20 +67,22 @@ local function doMount(device, dir)
         stderr("mount: fs.mount syscall not available\n")
         return
     end
-    local ok, err = syscalls["fs.mount"](device, dir, fstype or "ext2")
+    local ok, info = syscalls["fs.mount"](device, dir, fstype)
     if not ok then
-        stderr("mount: " .. tostring(err) .. "\n")
+        stderr("mount: " .. tostring(info) .. "\n")
         return
     end
-    io.write("mounted " .. device .. " on " .. dir .. "\n")
+    info = info or {}
+    io.write("mounted " .. (info.device or device) .. " on " .. dir
+        .. " type " .. (info.fstype or fstype or "?") .. "\n")
 end
 
-if #clean == 0 then
+if #operands == 0 then
     listMounts()
-elseif #clean == 1 then
-    stderr("mount: " .. clean[1] .. ": missing mount point\n")
-elseif #clean == 2 then
-    doMount(clean[1], clean[2])
+elseif #operands == 1 then
+    stderr("mount: " .. operands[1] .. ": missing mount point\n")
+elseif #operands == 2 then
+    doMount(operands[1], operands[2])
 else
     stderr("mount: too many arguments\n")
 end

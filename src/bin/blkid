@@ -1,0 +1,60 @@
+-- Delin blkid: 列出块设备的 UUID 与文件系统类型 (util-linux blkid 子集)。
+-- 用法: blkid [device...]
+-- 输出: /dev/sda: UUID="0" TYPE="ccdisk" LABEL="MYDISK"
+--       /dev/sda1: UUID="0-1" TYPE="ext2"
+-- UUID 由磁盘 ID 模拟(CC 无文件系统 UUID): 整盘 <磁盘ID>, 分区 <磁盘ID>-<分区号>。
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+local operands, noMoreOpts = {}, false
+for _, a in ipairs(args) do
+    if noMoreOpts then
+        operands[#operands + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        stderr("blkid: invalid option -- '" .. a:sub(2, 2) .. "'\n")
+        return
+    else
+        operands[#operands + 1] = a
+    end
+end
+
+local list = syscalls and syscalls["blkdev.list"] and syscalls["blkdev.list"]()
+if not list then
+    stderr("blkid: blkdev.list syscall not available\n")
+    return
+end
+
+local function find(spec)
+    local want = spec:gsub("^/dev/", "")
+    for _, e in ipairs(list) do
+        if e.name == want then return e end
+    end
+    return nil
+end
+
+local function show(e)
+    local parts = {}
+    if e.uuid then parts[#parts + 1] = 'UUID="' .. e.uuid .. '"' end
+    if e.fstype then parts[#parts + 1] = 'TYPE="' .. e.fstype .. '"' end
+    if e.label then parts[#parts + 1] = 'LABEL="' .. e.label .. '"' end
+    io.write(e.node .. ": " .. table.concat(parts, " ") .. "\n")
+end
+
+if #operands == 0 then
+    for _, e in ipairs(list) do show(e) end
+else
+    for _, spec in ipairs(operands) do
+        local e = find(spec)
+        if e then
+            show(e)
+        else
+            stderr("blkid: " .. spec .. ": not a block device\n")
+        end
+    end
+end

@@ -8,9 +8,9 @@ local scheduler = require("kernel.scheduler")
 local process    = require("kernel.process")
 local vfs        = require("kernel.vfs")
 local vfs_api    = require("kernel.vfs_api")
+local devdisk    = require("kernel.devdisk")
 local modules    = require("kernel.modules")
 local ext2       = require("kernel.ext2")
-local blockdev   = require("kernel.blockdev")
 local tty        = require("kernel.tty")
 local fb         = require("kernel.fb")
 local display    = require("kernel.display")
@@ -36,20 +36,11 @@ local function kprint(...)
     print(line) -- 也输出到终端(view 可见)
 end
 
---- 挂载: 根 hdd + 各磁盘驱动 + /dev(+占位 /proc)。
+--- 挂载: 根 hdd + /dev(+占位 /proc)。磁盘驱动器不自动挂载 —— 只作为 /dev/sdX 设备节点
+--- 暴露(见 setupDevices), 由 `mount` 显式挂载。
 local function setupVfs()
     -- 根 = 电脑 hdd(真实路径即 "/...")
-    vfs.mount("/", vfs.real(""))
-    -- 磁盘驱动: 挂到 /mnt/<side>(真实路径 = disk.getMountPath(side))
-    for _, name in ipairs(peripheral.getNames()) do
-        if disk.hasData(name) then
-            local mp = disk.getMountPath(name)
-            if mp then
-                vfs.mount("/mnt/" .. name, vfs.real(mp))
-                kprint("mount  /mnt/" .. name .. " <-> " .. mp)
-            end
-        end
-    end
+    vfs.mount("/", vfs.real(""), { device = "rootfs", fstype = "ccdisk" })
     vfs_api.mountDev()
 
     -- 终端 stdio(io.write/read 兜底)。用冒号调用(io.write 经 stdio.output:write)。
@@ -57,6 +48,17 @@ local function setupVfs()
         { read = function(self, ...) return read(...) end },
         { write = function(self, s) return write(s) end, writeLine = function(self, s) return write(s .. "\n") end, flush = function(self) return true end }
     )
+end
+
+--- 磁盘设备: 扫描所有磁盘驱动器, 把整盘/分区注册成 /dev/sdX 节点, 并挂上热插拔刷新钩子。
+local function setupDevices()
+    local list = devdisk.refresh()
+    local names = {}
+    for _, e in ipairs(list) do
+        names[#names + 1] = e.name .. "(" .. e.fstype .. (e.uuid and (",uuid=" .. e.uuid) or "") .. ")"
+    end
+    kprint("block devices: " .. (#names > 0 and table.concat(names, " ") or "(none)"))
+    scheduler.setDiskHook(function() devdisk.refresh() end)
 end
 
 --- 在磁盘上找模块目录: /lib/modules/<version>/ (真实 fs 路径)。
@@ -115,32 +117,25 @@ local function registerRuntimeSyscalls()
     sc["stdio.set"] = function(input, output) return process.setStdio(input, output) end
     sc["tty.setFocus"] = function(name) return tty.setFocus(name) end
     sc["tty.console"] = function() return tty.getFocus() end
-    -- 挂载/卸载: 把块设备镜像(真实后端上的 /parts/*.img 等)挂为 ext2 到 VFS 目录。
-    --   fs.mount(device, dir, fstype): device 是 VFS 路径, 在真实后端上解析为真实路径;
-    --     若 device 本身已是真实路径(非 VFS 前缀), 直接当真实路径开块设备。
-    --   fs.umount(dir): 卸载; fs.mounts(): 列出当前挂载。
-    sc["fs.mount"] = function(device, dir, fstype)
-        if fstype and fstype ~= "ext2" then return nil, "unsupported fstype: " .. tostring(fstype) end
-        -- 解析 device 为真实路径: 必须落在真实后端(hdd/磁盘), 否则无法当作原始块设备打开。
-        local backend, rel, rerr = vfs.resolve(device)
-        if not backend then return nil, "mount: " .. tostring(rerr) end
-        if not backend.toReal then return nil, "mount: " .. tostring(device) .. " not on a real filesystem" end
-        local realPath = backend.toReal(rel)
-        local bd, berr = blockdev.file(realPath)
-        if not bd then return nil, "mount: " .. tostring(berr) end
-        local rfs, ferr = ext2.mount(bd)
-        if not rfs then return nil, "mount: " .. tostring(ferr) end
-        vfs.mount(dir, ext2.backend(rfs), { device = device, fstype = "ext2" })
-        return true
-    end
-    sc["fs.umount"] = function(dir) return vfs.unmount(dir) end
+    -- 挂载/卸载: device 可为 /dev/sdX(整盘 ccdisk / manifest 分区 ext2)、/dev/ccdiskN、
+    --   UUID=<uuid>(UUID 由磁盘 ID 模拟: 整盘 <id>, 分区 <id>-<n>), 或真实后端上的镜像路径(旧式)。
+    --   fs.umount(dir): 卸载并关闭块设备; fs.mounts(): 列出当前挂载(含 uuid)。
+    sc["fs.mount"] = function(device, dir, fstype) return devdisk.mount(device, dir, fstype) end
+    sc["fs.umount"] = function(dir) return devdisk.umount(dir) end
     sc["fs.mounts"] = function()
         local out = {}
         for _, m in ipairs(vfs.list()) do
-            out[#out + 1] = { root = m.root, device = m.meta and m.meta.device, fstype = m.meta and m.meta.fstype or "?" }
+            out[#out + 1] = {
+                root = m.root,
+                device = m.meta and m.meta.device,
+                fstype = m.meta and m.meta.fstype,
+                uuid = m.meta and m.meta.uuid,
+            }
         end
         return out
     end
+    sc["fs.fstypes"] = function() return devdisk.fstypes() end
+    sc["blkdev.list"] = function() return devdisk.list() end
     -- 终端信号路由: ^C(SIGINT)/^Z(SIGTSTP) 发给 tty 前台进程组。
     tty.onSignal = function(sig)
         local fg = process.tcgetpgrp(tty.getFocus())
@@ -221,9 +216,19 @@ local function bootExt2(bi)
     kprint("EXT2 boot: root=" .. (bi.rootFstype or "?") .. " " .. (bi.rootPath or "?"))
     local rfs, ferr = ext2.mount(bi.blockDevice)
     if not rfs then kprint("FATAL: root ext2 mount: " .. tostring(ferr)); return end
-    vfs.mount("/", ext2.backend(rfs)) -- 根 = ext2 分区
     vfs_api.mountDev()
     registerConsole() -- 电脑自身 term 控制台(键盘输入焦点)
+    setupDevices()    -- /dev/sdX 设备节点(磁盘不自动挂载)
+    -- 根分区对上设备节点, 使 mount/lsblk 里根挂载显示为 /dev/sdXN 而不是 "rootfs"。
+    local rootDev
+    for _, e in ipairs(devdisk.list()) do
+        if e.type == "part" and e.img == bi.blockDevice.path then rootDev = e; break end
+    end
+    if not rootDev then
+        kprint("FATAL: boot partition has no /dev node: " .. tostring(bi.blockDevice.path))
+        return
+    end
+    vfs.mount("/", ext2.backend(rfs), { device = rootDev.node, fstype = rootDev.fstype, uuid = rootDev.uuid })
     vfs_api.setStdio(
         { read = function(self, ...) return read(...) end },
         { write = function(self, s) return write(s) end, writeLine = function(self, s) return write(s .. "\n") end, flush = function(self) return true end }
@@ -277,6 +282,7 @@ function boot.boot()
         return
     end
     kprint("vfs ready")
+    setupDevices()    -- /dev/sdX 设备节点(磁盘不自动挂载)
     registerConsole() -- 电脑自身 term 控制台(键盘输入焦点)
 
     local mdir = findModuleDir()
