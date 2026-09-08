@@ -25,9 +25,9 @@ return {
         --        调度器每收到一个 hse_tick 递减, 归零后 resume。
         os.msleep = function(ms)
             ms = tonumber(ms) or 0
-            -- 四舍五入到 tick 粒度, 至少 1 tick
+            -- 四舍五入到 tick 粒度, 至少 2ms(4 ticks @2kHz), 保证调度器有时间处理键盘事件
             local ticks = math.floor(ms * FREQ / 1000 + 0.5)
-            if ticks < 1 then ticks = 1 end
+            if ticks < 4 then ticks = 4 end
             -- 设在调用者的 _ENV 上(而非模块 _G), 供调度器 rawget(proc.co_env, ...) 读取。
             -- getfenv(2) 取调用 msleep 的函数的环境(即进程 _ENV)。
             local callerEnv = getfenv(2)

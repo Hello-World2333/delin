@@ -4,7 +4,10 @@
      scheduler resumes a process when the event it is filtering for arrives.
 
      信号投递: 由 process.lua 经 scheduler.setSignalCheck 注入一个检查函数,
-     在 resume 前处理进程的 pending 信号(dead->移除 / stop->本轮跳过 / run->继续)。 ]]
+     在 resume 前处理进程的 pending 信号(dead->移除 / stop->本轮跳过 / run->继续)。
+
+     键盘路由: 在 resume 每个进程之前, 先把当前事件路由给 tty(^C/^Z 信号投递),
+     确保 SIGINT/SIGTSTP 在进程被 resume 前已进入 pending 队列。 ]]
 
 ---@class DelinProc
 ---@field pid integer
@@ -37,14 +40,38 @@ function scheduler.addProcess(proc)
     procs[#procs + 1] = proc
 end
 
+--- 处理当前事件的键盘/终端路由(在 resume 每个进程前调用)。
+--- 确保 ^C/^Z 的信号投递在进程被 resume 前完成。
+local function routeEvent(event)
+    if event[1] == "char" or event[1] == "paste" then
+        tty.feedInput(event)
+    elseif event[1] == "key" or event[1] == "key_up" then
+        tty.routeKey(event)
+    end
+end
+
 --- 事件循环。直到没有任何存活进程才返回。
 function scheduler.run()
     local event = { n = 0 }
     local blinkTimer = os.startTimer(0.5) -- 光标闪烁节拍
+    local routed = false -- 当前事件是否已路由过键盘(避免重复路由)
     while #procs > 0 do
         local i = 1
+        routed = false
         while i <= #procs do
             local proc = procs[i]
+
+            -- 0) 键盘路由: 在 resume 每个进程前, 先把当前事件路由给 tty。
+            --    这确保 ^C 的 SIGINT 在进程被 resume 前已投递到前台进程组。
+            if not routed then
+                routed = true
+                -- 内核光标闪烁计时器: 翻转光标并继续, 不外发给进程(避免唤醒 os.sleep 等)。
+                if event[1] == "timer" and event[2] == blinkTimer then
+                    tty.blinkTick()
+                    blinkTimer = os.startTimer(0.5)
+                end
+                routeEvent(event)
+            end
 
             -- 1) 投递信号: dead -> 移除; stop -> 暂停(本轮不 resume); run -> 继续。
             local state = "run"
@@ -103,19 +130,6 @@ function scheduler.run()
 
         if #procs > 0 then
             event = table.pack(os.pullEventRaw())
-            -- 内核光标闪烁计时器: 翻转光标并继续, 不外发给进程(避免唤醒 os.sleep 等)。
-            if event[1] == "timer" and event[2] == blinkTimer then
-                tty.blinkTick()
-                blinkTimer = os.startTimer(0.5)
-                event = { n = 0 }
-            end
-            -- 键盘事件路由给前台 tty(canonical 行规程: 缓冲+回显)。
-            -- key/key_up 走 routeKey(跟踪修饰键 + Ctrl+Alt+数字切换前台 tty + ^C/^D/^Z)。
-            if event[1] == "char" or event[1] == "paste" then
-                tty.feedInput(event)
-            elseif event[1] == "key" or event[1] == "key_up" then
-                tty.routeKey(event)
-            end
         end
     end
 end
