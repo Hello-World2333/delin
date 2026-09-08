@@ -22,6 +22,14 @@ local function yieldCheck(n)
     end
 end
 
+-- 安装 SIGINT handler: 收到 ^C 时跳出输出循环, 而非依赖默认终止。
+-- 默认终止依赖调度器在下一次 resume 前检查信号; 若进程正在输出(未阻塞在 pullEvent),
+-- 可能要等到下次 yield 才终止, 期间继续输出。
+local _interrupted = false
+if syscalls and syscalls["signal.install"] then
+    syscalls["signal.install"](2, function() _interrupted = true end)
+end
+
 local args = args or {}
 local cwd = (type(cwd) == "string" and cwd) or "/"
 local function resolve(p)
@@ -102,7 +110,7 @@ end
 local nLine, nNb, blankRun = 0, 0, 0
 
 local function emit(fh)
-    while true do
+    while not _interrupted do
         local line = fh.readLine()
         if line == nil then break end
         nLine = nLine + 1
@@ -153,5 +161,5 @@ local function catFile(p)
 end
 
 for _, a in ipairs(files) do
-    if not catFile(a) then return end
+    if _interrupted or not catFile(a) then return end
 end
