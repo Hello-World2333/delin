@@ -1,5 +1,20 @@
 -- Delin 用户/权限测试(EXT2 根引导时跑)。 不交互, 用程序验证。
 local msleep = os.msleep or function(ms) os.sleep(math.max(ms / 1000, 0.05)) end
+
+--- 等进程结束(轮询)。超时按墙钟算, 不按让出次数 —— 一次让出的墙钟时长随内核/HSE 模式
+--- 变化(推模式洪泛时可达几十 ms), 按次数计预算会随负载漂移, 让测试假超时。
+---@return number|nil exitCode(-1=进程不存在), nil=超时
+local function waitExit(pid, budgetMs)
+    local t0 = os.epoch("utc")
+    while os.epoch("utc") - t0 < (budgetMs or 10000) do
+        local p = syscalls["proc.info"](pid)
+        if not p then return -1 end
+        if p.status == "dead" or p.status == "error" then return p.exitCode or 0 end
+        msleep(0)
+    end
+    return nil
+end
+
 print("ext2-init: pid=" .. pid .. " uid=" .. uid .. " gid=" .. gid)
 
 -- 准备测试文件权限(以 root, uid 0)
@@ -177,6 +192,69 @@ do
 end
 print("ext2-init: tty keyboard test => " .. ttytest)
 
+-- 1b) 长输出期间的键盘投递 + 让出吞吐回归(cc_hse 推模式 -> 拉模式)。
+--     旧推模式 @2kHz 把电脑事件队列(上限 256)填满, CC 对满队列是静默丢弃 —— 长命令输出
+--     期间按键(字符/切 tty/^C)就是这样被丢掉的。拉模式只在让出时按需等 tick, 队列不积压。
+do
+    print("ext2-init: blocktest start")
+    local big = fs.open("/big.txt", "w")
+    for _ = 1, 1600 do big.write("0123456789012345678901234567890123456789\n") end -- 64KB
+    big.close()
+
+    local readerSrc = [[
+local h = fs.open("/dev/tty0", "r")
+local line = h.readLine()
+print("ext2-init: blocktest flood-reader got=[" .. tostring(line) .. "]")
+]]
+    local floodSrc = [[
+local out = fs.open("/dev/tty0", "w")
+local line = "flood-0123456789012345678901234567890123456789012345678901234567\n"
+local t0, last, n = os.epoch("utc"), os.epoch("utc"), 0
+while os.epoch("utc") - t0 < 1200 do
+    out.write(line); n = n + 1
+    local now = os.epoch("utc")
+    if now - last >= 50 then last = now; os.msleep(0) end -- 工具同款 50ms 时间片让出
+end
+out.close()
+print("ext2-init: blocktest flooder lines=" .. n .. " ms=" .. (os.epoch("utc") - t0))
+]]
+    local rpid = spawn(readerSrc, "flood-reader")
+    local fpid = spawn(floodSrc, "flooder")
+    sleep(0.2) -- 洪流已在输出、读者已阻塞在 readLine
+    -- A) 洪流中的字符仍进前台 tty 行规程(读者拿到整行)
+    for _, ch in ipairs({ "h", "i" }) do os.queueEvent("char", ch) end
+    os.queueEvent("key", keys.enter, false)
+    -- B) 洪流中的 Ctrl+Alt+2/1 仍切换前台 tty
+    local function tapSwitch(digitKey)
+        os.queueEvent("key", keys.leftCtrl, false)
+        os.queueEvent("key", keys.leftAlt, false)
+        os.queueEvent("key", digitKey, false)
+        os.queueEvent("key_up", keys.leftCtrl, false)
+        os.queueEvent("key_up", keys.leftAlt, false)
+    end
+    tapSwitch(keys.two)
+    sleep(0.1)
+    local focus1 = syscalls["tty.console"]()
+    tapSwitch(keys.one)
+    sleep(0.1)
+    print("ext2-init: blocktest focus " .. tostring(focus1) .. " -> " .. tostring(syscalls["tty.console"]())
+        .. " (expect tty1 -> tty0)")
+    waitExit(rpid, 10000)
+    waitExit(fpid, 10000)
+
+    -- C) 吞吐: cat 64KB 到文件(纯 CPU + ext2 写)。按字节让出会把吞吐钳死到几百 B/s。
+    local catHand = fs.open("/bin/cat", "r")
+    local catSrc = catHand and catHand.readAll() or nil
+    if catHand then catHand.close() end
+    local sink = { write = function(self, s) return #s end, writeLine = function(self, s) return #s + 1 end }
+    local t0 = os.epoch("utc")
+    local cpid = spawn(catSrc, "cat", nil, nil, { [0] = "/bin/cat", "/big.txt" }, { stdio = { output = sink } })
+    local code = waitExit(cpid, 120000)
+    print("ext2-init: blocktest cat 64KB->file code=" .. tostring(code)
+        .. " ms=" .. tostring(os.epoch("utc") - t0))
+    if fs.exists("/big.txt") then pcall(fs.delete, "/big.txt") end
+end
+
 -- 2) shell 脚本模式: 内存命令行(stdin) -> 内存输出缓冲(stdout)。
 --    验证内建(cd/pwd/echo/exit) + 只读外部工具(ls/cat) + spawn/argv/wait。
 --    用内存 stdio, 不写 ext2 根; 结果经 print 记录到 /delin.log。
@@ -233,14 +311,7 @@ else
     syscalls["stdio.set"](inH, outH)
     local spid = spawn(shSrc, "sh", nil, nil, { [0] = "/bin/sh" })
     print("ext2-init: shell spawn pid=" .. tostring(spid))
-    local code
-    local tries = 0
-    while tries < 30 do
-        local p = syscalls["proc.info"](spid)
-        if not p then code = -1; break end
-        if p.status == "dead" or p.status == "error" then code = p.exitCode or 0; break end
-        msleep(0); tries = tries + 1
-    end
+    local code = waitExit(spid, 10000)
     if code == nil then code = "TIMEOUT" end
     print("ext2-init: shell exited code=" .. tostring(code))
     print("ext2-init: shell out=[" .. table.concat(outbuf, "|") .. "]")
@@ -274,13 +345,7 @@ do
     }
     syscalls["stdio.set"](inH, outH)
     local spid = spawn(shSrc, "sh-dash", nil, nil, { [0] = "/bin/sh" })
-    local tries = 0
-    while spid and tries < 30 do
-        local p = syscalls["proc.info"](spid)
-        if not p then break end
-        if p.status == "dead" or p.status == "error" then break end
-        msleep(0); tries = tries + 1
-    end
+    if spid then waitExit(spid, 10000) end
     local out = table.concat(outbuf)
     local function has(s) return out:find(s, 1, true) ~= nil end
     print("ext2-init: dash touch+cat+ls+rm out=[" .. out .. "]")
@@ -316,13 +381,7 @@ do
     }
     syscalls["stdio.set"](inH, outH)
     local spid = spawn(shSrc, "sh-alice", 1000, 1000, { [0] = "/bin/sh" })
-    local tries = 0
-    while spid and tries < 30 do
-        local p = syscalls["proc.info"](spid)
-        if not p then break end
-        if p.status == "dead" or p.status == "error" then break end
-        msleep(0); tries = tries + 1
-    end
+    if spid then waitExit(spid, 10000) end
     local out = table.concat(outbuf)
     local function has(s) return out:find(s, 1, true) ~= nil end
     print("ext2-init: alice sh run nonx => [" .. out .. "]")
@@ -356,13 +415,7 @@ do
             }
             syscalls["stdio.set"](inH, outH)
             local pid = spawn(sedSrc, "sed", nil, nil, argv)
-            local tries = 0
-            while pid and tries < 30 do
-                local p = syscalls["proc.info"](pid)
-                if not p then break end
-                if p.status == "dead" or p.status == "error" then break end
-                msleep(0); tries = tries + 1
-            end
+            if pid then waitExit(pid, 10000) end
             return table.concat(outbuf)
         end
 
@@ -560,13 +613,7 @@ do
             syscalls["stdio.set"](inH, outH)
             local spid = spawn(shSrc, "sh-" .. label, nil, nil, { [0] = "/bin/sh" })
             print("ext2-init: running " .. label .. " (pid " .. tostring(spid) .. ")")
-            local tries = 0
-            while spid and tries < 500 do
-                local p = syscalls["proc.info"](spid)
-                if not p then break end
-                if p.status == "dead" or p.status == "error" then break end
-                msleep(0); tries = tries + 1
-            end
+            if spid then waitExit(spid, 60000) end
             print("ext2-init: " .. label .. " output:")
             for _, s in ipairs(outbuf) do print("  " .. s) end
         end
@@ -584,8 +631,7 @@ do
     if not shSrc then
         print("ext2-init: /bin/sh not found (chmod/chown/mount tests skipped)")
     else
-        local function runCheck(label, commands, maxTries)
-            maxTries = maxTries or 40
+        local function runCheck(label, commands)
             local li = 0
             local inH = { readLine = function(self) li = li + 1; return commands[li] end }
             local outbuf = {}
@@ -595,13 +641,7 @@ do
             }
             syscalls["stdio.set"](inH, outH)
             local spid = spawn(shSrc, "sh-" .. label, nil, nil, { [0] = "/bin/sh" })
-            local tries = 0
-            while spid and tries < maxTries do
-                local p = syscalls["proc.info"](spid)
-                if not p then break end
-                if p.status == "dead" or p.status == "error" then break end
-                msleep(0); tries = tries + 1
-            end
+            if spid then waitExit(spid, 10000) end
             local out = table.concat(outbuf)
             local function has(s) return out:find(s, 1, true) ~= nil end
             return out, has

@@ -1,6 +1,6 @@
 --@name cc_hse
---@version 0.1.0
---@description HSE clock acceleration: os.msleep(ms) for sub-tick sleep
+--@version 0.2.0
+--@description HSE clock acceleration: os.msleep(ms) via pull-mode waitNextTick
 --@deps
 
 local FREQ = 2000  -- Hz, 每 tick 0.5ms
@@ -13,31 +13,48 @@ return {
         if not hse then
             error("cc_hse: cannot wrap peripheral '" .. tostring(device) .. "'", 2)
         end
-
-        -- 设置频率并启用
-        hse.setFrequency(FREQ)
-        hse.setOn(true)
-        log("cc_hse: enabled on " .. device .. " @ " .. FREQ .. "Hz")
-
-        -- 注入 os.msleep 到全局 os 表, 所有进程通过 __index = _G 继承。
-        -- os.msleep(ms): 睡眠约 ms 毫秒, 四舍五入到 hse_tick 粒度。
-        -- 实现: 设 __msleep_remaining = ticks, yield "hse_tick",
-        --        调度器每收到一个 hse_tick 递减, 归零后 resume。
-        os.msleep = function(ms)
-            ms = tonumber(ms) or 0
-            -- 四舍五入到 tick 粒度, 至少 2ms(4 ticks @2kHz), 保证调度器有时间处理键盘事件
-            local ticks = math.floor(ms * FREQ / 1000 + 0.5)
-            if ticks < 4 then ticks = 4 end
-            -- 设在调用者的 _ENV 上(而非模块 _G), 供调度器 rawget(proc.co_env, ...) 读取。
-            -- getfenv(2) 取调用 msleep 的函数的环境(即进程 _ENV)。
-            local callerEnv = getfenv(2)
-            if callerEnv then
-                rawset(callerEnv, "__msleep_remaining", ticks)
-            end
-            coroutine.yield("hse_tick")
+        if type(hse.waitNextTick) ~= "function" then
+            error("cc_hse: peripheral has no waitNextTick (need pull-mode cc_hse)", 2)
         end
 
-        log("cc_hse: os.msleep installed")
+        -- 拉模式: 关掉 hse_tick 推送, 只在 os.msleep 里按需 waitNextTick。
+        -- 推模式 @2kHz 会在 ~128ms 内塞满电脑事件队列(上限 256), CC 对满队列是静默丢弃,
+        -- 长命令输出期间键盘事件就是这样被丢掉的("不响应键盘")。
+        -- waitNextTick 只在有人等待时产生一个唤醒事件, tick 不会在队列里积压。
+        hse.setFrequency(FREQ)
+        hse.setPushEvents(false)
+        hse.setOn(true)
+        log("cc_hse: pull mode on " .. device .. " @ " .. FREQ .. "Hz (pushEvents=false)")
+
+        -- 等够 ticks 个 HSE tick。waitNextTick 返回距上次调用经过的 tick 数(处理慢时 >1),
+        -- 用它跳过错过的拍; 返回值异常时按 1 拍计, 保证循环必然收敛。
+        local function waitTicks(ticks)
+            while ticks > 0 do
+                local elapsed = hse.waitNextTick()
+                if type(elapsed) ~= "number" or elapsed < 1 then elapsed = 1 end
+                ticks = ticks - elapsed
+            end
+        end
+
+        -- 注入 os.msleep 到全局 os 表, 所有进程通过 __index = _G 继承。
+        -- os.msleep(ms): 睡约 ms 毫秒, 亚 tick 精度(0.5ms)。
+        --   ms <= 0    -> 让出: 拉模式等 4 tick(2ms)。调用者(工具/sh)只在 50ms 时间片
+        --                 边界让出, 频率 ≤20 次/s, 不会淹没事件队列。
+        --   0 < ms < 50 -> 拉模式逐拍等够 ticks(每拍一个唤醒事件, 最多 100 个)。
+        --   ms >= 50   -> 一次 CC 定时器睡完: 逐拍等要为每拍付一个唤醒事件(50ms = 100 拍),
+        --                 那是把 tick 洪泛从推模式原样搬到拉模式, 定时器 1 个事件就够。
+        os.msleep = function(ms)
+            ms = tonumber(ms) or 0
+            if ms >= 50 then
+                os.sleep(ms / 1000)
+                return
+            end
+            local ticks = math.floor(ms * FREQ / 1000 + 0.5)
+            if ticks < 4 then ticks = 4 end
+            waitTicks(ticks)
+        end
+
+        log("cc_hse: os.msleep installed (pull mode)")
     end,
 
     exit = function()

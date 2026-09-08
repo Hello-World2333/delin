@@ -205,7 +205,6 @@ function process.spawn(src, name, ppid, uid, gid, argv, opts)
         started = false, filter = nil, dead = false,
         status = "running", onExit = proc.onExit,
         sig = proc.sig, canonical = proc,
-        co_env = env,  -- 进程隔离 _ENV, 供调度器读写 __msleep_remaining
     })
 
     return pid, proc, nil

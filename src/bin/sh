@@ -6,6 +6,16 @@
 -- 输出走 io.stdout(父进程把它指向控制台 tty 或文件), 绝不 print(kprint 走日志+term)。
 
 local msleep = os.msleep or function(ms) os.sleep(math.max(ms / 1000, 0.05)) end
+-- 让出调度器: 50ms 时间片。循环体每次迭代都让出的话, 事件往返会吞掉大部分时间;
+-- 时间片式让出既防 "Too long without yielding", 又保证 ^C/按键延迟不超过一个时间片。
+local _sliceAt = os.epoch("utc")
+local function schedYield()
+    local now = os.epoch("utc")
+    if now - _sliceAt >= 50 then
+        _sliceAt = now
+        msleep(0)
+    end
+end
 
 local stdin  = io.stdin()
 local stdout = io.stdout()
@@ -645,7 +655,7 @@ local function pollWait(pidIn)
             msleep(0) -- 等调度器处理退出
             return "exited", -2
         end
-        msleep(0)
+        msleep(50) -- 轮询子进程状态: 50ms 一次(逐拍让出会让事件往返吞掉整个时间片)
     end
 end
 local function resolveJob(ref)
@@ -1005,7 +1015,7 @@ evalNode = function(node)
             if c == "exit" then return rt end
             if c == "break" then break end
             lastst = rt  -- continue: 走到下一个迭代即可
-            msleep(0)
+            schedYield()
             if sigintPending then sigintPending = false; break end
         end
         return lastst
@@ -1021,7 +1031,7 @@ evalNode = function(node)
             if cc == "exit" then return rt end
             if cc == "break" then break end
             lastst = rt
-            msleep(0)
+            schedYield()
             if sigintPending then sigintPending = false; break end
         end
         return lastst

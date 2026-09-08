@@ -10,6 +10,9 @@ local ROOT = "/tmp/delinhost"
 -- pipe 内核模块用 os.sleep 做协作式阻塞; 在宿主上把它改成 yield 给调度器
 -- (宿主 lua5.1 的 os 没有 sleep, 且这里必须能让出当前协程让调度器切走)。
 os.sleep = function() coroutine.yield() end
+-- 工具的让出是时间片式的(os.epoch("utc") 毫秒); 宿主用 os.clock 顶上。
+-- 宿主调度器不推进真实时间, 时间片基本不会到期 —— 逻辑测试不受影响。
+os.epoch = os.epoch or function() return math.floor(os.clock() * 1000) end
 
 local function cmd(...) return { ... } end
 

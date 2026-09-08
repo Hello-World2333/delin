@@ -54,10 +54,16 @@ end
 function scheduler.run()
     local event = { n = 0 }
     local blinkTimer = os.startTimer(0.5) -- 光标闪烁节拍
+    -- 调度心跳: 裸让出(filter=nil, 如 tty.readLine 里的 os.pullEvent())的进程只在事件到来
+    -- 时才会被恢复; 空闲期没有键盘/定时器事件, 必须靠心跳推进, 否则会永久挂起。
+    -- 20Hz 对事件队列(上限 256)压力可忽略 —— 与旧 hse_tick 2kHz 推模式完全不是一回事。
+    local beatTimer = os.startTimer(0.05)
     local routed = false -- 当前事件是否已路由过键盘(避免重复路由)
+    local kernelTimer = false -- 当前 timer 事件是否属于内核(闪烁/心跳)
     while #procs > 0 do
         local i = 1
         routed = false
+        kernelTimer = false
         while i <= #procs do
             local proc = procs[i]
 
@@ -65,10 +71,17 @@ function scheduler.run()
             --    这确保 ^C 的 SIGINT 在进程被 resume 前已投递到前台进程组。
             if not routed then
                 routed = true
-                -- 内核光标闪烁计时器: 翻转光标并继续, 不外发给进程(避免唤醒 os.sleep 等)。
-                if event[1] == "timer" and event[2] == blinkTimer then
-                    tty.blinkTick()
-                    blinkTimer = os.startTimer(0.5)
+                -- 内核自己的计时器: 翻转光标 / 心跳续期。两者都不投给等待 "timer" 的进程
+                -- (那是进程自己 os.startTimer 的事件), 但裸让出进程照常被心跳唤醒。
+                if event[1] == "timer" then
+                    if event[2] == blinkTimer then
+                        tty.blinkTick()
+                        blinkTimer = os.startTimer(0.5)
+                        kernelTimer = true
+                    elseif event[2] == beatTimer then
+                        beatTimer = os.startTimer(0.05)
+                        kernelTimer = true
+                    end
                 end
                 routeEvent(event)
             end
@@ -84,18 +97,16 @@ function scheduler.run()
                 i = i + 1
             else
                 -- 2) 新进程用空事件启动；已启动进程仅在 filter 匹配(或 terminate)时恢复。
-                local shouldRun = (not proc.started)
-                    or proc.filter == nil
-                    or proc.filter == event[1]
-                    or event[1] == "terminate"
-
-                -- msleep 计数器: hse_tick 到来时, 若 __msleep_remaining > 0 则递减, 不 resume。
-                if shouldRun and proc.filter == "hse_tick" and event[1] == "hse_tick" then
-                    local rem = rawget(proc.co_env, "__msleep_remaining")
-                    if rem and rem > 0 then
-                        rawset(proc.co_env, "__msleep_remaining", rem - 1)
-                        shouldRun = false
-                    end
+                --    裸让出(filter=nil)匹配任意事件(含心跳); 内核计时器不唤醒等 "timer" 的进程。
+                local shouldRun
+                if not proc.started or event[1] == "terminate" then
+                    shouldRun = true
+                elseif proc.filter == nil then
+                    shouldRun = true
+                elseif proc.filter == event[1] then
+                    shouldRun = not kernelTimer
+                else
+                    shouldRun = false
                 end
 
                 if shouldRun then

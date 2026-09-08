@@ -95,6 +95,11 @@ v0.0.1 的协程调度内核 + 进程树之后，已扩展为具备 VFS、块设
 
 - **并发**：内核自持 `os.pullEventRaw` 循环，`coroutine.create/resume` + 按协程 yield 的 filter
   分发事件；进程经原始 API（`os.sleep`/`os.pullEvent`/`fs`……）yield，调度器驱动。
+- **时钟与让出**：`cc_hse` 时钟走**拉模式**（`setPushEvents(false)` + 按需 `waitNextTick`）。
+  推送模式 @2kHz 会在 ~128ms 内塞满电脑事件队列（上限 256），CC 对满队列静默丢弃 —— 长命令
+  输出期间的按键（字符/切 tty/`^C`）就是这样被丢掉的。`os.msleep(0)` 是一次按需 tick 让出
+  （≥2ms，`ms>=50` 走 CC 定时器），工具与 `sh` 只在 ~50ms 时间片边界让出；内核另有 0.05s 调度
+  心跳，保证裸让出（`filter=nil`，如 `tty.readLine`）的进程在空闲期也能推进。
 - **隔离环境**：每个进程有自己的 `_ENV`（`load(src, name, "t", env)`），注入内核上下文
   `spawn`/`pid`/`ppid`/`uid`/`gid`/`syscalls`，`__index = _G` 兜底原始 API。
 - **`spawn` 只收源码字符串**：`spawn(src, name?, uid?, gid?, argv?, opts?)` 在隔离 `_ENV` 里建子进程；
@@ -165,8 +170,8 @@ src/bin/mount              挂载 ext2 块设备镜像; 无参列出已挂载 (m
 src/bin/umount             卸载已挂载文件系统 (umount dir)
 src/bin/login              getty/login: 登录提示->验证->启动 sh->循环
 src/bin/sh                 交互/脚本 shell(POSIX 核心子集: 变量/引号/if/for/while/case/函数/test/[ ]/&&/|| /重定向, 支持 shebang 脚本执行)
-src/modules/*.ko           内核模块: ccdisk(CC 原生 fs) ccmonitor(CC 显示器驱动) demo(演示)
-                           ext2(ext2 挂载) tom(Tom GPU 驱动) void(Void 全息驱动)
+src/modules/*.ko           内核模块: ccdisk(CC 原生 fs) ccmonitor(CC 显示器驱动) cc_hse(HSE 时钟拉模式
+                           os.msleep) demo(演示) ext2(ext2 挂载) tom(Tom GPU 驱动) void(Void 全息驱动)
 src/modules/modules.alias  驱动别名(modprobe 风格): tm_gpu->tom hologram->void monitor->ccmonitor
 src/modules/manifest       默认装载模块清单: demo ext2 ccdisk
 scripts/posix_test.sh      可移植 POSIX 自检(host 与 Delin 各跑一次比对, 92 项全过)
