@@ -9,6 +9,18 @@
 --   -t                  按修改时间排序(新的在前)
 --   -r, --reverse        逆序输出
 -- 支持短选项组合(-la)与 -- 结束选项。FILE 缺省为当前目录。
+-- 让出调度器: 防止大量输出时 "Too long without yielding"。
+local _msleep = os.msleep or function(ms) os.sleep(math.max((ms or 0) / 1000, 0.05)) end
+local _yieldEvery = os.msleep and 1 or 200
+local _yieldAcc = 0
+local function yieldCheck(n)
+    _yieldAcc = _yieldAcc + (n or 0)
+    if _yieldAcc >= _yieldEvery then
+        _yieldAcc = 0
+        _msleep(0)
+    end
+end
+
 local args = args or {}
 local cwd = (type(cwd) == "string" and cwd) or "/"
 local function resolve(p)
@@ -154,6 +166,7 @@ local function lineLong(a, name)
     s = s .. " " .. fmtTime(a.mtime)
     s = s .. " " .. classify(a, name)
     io.write(s .. "\n")
+    yieldCheck(#s + 1)
 end
 
 -- ---------------------------------------------------------------
@@ -173,7 +186,9 @@ local function renderOne(full, name)
     if optLong then
         lineLong(a, name)
     else
-        io.write(name .. (a.isDir and "/" or "") .. "\n")
+        local out = name .. (a.isDir and "/" or "") .. "\n"
+        io.write(out)
+        yieldCheck(#out)
     end
 end
 

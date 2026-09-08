@@ -6,6 +6,18 @@
 --   支持的选项: -n -s -e script -f file -i[suffix]。
 --   正则用 Lua pattern(与 grep 一致): % 是转义符, () 是捕获; 替换里 & = 整串匹配,
 --   \1..\9 = 捕获组, \n/\t 换行/制表, \& \\ 转义。BRE 风格的 \(...\) 与模式内 \1 逆引用不支持。
+-- 让出调度器: 防止大量输出时 "Too long without yielding"。
+local _msleep = os.msleep or function(ms) os.sleep(math.max((ms or 0) / 1000, 0.05)) end
+local _yieldEvery = os.msleep and 1 or 200
+local _yieldAcc = 0
+local function yieldCheck(n)
+    _yieldAcc = _yieldAcc + (n or 0)
+    if _yieldAcc >= _yieldEvery then
+        _yieldAcc = 0
+        _msleep(0)
+    end
+end
+
 local args = args or {}
 local cwd = (type(cwd) == "string" and cwd) or "/"
 local function resolve(p)
@@ -496,7 +508,9 @@ end
 
 local curOut -- nil => stdout; 否则为写入的文件句柄
 local function wline(s)
-    if curOut then curOut.write((s or "") .. "\n") else io.write((s or "") .. "\n") end
+    local out = (s or "") .. "\n"
+    if curOut then curOut.write(out) else io.write(out) end
+    yieldCheck(#out)
 end
 
 local function readAllLines(handle)

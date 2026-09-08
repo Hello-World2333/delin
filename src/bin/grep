@@ -15,6 +15,18 @@
 --   -s, --no-messages     抑制错误信息
 --   -F, --fixed-strings   PATTERN 按字面匹配(转义 Lua pattern 元字符)
 --   正则为 Lua pattern(与 GNU BRE/ERE 不同)。无 FILE 或 FILE 为 "-" 时读 stdin。
+-- 让出调度器: 防止大量输出时 "Too long without yielding"。
+local _msleep = os.msleep or function(ms) os.sleep(math.max((ms or 0) / 1000, 0.05)) end
+local _yieldEvery = os.msleep and 1 or 200
+local _yieldAcc = 0
+local function yieldCheck(n)
+    _yieldAcc = _yieldAcc + (n or 0)
+    if _yieldAcc >= _yieldEvery then
+        _yieldAcc = 0
+        _msleep(0)
+    end
+end
+
 local args = args or {}
 local cwd = (type(cwd) == "string" and cwd) or "/"
 local function resolve(p)
@@ -224,7 +236,9 @@ local function search(fh, label)
             count = count + 1
             if quiet then return count, n end
             if doFiles then
-                io.write((label or "") .. "\n")
+                local out = (label or "") .. "\n"
+                io.write(out)
+                yieldCheck(#out)
                 return count, n
             elseif not doCount then
                 local prefix = ""
@@ -232,10 +246,14 @@ local function search(fh, label)
                 if withNum then prefix = prefix .. tostring(n) .. ":" end
                 if onlyMatch then
                     for _, span in ipairs(collectMatches(hay)) do
-                        io.write(prefix .. line:sub(span[1], span[2]) .. "\n")
+                        local out = prefix .. line:sub(span[1], span[2]) .. "\n"
+                        io.write(out)
+                        yieldCheck(#out)
                     end
                 else
-                    io.write(prefix .. line .. "\n")
+                    local out = prefix .. line .. "\n"
+                    io.write(out)
+                    yieldCheck(#out)
                 end
             end
         end

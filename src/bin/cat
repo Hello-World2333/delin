@@ -9,6 +9,19 @@
 --   -v, --show-nonprinting 以 ^ 与 M- 记号显示不可打印字符
 --   -u                    忽略(无缓冲)
 -- FILE 为 "-" 或缺省时读 stdin。支持组合短选项与 --。
+-- 让出调度器: 防止大量输出时 "Too long without yielding"。
+-- HSE 环境用 os.msleep(0) 细粒度让出; 否则每 200 字节 sleep(0) 让出一次。
+local _msleep = os.msleep or function(ms) os.sleep(math.max((ms or 0) / 1000, 0.05)) end
+local _yieldEvery = os.msleep and 1 or 200  -- HSE: 每字节; 无 HSE: 每 200 字节
+local _yieldAcc = 0
+local function yieldCheck(n)
+    _yieldAcc = _yieldAcc + (n or 0)
+    if _yieldAcc >= _yieldEvery then
+        _yieldAcc = 0
+        _msleep(0)
+    end
+end
+
 local args = args or {}
 local cwd = (type(cwd) == "string" and cwd) or "/"
 local function resolve(p)
@@ -112,7 +125,9 @@ local function emit(fh)
             end
             local body = showLine(line)
             if optEnds then body = body .. "$" end
-            io.write(prefix .. body .. "\n")
+            local out = prefix .. body .. "\n"
+            io.write(out)
+            yieldCheck(#out)
         end
     end
 end

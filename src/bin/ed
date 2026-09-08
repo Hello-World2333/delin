@@ -13,6 +13,18 @@
 --
 --   与真实 ed 的已知偏离: g 命令表内仅一条命令(单行); g 表内 m/t 反向移动不保证
 --   后续目标行定位(行身份用内部 id 追踪, d/a/s 等常规命令不受影响)。
+-- 让出调度器: 防止大量输出时 "Too long without yielding"。
+local _msleep = os.msleep or function(ms) os.sleep(math.max((ms or 0) / 1000, 0.05)) end
+local _yieldEvery = os.msleep and 1 or 200
+local _yieldAcc = 0
+local function yieldCheck(n)
+    _yieldAcc = _yieldAcc + (n or 0)
+    if _yieldAcc >= _yieldEvery then
+        _yieldAcc = 0
+        _msleep(0)
+    end
+end
+
 local args = args or {}
 local cwd = (type(cwd) == "string" and cwd) or "/"
 local function resolve(p)
@@ -62,7 +74,7 @@ local interactive = stdin and stdin.isTTY
 
 local unpack = table.unpack or unpack
 
-local function out(s) stdout:write(s) end
+local function out(s) stdout:write(s); yieldCheck(#s) end
 
 local function reportErr(msg)
     helpMsg = msg
