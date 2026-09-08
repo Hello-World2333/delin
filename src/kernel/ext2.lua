@@ -546,6 +546,40 @@ function ext2.writeFile(fs, ino, content)
     return true
 end
 
+--- 在文件末尾追加数据(增量落盘, 不重写已有内容)。
+--- 供日志类长驻进程用: 追加句柄 flush 时只写新增部分, 不必重写整个文件。
+---@param fs Ext2Fs
+---@param ino integer
+---@param content string
+---@return boolean|nil ok, string|nil err
+function ext2.appendFile(fs, ino, content)
+    if content == "" then return true end
+    local inode = ext2.readInode(fs, ino)
+    if not inode or (inode.type ~= T_REG and inode.type ~= T_SYM) then return nil, "not a regular file" end
+    local blockSize = fs.blockSize
+    local offset = inode.size or 0
+    local i = 1
+    while i <= #content do
+        local idx = math.floor(offset / blockSize)
+        local blk = ext2.ensureBlock(fs, inode, idx)
+        if not blk then return nil, "no block" end
+        local off = offset % blockSize
+        local chunk = content:sub(i, i + (blockSize - off) - 1)
+        if off == 0 and #chunk == blockSize then
+            writeBlockStr(fs, blk, chunk)
+        else
+            local old = readBlockStr(fs, blk) or ""
+            writeBlockStr(fs, blk, old:sub(1, off) .. chunk .. old:sub(off + #chunk + 1))
+        end
+        offset = offset + #chunk
+        i = i + #chunk
+    end
+    inode.size = offset
+    inode.mtime = math.floor(os.epoch("utc") / 1000)
+    ext2.writeInode(fs, inode)
+    return true
+end
+
 function ext2.removeDirEntry(fs, dirIno, name)
     local nBlocks = math.ceil((dirIno.size or 0) / fs.blockSize)
     for idx = 0, nBlocks - 1 do
@@ -673,16 +707,18 @@ function ext2.backend(fs)
                 ext2.writeFile(fs, i.ino, "")
                 local parts = {}
                 -- 句柄方法同时支持 `.method(s)` 与 `:method(s)`(CC 原生句柄两者皆可)。
+                -- flush/close 把累积内容整体写回(w 模式语义: 全量重写)。
+                local function commit() return ext2.writeFile(fs, i.ino, table.concat(parts)) end
                 return {
                     write = function(self, s) if s == nil then s = self end; parts[#parts + 1] = s; return #s end,
                     writeLine = function(self, s) if s == nil then s = self end; parts[#parts + 1] = s .. "\n"; return #s + 1 end,
-                    flush = function() return true end,
-                    close = function() ext2.writeFile(fs, i.ino, table.concat(parts)); return true end,
+                    flush = commit,
+                    close = commit,
                     seek = function() return 0 end,
                 }
             end
             if mode and mode:find("a") then
-                -- 追加: 若不存在则创建; close 时写"原内容 + 新内容"。
+                -- 追加: 若不存在则创建; 写入只在文件末尾增量落盘(flush/close 提交新增部分)。
                 if not i then
                     local pdir = rel:match("^(.*)/[^/]*$") or "/"
                     local pname = rel:match("([^/]*)$") or rel
@@ -693,13 +729,18 @@ function ext2.backend(fs)
                 end
                 if i.type == T_DIR then return nil, "is a directory" end
                 if not hasPerm(i, c.uid, c.gid, 2) then return nil, "permission denied (file)" end
-                local existing = ext2.readFile(fs, i)
                 local parts = {}
+                local function commit()
+                    if #parts == 0 then return true end
+                    local data = table.concat(parts)
+                    parts = {}
+                    return ext2.appendFile(fs, i.ino, data)
+                end
                 return {
                     write = function(self, s) if s == nil then s = self end; parts[#parts + 1] = s; return #s end,
                     writeLine = function(self, s) if s == nil then s = self end; parts[#parts + 1] = s .. "\n"; return #s + 1 end,
-                    flush = function() return true end,
-                    close = function() ext2.writeFile(fs, i.ino, existing .. table.concat(parts)); return true end,
+                    flush = commit,
+                    close = commit,
                     seek = function() return 0 end,
                 }
             end

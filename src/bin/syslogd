@@ -1,0 +1,276 @@
+-- Delin syslogd: 系统日志守护进程 (rsyslog/syslogd 子集)。
+-- 用法: syslogd [-f /etc/syslog.conf] [-p /run/syslogd.pid] [-n]
+--   -f FILE  规则文件(默认 /etc/syslog.conf)
+--   -p FILE  pid 文件(默认 /run/syslogd.pid)
+--   -n       前台运行(Delin 无 fork, 恒为前台; 接受此选项仅为兼容)
+--
+-- 数据来源(两条通道与 Linux 同构):
+--   /dev/kmsg  内核 ring buffer 流, 行格式 "pri,seq,usec,-;text"  -> tag "kernel"
+--   /dev/log   用户态 syslog 输入, 行格式 "<PRI>tag: message"      -> tag 取冒号前
+-- 规则文件 /etc/syslog.conf(syslog.conf(5) 子集):
+--   selector        action
+--   selector = facility[.severity], 逗号分隔多项, 分号分隔多组(后者可覆盖前者的 none 排除);
+--   facility: kern user mail daemon auth syslog lpr news uucp cron authpriv ftp local0..7 或 *
+--   severity: emerg alert crit err warning notice info debug 或 *(none 表示排除该 facility)
+--   severity 语义: 该等级及更严重(数值更小)的消息。
+--   action: 文件路径(以 - 开头表示不 fsync, Delin 恒为立即 flush, 前缀被忽略)或 /dev/console。
+-- 收到 SIGHUP 重新打开全部输出文件(供 /bin/logrotate 轮转后通知); SIGTERM 正常退出。
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+local function fatal(msg)
+    stderr("syslogd: " .. msg .. "\n")
+    return 1
+end
+
+-- ---------------------------------------------------------------
+-- 参数
+-- ---------------------------------------------------------------
+local confPath, pidPath = "/etc/syslog.conf", "/run/syslogd.pid"
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if a == "-f" and args[i + 1] then confPath = args[i + 1]; i = i + 1
+    elseif a:match("^%-%-conf=") then confPath = a:sub(8)
+    elseif a == "-p" and args[i + 1] then pidPath = args[i + 1]; i = i + 1
+    elseif a:match("^%-%-pidfile=") then pidPath = a:sub(11)
+    elseif a == "-n" or a == "--no-fork" then -- 恒前台, 接受即可
+    elseif a == "--help" or a == "-h" then
+        io.write("usage: syslogd [-f conffile] [-p pidfile] [-n]\n")
+        return 0
+    else
+        return fatal("unknown option '" .. a .. "'")
+    end
+    i = i + 1
+end
+
+-- ---------------------------------------------------------------
+-- facility/severity 名表(内核 syscall 提供, 唯一真源)
+-- ---------------------------------------------------------------
+local FAC, SEV = {}, {}
+for _, n in ipairs(syscalls["syslog.facilities"]()) do FAC[n] = syscalls["syslog.facility"](n) end
+for _, n in ipairs(syscalls["syslog.severities"]()) do SEV[n] = syscalls["syslog.severity"](n) end
+
+-- ---------------------------------------------------------------
+-- 规则解析
+-- ---------------------------------------------------------------
+local function parseSelectors(spec, lineno)
+    local groups = {}
+    for one in (spec .. ";"):gmatch("([^;]*);") do
+        local group = {}
+        for item in (one .. ","):gmatch("([^,]*),") do
+            item = item:gsub("%s+", "")
+            if item ~= "" then
+                local fac, sev = item:match("^([%w%*]+)%.([%w%*]+)$")
+                if not fac then fac, sev = item, nil end
+                if fac ~= "*" and not FAC[fac] then
+                    return nil, string.format("%s:%d: unknown facility '%s'", confPath, lineno, fac)
+                end
+                if sev and sev ~= "*" and sev ~= "none" and not SEV[sev] then
+                    return nil, string.format("%s:%d: unknown severity '%s'", confPath, lineno, sev)
+                end
+                group[#group + 1] = {
+                    facility = fac,
+                    severity = sev and (sev == "*" and "*" or (sev == "none" and "none" or SEV[sev])) or "*",
+                }
+            end
+        end
+        if #group > 0 then groups[#groups + 1] = group end
+    end
+    if #groups == 0 then return nil, string.format("%s:%d: empty selector", confPath, lineno) end
+    return groups
+end
+
+local function readConf(path)
+    local f = fs.open(path, "r")
+    if not f then return nil, path .. ": cannot open" end
+    local text = f.readAll()
+    f.close()
+    local rules = {}
+    local lineno = 0
+    for raw in (text .. "\n"):gmatch("([^\n]*)\n") do
+        lineno = lineno + 1
+        local line = raw:gsub("#.*$", ""):gsub("^%s+", ""):gsub("%s+$", "")
+        if line ~= "" then
+            local sel, action = line:match("^(%S+)%s+(.+)$")
+            if not sel then
+                return nil, string.format("%s:%d: expected 'selector action'", path, lineno)
+            end
+            action = action:gsub("%s+$", "")
+            if action:sub(1, 1) == "-" then action = action:sub(2) end -- 忽略 fsync 前缀
+            local groups, err = parseSelectors(sel, lineno)
+            if not groups then return nil, err end
+            rules[#rules + 1] = { groups = groups, action = action, line = lineno }
+        end
+    end
+    return rules
+end
+
+local function selectorMatch(groups, fac, sev)
+    local hit = false
+    for _, group in ipairs(groups) do
+        for _, s in ipairs(group) do
+            if s.facility == "*" or s.facility == fac then
+                if s.severity == "none" then
+                    hit = false
+                elseif s.severity == "*" then
+                    hit = true
+                elseif sev <= s.severity then
+                    hit = true
+                else
+                    hit = false
+                end
+            end
+        end
+    end
+    return hit
+end
+
+-- ---------------------------------------------------------------
+-- 输出文件
+-- ---------------------------------------------------------------
+local outputs = {}   -- path -> handle
+local rules = {}     -- 规则表(readConf 填充)
+local hupPending = false
+local running = true
+
+local function openOutput(path)
+    local h = outputs[path]
+    if h then return h end
+    h = fs.open(path, "a")
+    if not h then return nil, path .. ": cannot open for append" end
+    outputs[path] = h
+    return h
+end
+
+local function closeOutputs()
+    for path, h in pairs(outputs) do
+        pcall(h.flush)
+        pcall(h.close)
+        outputs[path] = nil
+    end
+end
+
+--- 一条消息按规则分发。
+local function dispatch(pri, tag, msg)
+    local fac, sev = syscalls["syslog.facilityName"](math.floor(pri / 8)), pri % 8
+    local stamp = os.date("%b %d %H:%M:%S", math.floor(os.epoch("utc") / 1000))
+    local line = stamp .. " " .. tag .. ": " .. msg
+    for _, rule in ipairs(rules) do
+        if selectorMatch(rule.groups, fac, sev) then
+            local h, err = openOutput(rule.action)
+            if not h then
+                stderr("syslogd: " .. err .. "\n")
+            else
+                h:writeLine(line)
+                h:flush()
+            end
+        end
+    end
+end
+
+-- ---------------------------------------------------------------
+-- 输入解析
+-- ---------------------------------------------------------------
+--- /dev/kmsg 行: "pri,seq,usec,-;text"
+local function handleKmsg(line)
+    local pri, text = line:match("^(%d+),%d+,%d+,%-?%d*;(.*)$")
+    if not pri then return end
+    dispatch(tonumber(pri), "kernel", text)
+end
+
+--- /dev/log 行: "<PRI>tag: message"(可选 RFC3164 时间戳被忽略)
+local function handleUser(line)
+    local pri, rest = line:match("^<(%d+)>(.*)$")
+    if not pri then
+        pri, rest = 13, line -- 无优先级 -> user.notice
+    else
+        pri = tonumber(pri)
+    end
+    rest = rest:gsub("^%a%a%a +%d+ +%d%d:%d%d:%d%d +", "")
+    local tag, msg = rest:match("^([^:]+):%s*(.*)$")
+    if not tag then tag, msg = "user", rest end
+    dispatch(pri, tag, msg)
+end
+
+-- ---------------------------------------------------------------
+-- 启动
+-- ---------------------------------------------------------------
+local loaded, err = readConf(confPath)
+if not loaded then return fatal(err) end
+rules = loaded
+if #rules == 0 then return fatal(confPath .. ": no rules") end
+
+local kmsg = fs.open("/dev/kmsg", "r")
+if not kmsg then return fatal("/dev/kmsg: cannot open") end
+local ulog = fs.open("/dev/log", "r")
+if not ulog then return fatal("/dev/log: cannot open") end
+
+-- 续读游标: /dev/kmsg 的读取位置持久化在 /run/syslogd.kmsg(格式 "<seq> <引导标识>")。
+-- 首次启动(无游标)从 ring buffer 最旧一条开始, 把引导日志一并落盘;
+-- 重启后从游标续读, 不重放整段 ring buffer(否则每次重启都会重复写一遍引导日志)。
+-- 引导标识不符(上次引导留下的游标)则忽略, 从最旧开始。
+local cursorPath = "/run/syslogd.kmsg"
+local klogBoot = syscalls["klog.stats"]().boot
+do
+    local cf = fs.open(cursorPath, "r")
+    if cf then
+        local seq, boot = (cf.readLine() or ""):match("^(%d+)%s*(%d*)")
+        cf.close()
+        seq, boot = tonumber(seq), tonumber(boot)
+        local st = syscalls["klog.stats"]()
+        if seq and boot and boot == st.boot and seq >= st.first and seq <= st.next then
+            local ok, serr = kmsg:seek(seq)
+            if not ok then return fatal("/dev/kmsg: " .. tostring(serr)) end
+            print("syslogd: resumed /dev/kmsg at seq " .. seq)
+        end
+    end
+end
+
+local function saveCursor()
+    local w = fs.open(cursorPath, "w")
+    if not w then return end
+    w:writeLine(kmsg:cursor() .. " " .. tostring(klogBoot))
+    w:close()
+end
+
+local pf = fs.open(pidPath, "w")
+if not pf then return fatal(pidPath .. ": cannot write pid file") end
+pf:writeLine(tostring(pid))
+pf:close()
+
+syscalls["signal.install"](1, function() hupPending = true end)  -- SIGHUP: 重开输出文件
+syscalls["signal.install"](15, function() running = false end)   -- SIGTERM: 退出
+
+print("syslogd: started pid=" .. pid .. " conf=" .. confPath .. " rules=" .. #rules)
+
+while running do
+    -- SIGHUP 先于本轮读取处理: logrotate 轮转后发来的信号必须让本轮消息就写进新文件
+    -- (否则本轮消息会落进已被改名/删除的旧句柄)。
+    if hupPending then
+        hupPending = false
+        closeOutputs()
+        print("syslogd: SIGHUP - reopened log files")
+    end
+    local got = false
+    local data = kmsg:readAvailable()
+    if data and data ~= "" then
+        got = true
+        for line in data:gmatch("[^\n]+") do handleKmsg(line) end
+        saveCursor()
+    end
+    data = ulog:readAvailable()
+    if data and data ~= "" then
+        got = true
+        for line in data:gmatch("[^\n]+") do handleUser(line) end
+    end
+    if not got then os.sleep(0.05) end
+end
+
+closeOutputs()
+print("syslogd: stopped")
+return 0

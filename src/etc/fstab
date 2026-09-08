@@ -1,0 +1,14 @@
+# Delin /etc/fstab —— 见 fstab(5)。
+#   <file system> <mount point> <type> <options> <dump> <pass>
+# 设备:
+#   /dev/sdaN            引导盘的第 N 个分区(盘上 /parts/manifest 的分区行序号)
+#   UUID=<磁盘ID>-<分区号>  按 UUID 挂载(CC 无文件系统 UUID, 用磁盘 ID 模拟)
+#   /dev/ccdiskN         整盘 CC 原生文件系统(fstype ccdisk)
+# 选项: defaults ro rw auto noauto nofail user users
+#   noauto 启动时不自动挂载; nofail 挂载失败不阻断 local-fs.target;
+#   ro/rw/user/users 解析后忽略(Delin 的 fstype 无只读模式/无 setuid)。
+# 根文件系统由引导装载器挂载, 无需在此列出(重复列出会被跳过)。
+#
+# 示例(默认注释, 需要时启用):
+# UUID=0-2   /mnt/data   ext2   defaults   0 2
+# /dev/sda2  /mnt/extra  ext2   noauto     0 2

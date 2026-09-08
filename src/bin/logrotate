@@ -1,0 +1,264 @@
+-- Delin logrotate: 日志轮转工具 (logrotate(8) 子集)。
+-- 用法: logrotate [-f] [-d] [-v] [config]
+--   -f  忽略触发条件强制轮转; -d 只打印将做什么; -v 详细
+-- 配置文件(默认 /etc/logrotate.conf)格式:
+--   全局默认指令(第一条路径之前) + 若干 "/path { ... }" 段:
+--     size N[k|M]        超过 N 字节才轮转
+--     daily|weekly|monthly  按 mtime 到达周期才轮转(与 size 同时给出时 size 优先)
+--     rotate N           保留 N 个历史档(.1 最新), 超出删除
+--     create [mode [owner [group]]]  轮转后新建空文件(默认 0644)
+--     notifempty         空文件不轮转
+--     missingok          文件不存在不报错
+--   未列出的指令一律 fail-fast 报错(不做静默忽略)。
+-- 轮转后若 /run/syslogd.pid 存在, 向该进程发 SIGHUP 使其重开日志文件。
+-- 旋转用 读+写+删 实现(ext2 后端无 rename 语义), 历史档保留原文件 mode/属主。
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+local force, debug, verbose, confPath = false, false, false, "/etc/logrotate.conf"
+for _, a in ipairs(args) do
+    if a == "-f" or a == "--force" then force = true
+    elseif a == "-d" or a == "--debug" then debug = true
+    elseif a == "-v" or a == "--verbose" then verbose = true
+    elseif a == "--help" or a == "-h" then
+        io.write("usage: logrotate [-f] [-d] [-v] [config]\n")
+        return 0
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        stderr("logrotate: invalid option '" .. a .. "'\n")
+        return 1
+    else
+        confPath = a
+    end
+end
+
+local function say(msg) if verbose or debug then io.write(msg .. "\n") end end
+
+local function parseSize(s)
+    local num, suffix = s:match("^([%d]+)([kKmM]?)$")
+    if not num then return nil end
+    local n = tonumber(num)
+    if suffix == "k" or suffix == "K" then return n * 1024 end
+    if suffix == "m" or suffix == "M" then return n * 1024 * 1024 end
+    return n
+end
+
+-- ---------------------------------------------------------------
+-- 配置解析
+-- ---------------------------------------------------------------
+local DIRECTIVES = {
+    size = "value", rotate = "value", create = "value",
+    daily = "flag", weekly = "flag", monthly = "flag",
+    notifempty = "flag", missingok = "flag", compress = "unsupported",
+    postrotate = "unsupported", prerotate = "unsupported", sharedscripts = "unsupported",
+    dateext = "unsupported", delaycompress = "unsupported", olddir = "unsupported",
+    maxsize = "unsupported", minsize = "unsupported", hourly = "unsupported",
+    copytruncate = "unsupported", su = "unsupported", extension = "unsupported",
+    nomissingok = "unsupported", nocreate = "unsupported",
+}
+
+local function newEntry(path, defaults)
+    local e = {
+        path = path, size = defaults.size, rotate = defaults.rotate,
+        create = defaults.create, daily = defaults.daily, weekly = defaults.weekly,
+        monthly = defaults.monthly, notifempty = defaults.notifempty,
+        missingok = defaults.missingok,
+    }
+    return e
+end
+
+local function applyDirective(target, key, value, lineno)
+    local kind = DIRECTIVES[key]
+    if not kind then
+        return nil, string.format("%s:%d: unknown directive '%s'", confPath, lineno, key)
+    end
+    if kind == "unsupported" then
+        return nil, string.format("%s:%d: directive '%s' is not supported", confPath, lineno, key)
+    end
+    if kind == "flag" then
+        target[key] = true
+    elseif key == "size" then
+        local n = value and parseSize(value)
+        if not n then return nil, string.format("%s:%d: bad size '%s'", confPath, lineno, tostring(value)) end
+        target.size = n
+    elseif key == "rotate" then
+        local n = tonumber(value)
+        if not n or n < 1 or n ~= math.floor(n) then
+            return nil, string.format("%s:%d: bad rotate count '%s'", confPath, lineno, tostring(value))
+        end
+        target.rotate = n
+    elseif key == "create" then
+        local mode, owner, group = (value or ""):match("^%s*(%d*)%s*(%S*)%s*(%S*)")
+        target.create = {
+            mode = (mode ~= "" and tonumber(mode, 8)) or 0x1A4,
+            owner = (owner ~= "" and owner) or nil,
+            group = (group ~= "" and group) or nil,
+        }
+    end
+    return true
+end
+
+local function readConf(path)
+    local f = fs.open(path, "r")
+    if not f then return nil, path .. ": cannot open" end
+    local text = f.readAll()
+    f.close()
+    local defaults = { rotate = 1, size = nil, daily = false, weekly = false, monthly = false,
+                       notifempty = false, missingok = false, create = { mode = 0x1A4 } }
+    local entries, cur = {}, nil
+    local lineno = 0
+    for raw in (text .. "\n"):gmatch("([^\n]*)\n") do
+        lineno = lineno + 1
+        local line = raw:gsub("#.*$", ""):gsub("^%s+", ""):gsub("%s+$", "")
+        if line ~= "" then
+            if line:sub(-1) == "{" then
+                local p = line:sub(1, -2):gsub("%s+$", "")
+                if p == "" then return nil, string.format("%s:%d: missing path before '{'", path, lineno) end
+                cur = newEntry(p, defaults)
+                entries[#entries + 1] = cur
+            elseif line == "}" then
+                if not cur then return nil, string.format("%s:%d: '}' without '{'", path, lineno) end
+                cur = nil
+            else
+                local key, value = line:match("^([%w_]+)%s*(.*)$")
+                local ok, err = applyDirective(cur or defaults, key, value ~= "" and value or nil, lineno)
+                if not ok then return nil, err end
+            end
+        end
+    end
+    if cur then return nil, string.format("%s: unterminated '%s {' block", path, cur.path) end
+    for _, e in ipairs(entries) do
+        if not (e.size or e.daily or e.weekly or e.monthly) then
+            return nil, e.path .. ": no trigger (need size/daily/weekly/monthly)"
+        end
+    end
+    return entries
+end
+
+-- ---------------------------------------------------------------
+-- 文件操作(无 rename 后端: 读+写+删)
+-- ---------------------------------------------------------------
+local function readAllFile(path)
+    local f = fs.open(path, "r")
+    if not f then return nil end
+    local s = f.readAll()
+    f.close()
+    return s
+end
+
+local function writeFile(path, data, mode, owner, group)
+    local f = fs.open(path, "w")
+    if not f then return nil, path .. ": cannot create" end
+    f:write(data)
+    f:close()
+    if mode and fs.chmod then fs.chmod(path, mode) end
+    if (owner or group) and fs.chown then
+        local uid = owner and (tonumber(owner) or (syscalls["user.get"] and syscalls["user.get"](owner) or {}).uid)
+        local gid = group and (tonumber(group) or (syscalls["user.groupByName"] and syscalls["user.groupByName"](group) or {}).gid)
+        fs.chown(path, uid, gid)
+    end
+    return true
+end
+
+local function renameFile(src, dst)
+    local data, err = readAllFile(src)
+    if not data then return nil, src .. ": cannot read" end
+    local attr = fs.attributes(src) or {}
+    local ok, werr = writeFile(dst, data, attr.mode)
+    if not ok then return nil, werr end
+    fs.delete(src)
+    return true
+end
+
+local function mtimeOf(path)
+    local a = fs.attributes(path)
+    return a and (a.mtime or a.modified) or 0
+end
+
+--- 是否到达时间周期(以 mtime 与当前时间比较)。
+local function timeDue(entry, mtime)
+    if not mtime or mtime == 0 then return false end
+    local now = math.floor(os.epoch("utc") / 1000)
+    if entry.daily then return now - mtime >= 86400 end
+    if entry.weekly then return now - mtime >= 7 * 86400 end
+    if entry.monthly then return now - mtime >= 30 * 86400 end
+    return false
+end
+
+local function rotateOne(entry)
+    local path = entry.path
+    if not fs.exists(path) then
+        if entry.missingok then say("skipping " .. path .. " (missingok)") return 0 end
+        stderr("logrotate: " .. path .. ": No such file or directory\n")
+        return 1
+    end
+    if fs.isDir(path) then
+        stderr("logrotate: " .. path .. ": is a directory\n")
+        return 1
+    end
+    local size = fs.getSize(path) or 0
+    if entry.notifempty and size == 0 then
+        say("skipping " .. path .. " (empty)")
+        return 0
+    end
+    local due = force or (entry.size and size >= entry.size) or timeDue(entry, mtimeOf(path))
+    if not due then
+        say("skipping " .. path .. " (size " .. size .. ")")
+        return 0
+    end
+
+    say("rotating " .. path .. " (size " .. size .. ", keep " .. entry.rotate .. ")")
+    if debug then return 0 end
+
+    -- 删除最旧档, 依次后移
+    local oldest = path .. "." .. entry.rotate
+    if fs.exists(oldest) then fs.delete(oldest) end
+    for n = entry.rotate - 1, 1, -1 do
+        local from, to = path .. "." .. n, path .. "." .. (n + 1)
+        if fs.exists(from) then
+            local ok, err = renameFile(from, to)
+            if not ok then stderr("logrotate: " .. err .. "\n") return 1 end
+        end
+    end
+    local ok, err = renameFile(path, path .. ".1")
+    if not ok then stderr("logrotate: " .. err .. "\n") return 1 end
+
+    if entry.create then
+        local ok2, err2 = writeFile(path, "", entry.create.mode, entry.create.owner, entry.create.group)
+        if not ok2 then stderr("logrotate: " .. err2 .. "\n") return 1 end
+    end
+    return 0
+end
+
+-- ---------------------------------------------------------------
+-- 主流程
+-- ---------------------------------------------------------------
+local entries, err = readConf(confPath)
+if not entries then
+    stderr("logrotate: " .. tostring(err) .. "\n")
+    return 1
+end
+
+local rc = 0
+for _, e in ipairs(entries) do
+    rc = math.max(rc, rotateOne(e))
+end
+
+-- 通知 syslogd 重开日志文件(轮转后它必须重新 open 才能写到新文件)。
+if not debug then
+    local pf = fs.open("/run/syslogd.pid", "r")
+    if pf then
+        local line = pf.readLine()
+        pf.close()
+        local spid = tonumber((line or ""):match("^%s*(%d+)"))
+        if spid then
+            local ok, kerr = syscalls["signal.kill"](spid, 1) -- SIGHUP
+            if ok then say("SIGHUP -> syslogd pid " .. spid)
+            else stderr("logrotate: SIGHUP syslogd: " .. tostring(kerr) .. "\n") end
+        end
+    end
+end
+return rc

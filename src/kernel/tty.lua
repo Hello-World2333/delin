@@ -535,9 +535,20 @@ function tty.get(name)
     return devices[name]
 end
 
+--- 打开某个 tty 的句柄(供别名设备, 如 /dev/console -> 控制台 tty)。
+---@param name string
+---@param mode string|nil
+---@return table|nil handle, string|nil err
+function tty.open(name, mode)
+    local ctx = devices[name]
+    if not ctx then return nil, "no such tty: " .. tostring(name) end
+    return openHandle(ctx, mode)
+end
+
 function tty.list()
     local out = {}
     for n in pairs(devices) do out[#out + 1] = n end
+    table.sort(out)
     return out
 end
 

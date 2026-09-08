@@ -124,6 +124,9 @@ end
 ---@param opts table|nil    选项 { cwd=, stdio={input=,output=} } (可缺省)
 ---@return integer|nil pid, table|nil proc, string|nil err
 function process.spawn(src, name, ppid, uid, gid, argv, opts)
+    -- opts.ppid: 显式指定父进程(init 的服务引擎用它把服务挂到 PID 1 名下,
+    -- 而不是发起 systemctl 的调用者名下)。
+    if opts and opts.ppid then ppid = opts.ppid end
     ppid = ppid or 0
     if type(src) ~= "string" then
         return nil, nil, "spawn expects a source string, got " .. type(src)
@@ -207,6 +210,12 @@ function process.spawn(src, name, ppid, uid, gid, argv, opts)
             end
         end
         reparentOrphans(pid)
+        -- 子进程退出通知(init/PID 1 注册, 用于服务监督)。在调度器上下文中调用,
+        -- 回调不得让出; 回调出错只记录, 不影响调度器。
+        if process.onExit then
+            local ok, herr = pcall(process.onExit, pid, status, proc.exitCode, proc.termSig)
+            if not ok and process.log then process.log("[proc exit hook] " .. tostring(herr)) end
+        end
     end
 
     registry[pid] = proc
@@ -227,6 +236,12 @@ end
 ---@return DelinProcess|nil
 function process.info(pid)
     return registry[pid]
+end
+
+--- 注册子进程退出钩子(init 用): fn(pid, status, exitCode, termSig)。
+--- 在调度器上下文里同步调用, 不得让出。
+function process.setExitHook(fn)
+    process.onExit = fn
 end
 
 --- 当前进程的 {pid, uid, gid}。通过 coroutine.running() 查进程表。

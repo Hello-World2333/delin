@@ -1,8 +1,13 @@
 --[[ Delin boot entry.
-     1. 打开一个日志文件(写在电脑自身 FS, 便于宿主从 /mnt/computer/N 抓取)
-     2. 安装内核受控 print(写入日志 + 终端)
-     3. 以源码字符串 spawn 出 PID 1(init)
-     4. 进入调度循环 ]]
+     1. 打开引导日志文件(写在电脑自身 FS, 便于宿主从 /mnt/computer/N 抓取)
+     2. 安装内核受控 print(进 klog ring buffer + 引导日志 + 终端)
+     3. 挂载/枚举设备/注册控制台, 装载模块
+     4. 以源码字符串 spawn 出 PID 1(init, 用户态服务管理器)
+     5. 进入调度循环
+
+     日志: 内核消息走 klog(kern facility) -> /dev/kmsg -> syslogd -> /var/log/*;
+           进程 print 走 user facility。引导日志 /delin.log 是内核自己的早期落盘副本,
+           在 syslogd 起来之前/起不来时仍能排障(CC 无法读屏)。 ]]
 
 local scheduler = require("kernel.scheduler")
 local process    = require("kernel.process")
@@ -16,14 +21,18 @@ local fb         = require("kernel.fb")
 local display    = require("kernel.display")
 local sysfs      = require("kernel.sysfs")
 local pipe       = require("kernel.pipe")
+local klog       = require("kernel.klog")
+local fstab      = require("kernel.fstab")
 local INIT_SOURCE = require("kernel.init_src") -- 打包器注入的 init 源码字符串
-local EXT2_INIT_SOURCE = require("kernel.ext2_init_src") -- EXT2 根引导用最小 PID1
 
-local log = nil
+local bootLog = nil
 local bootMs = nil
 
---- 内核受控 print: 时间戳(自引导起的毫秒)写到日志 + 终端。
-local function kprint(...)
+local PRI_KERN = klog.makePri(klog.FACILITIES.kern, klog.SEVERITIES.info)
+local PRI_USER = klog.makePri(klog.FACILITIES.user, klog.SEVERITIES.info)
+
+--- 内核受控 print: 时间戳(自引导起的毫秒)进 klog + 引导日志 + 终端。
+local function emit(pri, ...)
     local parts = {}
     for i = 1, select("#", ...) do
         parts[i] = tostring(select(i, ...))
@@ -31,17 +40,24 @@ local function kprint(...)
     local now = os.epoch("utc")
     local el = (bootMs and (now - bootMs)) or 0
     local line = string.format("[%8.3f] %s", el / 1000, table.concat(parts, "\t"))
+    klog.write(pri, line)
     -- CC 的 fs 文件句柄方法用点号(非冒号), 否则会写成 tostring(handle)
-    if log then log.writeLine(line); log.flush() end
-    print(line) -- 也输出到终端(view 可见)
+    if bootLog then bootLog.writeLine(line); bootLog.flush() end
+    write(line .. "\n") -- 也输出到终端(view 可见)
 end
 
+--- 内核消息(facility=kern)。
+local function kprint(...) return emit(PRI_KERN, ...) end
+--- 进程 print(facility=user)。Delin 的内核 print 是控制台, 不是进程 stdout。
+local function userprint(...) return emit(PRI_USER, ...) end
+
 --- 挂载: 根 hdd + /dev(+占位 /proc)。磁盘驱动器不自动挂载 —— 只作为 /dev/sdX 设备节点
---- 暴露(见 setupDevices), 由 `mount` 显式挂载。
+--- 暴露(见 setupDevices), 由 fstab/mount 显式挂载。
 local function setupVfs()
     -- 根 = 电脑 hdd(真实路径即 "/...")
     vfs.mount("/", vfs.real(""), { device = "rootfs", fstype = "ccdisk" })
     vfs_api.mountDev()
+    klog.register() -- /dev/kmsg + /dev/log
 
     -- 终端 stdio(io.write/read 兜底)。用冒号调用(io.write 经 stdio.output:write)。
     vfs_api.setStdio(
@@ -75,9 +91,6 @@ local function findModuleDir()
     return nil
 end
 
---- 在磁盘上找带 /parts/manifest 的(引导盘)。返回真实 fs 路径。
--- (DLUB 独立文件自己扫描; 内核不再需要)
-
 local function launch(initSrc, label)
     if type(initSrc) ~= "string" then kprint("FATAL: " .. label .. " init source missing"); return end
     local pid, proc, err = process.spawn(initSrc, "init", 0)
@@ -86,7 +99,7 @@ local function launch(initSrc, label)
     kprint("running scheduler (all processes concurrently) ...")
     scheduler.run()
     kprint("kernel: all processes exited, shutting down")
-    if log then log.close(); log = nil end
+    if bootLog then bootLog.close(); bootLog = nil end
 end
 
 --- 显示设备 syscalls(供进程枚举 /dev/ttyN、/dev/fbN; 写入走设备文件)。
@@ -113,6 +126,48 @@ local function registerRuntimeSyscalls()
         end
     end
     sc["proc.info"] = function(pid) return process.info(pid) end
+    -- 子进程退出钩子(init 服务监督用; 回调在调度器上下文同步调用, 不得让出)。
+    sc["proc.onExit"] = function(fn) process.setExitHook(fn) end
+    -- execve 语义: 按路径装载可执行文件(处理 shebang)并 spawn。init 的 ExecStart 用它。
+    sc["proc.spawnFile"] = function(path, argv, opts)
+        local fsapi = vfs_api.fs
+        if not fsapi.exists(path) then return nil, path .. ": no such file" end
+        if not fsapi.canExecute(path) then return nil, path .. ": permission denied" end
+        local f, oerr = fsapi.open(path, "r")
+        if not f then return nil, path .. ": " .. tostring(oerr) end
+        local src = f.readAll()
+        f.close()
+        local outArgv = {}
+        local shebang = src:match("^#!([^\n]*)")
+        local progName = path
+        if shebang then
+            local interp, rest = shebang:match("^%s*(%S+)%s*(.-)%s*$")
+            if not interp then return nil, path .. ": empty shebang" end
+            if interp:match("[^/]+$") == "env" then
+                local prog = rest:match("^(%S+)")
+                if not prog then return nil, path .. ": shebang env without program" end
+                rest = rest:sub(#prog + 1)
+                interp = prog
+            end
+            if not fsapi.exists(interp) then return nil, path .. ": shebang interpreter not found: " .. interp end
+            if not fsapi.canExecute(interp) then return nil, path .. ": shebang interpreter not executable: " .. interp end
+            local hf = fsapi.open(interp, "r")
+            if not hf then return nil, interp .. ": permission denied" end
+            src = hf.readAll()
+            hf.close()
+            outArgv[0] = interp
+            local n = 1
+            for w in rest:gmatch("%S+") do outArgv[n] = w; n = n + 1 end
+            outArgv[n] = path; n = n + 1
+            for i = 1, #argv do outArgv[n] = argv[i]; n = n + 1 end
+            progName = interp
+        else
+            outArgv[0] = path
+            for i = 1, #argv do outArgv[i] = argv[i] end
+        end
+        local caller = process.current()
+        return process.spawn(src, progName, caller.pid, nil, nil, outArgv, opts)
+    end
     sc["pipe.create"] = function() return pipe.create() end
     sc["stdio.set"] = function(input, output) return process.setStdio(input, output) end
     sc["tty.setFocus"] = function(name) return tty.setFocus(name) end
@@ -136,6 +191,9 @@ local function registerRuntimeSyscalls()
     end
     sc["fs.fstypes"] = function() return devdisk.fstypes() end
     sc["blkdev.list"] = function() return devdisk.list() end
+    -- /etc/fstab: 解析结果给 init(生成 mount 单元)与 mount -a。
+    sc["fstab.entries"] = function(path) return fstab.read(vfs_api.fs, path) end
+    klog.registerSyscalls(sc)
     -- 终端信号路由: ^C(SIGINT)/^Z(SIGTSTP) 发给 tty 前台进程组。
     tty.onSignal = function(sig)
         local fg = process.tcgetpgrp(tty.getFocus())
@@ -143,7 +201,7 @@ local function registerRuntimeSyscalls()
     end
 end
 
---- 注册电脑自身 term 作为 /dev/ttyN 控制台(console)。
+--- 注册电脑自身 term 作为 /dev/ttyN 控制台(console), 并派生 /dev/console 别名(Linux 语义)。
 local function registerConsole()
     pcall(term.setCursorBlink, false) -- 光标由 tty 层自己反显, 关掉 CC 原生闪烁避免双光标
     local function hex(c) return string.format("%x", c) end
@@ -176,7 +234,13 @@ local function registerConsole()
         release = function() end,
     }
     display.register(cons)
-    kprint("console tty registered -> " .. tty.getFocus())
+    local ttyName = tty.getFocus()
+    -- /dev/console = 系统控制台(同 /dev/ttyN 中第一个注册的 tty)。
+    vfs_api.registerDevice("console", {
+        writable = true,
+        open = function(mode) return tty.open(ttyName, mode) end,
+    })
+    kprint("console tty registered -> " .. ttyName .. " (/dev/console alias)")
 end
 
 --- 装载内核模块: init(目录) -> loadAll -> loadAliases -> 按外设 autoload 驱动。
@@ -211,12 +275,13 @@ local function setupModules(reader, dir)
     return true
 end
 
---- EXT2 根引导: 挂根分区为 "/", 再跑最小 PID1。
+--- EXT2 根引导: 挂根分区为 "/", 再跑 init。
 local function bootExt2(bi)
     kprint("EXT2 boot: root=" .. (bi.rootFstype or "?") .. " " .. (bi.rootPath or "?"))
     local rfs, ferr = ext2.mount(bi.blockDevice)
     if not rfs then kprint("FATAL: root ext2 mount: " .. tostring(ferr)); return end
     vfs_api.mountDev()
+    klog.register()
     registerConsole() -- 电脑自身 term 控制台(键盘输入焦点)
     setupDevices()    -- /dev/sdX 设备节点(磁盘不自动挂载)
     -- 根分区对上设备节点, 使 mount/lsblk 里根挂载显示为 /dev/sdXN 而不是 "rootfs"。
@@ -256,16 +321,16 @@ local function bootExt2(bi)
     registerDisplaySyscalls()
     registerRuntimeSyscalls()
     sysfs.mount() -- /sys/class/display 虚拟配置 fs(display 已注册)
-    launch(EXT2_INIT_SOURCE, "ext2")
+    launch(INIT_SOURCE, "ext2")
 end
 
 local boot = {}
 
 function boot.boot()
-    -- 打开日志(电脑自身 FS, 追加以便 DLUB 引导的两段都记录)
-    log = fs.open("/delin.log", "a")
+    -- 打开引导日志(电脑自身 FS, 追加以便 DLUB 引导的两段都记录)
+    bootLog = fs.open("/delin.log", "a")
     bootMs = os.epoch("utc")
-    process.log = kprint
+    process.log = userprint
 
     kprint("Delin OS " .. modules.version .. " boot")
     kprint("craftos=" .. os.version())

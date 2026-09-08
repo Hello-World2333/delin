@@ -1,0 +1,73 @@
+-- Delin logger: 向系统日志写入一条消息 (util-linux logger 子集)。
+-- 用法: logger [-p facility.severity] [-t tag] [message ...]
+--   无 message 操作数时从 stdin 逐行读取。
+-- 经 /dev/log 交给 syslogd(syslog(3) 语义); 无 syslogd 时消息进内核缓冲, 待其启动后落盘。
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+local pri, tag = "user.notice", "logger"
+local operands = {}
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if a == "-p" and args[i + 1] then pri = args[i + 1]; i = i + 1
+    elseif a:match("^%-%-priority=") then pri = a:sub(12)
+    elseif a == "-t" and args[i + 1] then tag = args[i + 1]; i = i + 1
+    elseif a:match("^%-%-tag=") then tag = a:sub(7)
+    elseif a == "--" then
+        for k = i + 1, #args do operands[#operands + 1] = args[k] end
+        break
+    elseif a == "--help" or a == "-h" then
+        io.write("usage: logger [-p facility.severity] [-t tag] [message ...]\n")
+        return 0
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        stderr("logger: invalid option '" .. a .. "'\n")
+        return 1
+    else
+        operands[#operands + 1] = a
+    end
+    i = i + 1
+end
+
+-- 解析 facility.severity -> PRI
+local facName, sevName = pri:match("^([%w]+)%.([%w]+)$")
+if not facName then facName, sevName = pri, "notice" end
+local fac = syscalls["syslog.facility"](facName)
+local sev = syscalls["syslog.severity"](sevName)
+if not fac then
+    stderr("logger: unknown facility '" .. facName .. "'\n")
+    return 1
+end
+if not sev then
+    stderr("logger: unknown severity '" .. sevName .. "'\n")
+    return 1
+end
+local PRI = fac * 8 + sev
+
+local log = fs.open("/dev/log", "w")
+if not log then
+    stderr("logger: /dev/log: cannot open\n")
+    return 1
+end
+
+local function send(msg)
+    log:writeLine("<" .. PRI .. ">" .. tag .. ": " .. msg)
+end
+
+if #operands > 0 then
+    send(table.concat(operands, " "))
+else
+    local stdin = io.stdin()
+    while true do
+        local line = stdin and stdin.readLine and stdin:readLine()
+        if line == nil then break end
+        send(line)
+    end
+end
+log:flush()
+log:close()
+return 0

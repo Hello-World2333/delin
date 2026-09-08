@@ -1,0 +1,217 @@
+-- Delin systemctl: 控制 init(PID 1)的服务管理器 (systemd 风格子集)。
+-- 用法:
+--   systemctl list-units [--type=TYPE] [--all]   列出已装载单元(默认只列 active/failed)
+--   systemctl list-unit-files [PATTERN]          列出单元文件与 enabled 状态
+--   systemctl status [UNIT...]                   显示单元状态
+--   systemctl start|stop|restart UNIT...         启动/停止/重启
+--   systemctl enable|disable UNIT...             按 [Install] WantedBy= 建立/删除标记
+--   systemctl is-active UNIT...                  活动则退出码 0, 否则 3
+--   systemctl is-enabled UNIT...                 已启用退出码 0, 否则 1
+--   systemctl daemon-reload                      重新读取单元文件
+--   systemctl shutdown                           停止全部单元并关机(init 退出)
+-- UNIT 省略类型后缀时按 .service -> .target -> .timer -> .mount 顺序补全。
+-- 与 init 的通信走内核 syscall 表(Delin 无 Unix socket/D-Bus, 这是等价的私有控制通道)。
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+local function out(s) io.write(s) end
+local function outln(s) io.write((s or "") .. "\n") end
+
+if not (syscalls and syscalls["init.list"]) then
+    stderr("systemctl: init control interface not available (init not running?)\n")
+    return 1
+end
+
+local SUFFIXES = { ".service", ".target", ".timer", ".mount" }
+
+--- 补全单元名: 无后缀时依次尝试已知类型。
+local function resolve(name)
+    if name:match("%.[%a]+$") then return name end
+    for _, sfx in ipairs(SUFFIXES) do
+        if syscalls["init.status"](name .. sfx) then return name .. sfx end
+    end
+    return name .. ".service"
+end
+
+--- 时间戳 -> 可读时刻(供 status 显示)。
+local function clockStr(ms)
+    if not ms then return "-" end
+    return os.date("%Y-%m-%d %H:%M:%S", math.floor(ms / 1000))
+end
+
+local function pad(s, n)
+    s = tostring(s or "")
+    if #s >= n then return s end
+    return s .. string.rep(" ", n - #s)
+end
+
+local function describe(r)
+    local d = r.description or r.name
+    if r.kind == "mount" then d = "Mount " .. (r.where or "?") end
+    if r.kind == "timer" and r.unit then d = (d or "") .. " -> " .. r.unit end
+    return d
+end
+
+-- ---------------------------------------------------------------
+-- 子命令
+-- ---------------------------------------------------------------
+local function listUnits(typeFilter, all)
+    local list = syscalls["init.list"]() or {}
+    outln(pad("UNIT", 28) .. pad("LOAD", 8) .. pad("ACTIVE", 10) .. pad("SUB", 12) .. "DESCRIPTION")
+    local n = 0
+    for _, r in ipairs(list) do
+        if (not typeFilter or r.kind == typeFilter)
+            and (all or r.active ~= "inactive") then
+            outln(pad(r.name, 28) .. pad("loaded", 8) .. pad(r.active, 10) .. pad(r.sub, 12) .. describe(r))
+            n = n + 1
+        end
+    end
+    if n == 0 then outln("0 units listed.") else outln("") outln(n .. " units listed.") end
+end
+
+local function listUnitFiles(pattern)
+    local list = syscalls["init.list"]() or {}
+    outln(pad("UNIT FILE", 32) .. pad("STATE", 12) .. "TYPE")
+    for _, r in ipairs(list) do
+        if not pattern or r.name:find(pattern, 1, true) then
+            local state = r.enabled and "enabled" or "disabled"
+            if #(r.wantedBy or {}) == 0 and not r.enabled then state = "static" end
+            outln(pad(r.name, 32) .. pad(state, 12) .. r.kind)
+        end
+    end
+end
+
+local function statusOf(names)
+    local rc = 0
+    for _, raw in ipairs(names) do
+        local r = syscalls["init.status"](resolve(raw))
+        if not r then
+            stderr("Unit " .. raw .. " could not be found.\n")
+            rc = 4
+        else
+            local mark = (r.active == "failed") and "x" or (r.active == "inactive" and "o" or "*")
+            outln(mark .. " " .. r.name .. " - " .. describe(r))
+            local loaded = "loaded (" .. (r.path or "?") .. "; " .. (r.enabled and "enabled" or "disabled") .. ")"
+            outln("     Loaded: " .. loaded)
+            local since = (r.active == "active" or r.active == "activating") and (" since " .. clockStr(r.startMs)) or ""
+            outln("     Active: " .. r.active .. " (" .. r.sub .. ")" .. since)
+            if r.pid then outln("   Main PID: " .. r.pid .. " (" .. r.name:gsub("%..-$", "") .. ")") end
+            if r.exec then outln("    ExecStart: " .. r.exec) end
+            if r.exitCode ~= nil or r.termSig then
+                outln("     Exit: code=" .. tostring(r.exitCode) .. " signal=" .. tostring(r.termSig))
+            end
+            if r.failReason then outln("     Error: " .. r.failReason) end
+            outln("")
+            if r.active == "failed" then rc = 3 end
+        end
+    end
+    return rc
+end
+
+local function verbAll(verb, names)
+    local rc = 0
+    for _, raw in ipairs(names) do
+        local name = resolve(raw)
+        local ok, err = syscalls["init." .. verb](name)
+        if not ok then
+            stderr("Failed to " .. verb .. " " .. name .. ": " .. tostring(err) .. "\n")
+            rc = 1
+        end
+    end
+    return rc
+end
+
+local function isActive(names)
+    local rc = 0
+    for _, raw in ipairs(names) do
+        local r = syscalls["init.status"](resolve(raw))
+        local state = r and r.active or "unknown"
+        outln(state)
+        if state ~= "active" then rc = 3 end
+    end
+    return rc
+end
+
+local function isEnabled(names)
+    local rc = 0
+    for _, raw in ipairs(names) do
+        local name = resolve(raw)
+        if syscalls["init.isEnabled"](name) then
+            outln("enabled")
+        else
+            outln("disabled")
+            rc = 1
+        end
+    end
+    return rc
+end
+
+-- ---------------------------------------------------------------
+-- 参数解析
+-- ---------------------------------------------------------------
+local cmd, typeFilter, all, operands = nil, nil, false, {}
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if not cmd and a:sub(1, 1) ~= "-" then
+        cmd = a
+    elseif a == "--all" or a == "-a" then
+        all = true
+    elseif a:match("^%-%-type=") then
+        typeFilter = a:sub(8)
+    elseif a == "--type" and args[i + 1] then
+        typeFilter = args[i + 1]; i = i + 1
+    elseif a == "--help" or a == "-h" then
+        outln("systemctl [list-units|list-unit-files|status|start|stop|restart|enable|disable|is-active|is-enabled|daemon-reload|shutdown] [UNIT...]")
+        return 0
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        stderr("systemctl: invalid option '" .. a .. "'\n")
+        return 1
+    else
+        operands[#operands + 1] = a
+    end
+    i = i + 1
+end
+
+if not cmd then
+    stderr("systemctl: missing command (see systemctl --help)\n")
+    return 1
+end
+
+if cmd == "list-units" then
+    listUnits(typeFilter, all)
+elseif cmd == "list-unit-files" then
+    listUnitFiles(operands[1])
+elseif cmd == "status" then
+    if #operands == 0 then
+        listUnits(nil, true)
+    else
+        return statusOf(operands)
+    end
+elseif cmd == "start" or cmd == "stop" or cmd == "restart" then
+    if #operands == 0 then stderr("systemctl: " .. cmd .. ": missing unit name\n") return 1 end
+    return verbAll(cmd, operands)
+elseif cmd == "enable" or cmd == "disable" then
+    if #operands == 0 then stderr("systemctl: " .. cmd .. ": missing unit name\n") return 1 end
+    return verbAll(cmd, operands)
+elseif cmd == "is-active" then
+    if #operands == 0 then stderr("systemctl: is-active: missing unit name\n") return 1 end
+    return isActive(operands)
+elseif cmd == "is-enabled" then
+    if #operands == 0 then stderr("systemctl: is-enabled: missing unit name\n") return 1 end
+    return isEnabled(operands)
+elseif cmd == "daemon-reload" then
+    local ok, err = syscalls["init.reload"]()
+    if not ok then stderr("systemctl: daemon-reload: " .. tostring(err) .. "\n") return 1 end
+elseif cmd == "shutdown" then
+    syscalls["init.shutdown"]()
+    outln("shutting down")
+else
+    stderr("systemctl: unknown command '" .. cmd .. "'\n")
+    return 1
+end
+return 0

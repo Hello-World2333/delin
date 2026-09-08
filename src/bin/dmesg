@@ -1,0 +1,48 @@
+-- Delin dmesg: 打印内核 ring buffer (/dev/kmsg)。
+-- 用法: dmesg [-x] [-h]
+--   -x  在每行前加 "facility.severity:" 前缀(调试用)
+-- 读 /dev/kmsg 当前缓冲(读尽即返回, 不阻塞等待新消息)。
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+local showPri = false
+for _, a in ipairs(args) do
+    if a == "-x" or a == "--decode" then showPri = true
+    elseif a == "--help" or a == "-h" then
+        io.write("usage: dmesg [-x]\n")
+        return 0
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        stderr("dmesg: invalid option '" .. a .. "'\n")
+        return 1
+    end
+end
+
+local h = fs.open("/dev/kmsg", "r")
+if not h then
+    stderr("dmesg: /dev/kmsg: cannot open\n")
+    return 1
+end
+
+while true do
+    local data = h:readAvailable()
+    if not data or data == "" then break end
+    for line in data:gmatch("[^\n]+") do
+        local pri, usec, text = line:match("^(%d+),%d+,(%d+),%-?%d*;(.*)$")
+        if pri then
+            local prefix = string.format("[%12.6f] ", tonumber(usec) / 1000000)
+            if showPri then
+                prefix = prefix .. syscalls["syslog.facilityName"](math.floor(tonumber(pri) / 8))
+                    .. "." .. syscalls["syslog.severityName"](tonumber(pri) % 8) .. ": "
+            end
+            io.write(prefix .. text .. "\n")
+        else
+            io.write(line .. "\n")
+        end
+    end
+end
+h:close()
+return 0
