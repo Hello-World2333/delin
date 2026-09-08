@@ -1,0 +1,40 @@
+-- Delin sleep: 暂停指定时间。用法: sleep NUMBER[smhd]...
+-- GNU 风格: 支持小数秒(如 0.5)与 s/m/h/d 后缀, 多个操作数求和; 非法输入 fail-fast。
+-- 分片睡眠(50ms/片): 信号只在进程被 resume 时投递, 一次性 os.sleep(300) 会让 ^C/^Z
+-- 等到定时器到期才生效; 50ms 分片把响应延迟压在一个调度心跳内(与内核心跳同频)。
+
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+if #args == 0 then
+    stderr("sleep: missing operand\n")
+    return 1
+end
+
+local total = 0
+for _, a in ipairs(args) do
+    local num, suf = a:match("^([%d%.]+)([smhdSMHD]?)$")
+    local n = num and tonumber(num)
+    if not n then
+        stderr("sleep: invalid time interval '" .. tostring(a) .. "'\n")
+        return 1
+    end
+    suf = (suf or ""):lower()
+    local mult = 1
+    if suf == "m" then mult = 60
+    elseif suf == "h" then mult = 3600
+    elseif suf == "d" then mult = 86400 end
+    total = total + n * mult
+end
+
+local remaining = total * 1000
+while remaining > 0 do
+    local chunk = remaining > 50 and 50 or remaining
+    if os.msleep then os.msleep(chunk) else os.sleep(chunk / 1000) end
+    remaining = remaining - chunk
+end
+return 0

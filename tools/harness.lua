@@ -466,7 +466,7 @@ local SRCBIN = "/home/worker/delin/src/bin"
 local function setupRoot()
     os.execute("rm -rf " .. ROOT .. " && mkdir -p " .. ROOT)
     os.execute("mkdir -p " .. ROOT .. "/bin " .. ROOT .. "/etc " .. ROOT .. "/home/alice " .. ROOT .. "/root " .. ROOT .. "/tmp " .. ROOT .. "/mnt/cc")
-    for _, f in ipairs({ "cat","cp","ed","grep","head","kill","login","ls","mkdir","mv","rm","sed","sh","tail","touch","wc","chmod","chown","mount","umount","blkid","lsblk" }) do
+    for _, f in ipairs({ "cat","cp","ed","grep","head","kill","login","ls","mkdir","mv","rm","sed","sh","sleep","tail","touch","wc","chmod","chown","mount","umount","blkid","lsblk" }) do
         os.execute("cp -f " .. SRCBIN .. "/" .. f .. " " .. ROOT .. "/bin/" .. f)
         os.execute("chmod 755 " .. ROOT .. "/bin/" .. f)
     end

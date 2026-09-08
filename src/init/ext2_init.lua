@@ -878,7 +878,7 @@ do
 local out = {}
 local function emit(s) out[#out + 1] = tostring(s) end
 local lines = {
-    "sh -c 'while true; do :; done' &", -- 长跑作业(不读 stdin, 便于反复停/继续)
+    "sh -c 'sleep 30' &", -- 长跑作业(不读 stdin; 同时验证 sleep 对信号的响应)
     "echo bgpid=$!",
     "jobs",
     "jobs -l",
@@ -898,6 +898,7 @@ local lines = {
     "exit",
 }
 local jobPid, jobPgid = nil, nil
+local killAt = nil
 local inH = {
     isTTY = true,
     getDeviceName = function() return "tty9" end,
@@ -905,6 +906,7 @@ local inH = {
     readLine = function()
         os.sleep(0.3)
         local l = table.remove(lines, 1)
+        if l == "kill -TSTP %1" and not killAt then killAt = os.epoch("utc") end
         if l == "fg %1" and jobPgid then
             -- fg 会阻塞到作业停止/退出: 由辅助进程延迟把作业再停住(等价于用户按 ^Z)。
             spawn("os.sleep(1.0)\nsyscalls['signal.killpg'](" .. jobPgid .. ", 20)", "fg-stopper")
@@ -941,7 +943,12 @@ while true do
         local jp = syscalls["proc.info"](jobPid)
         local st = jp and (jp.status .. " termSig=" .. tostring(jp.termSig) .. " pgrp=" .. tostring(jp.pgrp))
             or "gone"
-        if st ~= lastst then emit("DRV job " .. jobPid .. " -> " .. st); lastst = st end
+        if st ~= lastst then
+            local extra = ""
+            if killAt and st:match("^stopped") then extra = " dt-kill->stop=" .. (os.epoch("utc") - killAt) .. "ms" end
+            emit("DRV job " .. jobPid .. " -> " .. st .. extra)
+            lastst = st
+        end
     end
     if not p or p.status ~= "running" then break end
     os.sleep(0.1)
@@ -1071,6 +1078,91 @@ print("FGT-END")
             .. tostring(syscalls["job.sessfor"]("tty0")) .. " (expect nil)")
     else
         print("ext2-init: jobctl fg: spawn failed")
+    end
+end
+
+-- 5) read 内建 + /bin/sleep(真机): read 从内存 stdin 逐行喂, 校验字段分割/IFS/-r/EOF 状态;
+--    sleep 校验真实墙钟耗时与非法参数 fail-fast。
+do
+    local shHand = fs.open("/bin/sh", "r")
+    local shSrc = shHand and shHand.readAll() or nil
+    if shHand then shHand.close() end
+
+    -- sleep 0.2 应真的花掉约 0.2s(内核 HSE 时钟 + 分片睡眠)
+    if fs.exists("/bin/sleep") then
+        local sh2 = fs.open("/bin/sleep", "r")
+        local sleepSrc = sh2 and sh2.readAll() or nil
+        if sh2 then sh2.close() end
+        local t0 = os.epoch("utc")
+        local sp = spawn(sleepSrc, "sleep", nil, nil, { [0] = "/bin/sleep", "0.2" })
+        if sp then
+            waitExit(sp, 10000)
+            print("ext2-init: sleep 0.2 elapsed=" .. tostring(os.epoch("utc") - t0) .. "ms (expect >=150)")
+        end
+        local bp = spawn(sleepSrc, "sleep-bad", nil, nil, { [0] = "/bin/sleep", "bogus" })
+        if bp then
+            local code = waitExit(bp, 10000)
+            print("ext2-init: sleep bogus exit=" .. tostring(code) .. " (expect 1)")
+        end
+        local np = spawn(sleepSrc, "sleep-noarg", nil, nil, { [0] = "/bin/sleep" })
+        if np then
+            local code = waitExit(np, 10000)
+            print("ext2-init: sleep no-arg exit=" .. tostring(code) .. " (expect 1)")
+        end
+    else
+        print("ext2-init: /bin/sleep missing")
+    end
+
+    -- read: stdin 为内存句柄, 脚本经 -c 提供(read 因此从 stdin 读而不是读脚本自身)
+    if shSrc then
+        local lines = { "a b c", "p:q:r", "one", "back\\ slash", "back\\ slash", "" }
+        local li = 0
+        local inH = {
+            isTTY = false,
+            read = function() end,
+            readLine = function() li = li + 1; return lines[li] end,
+        }
+        local outbuf = {}
+        local outH = {
+            write = function(_, s) outbuf[#outbuf + 1] = tostring(s); return #s end,
+            writeLine = function(_, s) outbuf[#outbuf + 1] = tostring(s or "") .. "\n"; return 1 end,
+            flush = function() return true end,
+        }
+        local script = [[
+saved=$IFS
+read r1 r2
+echo "r=[$r1][$r2]"
+IFS=: read c1 c2 c3
+echo "c=[$c1][$c2][$c3]"
+if [ "$IFS" = "$saved" ]; then echo "ifs-restored=yes"; else echo "ifs-restored=no"; fi
+read o1 o2 o3
+echo "o=[$o1][$o2][$o3]"
+read bs
+echo "bs=[$bs]"
+read -r raw
+echo "raw=[$raw]"
+read e1 e2
+echo "eof=[$e1][$e2] st=$?"
+read x
+echo "eof2=$?"
+echo "p q" | read pa pb
+echo "pipe=[$pa][$pb]"
+echo "file-line" > /tmp/read_real.txt
+read fa < /tmp/read_real.txt
+echo "file=[$fa]"
+rm -f /tmp/read_real.txt
+]]
+        local sp = spawn(shSrc, "sh-read", nil, nil, { [0] = "/bin/sh", "-c", script },
+            { stdio = { input = inH, output = outH } })
+        if sp then
+            local code = waitExit(sp, 30000)
+            print("ext2-init: read exit=" .. tostring(code) .. " (expect 0)")
+            for _, s in ipairs(outbuf) do print("  read| " .. s) end
+        else
+            print("ext2-init: read: spawn failed")
+        end
+    else
+        print("ext2-init: read: /bin/sh missing")
     end
 end
 

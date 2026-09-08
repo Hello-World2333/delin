@@ -42,7 +42,7 @@ local function setPos(argv)
     if argv then for i = 1, #argv do posArgs[i] = argv[i] end end
 end
 
-local vars = {}
+local vars = { IFS = " \t\n" } -- IFS 是真正的 shell 变量(POSIX 默认空白; 置空则不分割)
 local funcSrcs = {} -- 函数名 -> 定义原文(后台子 shell 注入用)
 
 -- 规范化绝对路径: 折叠 . / .. , 去掉多余斜杠(相对路径以 cwd 起)。
@@ -115,8 +115,14 @@ if argErr then errln(argErr); return 2 end
 -- 运行脚本文件/命令行时不做交互(不读 tty): stdin 仍可能是终端(被父 sh 继承)。
 local interactive = stdin and stdin.isTTY and not scriptPath and not cmdString
 
-local IFS = " \t\n"
-local function isIfs(c) return IFS:find(c, 1, true) ~= nil end
+-- IFS 是真正的 shell 变量(未设置时默认空白); 未加引号的展开与 `read` 都按它分割。
+local function curIFS()
+    local v = vars.IFS
+    if v == nil then return " \t\n" end
+    return v
+end
+local function isIfs(c) return curIFS():find(c, 1, true) ~= nil end
+local function isIfsWs(c) return (c == " " or c == "\t" or c == "\n") and isIfs(c) end
 local function splitIfs(s)
     if not s or s == "" then return {} end
     local out, cur, started = {}, "", false
@@ -623,6 +629,10 @@ end
 -- ---------------------------------------------------------------
 -- 求值
 -- ---------------------------------------------------------------
+-- POSIX 特殊内建: 赋值前缀在它们身上留在当前环境(不恢复)。
+local specialBuiltins = { [":"] = true, ["exit"] = true, ["return"] = true,
+    ["shift"] = true, ["break"] = true, ["continue"] = true }
+
 local builtins = {}
 local evalNode, evalList, evalSimple, restoreRedir, matchGlob, evalPipe, spawnChild
 
@@ -701,9 +711,81 @@ builtins.shift = function(args)
     for i = n + 1, #posArgs do np[#np + 1] = posArgs[i] end
     posArgs = np
 end
+-- read [-r] var...: 从当前 stdin 读一整行, 按 IFS 分割后赋给变量(POSIX read)。
+-- 无 -r 时反斜杠转义下一个字符(被转义的字符即使是 IFS 也不是分隔符), 行尾反斜杠为续行;
+-- 多于变量的字段全部归最后一个变量(保留中间分隔符, 去掉尾部 IFS 空白)。EOF 时变量置空并返回 >0。
+builtins.read = function(args)
+    local raw = false
+    local names = {}
+    for _, a in ipairs(args) do
+        if a == "-r" then raw = true
+        elseif a:sub(1, 1) == "-" and a ~= "-" then
+            errln("read: " .. a .. ": invalid option"); lastExit = 2; return
+        else names[#names + 1] = a end
+    end
+    if #names == 0 then errln("read: variable name required"); lastExit = 2; return end
+    for _, n in ipairs(names) do
+        if not n:match("^[%a_][%w_]*$") then
+            errln("read: " .. n .. ": not a valid variable name"); lastExit = 2; return
+        end
+    end
+    if not (inH and inH.readLine) then errln("read: stdin is not readable"); lastExit = 1; return end
+
+    -- 逐字符收集: chars 为字符, esc 标记该字符是否由反斜杠转义(转义的 IFS 不是分隔符)。
+    local chars, esc = {}, {}
+    local function add(c, e)
+        local k = #chars + 1
+        chars[k] = c; esc[k] = e or false
+    end
+    local eof = false
+    while true do
+        local l = inH:readLine()
+        if l == nil then eof = true; break end
+        if raw then
+            for k = 1, #l do add(l:sub(k, k), false) end
+            break
+        end
+        local i, cont = 1, false
+        while i <= #l do
+            if l:sub(i, i) == "\\" then
+                if i == #l then cont = true; break end -- 行尾反斜杠: 续行
+                add(l:sub(i + 1, i + 1), true); i = i + 2
+            else
+                add(l:sub(i, i), false); i = i + 1
+            end
+        end
+        if not cont then break end
+    end
+
+    local n = #chars
+    local function isDelim(i) return not esc[i] and isIfs(chars[i]) end
+    local function isWs(i) return not esc[i] and isIfsWs(chars[i]) end
+    local fields = {}
+    local i = 1
+    while i <= n and isWs(i) do i = i + 1 end
+    for fi = 1, #names - 1 do
+        if i > n then break end
+        local f = {}
+        while i <= n and not isDelim(i) do f[#f + 1] = chars[i]; i = i + 1 end
+        fields[fi] = table.concat(f)
+        -- 吃掉分隔符: IFS 空白 + 至多一个非空白 IFS 字符 + 其后的 IFS 空白
+        while i <= n and isWs(i) do i = i + 1 end
+        if i <= n and isDelim(i) and not isWs(i) then i = i + 1 end
+        while i <= n and isWs(i) do i = i + 1 end
+    end
+    -- 最后一个变量: 剩余字符(去掉尾部未转义的 IFS 空白)
+    local last = n
+    while last >= i and isWs(last) do last = last - 1 end
+    local rest = {}
+    for k = i, last do rest[#rest + 1] = chars[k] end
+    fields[#names] = table.concat(rest)
+    for idx, name in ipairs(names) do vars[name] = fields[idx] or "" end
+    lastExit = eof and 1 or 0
+end
+
 builtins.help = function(args)
     outln("Delin sh (POSIX core subset)")
-    outln("builtins : cd pwd echo exit help jobs fg bg wait kill test [ true false :")
+    outln("builtins : cd pwd echo read exit help jobs fg bg wait kill test [ true false :")
     outln("external : ls cat rm mkdir cp mv touch head tail wc grep sed ed chmod chown login")
     outln("usage    : sh [-c cmd [name [args...]]] [script] [args...]   (no script => interactive/stdin)")
 end
@@ -1097,8 +1179,30 @@ restoreRedir = function(out, inp)
     if inp then inH = stdin end
 end
 
+-- 赋值前缀(命令作用域): 返回 restore 表, 或 nil 表示"留在当前环境"(特殊内建/函数/纯赋值)。
+local function applyAssigns(node)
+    if #node.assigns == 0 then return nil end
+    local restore
+    if #node.argv > 0 then
+        local w = node.argv[1]
+        local nm = (w and #w == 1) and w[1].raw or nil
+        if not (nm and (specialBuiltins[nm] or funcSrcs[nm])) then restore = {} end
+    end
+    if restore then
+        for _, a in ipairs(node.assigns) do
+            restore[a.name] = vars[a.name]
+            vars[a.name] = expandGlue(a.value)
+        end
+    else
+        for _, a in ipairs(node.assigns) do vars[a.name] = expandGlue(a.value) end
+    end
+    return restore
+end
+local function undoAssigns(restore)
+    if restore then for k, v in pairs(restore) do vars[k] = v end end
+end
+
 evalSimple = function(node)
-    for _, a in ipairs(node.assigns) do vars[a.name] = expandGlue(a.value) end
     local needOut, needIn = false, false
     local openOut, openIn = {}, {}
     for _, r in ipairs(node.redirects) do
@@ -1117,6 +1221,7 @@ evalSimple = function(node)
             outH = h; needOut = true; openOut[#openOut + 1] = h
         end
     end
+    local restore = applyAssigns(node)
     local ctrl
     if #node.argv == 0 then
         lastExit = 0
@@ -1133,6 +1238,7 @@ evalSimple = function(node)
             runExternal(cmd, rest, s, node.src)
         end
     end
+    undoAssigns(restore)
     -- 关闭重定向打开的句柄(真正落盘): CC 句柄写入可能缓冲, 需 flush/close 才提交。
     for _, h in ipairs(openOut) do if h.close then pcall(h.close) end end
     for _, h in ipairs(openIn) do if h.close then pcall(h.close) end end
@@ -1227,7 +1333,9 @@ evalPipe = function(node)
         if it.cmd and it.builtin then
             inH, outH = it.inH, it.outH
             lastExit = 0
+            local restore = applyAssigns(items[i])
             local ctrl = builtins[it.cmd](it.rest)
+            undoAssigns(restore)
             inH, outH = savedIn, savedOut
             closePipeEl(i, n, pipes)
             if ctrl == "exit" then return lastExit, "exit" end

@@ -7,6 +7,7 @@
 
 T=/tmp/posix_self
 outcome=0
+SAVED_IFS="$IFS"
 
 chk() {
     # chk <name> <cmd...> : 运行命令, 以其退出码判定(0=ok)。
@@ -415,6 +416,53 @@ chk mount_list [ -s "$S/mnt.txt" ]
 
 rm -rf "$S"
 chk new_cleanup [ ! -e "$S" ]
+
+# ---------------------------------------------------------------
+# 12. read 内建 / sleep
+# ---------------------------------------------------------------
+# 管道里的内建在 POSIX 里跑在子 shell 中(变量不外泄), 所以用 { ... } 把 read 与判定放一起,
+# 这样宿主 bash/dash 与 Delin 的结论一致。
+rd_two() { echo "a b c" | { read rx ry; [ "$rx" = "a" ] && [ "$ry" = "b c" ]; }; }
+chk read_two_fields rd_two
+
+rd_ifs() { echo "p:q:r" | { IFS=: read ra rb rc; [ "$ra" = "p" ] && [ "$rb" = "q" ] && [ "$rc" = "r" ]; }; }
+chk read_ifs_colon rd_ifs
+
+rd_ifs_scope() { IFS=: read _z < /dev/null; [ "$IFS" = "$SAVED_IFS" ]; }
+chk read_ifs_scoped rd_ifs_scope
+
+rd_fewer() { echo "one" | { read ro1 ro2; [ "$ro1" = "one" ] && [ "$ro2" = "" ]; }; }
+chk read_fewer_fields rd_fewer
+
+rd_bslash() { echo 'back\ slash' | { read rb1; [ "$rb1" = "back slash" ]; }; }
+chk read_backslash rd_bslash
+
+rd_raw() { echo 'back\ slash' | { read -r rb2; [ "$rb2" = 'back\ slash' ]; }; }
+chk read_raw rd_raw
+
+# 被反斜杠转义的 IFS 字符不是分隔符(转义在分割时生效, 不是先还原再分割)
+rd_esc_delim() { echo 'back\ slash here' | { read rx2 ry2; [ "$rx2" = "back slash" ] && [ "$ry2" = "here" ]; }; }
+chk read_escaped_delim rd_esc_delim
+
+RT=/tmp/posix_read
+rm -rf "$RT"
+mkdir -p "$RT"
+echo "l1 l2" > "$RT/read_in"
+rd_file() { read u v < "$RT/read_in"; [ "$u" = "l1" ] && [ "$v" = "l2" ]; }
+chk read_from_file rd_file
+
+rd_eof_empty() { read re < /dev/null; [ "$re" = "" ]; }
+chk read_eof_empty rd_eof_empty
+
+rd_eof_status() { read re2 < /dev/null; [ "$?" != "0" ]; }
+chk read_eof_status rd_eof_status
+
+chk sleep_zero sleep 0
+chk sleep_frac sleep 0.05
+chk sleep_sum sleep 0 0.05
+sleep_bg() { sleep 0.05 & wait $!; [ "$?" = "0" ]; }
+chk sleep_background sleep_bg
+rm -rf "$RT"
 
 # ---------------------------------------------------------------
 # 汇总

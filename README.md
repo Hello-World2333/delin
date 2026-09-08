@@ -14,7 +14,7 @@
 
 | 路径 | 作用 |
 |---|---|
-| `/bin/` | 用户工具：`cat ls mkdir rm cp mv touch head tail wc grep sed kill login sh` |
+| `/bin/` | 用户工具：`cat ls mkdir rm cp mv touch head tail wc grep sed kill login sh sleep` |
 | `/dev/` | 设备文件：`/dev/ttyN`（字符终端）、`/dev/fbN`（像素帧缓冲）、`/dev/sdX`（磁盘，见下）、`/dev/null`（读 EOF/写丢弃） |
 | `/etc/` | 用户/组配置：`passwd` `shadow` `group` |
 | `/proc/` | 虚拟进程/系统信息 fs（由模块提供） |
@@ -66,6 +66,7 @@ CC 没有裸块 API：磁盘驱动器只提供「盘上的 CC 原生文件系统
 **显示抽象**：进程面向设备文件而非库接口——`/dev/ttyN`（控制台）、`/dev/fbN`（帧缓冲）。
 
 **工具**：`ls`、`cat`、`mkdir (-p)`、`rm (-r|-f)`、`cp (-r)`、`mv`、`touch`、`head (-n)`、`tail (-n)`、
+`sleep`（GNU 风格：小数秒 + `s/m/h/d` 后缀 + 多操作数求和；50ms 分片睡眠，信号可及时打断）、
 `wc (-l|-w|-c)`、`grep (-n|-i|-v)`、`sed`（GNU 子集：`s/y/d/p/q/a/i/c/=`、行号/`$`/正则地址与区间、
 `!` 取反、`-n -s -e -f -i`）、`ed`（POSIX 子集：`a/i/c/d/p/n/l/s/t/m/r/w/q/u/g/v/=`、地址 `.` `$` n `/re/` `+n` `-n`、输入模式以 `.` 结束）、`kill`、`login`、
 `chmod`（八进制 + 符号模式 `[ugoa]*[+-=][rwx]*` + `-R` 递归）、`chown`（`[OWNER][:[GROUP]]` + `-R`）、
@@ -79,7 +80,10 @@ CC 没有裸块 API：磁盘驱动器只提供「盘上的 CC 原生文件系统
 `if/elif/else`、`for`、`while`、`case`、函数（位置参数）、`[ ]`/`test`（`=` `!=` `-n` `-z` `-eq/-ne/-lt/-le/-gt/-ge`
 `-e/-f/-d/-s/-x/-r/-w`、`!`）；`&&`/`||`/`;`；文件重定向（`>` `>>` `<`）；管道（`|`，每元素一个进程/内建，
 经内核 pipe 缓冲传递，`$?`=末元素退出码，生产端写满/消费端读空时让出调度器，broken pipe 中止写端）；内建
-`cd pwd echo exit help jobs fg bg wait kill test [ true false : break continue return shift`。
+`cd pwd echo read exit help jobs fg bg wait kill test [ true false : break continue return shift`。
+**`read [-r] var...`**（POSIX）：从当前 stdin 读一行, 按 `IFS` 分割后赋值（多余字段全部归最后一个
+变量、去尾部 IFS 空白）；无 `-r` 时反斜杠转义下一字符、行尾反斜杠续行；EOF 时变量置空并返回 1。
+`IFS` 是真正的 shell 变量（默认空白；置空则不分割），`IFS=: read a b` 的赋值是命令作用域（不污染后续）。
 **作业控制**：`cmd &` 后台执行（POSIX 异步列表），交互式下打印 `[jid] pid`、`$!` 为最近后台 pid、
 命令结束时报告 `[jid]+ Done  cmd`；`jobs`（`-l` 带 pid、`-p` 只列进程组，`%+`/`%-` 标当前/前一作业）、
 `fg [%job]`、`bg [%job]`、`wait [%job|pid]`、`kill [-SIG] %job`；作业引用 `%n`/`%+`/`%-`/pid。
@@ -101,7 +105,9 @@ shebang 支持 `#!/bin/sh` / `#!/usr/bin/env sh` 等形式，env 特殊解释为
 注意 Lua pattern 里 `-` 是量词（非贪婪），要匹配字面连字符需 `%-`，与 GNU grep 的 `-`（字面）不同。
 不支持**命令替换 `$()`/反引号**、**算术 `$(( ))`**、**here-doc `<<`**（暂未实现，遇到即语法错误）。
 `&` 的子 shell 是重新执行的进程（无 fork）：父 shell 的变量与函数定义经赋值/定义语句注入，
-但 `$?` 在子 shell 里从 0 开始（不继承父 shell 的最后状态），`read` 内建尚未实现。
+但 `$?` 在子 shell 里从 0 开始（不继承父 shell 的最后状态）。`VAR=value cmd` 的赋值在命令词
+展开**之前**生效（POSIX/bash 是展开之后，故 `x=0; x=1 echo $x` 在 Delin 打印 1、在 bash 打印 0）；
+外部命令拿不到环境变量（Delin 无环境块）；`read` 无法区分“末行无换行”（句柄 API 限制，按成功计）。
 因 CC 5.2 无位运算，`/etc/shadow` 哈希用盐+密码的 32 位滚动哈希（djb2）替代传统 `crypt`。
 
 ## 当前状态
@@ -116,11 +122,13 @@ v0.0.1 的协程调度内核 + 进程树之后，已扩展为具备 VFS、块设
 `mount`（挂载 `/dev/sdX`、`UUID=` 或镜像路径 / 无参列出）/ `umount` / `blkid` / `lsblk`；磁盘驱动器
 经 `devdisk` 抽象为 `/dev/sda`（整盘 ccdisk）与 `/dev/sdaN`（manifest 分区 ext2）设备节点，UUID 用磁盘 ID
 模拟，启动时不再自动挂载磁盘。作业控制落地：`&` 后台作业 + `jobs`/`fg`/`bg`/`wait`/`kill %job`/`$!`、
-前台作业进程组与 `^C`/`^Z` 路由、后台进程组读 tty 的 `SIGTTIN`、`/dev/null`、`sh -c`。
-`scripts/posix_test.sh`（97 项）与 `scripts/jobctl_test.sh` 在宿主
+前台作业进程组与 `^C`/`^Z` 路由、后台进程组读 tty 的 `SIGTTIN`、`/dev/null`、`sh -c`；
+新增 `read` 内建（POSIX，跟随 `IFS` 变量）与 `/bin/sleep`（GNU 风格，分片睡眠便于信号打断）。
+`scripts/posix_test.sh`（111 项）与 `scripts/jobctl_test.sh` 在宿主
 与 Delin 上各跑一次逐项比对，`scripts/sysinfo.sh` 演示实用用法。可经
 `tools/harness.lua`（宿主）或 `tools/deploy.py`（真机）验证；真机自检在 `src/init/ext2_init.lua`
-（非交互作业控制、假 tty 会话下的交互作业控制、真 tty0 的 `^Z`/`^C` 前台路由与 `SIGTTIN`）。
+（非交互作业控制、假 tty 会话下的交互作业控制、真 tty0 的 `^Z`/`^C` 前台路由与 `SIGTTIN`、
+`read` 的字段分割/IFS/`-r`/EOF 状态、`sleep` 墙钟耗时与非法参数）。
 
 ### 引导
 
@@ -227,12 +235,14 @@ src/bin/umount             卸载文件系统 (umount <dir>|<-device>)
 src/bin/blkid              列出块设备的 UUID/TYPE/LABEL (util-linux blkid 子集)
 src/bin/lsblk              树状列出块设备: NAME/SIZE/TYPE/MOUNTPOINT (util-linux lsblk 子集)
 src/bin/login              getty/login: 登录提示->验证->启动 sh->循环
-src/bin/sh                 交互/脚本 shell(POSIX 核心子集: 变量/引号/if/for/while/case/函数/test/[ ]/&&/|| /重定向, 支持 shebang 脚本执行)
+src/bin/sleep              暂停指定时间 (GNU 风格: 小数秒 + s/m/h/d 后缀 + 多操作数求和)
+src/bin/sh                 交互/脚本 shell(POSIX 核心子集: 变量/IFS/引号/if/for/while/case/函数/test/[ ]/&&/||
+                           /重定向/管道/作业控制(& jobs fg bg wait kill %job)/read, 支持 -c 与 shebang 脚本)
 src/modules/*.ko           内核模块: ccdisk(ccdisk fstype) ccmonitor(CC 显示器驱动) cc_hse(HSE 时钟拉模式
                            os.msleep) demo(演示) ext2(ext2 fstype) tom(Tom GPU 驱动) void(Void 全息驱动)
 src/modules/modules.alias  驱动别名(modprobe 风格): tm_gpu->tom hologram->void monitor->ccmonitor
 src/modules/manifest       默认装载模块清单: demo ext2 ccdisk
-scripts/posix_test.sh      可移植 POSIX 自检(host 与 Delin 各跑一次比对, 97 项全过)
+scripts/posix_test.sh      可移植 POSIX 自检(host 与 Delin 各跑一次比对, 111 项全过)
 scripts/jobctl_test.sh     作业控制自检(& / $! / jobs / fg / bg / wait / kill %job, host 与真机各跑一次)
 scripts/sysinfo.sh         实用小工具: 系统信息(变量/函数/for/case/if/重定向/工具)
 tools/bundle.lua           打包 src/ -> dist/kernel.lua 或 dist/dlub.lua
