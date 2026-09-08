@@ -26,6 +26,7 @@ if syscalls and syscalls["user.byUid"] then
     if u then uname = u.name end
 end
 local lastExit = 0
+local lastBgPid = nil -- $! : 最近一个后台作业的 pid
 
 local cwd = "/"
 if syscalls and syscalls["user.byUid"] then
@@ -42,6 +43,7 @@ local function setPos(argv)
 end
 
 local vars = {}
+local funcSrcs = {} -- 函数名 -> 定义原文(后台子 shell 注入用)
 
 -- 规范化绝对路径: 折叠 . / .. , 去掉多余斜杠(相对路径以 cwd 起)。
 local function resolve(p)
@@ -62,28 +64,43 @@ end
 
 -- 脚本文件检测: `sh [args...] <script> [args...]`。shebang 解释器调用 sh 时 argv[1]=脚本路径,
 -- 因此本分支兼作"以解释器运行脚本"的入口 —— 非交互读取该脚本文件。
+-- `sh -c '命令' [name [args...]]`: 直接执行命令行(POSIX 2.5.3; 后台作业 `&` 的子 shell 走这里)。
 local scriptPath, scriptArgs = nil, {}
+local cmdString, cmdName, cmdArgs = nil, nil, {}
+local argErr = nil
 if argv and #argv >= 1 then
     local idx = 1
-    while argv[idx] and argv[idx]:sub(1, 1) == "-" and argv[idx] ~= "-" and argv[idx] ~= "--" do idx = idx + 1 end
-    if argv[idx] == "--" then idx = idx + 1 end
-    if argv[idx] then
-        local cand = resolve(argv[idx])
-        if fs.exists(cand) and fs.isFile(cand) then
-            scriptPath = cand
-            for i = idx + 1, #argv do scriptArgs[#scriptArgs + 1] = argv[i] end
+    while argv[idx] and argv[idx]:sub(1, 1) == "-" and argv[idx] ~= "-" and argv[idx] ~= "--" do
+        if argv[idx] == "-c" then
+            cmdString = argv[idx + 1]
+            if not cmdString then argErr = "sh: -c: option requires an argument" end
+            cmdName = argv[idx + 2]
+            for i = idx + 3, #argv do cmdArgs[#cmdArgs + 1] = argv[i] end
+            idx = #argv + 1
+            break
+        end
+        idx = idx + 1
+    end
+    if not cmdString and not argErr then
+        if argv[idx] == "--" then idx = idx + 1 end
+        if argv[idx] then
+            local cand = resolve(argv[idx])
+            if fs.exists(cand) and fs.isFile(cand) then
+                scriptPath = cand
+                for i = idx + 1, #argv do scriptArgs[#scriptArgs + 1] = argv[i] end
+            end
         end
     end
 end
 if scriptPath then
     posArg0 = scriptPath
     posArgs = scriptArgs
+elseif cmdString then
+    posArg0 = cmdName or "sh"
+    posArgs = cmdArgs
 elseif argv then
     setPos(argv)
 end
-
--- 运行脚本文件时不做交互(不读 tty): stdin 仍可能是终端(被父 sh 继承)。
-local interactive = stdin and stdin.isTTY and not scriptPath
 
 local outH, inH = stdout, stdin
 local function outln(s)
@@ -93,6 +110,10 @@ local function errln(s)
     local e = io.stderr()
     if e and e.write then e:write(tostring(s or "") .. "\n") end
 end
+if argErr then errln(argErr); return 2 end
+
+-- 运行脚本文件/命令行时不做交互(不读 tty): stdin 仍可能是终端(被父 sh 继承)。
+local interactive = stdin and stdin.isTTY and not scriptPath and not cmdString
 
 local IFS = " \t\n"
 local function isIfs(c) return IFS:find(c, 1, true) ~= nil end
@@ -112,6 +133,7 @@ local function getVarVal(name)
     if name == "?" then return tostring(lastExit) end
     if name == "#" then return tostring(#posArgs) end
     if name == "$" then return tostring(pid) end
+    if name == "!" then return lastBgPid and tostring(lastBgPid) or "" end
     if name == "0" then return posArg0 end
     if name == "*" then return table.concat(posArgs, " ") end
     if name == "@" then return table.concat(posArgs, " ") end
@@ -134,6 +156,7 @@ local function readVarName(src, i)
     end
     if c == "?" then return "?", i + 1 end
     if c == "#" then return "#", i + 1 end
+    if c == "!" then return "!", i + 1 end
     if c == "@" then return "@", i + 1 end
     if c == "*" then return "*", i + 1 end
     if c == "$" then return "$", i + 1 end
@@ -148,6 +171,7 @@ end
 
 -- 词法: 返回 toks, inc。inc=true 表示输入在引号/行续接中结束 —— 即"输入不完整"
 -- (交互式应继续读下一行, 非交互式到 EOF 则是语法错误)。
+-- 每个 token 记 pos/fin(源文本起止下标): 后台作业 `&` 要按原文重新起子 shell 执行。
 local function lex(src)
     local toks, i, n = {}, 1, #src
     local inc = false
@@ -156,21 +180,22 @@ local function lex(src)
         if c == " " or c == "\t" or c == "\r" then
             i = i + 1
         elseif c == "\n" then
-            toks[#toks + 1] = { t = "nl" }; i = i + 1
+            toks[#toks + 1] = { t = "nl", pos = i, fin = i }; i = i + 1
         elseif c == "&" and src:sub(i + 1, i + 1) == "&" then
-            toks[#toks + 1] = { t = "op", op = "&&" }; i = i + 2
+            toks[#toks + 1] = { t = "op", op = "&&", pos = i, fin = i + 1 }; i = i + 2
         elseif c == "|" and src:sub(i + 1, i + 1) == "|" then
-            toks[#toks + 1] = { t = "op", op = "||" }; i = i + 2
+            toks[#toks + 1] = { t = "op", op = "||", pos = i, fin = i + 1 }; i = i + 2
         elseif c == ">" and src:sub(i + 1, i + 1) == ">" then
-            toks[#toks + 1] = { t = "op", op = ">>" }; i = i + 2
+            toks[#toks + 1] = { t = "op", op = ">>", pos = i, fin = i + 1 }; i = i + 2
         elseif c == ";" and src:sub(i + 1, i + 1) == ";" then
-            toks[#toks + 1] = { t = "op", op = ";;" }; i = i + 2
+            toks[#toks + 1] = { t = "op", op = ";;", pos = i, fin = i + 1 }; i = i + 2
         elseif c == "#" then
             -- 行注释: 跳到行尾(保留换行交给下一轮)。
             while i <= n and src:sub(i, i) ~= "\n" do i = i + 1 end
         elseif operatorChars[c] then
-            toks[#toks + 1] = { t = "op", op = c }; i = i + 1
+            toks[#toks + 1] = { t = "op", op = c, pos = i, fin = i }; i = i + 1
         else
+            local wordStart = i
             local segs, raw, rawbuf = {}, "", ""
             local function flushRaw()
                 if rawbuf ~= "" then segs[#segs + 1] = { raw = rawbuf }; rawbuf = "" end
@@ -230,7 +255,9 @@ local function lex(src)
             end
             flushRaw()
             -- 整词都是行续接时不产生空词(`echo \` + 换行 + `foo` 应为 2 个词)。
-            if #segs > 0 or raw ~= "" then toks[#toks + 1] = { t = "word", segs = segs, raw = raw } end
+            if #segs > 0 or raw ~= "" then
+                toks[#toks + 1] = { t = "word", segs = segs, raw = raw, pos = wordStart, fin = i - 1 }
+            end
         end
     end
     return toks, inc
@@ -299,9 +326,15 @@ local kw = { ["if"]=true, ["then"]=true, ["elif"]=true, ["else"]=true, ["fi"]=tr
     ["in"]=true, ["do"]=true, ["done"]=true, ["while"]=true, ["until"]=true, ["case"]=true,
     ["esac"]=true, ["function"]=true, ["!"]=true }
 
-local T, ti
+local T, ti, curSrc
 local function peek() return T[ti] end
 local function adv() local t = T[ti]; ti = ti + 1; return t end
+-- 一段 token 区间的源文本(后台作业 `&` 按原文起子 shell: 语义与 POSIX 子 shell 一致)。
+local function tokText(a, b)
+    local first, last = T[a], T[b]
+    if not first or not last or not curSrc then return nil end
+    return curSrc:sub(first.pos, last.fin)
+end
 local function isKw(t, w) return t and t.t == "word" and t.raw == w and #t.segs == 1 and t.segs[1].raw ~= nil end
 local function skipNl() while true do local t = T[ti]; if t and t.t == "nl" then ti = ti + 1 else return end end end
 local function skipSep() while true do local t = T[ti]; if t and (t.t == "nl" or (t.t == "op" and t.op == ";")) then ti = ti + 1 else return end end end
@@ -362,6 +395,7 @@ end
 -- 函数定义检测: name () { ... } 或 function name { ... } (t 处为 name/function)
 local function tryFuncDef()
     -- 形式 "name ( ) {": 
+    local startTok = ti
     local a, b, c = T[ti], T[ti + 1], T[ti + 2]
     if a and a.t == "word" and b and b.t == "op" and b.op == "(" and c and c.t == "op" and c.op == ")" then
         local fname = a.raw
@@ -375,13 +409,13 @@ local function tryFuncDef()
         if body == nil then return nil, err, inc end
         if not isKw(T[ti], "}") then return needMore("} expected") end
         ti = ti + 1
-        return { kind = "funcdef", name = fname, body = body }
+        return { kind = "funcdef", name = fname, body = body, src = tokText(startTok, ti - 1) }
     end
     return false
 end
 
-local function parseFuncKeyword()
-    -- 已看到 'function'
+local function parseFuncKeyword(startTok)
+    -- 已看到 'function'(startTok 指向该关键字)
     local nameTok = T[ti]
     if not nameTok then return nil, nil, true end
     if nameTok.t ~= "word" then return nil, "function name expected" end
@@ -395,7 +429,7 @@ local function parseFuncKeyword()
     if body == nil then return nil, err, inc end
     if not isKw(T[ti], "}") then return needMore("} expected") end
     ti = ti + 1
-    return { kind = "funcdef", name = nameTok.raw, body = body }
+    return { kind = "funcdef", name = nameTok.raw, body = body, src = tokText(startTok, ti - 1) }
 end
 
 parseCommand = function()
@@ -502,8 +536,9 @@ parseCommand = function()
         ti = ti + 1
         return { kind = "case", word = word, cases = cases }
     elseif isKw(t, "function") then
+        local kwTok = ti
         ti = ti + 1
-        return parseFuncKeyword()
+        return parseFuncKeyword(kwTok)
     elseif isKw(t, "{") then
         ti = ti + 1
         local body, err, inc = parseList({ ["}"] = true })
@@ -564,17 +599,20 @@ parseList = function(stop)
         if t.t == "op" then
             if t.op == ";" or t.op == "&" then ti = ti + 1 else break end
         end
+        local startTok = ti
         local node, err, inc = parseAndOr()
         if node == nil then
             if inc then return nil, nil, true end
             return nil, err or "parse error"
         end
+        local srcText = tokText(startTok, ti - 1) -- 先截取, 再吃掉分隔符(不含 `&` 本身)
         local op = ""
         local sep = T[ti]
         if sep and sep.t == "op" and (sep.op == ";" or sep.op == "&") then
             op = sep.op; ti = ti + 1
         end
-        items[#items + 1] = { node = node, op = op }
+        node.src = srcText -- 节点自带源文本(后台子 shell / 停止作业的显示名)
+        items[#items + 1] = { node = node, op = op, src = srcText }
         if op == "" and (isStop(T[ti], stop) or not T[ti]) then break end
         if isStop(T[ti], stop) then break end
         if not T[ti] then break end
@@ -586,7 +624,7 @@ end
 -- 求值
 -- ---------------------------------------------------------------
 local builtins = {}
-local evalNode, evalList, evalSimple, restoreRedir, matchGlob, evalPipe
+local evalNode, evalList, evalSimple, restoreRedir, matchGlob, evalPipe, spawnChild
 
 local function expandWords(words)
     local out = {}
@@ -665,13 +703,16 @@ builtins.shift = function(args)
 end
 builtins.help = function(args)
     outln("Delin sh (POSIX core subset)")
-    outln("builtins : cd pwd echo exit help jobs fg bg kill test [ true false :")
+    outln("builtins : cd pwd echo exit help jobs fg bg wait kill test [ true false :")
     outln("external : ls cat rm mkdir cp mv touch head tail wc grep sed ed chmod chown login")
-    outln("usage    : sh [script] [args...]   (no script => interactive/stdin)")
+    outln("usage    : sh [-c cmd [name [args...]]] [script] [args...]   (no script => interactive/stdin)")
 end
 
 local ttyName = (stdin and stdin.getDeviceName) and stdin:getDeviceName() or nil
 local shPg, jobs, nextJid, sigintPending = nil, {}, 0, false
+-- 作业控制: 交互式 + 有控制终端 + 内核提供进程组 syscall。
+-- 非交互 sh 也记账作业(`cmd &` + `wait`), 但不建进程组、不可 fg/bg —— POSIX 规定无作业控制
+-- 时异步列表的 stdin 指向 /dev/null(否则后台作业会与前台抢键盘)。
 local hasJobCtl = interactive and ttyName and syscalls and syscalls["job.setpgid"]
 if hasJobCtl then
     syscalls["job.setpgid"](pid, 0)
@@ -680,13 +721,21 @@ if hasJobCtl then
     syscalls["signal.install"](20, function() end)
     syscalls["signal.install"](2, function() sigintPending = true end)
 end
+-- POSIX $? : 正常退出为退出码, 信号死亡为 128+signo。
+local function exitStatus(reason, code)
+    if reason ~= "exited" then return 1 end
+    code = code or 0
+    if code < 0 then return 128 - code end
+    return code
+end
 local function pollWait(pidIn)
     while true do
         local p = syscalls["proc.info"](pidIn)
         if not p then return "exited", -1 end
         if p.status == "dead" then return "exited", (p.termSig and -p.termSig) or (p.exitCode or 0)
         elseif p.status == "error" then return "error", p.error
-        elseif p.status == "stopped" then return "stopped", p end
+        elseif p.status == "stopped" then return "stopped", p
+        end
         -- ^C 中断: 杀子进程并返回。
         if sigintPending then
             sigintPending = false
@@ -697,62 +746,228 @@ local function pollWait(pidIn)
         msleep(50) -- 轮询子进程状态: 50ms 一次(逐拍让出会让事件往返吞掉整个时间片)
     end
 end
+
+-- 作业状态以内核进程表为准(外部信号可能已把它停止/继续)。
+---@return string|nil  "Running"|"Stopped"|"Done"|nil(进程已消失)
+local function jobStatus(j)
+    local p = syscalls["proc.info"](j.pid)
+    if not p then return nil end
+    if p.status == "dead" or p.status == "error" then return "Done" end
+    if p.status == "stopped" then return "Stopped" end
+    return "Running"
+end
+local function removeJob(j)
+    for i, x in ipairs(jobs) do if x == j then table.remove(jobs, i); return end end
+end
+-- 出队已结束的作业; verbose 时逐个报告(交互式在提示符前调用, 对齐 bash)。
+local function reapJobs(verbose)
+    local keep = {}
+    for _, j in ipairs(jobs) do
+        local st = jobStatus(j)
+        if st == nil or st == "Done" then
+            if verbose then outln("[" .. j.jid .. "]+ Done  " .. j.cmd) end
+        else
+            j.status = st
+            keep[#keep + 1] = j
+        end
+    end
+    jobs = keep
+end
+-- 作业引用: 缺省/`%%`/`%+` = 当前作业, `%-` = 前一个作业, `%n` = 作业号, 数字 = pid。
 local function resolveJob(ref)
-    if not ref then return jobs[#jobs] end
+    if not ref or ref == "%%" or ref == "%+" then return jobs[#jobs] end
+    if ref == "%-" then return jobs[#jobs - 1] end
     local n = tonumber(tostring(ref):match("^%%(%d+)$"))
     if n then for _, j in ipairs(jobs) do if j.jid == n then return j end end end
     if tonumber(ref) then local pn = tonumber(ref); for _, j in ipairs(jobs) do if j.pid == pn then return j end end end
 end
-local function pruneJobs()
-    local keep = {}
-    for _, j in ipairs(jobs) do
-        local p = syscalls and syscalls["proc.info"] and syscalls["proc.info"](j.pid)
-        if p and (p.status == "dead" or p.status == "error") then else keep[#keep + 1] = j end
-    end
-    jobs = keep
+
+-- 子 shell 前置注入: 变量赋值 + 函数定义原文。Delin 无 fork, 子 shell 是新进程, 不注入就
+-- 会让 `echo $x &` 的 $x 展开成空串 —— 静默错, 比报错更糟。
+local function quoteShell(s)
+    return "'" .. tostring(s):gsub("'", "'\"'\"'") .. "'"
 end
-builtins.jobs = function(args) if not hasJobCtl then return end; pruneJobs(); for _, j in ipairs(jobs) do outln(string.format("[%d]+ %-8s %s", j.jid, j.status, j.cmd)) end end
+local function subshellPrologue()
+    local parts = {}
+    for name, val in pairs(vars) do
+        if name:match("^[%a_][%w_]*$") then parts[#parts + 1] = name .. "=" .. quoteShell(val) end
+    end
+    table.sort(parts) -- 确定性输出(便于真机日志比对)
+    for _, src in pairs(funcSrcs) do parts[#parts + 1] = src end
+    return parts
+end
+
+-- 后台执行一个列表项(POSIX 异步列表)。Delin 无 fork: 用 `sh -c <原文>` 起一个子 shell,
+-- 内置命令/管道/复合命令因此都在子进程里跑, 不污染父 shell 状态。
+local function startBackground(text)
+    if not text then errln("sh: &: empty command"); lastExit = 1; return end
+    local input = inH
+    if not hasJobCtl then
+        input = fs.open("/dev/null", "r")
+        if not input then errln("sh: &: /dev/null unavailable"); lastExit = 1; return end
+    end
+    local prologue = subshellPrologue()
+    prologue[#prologue + 1] = text
+    local argv = { "-c", table.concat(prologue, "; "), posArg0 }
+    for i = 1, #posArgs do argv[#argv + 1] = posArgs[i] end
+    local child, cerr = spawnChild("sh", argv, { input = input, output = outH })
+    if not child then
+        errln("sh: &: " .. tostring(cerr))
+        lastExit = (cerr == "command not found") and 127 or 126
+        return
+    end
+    -- 有作业控制时给作业一个自己的进程组: kill %n / fg / bg / ^C 都按组路由。
+    local pgid = nil
+    if hasJobCtl then
+        local ok, e = syscalls["job.setpgid"](child, child)
+        if not ok then errln("sh: setpgid: " .. tostring(e)); lastExit = 1; return end
+        pgid = child
+    end
+    nextJid = nextJid + 1
+    jobs[#jobs + 1] = { jid = nextJid, pid = child, pgid = pgid, cmd = text, status = "Running" }
+    lastBgPid = child
+    if interactive then outln("[" .. nextJid .. "] " .. child) end
+    lastExit = 0
+end
+
+builtins.jobs = function(args)
+    local showPid, onlyPgid = false, false
+    for _, a in ipairs(args) do
+        if a == "-l" then showPid = true
+        elseif a == "-p" then onlyPgid = true
+        elseif a == "-lp" or a == "-pl" then showPid, onlyPgid = true, true
+        else errln("jobs: " .. a .. ": invalid option"); lastExit = 2; return end
+    end
+    reapJobs(true) -- 已结束的作业先报告并出队(bash 行为)
+    for i, j in ipairs(jobs) do
+        local mark = (i == #jobs) and "+" or ((i == #jobs - 1) and "-" or " ")
+        if onlyPgid then outln(j.pgid or j.pid)
+        elseif showPid then outln(string.format("[%d]%s %d %-8s %s", j.jid, mark, j.pid, j.status, j.cmd))
+        else outln(string.format("[%d]%s %-8s %s", j.jid, mark, j.status, j.cmd)) end
+    end
+    lastExit = 0
+end
 builtins.fg = function(args)
-    if not hasJobCtl then errln("fg: not a job-control shell"); lastExit = 1; return end
-    pruneJobs()
+    if not hasJobCtl then errln("fg: no job control"); lastExit = 1; return end
+    reapJobs(true)
     local j = resolveJob(args[1])
     if not j then errln("fg: no such job"); lastExit = 1; return end
-    syscalls["job.tcsetpgrp"](ttyName, j.pgid)
-    if j.status == "stopped" then syscalls["signal.killpg"](j.pgid, 18); j.status = "running" end
+    local st = jobStatus(j)
+    if st == nil then removeJob(j); errln("fg: job has terminated"); lastExit = 1; return end
+    local ok, e = syscalls["job.tcsetpgrp"](ttyName, j.pgid)
+    if not ok then errln("fg: tcsetpgrp: " .. tostring(e)); lastExit = 1; return end
+    if st == "Stopped" then
+        syscalls["signal.killpg"](j.pgid, 18) -- SIGCONT
+        j.status = "Running"
+        -- 等调度器把 SIGCONT 投递下去: 否则 proc.info 仍报旧 stopped, 会把"上次停止"当成本次。
+        local waited = 0
+        while waited < 1000 do
+            local p = syscalls["proc.info"](j.pid)
+            if not p or p.status ~= "stopped" then break end
+            msleep(50); waited = waited + 50
+        end
+    end
     local reason, code = pollWait(j.pid)
     syscalls["job.tcsetpgrp"](ttyName, shPg)
-    if reason == "stopped" then j.status = "stopped"; outln("[" .. j.jid .. "]+ Stopped " .. j.cmd); return end
-    for i, x in ipairs(jobs) do if x == j then table.remove(jobs, i); break end end
-    lastExit = (reason == "exited") and (code or 0) or 1
-    if lastExit > 0 then errln("sh: " .. j.cmd .. ": exit " .. tostring(lastExit)) end
+    if reason == "stopped" then
+        j.status = "Stopped"
+        outln("[" .. j.jid .. "]+ Stopped  " .. j.cmd)
+        lastExit = 148 -- 128 + SIGTSTP
+        return
+    end
+    removeJob(j)
+    lastExit = exitStatus(reason, code)
 end
 builtins.bg = function(args)
-    if not hasJobCtl then errln("bg: not a job-control shell"); lastExit = 1; return end
-    pruneJobs()
+    if not hasJobCtl then errln("bg: no job control"); lastExit = 1; return end
+    reapJobs(true)
     local j = resolveJob(args[1])
     if not j then errln("bg: no such job"); lastExit = 1; return end
-    syscalls["signal.killpg"](j.pgid, 18); j.status = "running"
-    outln("[" .. j.jid .. "] " .. j.cmd .. " &")
+    if jobStatus(j) == nil then removeJob(j); errln("bg: job has terminated"); lastExit = 1; return end
+    local ok, e = syscalls["signal.killpg"](j.pgid, 18) -- SIGCONT
+    if not ok then errln("bg: " .. tostring(e)); lastExit = 1; return end
+    j.status = "Running"
+    outln("[" .. j.jid .. "]+ " .. j.cmd .. " &")
+    lastExit = 0
+end
+builtins.wait = function(args)
+    if #args == 0 then
+        -- 等全部运行中的后台作业(已停止的作业不会被等: 与 bash 一致, 先 fg/bg 处理它)。
+        for _, j in ipairs(jobs) do
+            if jobStatus(j) == "Running" then pollWait(j.pid) end
+        end
+        reapJobs(false)
+        lastExit = 0
+        return
+    end
+    local st = 0
+    for _, ref in ipairs(args) do
+        local j = resolveJob(ref)
+        local target = j and j.pid or tonumber(ref)
+        local p = target and syscalls["proc.info"](target)
+        if not p then
+            errln("wait: " .. tostring(ref) .. ": not a child of this shell")
+            st = 127
+        else
+            local reason, code = pollWait(target)
+            st = (reason == "stopped") and 148 or exitStatus(reason, code) -- 148 = 128 + SIGTSTP
+            if j then removeJob(j) end
+        end
+    end
+    lastExit = st
 end
 builtins.kill = function(args)
     local sig, targets = 15, {}
-    for i = 1, #args do
+    local i = 1
+    while i <= #args do
         local a = args[i]
         if a == "-l" or a == "-L" then
-            local nums = (syscalls and syscalls["signal.list"] and syscalls["signal.list"]()) or {}
-            local t = {}
-            for _, s in ipairs(nums) do t[#t + 1] = syscalls["signal.name"](s) end
-            outln(table.concat(t, " ")); return
-        elseif a:match("^-%d+$") then sig = tonumber(a:sub(2))
-        elseif a:match("^%-[%a]+$") then sig = (syscalls and syscalls["signal.number"] and syscalls["signal.number"](a)) or 15
-        else targets[#targets + 1] = a end
+            local nxt = args[i + 1]
+            if nxt and nxt:match("^%-?%d+$") then
+                outln(syscalls["signal.name"](tonumber((nxt:gsub("^%-", "")))) or "?")
+            elseif nxt then
+                local n = syscalls["signal.number"]((nxt:gsub("^%-", "")):gsub("^SIG", ""))
+                outln(n and tostring(n) or "?")
+                if not n then lastExit = 1 end
+            else
+                local nums = (syscalls and syscalls["signal.list"] and syscalls["signal.list"]()) or {}
+                local t = {}
+                for _, s in ipairs(nums) do t[#t + 1] = syscalls["signal.name"](s) end
+                outln(table.concat(t, " "))
+            end
+            return
+        elseif a == "-s" or a == "--signal" then
+            i = i + 1
+            local nm = args[i]
+            if not nm then errln("kill: -s: option requires an argument"); lastExit = 1; return end
+            local n = tonumber(nm) or syscalls["signal.number"](nm:gsub("^%-", ""):gsub("^SIG", ""))
+            if not n then errln("kill: " .. nm .. ": invalid signal"); lastExit = 1; return end
+            sig = n
+        elseif a:match("^%-%d+$") then
+            sig = tonumber(a:sub(2))
+        elseif a:match("^%-%-?[%a]+$") then
+            -- `-TSTP` / `-SIGTSTP` / `--TSTP`: 去前缀查名, 未知信号 fail-fast
+            -- (旧实现直接把带 `-` 的原文交给 signal.number, 查不到就静默降级成 SIGTERM)。
+            local n = syscalls["signal.number"](a:gsub("^%-%-?", ""):gsub("^SIG", ""))
+            if not n then errln("kill: " .. a .. ": invalid signal"); lastExit = 1; return end
+            sig = n
+        else
+            targets[#targets + 1] = a
+        end
+        i = i + 1
     end
     if #targets == 0 then errln("usage: kill [-SIG] pid|%job ..."); lastExit = 1; return end
     for _, tgt in ipairs(targets) do
         if tostring(tgt):match("^%%") then
             local j = resolveJob(tgt)
             if not j then errln("kill: no such job " .. tgt); lastExit = 1
-            elseif syscalls and syscalls["signal.killpg"] then local ok, e = syscalls["signal.killpg"](j.pgid, sig); if not ok then errln("kill: " .. tgt .. ": " .. tostring(e)); lastExit = 1 end end
+            elseif j.pgid then -- 有作业控制: 整组投递
+                local ok, e = syscalls["signal.killpg"](j.pgid, sig)
+                if not ok then errln("kill: " .. tgt .. ": " .. tostring(e)); lastExit = 1 end
+            else -- 无作业控制(非交互 sh): 作业没有独立进程组, 直接投给进程
+                local ok, e = syscalls["signal.kill"](j.pid, sig)
+                if not ok then errln("kill: " .. tgt .. ": " .. tostring(e)); lastExit = 1 end
+            end
         else
             local ok, e = syscalls["signal.kill"](tonumber(tgt), sig)
             if not ok then errln("kill: " .. tostring(tgt) .. ": " .. tostring(e)); lastExit = 1 end
@@ -789,7 +1004,7 @@ end
 -- 定位并 spawn 一个外部程序/脚本(不等待)。返回 pid, err。
 --   - 无 shebang: 视作 Delin Lua 程序(现有 /bin/* 行为)直接 spawn。
 --   - 带 shebang: 以解释器跑脚本 —— 解释器路径(绝对或 PATH)解析; `env` 特判取下一程序名。
-local function spawnChild(cmd, argv, stdio)
+spawnChild = function(cmd, argv, stdio)
     local path = commandPath(cmd)
     if not fs.exists(path) then return nil, "command not found" end
     if not fs.canExecute(path) then return nil, "permission denied" end
@@ -829,16 +1044,52 @@ local function spawnChild(cmd, argv, stdio)
     return child
 end
 
-local function runExternal(cmd, argv, stdio)
+-- 前台作业: 有作业控制时给作业独立进程组并把它设为 tty 前台(^C/^Z 路由到它),
+-- 运行结束把 tty 收回归 shell。作业被 ^Z 停止时入作业表, 之后可 fg/bg。
+local function fgGive(pgid)
+    if not hasJobCtl then return end
+    local ok, e = syscalls["job.tcsetpgrp"](ttyName, pgid)
+    if not ok then errln("sh: tcsetpgrp: " .. tostring(e)) end
+end
+local function fgTakeBack()
+    if not hasJobCtl then return end
+    local ok, e = syscalls["job.tcsetpgrp"](ttyName, shPg)
+    if not ok then errln("sh: tcsetpgrp(back): " .. tostring(e)) end
+end
+local function registerStopped(cmd, pid, pgid)
+    nextJid = nextJid + 1
+    jobs[#jobs + 1] = { jid = nextJid, pid = pid, pgid = pgid, cmd = cmd, status = "Stopped" }
+    outln("[" .. nextJid .. "]+ Stopped  " .. cmd)
+end
+-- 给子进程建独立进程组(第一个成员即组长)。返回 pgid, err。
+local function newJobGroup(pid, pgid)
+    local ok, e = syscalls["job.setpgid"](pid, pgid or pid)
+    if not ok then return nil, e end
+    return pgid or pid
+end
+
+local function runExternal(cmd, argv, stdio, text)
     local child, cerr = spawnChild(cmd, argv, stdio)
     if not child then
         errln("sh: " .. cmd .. ": " .. tostring(cerr))
         lastExit = (cerr == "command not found") and 127 or 126
         return
     end
+    local pgid = nil
+    if hasJobCtl then
+        local e
+        pgid, e = newJobGroup(child)
+        if not pgid then errln("sh: setpgid: " .. tostring(e)); lastExit = 1; return end
+        fgGive(pgid)
+    end
     local reason, code = pollWait(child)
-    lastExit = (reason == "exited") and (code or 0) or 1
-    if lastExit > 0 then errln("sh: " .. cmd .. ": exit " .. tostring(lastExit)) end
+    if pgid then fgTakeBack() end
+    if reason == "stopped" then
+        registerStopped(text or cmd, child, pgid)
+        lastExit = 148 -- 128 + SIGTSTP
+        return
+    end
+    lastExit = exitStatus(reason, code)
 end
 
 restoreRedir = function(out, inp)
@@ -879,7 +1130,7 @@ evalSimple = function(node)
             ctrl = builtins[cmd](rest)
         else
             local s = (needOut or needIn) and { input = inH, output = outH } or nil
-            runExternal(cmd, rest, s)
+            runExternal(cmd, rest, s, node.src)
         end
     end
     -- 关闭重定向打开的句柄(真正落盘): CC 句柄写入可能缓冲, 需 flush/close 才提交。
@@ -948,12 +1199,20 @@ evalPipe = function(node)
             info[i] = { node = node, inH = inp, outH = outp, kind = "compound" }
         end
     end
-    -- Pass B: spawn 全部外部元素。
+    -- Pass B: spawn 全部外部元素(有作业控制时同属一个进程组, 整体作前台作业)。
+    local pgid, leader = nil, nil
     for i = 1, n do
         local it = info[i]
         if it.cmd and not it.builtin then
             local pid, cerr = spawnChild(it.cmd, it.rest, { input = it.inH, output = it.outH })
-            if pid then spawned[i] = pid
+            if pid then
+                spawned[i] = pid
+                leader = leader or pid
+                if hasJobCtl then
+                    local e
+                    pgid, e = newJobGroup(pid, pgid)
+                    if not pgid then errln("sh: setpgid: " .. tostring(e)); lastExit = 1 end
+                end
             else
                 codes[i] = (cerr == "command not found") and 127 or 126
                 errln("sh: " .. it.cmd .. ": " .. tostring(cerr))
@@ -961,6 +1220,7 @@ evalPipe = function(node)
             end
         end
     end
+    if pgid then fgGive(pgid) end
     -- Pass C: 运行内置/复合命令元素。
     for i = 1, n do
         local it = info[i]
@@ -981,9 +1241,19 @@ evalPipe = function(node)
             codes[i] = rt or 0
         end
     end
-    -- Pass D: 等待外部元素退出。
+    -- Pass D: 等待外部元素退出(被 ^Z 停止时立即返回, 交给作业表)。
+    local stopped = false
     for i = 1, n do
-        if spawned[i] then codes[i] = syscalls["proc.wait"](spawned[i]) or 0 end
+        if spawned[i] and not stopped then
+            local reason, code = pollWait(spawned[i])
+            codes[i] = exitStatus(reason, code)
+            if reason == "stopped" then stopped = true end
+        end
+    end
+    if pgid then fgTakeBack() end
+    if stopped then
+        registerStopped(node.src or "pipeline", leader, pgid)
+        return 148 -- 128 + SIGTSTP
     end
     -- 清理: 重定向打开的句柄(flush/close) + 剩余管道端(close 幂等)。
     for _, h in ipairs(openedRedirs) do if h.close then pcall(h.close) end end
@@ -1090,6 +1360,7 @@ evalNode = function(node)
     end
     if node.kind == "funcdef" then
         local fname, fbody = node.name, node.body
+        funcSrcs[fname] = node.src -- 供后台子 shell 注入(见 subshellPrologue)
         builtins[fname] = function(args)
             local saveArgs, saveArg0 = posArgs, posArg0
             posArg0 = fname
@@ -1109,16 +1380,23 @@ end
 evalList = function(items)
     local lastst = 0
     for idx, it in ipairs(items) do
-        local rt, c = evalNode(it.node)
-        if c == "exit" then lastExit = rt or lastExit; return rt or 0, "exit" end
-        if c == "break" then return rt or 0, "break" end
-        if c == "continue" then return rt or 0, "continue" end
-        if c == "return" then lastExit = rt or lastExit; return rt or 0, "return" end
-        lastExit = rt or 0
-        lastst = rt or 0
-        local nxt = items[idx + 1]
-        if nxt and it.op == "&&" and lastExit ~= 0 then return lastst end
-        if nxt and it.op == "||" and lastExit == 0 then return lastst end
+        if it.op == "&" then
+            -- 异步列表: 起子 shell 后立即继续, 不等待(POSIX: $? 置 0)。
+            startBackground(it.src)
+            lastExit = lastExit or 0
+            lastst = lastExit
+        else
+            local rt, c = evalNode(it.node)
+            if c == "exit" then lastExit = rt or lastExit; return rt or 0, "exit" end
+            if c == "break" then return rt or 0, "break" end
+            if c == "continue" then return rt or 0, "continue" end
+            if c == "return" then lastExit = rt or lastExit; return rt or 0, "return" end
+            lastExit = rt or 0
+            lastst = rt or 0
+            local nxt = items[idx + 1]
+            if nxt and it.op == "&&" and lastExit ~= 0 then return lastst end
+            if nxt and it.op == "||" and lastExit == 0 then return lastst end
+        end
     end
     return lastst
 end
@@ -1127,6 +1405,7 @@ local function evalProgram(src)
     local toks, lexInc = lex(src)
     T = toks
     ti = 1
+    curSrc = src -- 后台作业 `&` 按原文起子 shell: 解析时需回取源文本
     -- 引号/行续接未闭合: 输入不完整, 什么也不执行(交互式继续读行)。
     if lexInc then return nil, true end
     local items, err, inc = parseList(nil)
@@ -1146,6 +1425,7 @@ end
 if interactive then
     local buf = ""
     while true do
+        reapJobs(true) -- 提示符前报告已结束的后台作业(`[1]+ Done cmd`)
         -- PS1 在缓冲区为空时打印; 否则 PS2(`> `)表示命令跨行未结束。
         local prompt = (#buf == 0)
             and (uname .. "@delin:" .. (cwd == "/" and "/" or cwd) .. "# ")
@@ -1169,16 +1449,18 @@ if interactive then
         end
     end
 else
-    -- 非交互: 指定了脚本文件则读该文件; 否则从 stdin(管道/重定向)读。
+    -- 非交互: -c 命令行 > 脚本文件 > stdin(管道/重定向)。
     local src = ""
-    if scriptPath then
+    if cmdString then
+        src = cmdString
+    elseif scriptPath then
         local f = fs.open(scriptPath, "r")
         if f then
             src = (f.readAll and f.readAll()) or ""
             f.close()
         else
             errln("sh: " .. scriptPath .. ": cannot open")
-            return "sh done"
+            return 1
         end
     else
         while true do
@@ -1196,4 +1478,5 @@ else
     end
 end
 
-return "sh done"
+-- 退出码 = 最后一条命令的状态(POSIX): 后台子 shell(`&`)的 wait 状态即由此而来。
+return lastExit

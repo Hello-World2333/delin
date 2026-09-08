@@ -15,6 +15,10 @@ local tty = {}
 -- ^C/^Z 信号路由回调(boot 注入): (sig) -> nil。避免 tty 依赖 process 造成循环。
 tty.onSignal = nil
 
+-- 读保护回调(process 注入): (ttyName) -> true 表示调用进程不是该 tty 前台进程组,
+-- 按 POSIX 须投递 SIGTTIN 并阻塞(由注入方负责投递)。避免 tty 依赖 process 造成循环。
+tty.readGuard = nil
+
 local nextIndex = 0
 local devices = {} -- "ttyN" -> console ctx
 local focus = nil  -- 前台 tty 名(接收键盘输入)
@@ -472,29 +476,31 @@ local function openHandle(ctx, mode)
 
     --- 阻塞读取一整行。调度器把键盘事件喂进 ctx.lineQueue; 这里轮询队列。
     --- 也消费 ^D(EOF) 与 ^C/^Z(中断) 标志。
+    --- 后台进程组读控制终端: 经 readGuard 投 SIGTTIN 后阻塞(被 SIGCONT/`fg` 恢复后重查)。
     handle.readLine = function()
         if ctx.closed then return nil, "device closed" end
         ctx.reading = true
         while true do
-            if ctx.eof then
+            if tty.readGuard and tty.readGuard(ctx.name) then
+                os.pullEvent() -- 投递 SIGTTIN 后让出: 调度器会停止本进程直到 SIGCONT
+            elseif ctx.eof then
                 ctx.eof = false
                 ctx.reading = false
                 return nil
-            end
-            if ctx.intr then
+            elseif ctx.intr then
                 ctx.intr = false
                 ctx.inputBuffer = ""
                 ctx.reading = false
                 return ""
-            end
-            if #ctx.lineQueue > 0 then
+            elseif #ctx.lineQueue > 0 then
                 local line = table.remove(ctx.lineQueue, 1)
                 ctx.inputBuffer = ""
                 ctx.reading = false
                 return line
+            else
+                -- 阻塞进程直到有事件; feedInput 已处理缓冲+回显。忽略非键盘事件。
+                os.pullEvent()
             end
-            -- 阻塞进程直到有事件; feedInput 已处理缓冲+回显。忽略非键盘事件。
-            os.pullEvent()
         end
     end
 

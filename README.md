@@ -15,7 +15,7 @@
 | 路径 | 作用 |
 |---|---|
 | `/bin/` | 用户工具：`cat ls mkdir rm cp mv touch head tail wc grep sed kill login sh` |
-| `/dev/` | 设备文件：`/dev/ttyN`（字符终端）、`/dev/fbN`（像素帧缓冲）、`/dev/sdX`（磁盘，见下） |
+| `/dev/` | 设备文件：`/dev/ttyN`（字符终端）、`/dev/fbN`（像素帧缓冲）、`/dev/sdX`（磁盘，见下）、`/dev/null`（读 EOF/写丢弃） |
 | `/etc/` | 用户/组配置：`passwd` `shadow` `group` |
 | `/proc/` | 虚拟进程/系统信息 fs（由模块提供） |
 | `/sys/` | sysfs 挂载点（虚拟）；`/sys/class/display/` 下每设备一个目录，`name/type/size` 只读，分辨率/位置/旋转/缩放 可读写 |
@@ -50,10 +50,12 @@ CC 没有裸块 API：磁盘驱动器只提供「盘上的 CC 原生文件系统
 ### 接口与工具（POSIX + GNU 子集）
 
 **进程模型**：`pid/ppid/uid/gid`；`argv`（`[0]`=程序名，`[1..]`=位置参数）；会话（`sid`）与进程组
-（`pgrp`）；`tcgetpgrp` 前台进程组；作业控制（`&` `jobs` `fg` `bg` `kill`）。
+（`pgrp`）；`tcgetpgrp` 前台进程组；作业控制（`&` `jobs` `fg` `bg` `wait` `kill %job`）。
+进程的退出码 = 协程返回值（数字），`proc.wait`/`$?` 由此得到；信号死亡记为 `128+signo`。
 
 **信号**：POSIX 信号编号（`SIGHUP..SIGTTOU`，取 Linux x86-64 编号与默认动作/可捕获表）；
-`kill [-SIG] pid|-pgid`、`kill -l`；终端 `^C`（`SIGINT`）/`^Z`（`SIGTSTP`）路由到前台进程组。
+`kill [-SIG] pid|-pgid`、`kill -l`；终端 `^C`（`SIGINT`）/`^Z`（`SIGTSTP`）路由到前台进程组，
+后台进程组读控制终端按 POSIX 投 `SIGTTIN` 并停止（`jobs` 显示 `Stopped`，`fg`/`bg` 可恢复）。
 
 **文件系统**：进程所见 `fs/io` 走内核 VFS（真实磁盘 + 虚拟 `/dev` `/proc` `/sys` 同一命名空间）；
 权限用 `mode`（八进制）+ `uid/gid`，`chmod`/`chown`，启动外部程序强制检查执行（`x`）位。
@@ -73,11 +75,19 @@ CC 没有裸块 API：磁盘驱动器只提供「盘上的 CC 原生文件系统
 各工具支持 POSIX 的 **`--` 结束选项** 标记：`rm -- --help`、`touch -- -file`、`ls -- --ff` 等，用于操作以
 `-`/`--` 开头的文件名；单独的 `-` 视为普通操作数。
 
-**sh（POSIX 核心子集）**：变量与展开（`$x`/`${x}`/`$?`/`$#`/`$@`/`$*`/`$1..`）；单/双引号；
+**sh（POSIX 核心子集）**：变量与展开（`$x`/`${x}`/`$?`/`$#`/`$@`/`$*`/`$!`/`$1..`）；单/双引号；
 `if/elif/else`、`for`、`while`、`case`、函数（位置参数）、`[ ]`/`test`（`=` `!=` `-n` `-z` `-eq/-ne/-lt/-le/-gt/-ge`
 `-e/-f/-d/-s/-x/-r/-w`、`!`）；`&&`/`||`/`;`；文件重定向（`>` `>>` `<`）；管道（`|`，每元素一个进程/内建，
 经内核 pipe 缓冲传递，`$?`=末元素退出码，生产端写满/消费端读空时让出调度器，broken pipe 中止写端）；内建
-`cd pwd echo exit help jobs fg bg kill test [ true false : break continue return shift`。
+`cd pwd echo exit help jobs fg bg wait kill test [ true false : break continue return shift`。
+**作业控制**：`cmd &` 后台执行（POSIX 异步列表），交互式下打印 `[jid] pid`、`$!` 为最近后台 pid、
+命令结束时报告 `[jid]+ Done  cmd`；`jobs`（`-l` 带 pid、`-p` 只列进程组，`%+`/`%-` 标当前/前一作业）、
+`fg [%job]`、`bg [%job]`、`wait [%job|pid]`、`kill [-SIG] %job`；作业引用 `%n`/`%+`/`%-`/pid。
+交互式前台命令也各占一个进程组并接管 tty，`^Z` 停下的前台命令自动进作业表（`fg`/`bg` 可继续）。
+Delin 无 fork：`&` 的作业用 `sh -c <命令原文>` 起子 shell（内置/管道/复合命令都在子进程里跑），
+父 shell 的变量与函数定义以赋值/定义语句前置注入；无作业控制（非交互 sh）时后台命令 stdin 指向
+`/dev/null`（POSIX 规定）。
+命令行执行：`sh -c '命令' [name [args...]]`（POSIX 2.5.3，`$0`=name）。
 **多行命令**：`\` + 换行 行续接（POSIX 2.2.1，从输入中删除；词内部与双引号内同样生效，单引号内是字面反斜杠）；
 `|` / `&&` / `||` 之后允许换行；交互式下跨行结构（`if`/`for`/`while`/`case`/函数体、未闭合引号、续行）用
 PS2 提示 `> ` 继续读行；脚本/管道输入到 EOF 仍不完整则报 `syntax error: unexpected end of file`。
@@ -90,6 +100,8 @@ shebang 支持 `#!/bin/sh` / `#!/usr/bin/env sh` 等形式，env 特殊解释为
 替换区用 `&`=整串匹配、`\1..\9`=捕获组、`\n/\t`，不支持 BRE 风格 `\(...\)` 与模式内逆引用。
 注意 Lua pattern 里 `-` 是量词（非贪婪），要匹配字面连字符需 `%-`，与 GNU grep 的 `-`（字面）不同。
 不支持**命令替换 `$()`/反引号**、**算术 `$(( ))`**、**here-doc `<<`**（暂未实现，遇到即语法错误）。
+`&` 的子 shell 是重新执行的进程（无 fork）：父 shell 的变量与函数定义经赋值/定义语句注入，
+但 `$?` 在子 shell 里从 0 开始（不继承父 shell 的最后状态），`read` 内建尚未实现。
 因 CC 5.2 无位运算，`/etc/shadow` 哈希用盐+密码的 32 位滚动哈希（djb2）替代传统 `crypt`。
 
 ## 当前状态
@@ -103,9 +115,12 @@ v0.0.1 的协程调度内核 + 进程树之后，已扩展为具备 VFS、块设
 `rm`/`mkdir` 补了 GNU `-r/-f`/`-p`；新增 `chmod`（八进制 + 符号模式 + `-R`）、`chown`（`owner:group` + `-R`）、
 `mount`（挂载 `/dev/sdX`、`UUID=` 或镜像路径 / 无参列出）/ `umount` / `blkid` / `lsblk`；磁盘驱动器
 经 `devdisk` 抽象为 `/dev/sda`（整盘 ccdisk）与 `/dev/sdaN`（manifest 分区 ext2）设备节点，UUID 用磁盘 ID
-模拟，启动时不再自动挂载磁盘。`scripts/posix_test.sh` 在宿主
-与 Delin 上各跑一次逐项比对（97 项全过），`scripts/sysinfo.sh` 演示实用用法。可经
-`tools/harness.lua`（宿主）或 `tools/deploy.py`（真机）验证。
+模拟，启动时不再自动挂载磁盘。作业控制落地：`&` 后台作业 + `jobs`/`fg`/`bg`/`wait`/`kill %job`/`$!`、
+前台作业进程组与 `^C`/`^Z` 路由、后台进程组读 tty 的 `SIGTTIN`、`/dev/null`、`sh -c`。
+`scripts/posix_test.sh`（97 项）与 `scripts/jobctl_test.sh` 在宿主
+与 Delin 上各跑一次逐项比对，`scripts/sysinfo.sh` 演示实用用法。可经
+`tools/harness.lua`（宿主）或 `tools/deploy.py`（真机）验证；真机自检在 `src/init/ext2_init.lua`
+（非交互作业控制、假 tty 会话下的交互作业控制、真 tty0 的 `^Z`/`^C` 前台路由与 `SIGTTIN`）。
 
 ### 引导
 
@@ -218,9 +233,11 @@ src/modules/*.ko           内核模块: ccdisk(ccdisk fstype) ccmonitor(CC 显�
 src/modules/modules.alias  驱动别名(modprobe 风格): tm_gpu->tom hologram->void monitor->ccmonitor
 src/modules/manifest       默认装载模块清单: demo ext2 ccdisk
 scripts/posix_test.sh      可移植 POSIX 自检(host 与 Delin 各跑一次比对, 97 项全过)
+scripts/jobctl_test.sh     作业控制自检(& / $! / jobs / fg / bg / wait / kill %job, host 与真机各跑一次)
 scripts/sysinfo.sh         实用小工具: 系统信息(变量/函数/for/case/if/重定向/工具)
 tools/bundle.lua           打包 src/ -> dist/kernel.lua 或 dist/dlub.lua
-tools/harness.lua          host 测试台: 用真实 Delin 工具源码在宿主跑(fs/io/syscalls/spawn 桩)
-tools/deploy.py            重建干净 ext2 根镜像并部署到 disk(基镜像+更新后的内核/bin/脚本)
+tools/harness.lua          host 测试台: 用真实 Delin 工具源码在宿主跑(fs/io/syscalls/spawn 桩,
+                           含信号/进程组语义: kill/killpg/SIGCONT/stopped, 供 sh 作业控制验证)
+tools/deploy.py            重建干净 ext2 根镜像并部署到 disk(基镜像+更新后的内核/bin/脚本/自检)
 dist/                      生成物(不提交)
 ```

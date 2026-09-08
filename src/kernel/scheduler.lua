@@ -134,9 +134,9 @@ function scheduler.run()
                         if proc.onExit then proc.onExit(proc, "error", param) end
                         table.remove(procs, i)
                     elseif coroutine.status(proc.co) == "dead" then
-                        -- 进程正常结束。
+                        -- 进程正常结束。协程的返回值即进程退出码(数字时由 onExit 记录)。
                         proc.status = "dead"; proc.dead = true
-                        if proc.onExit then proc.onExit(proc, "dead", nil) end
+                        if proc.onExit then proc.onExit(proc, "dead", nil, param) end
                         table.remove(procs, i)
                     else
                         -- 进程让出：param 即其 filter。

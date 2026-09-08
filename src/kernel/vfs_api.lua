@@ -197,6 +197,22 @@ function vfsapi.mountDev()
     vfs.mount("/dev", devBackend, { device = "devtmpfs", fstype = "devtmpfs" })
 end
 
+-- /dev/null: 读立即 EOF, 写丢弃(Linux 语义)。POSIX 规定非交互 sh 的后台命令 stdin
+-- 指向 /dev/null, 故本设备是作业控制的组成部分, 随 /dev 一起注册。
+local function nullHandle()
+    return {
+        read = function() return nil end,
+        readLine = function() return nil end,
+        write = function(_, s) return #tostring(s or "") end,
+        flush = function() return true end,
+        close = function() return true end,
+    }
+end
+vfsapi.registerDevice("null", {
+    writable = true,
+    open = function() return nullHandle() end,
+})
+
 --- 暴露 fs 门面(供内核/模块/cat 使用)。
 vfsapi.fs = fsapi
 

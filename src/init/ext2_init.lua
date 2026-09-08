@@ -840,6 +840,240 @@ do
     end
 end
 
+-- ═══════════ 作业控制: & 后台作业 / jobs / fg / bg / wait / SIGTTIN ═══════════
+-- 1) 非交互 sh: 跑与宿主 harness 同一份 scripts/jobctl_test.sh, 输出捕获到 log 逐行比对。
+do
+    local shHand = fs.open("/bin/sh", "r")
+    local shSrc = shHand and shHand.readAll() or nil
+    if shHand then shHand.close() end
+    if not shSrc then
+        print("ext2-init: jobctl: /bin/sh missing")
+    elseif not fs.exists("/root/jobctl_test.sh") then
+        print("ext2-init: jobctl: /root/jobctl_test.sh missing")
+    else
+        local outbuf = {}
+        local outH = {
+            write = function(_, s) outbuf[#outbuf + 1] = tostring(s); return #s end,
+            writeLine = function(_, s) outbuf[#outbuf + 1] = tostring(s or "") .. "\n"; return #(tostring(s or "")) + 1 end,
+            flush = function() return true end,
+        }
+        local inH = { isTTY = false, readLine = function() return nil end, read = function() end }
+        local spid = spawn(shSrc, "sh-jobctl", nil, nil, { [0] = "/bin/sh", "/root/jobctl_test.sh" },
+            { stdio = { input = inH, output = outH } })
+        if not spid then
+            print("ext2-init: jobctl: spawn failed")
+        else
+            local code = waitExit(spid, 180000)
+            print("ext2-init: jobctl exit=" .. tostring(code) .. " (expect 0)")
+            for _, s in ipairs(outbuf) do print("  jobctl| " .. s) end
+        end
+    end
+end
+
+-- 2) 交互式作业控制(作业控制需要交互 sh + 控制终端; 真机用假 tty 名 "tty9" 建会话)。
+--    覆盖: `&` 入作业表、$!、jobs / jobs -l / jobs -p、kill -TSTP %n -> Stopped、
+--    bg -> SIGCONT -> Running、fg -> 作业再被停住 -> 回提示符、kill -9 + wait -> 137。
+do
+    local drv = [==[
+local out = {}
+local function emit(s) out[#out + 1] = tostring(s) end
+local lines = {
+    "sh -c 'while true; do :; done' &", -- 长跑作业(不读 stdin, 便于反复停/继续)
+    "echo bgpid=$!",
+    "jobs",
+    "jobs -l",
+    "jobs -p",
+    "kill -TSTP %1", -- 跨进程投递(经 killpg): 作业在下一次被调度时停止
+    "jobs",
+    "bg %1",
+    "jobs",
+    "kill -TSTP %1",
+    "jobs",
+    "fg %1",
+    "jobs",
+    "kill -9 %1",
+    "wait %1",
+    "echo wait-status=$?",
+    "jobs",
+    "exit",
+}
+local jobPid, jobPgid = nil, nil
+local inH = {
+    isTTY = true,
+    getDeviceName = function() return "tty9" end,
+    read = function() end,
+    readLine = function()
+        os.sleep(0.3)
+        local l = table.remove(lines, 1)
+        if l == "fg %1" and jobPgid then
+            -- fg 会阻塞到作业停止/退出: 由辅助进程延迟把作业再停住(等价于用户按 ^Z)。
+            spawn("os.sleep(1.0)\nsyscalls['signal.killpg'](" .. jobPgid .. ", 20)", "fg-stopper")
+        end
+        return l
+    end,
+}
+local outH = {
+    write = function(_, s) emit(s); return #s end,
+    writeLine = function(_, s) emit(tostring(s or "") .. "\n"); return 1 end,
+    flush = function() return true end,
+}
+syscalls["job.setsid"]()
+syscalls["job.tcsetpgrp"]("tty9", syscalls["job.group"]())
+local shf = fs.open("/bin/sh", "r")
+local shSrc = shf and shf.readAll() or nil
+if shf then shf.close() end
+if not shSrc then print("JOBC: /bin/sh missing") return end
+local spid = spawn(shSrc, "sh-interactive", nil, nil, { [0] = "/bin/sh" },
+    { stdio = { input = inH, output = outH } })
+if not spid then print("JOBC: spawn failed") return end
+emit("DRV sh pgrp=" .. tostring((syscalls["job.group"]())) .. " tty9 fg=" .. tostring(syscalls["job.tcgetpgrp"]("tty9")))
+local lastst = nil
+while true do
+    local p = syscalls["proc.info"](spid)
+    -- 从输出里抓作业 pid([1] <pid> / bgpid=<pid>), 然后逐拍记录它的状态变化。
+    if not jobPid then
+        for i = #out, 1, -1 do
+            local n = tonumber((out[i] or ""):match("^bgpid=(%d+)"))
+            if n then jobPid = n; jobPgid = n; break end
+        end
+    end
+    if jobPid then
+        local jp = syscalls["proc.info"](jobPid)
+        local st = jp and (jp.status .. " termSig=" .. tostring(jp.termSig) .. " pgrp=" .. tostring(jp.pgrp))
+            or "gone"
+        if st ~= lastst then emit("DRV job " .. jobPid .. " -> " .. st); lastst = st end
+    end
+    if not p or p.status ~= "running" then break end
+    os.sleep(0.1)
+end
+print("JOBC-BEGIN")
+for _, s in ipairs(out) do print("JOBC| " .. s) end
+print("JOBC-END")
+]==]
+    local dp = spawn(drv, "jobctl-driver")
+    if dp then waitExit(dp, 120000) else print("ext2-init: jobctl interactive: spawn failed") end
+end
+
+-- 3) SIGTTIN(内核 tty 读保护): 会话拥有 tty0, 非前台进程组读 /dev/tty0 -> 停止。
+--    随后把前台权交给该组 + SIGCONT -> 恢复读取; 再 SIGKILL 清理。
+--    会话首进程退出时必须释放控制终端(否则后面的 login 无法收养 tty0)。
+do
+    local ttin = [==[
+syscalls["job.setsid"]()
+syscalls["job.tcsetpgrp"]("tty0", syscalls["job.group"]())
+local r = spawn([[
+local h = fs.open("/dev/tty0", "r")
+local line = h:readLine()
+print("TTIN-READER got=[" .. tostring(line) .. "]")
+]], "ttin-reader")
+if not r then print("TTIN: spawn failed") return end
+syscalls["job.setpgid"](r, 0) -- 独立进程组: 不是 tty0 的前台组
+os.sleep(0.8)
+local p = syscalls["proc.info"](r)
+print("TTIN: reader status=" .. tostring(p and p.status) .. " (expect stopped)")
+syscalls["job.tcsetpgrp"]("tty0", r) -- 前台权交给 reader 组
+syscalls["signal.kill"](r, 18)        -- SIGCONT
+os.sleep(0.8)
+local p2 = syscalls["proc.info"](r)
+print("TTIN: after fg+CONT status=" .. tostring(p2 and p2.status) .. " (expect running)")
+syscalls["signal.kill"](r, 9)
+os.sleep(0.3)
+print("TTIN: after KILL status=" .. tostring((syscalls["proc.info"](r) or {}).status))
+]==]
+    local lp = spawn(ttin, "ttin-leader")
+    if lp then
+        waitExit(lp, 30000)
+        os.sleep(0.4)
+        print("ext2-init: jobctl ttin tty0 owner after leader exit="
+            .. tostring(syscalls["job.sessfor"]("tty0")) .. " (expect nil)")
+    else
+        print("ext2-init: jobctl ttin: spawn failed")
+    end
+end
+
+-- 4) 真机 tty0 的信号路由: 交互 sh 的 stdin 用"名为 tty0 的假句柄"(命令可控),
+--    前台作业跑在真 tty0 的会话里, 于是 ^Z/^C 经 tty -> 前台进程组真实投递。
+--    作业先以 `&` 起(拿到 pid), 再 `fg` 转前台; 覆盖 ^Z 停止 -> jobs Stopped -> fg 恢复
+--    -> ^C 终止 -> jobs 清空, 以及停止后 shell 收回 tty 前台权。
+do
+    local fgdrv = [==[
+local out = {}
+local function emit(s) out[#out + 1] = tostring(s) end
+syscalls["job.setsid"]()
+syscalls["job.tcsetpgrp"]("tty0", syscalls["job.group"]())
+local lines = {
+    "sh -c 'while true; do :; done' &", -- 长跑作业(不读 tty)
+    "echo job=$!",
+    "fg %1", -- 转前台: ^Z/^C 应打到它
+    "jobs",
+    "fg",
+    "jobs",
+    "exit",
+}
+local inH = {
+    isTTY = true,
+    getDeviceName = function() return "tty0" end,
+    read = function() end,
+    readLine = function()
+        os.sleep(0.4)
+        return table.remove(lines, 1)
+    end,
+}
+local outH = {
+    write = function(_, s) emit(s); return #s end,
+    writeLine = function(_, s) emit(tostring(s or "") .. "\n"); return 1 end,
+    flush = function() return true end,
+}
+local shf = fs.open("/bin/sh", "r")
+local shSrc = shf and shf.readAll() or nil
+if shf then shf.close() end
+if not shSrc then print("FGT: /bin/sh missing") return end
+local spid = spawn(shSrc, "sh-tty", nil, nil, { [0] = "/bin/sh" },
+    { stdio = { input = inH, output = outH } })
+if not spid then print("FGT: spawn failed") return end
+local function ctrl(k)
+    os.queueEvent("key", keys.leftCtrl, false)
+    os.queueEvent("key", k, false)
+    os.queueEvent("key_up", keys.leftCtrl, false)
+end
+local function jobPid()
+    for i = #out, 1, -1 do
+        local n = tonumber((out[i] or ""):match("^job=(%d+)"))
+        if n then return n end
+    end
+end
+local function fg() return tostring(syscalls["job.tcgetpgrp"]("tty0")) end
+local function shpgrp() local p = syscalls["proc.info"](spid); return p and tostring(p.pgrp) or "?" end
+os.sleep(2.0) -- 起作业 + fg 转前台
+emit("DRV before-z fg=" .. fg() .. " job=" .. tostring(jobPid()) .. " shpgrp=" .. shpgrp())
+ctrl(keys.z) -- ^Z -> SIGTSTP 给前台作业组
+os.sleep(0.3) -- 立刻观察: 停止后 shell 应收回 tty 前台权
+emit("DRV after-z fg=" .. fg() .. " (expect shpgrp=" .. shpgrp() .. ")")
+os.sleep(2.0) -- 让 shell 读完 "jobs" 与 "fg"(作业重新前台)
+emit("DRV before-c fg=" .. fg() .. " (expect job=" .. tostring(jobPid()) .. ")")
+ctrl(keys.c) -- ^C -> SIGINT 给前台作业组(内层 sh 终止)
+os.sleep(1.5)
+emit("DRV after-c fg=" .. fg() .. " (expect shpgrp=" .. shpgrp() .. ")")
+while true do
+    local p = syscalls["proc.info"](spid)
+    if not p or p.status ~= "running" then break end
+    os.sleep(0.2)
+end
+print("FGT-BEGIN")
+for _, s in ipairs(out) do print("FGT| " .. s) end
+print("FGT-END")
+]==]
+    local fp = spawn(fgdrv, "jobctl-fg-tty")
+    if fp then
+        waitExit(fp, 120000)
+        os.sleep(0.4)
+        print("ext2-init: jobctl fg tty0 owner after driver exit="
+            .. tostring(syscalls["job.sessfor"]("tty0")) .. " (expect nil)")
+    else
+        print("ext2-init: jobctl fg: spawn failed")
+    end
+end
+
 -- ═══════════ 产品形态 ═══════════
 -- 3) 产品形态: 在每个 tty 上 spawn 一个 login 进程(登录到 sh)。init 保持存活。
 --    login 各自绑定自己的 tty(per-process stdio), 经 Ctrl+Alt+数字切换前台焦点共用一把键盘。

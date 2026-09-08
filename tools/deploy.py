@@ -53,6 +53,7 @@ def main():
         os.makedirs(os.path.join(rootfs, "root"), exist_ok=True)
         os.makedirs(os.path.join(rootfs, "tmp"),  exist_ok=True)
         shutil.copy(os.path.join(REPO, "scripts/posix_test.sh"), os.path.join(rootfs, "root/posix_test.sh"))
+        shutil.copy(os.path.join(REPO, "scripts/jobctl_test.sh"), os.path.join(rootfs, "root/jobctl_test.sh"))
         shutil.copy(os.path.join(REPO, "scripts/sysinfo.sh"),    os.path.join(rootfs, "root/sysinfo.sh"))
         # 安装内核模块(src/modules -> /lib/modules/<version>/):
         # 基镜像的 /lib 可能因 debugfs 元数据损坏而无法 rdump, 且模块应始终取当前 src。

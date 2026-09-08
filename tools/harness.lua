@@ -167,9 +167,21 @@ local function makeIo(stdio)
     }
 end
 
+-- /dev/null(与内核 devtmpfs 的 null 设备一致): 读立即 EOF, 写丢弃。
+local NULL_HANDLE = {
+    isTTY = false,
+    read = function() return nil end,
+    readLine = function() return nil end,
+    write = function(_, s) return #tostring(s or "") end,
+    flush = function() return true end,
+    close = function() return true end,
+    getDeviceName = function() return nil end,
+}
+
 -- io.open 落在 F.open / fs.open
 function F.open(p, mode)
     p = norm(p)
+    if p == "/dev/null" then return NULL_HANDLE end
     local m = mode or "r"
     local hostp = host(p)
     if m == "r" then
@@ -193,6 +205,7 @@ end
 -- syscalls(最小桩)
 -- ---------------------------------------------------------------
 local procs = {}
+local curPid = nil -- 调度器当前 resume 的进程(供 job.group/signal.install 定位调用者)
 local users = {}
 local groups = {}
 local syscalls = {}
@@ -211,21 +224,84 @@ syscalls["proc.wait"] = function(pid)
         local p = procs[pid]
         if not p then return -1 end
         if p.status == "dead" or p.status == "error" then
+            if p.termSig then return -p.termSig end
             return (p.status == "error" and 1) or (p.exitCode or 0)
         end
         os.sleep(0.01)
     end
 end
 syscalls["pipe.create"] = function() return pipeCreate() end
-syscalls["signal.list"] = function() return { 1, 2, 3, 9, 15 } end
-syscalls["signal.name"] = function(n) return ({ [1]="HUP", [2]="INT", [3]="QUIT", [9]="KILL", [15]="TERM" })[n] or "?" end
-syscalls["signal.number"] = function(name) return ({ ["HUP"]=1, ["INT"]=2, ["QUIT"]=3, ["KILL"]=9, ["TERM"]=15 })[name] end
-syscalls["signal.kill"] = function() return true end
-syscalls["signal.killpg"] = function() return 1 end
-syscalls["signal.install"] = function() return true end
-syscalls["job.group"] = function() return 0 end
-syscalls["job.setpgid"] = function() return true end
-syscalls["job.setsid"] = function() return 0 end
+
+-- 信号/作业控制桩: 与内核 signal.lua/process.lua 的语义对齐(编号/默认动作/进程组),
+-- 使 sh 的 `&`/jobs/fg/bg/wait/kill %job 能在宿主上被真实验证(前台 tty 部分除外)。
+local SIG = {
+    [1] = "HUP", [2] = "INT", [3] = "QUIT", [9] = "KILL", [10] = "USR1", [12] = "USR2",
+    [13] = "PIPE", [14] = "ALRM", [15] = "TERM", [17] = "CHLD", [18] = "CONT",
+    [19] = "STOP", [20] = "TSTP", [21] = "TTIN", [22] = "TTOU",
+}
+local SIGNO = {}
+for n, nm in pairs(SIG) do SIGNO[nm] = n end
+local SIG_LIST = {}
+for n in pairs(SIG) do SIG_LIST[#SIG_LIST + 1] = n end
+table.sort(SIG_LIST)
+local STOP_SIGS = { [19] = true, [20] = true, [21] = true, [22] = true }
+
+local function deliver(pid, sig)
+    local p = procs[pid]
+    if not p then return nil, "no such process: " .. tostring(pid) end
+    if p.status == "dead" or p.status == "error" then return true end -- 已死: 无效果但不算错
+    if sig == 18 then -- SIGCONT
+        if p.status == "stopped" then p.status = "running" end
+        return true
+    end
+    local h = p.handlers and p.handlers[sig]
+    if h then pcall(h, sig); return true end
+    if sig == 9 or STOP_SIGS[sig] == nil then
+        p.termSig = sig
+        p.status = "dead"
+    else
+        p.status = "stopped"
+    end
+    return true
+end
+
+syscalls["signal.list"] = function() return SIG_LIST end
+syscalls["signal.name"] = function(n) return SIG[n] or "?" end
+syscalls["signal.number"] = function(name)
+    return SIGNO[(name or ""):upper():gsub("^SIG", "")]
+end
+syscalls["signal.kill"] = function(pid, sig) return deliver(pid, sig) end
+syscalls["signal.killpg"] = function(pgid, sig)
+    local n = 0
+    for pid, p in pairs(procs) do
+        if p.pgrp == pgid then deliver(pid, sig); n = n + 1 end
+    end
+    if n == 0 then return nil, "no such process group" end
+    return n
+end
+syscalls["signal.install"] = function(sig, fn)
+    local p = procs[curPid]
+    if not p then return nil, "no current process" end
+    p.handlers = p.handlers or {}
+    p.handlers[sig] = fn
+    return true
+end
+syscalls["job.group"] = function()
+    local p = procs[curPid]
+    return p and p.pgrp or 0
+end
+syscalls["job.setpgid"] = function(pid, pgid)
+    local p = procs[pid]
+    if not p then return nil, "no such process: " .. tostring(pid) end
+    p.pgrp = (not pgid or pgid == 0) and pid or pgid
+    return true
+end
+syscalls["job.setsid"] = function()
+    local p = procs[curPid]
+    if not p then return nil, "no current process" end
+    p.pgrp, p.sid = curPid, curPid
+    return curPid
+end
 syscalls["job.tcsetpgrp"] = function() return true end
 syscalls["stdio.set"] = function(i, o) return true end
 syscalls["tty.console"] = function() return "tty0" end
@@ -335,8 +411,13 @@ local function spawn(src, name, ppid, uid, gid, argv, opts)
         procs[pid] = { pid = pid, name = name, status = "error", error = lerr, exitCode = 1 }
         return nil, "load failed: " .. tostring(lerr)
     end
-    procs[pid] = { pid = pid, name = name, status = "running", exitCode = 0, stdio = stdio }
-    running[#running + 1] = { pid = pid, co = coroutine.create(chunk), status = "running" }
+    -- 进程组/会话: 子进程继承父进程的 pgrp/sid(与内核 process.spawn 一致)。
+    local parent = procs[ppid]
+    local pgrp = parent and parent.pgrp or pid
+    local sid = parent and parent.sid or 0
+    procs[pid] = { pid = pid, name = name, status = "running", exitCode = 0, stdio = stdio,
+                   pgrp = pgrp, sid = sid, handlers = {} }
+    running[#running + 1] = { pid = pid, co = coroutine.create(chunk) }
     return pid
 end
 
@@ -350,21 +431,26 @@ local function closeProcPipes(pid)
 end
 
 -- 协作式调度器: 轮流 resume 每个未退出进程; 进程 yield(os.sleep)则让位, 下轮再恢复。
+-- 被信号杀死/停止的进程(procs[pid].status)不再被 resume —— 对应内核调度器的信号投递。
+-- 只剩 stopped 进程时结束调度(宿主无事件循环, 停住的作业被遗弃; 真机由 SIGCONT/fg 恢复)。
 local function schedulerRun()
     while true do
         local anyAlive = false
         for _, pr in ipairs(running) do
-            if pr.status ~= "dead" and pr.status ~= "error" then
+            local p = procs[pr.pid]
+            if p.status == "running" then
                 anyAlive = true
-                local ok, err = coroutine.resume(pr.co)
+                curPid = pr.pid
+                local ok, res = coroutine.resume(pr.co)
+                curPid = nil
                 if not ok then
-                    pr.status = "error"
-                    procs[pr.pid].status = "error"; procs[pr.pid].error = err; procs[pr.pid].exitCode = 1
-                    io.stderr:write("[harness] " .. (procs[pr.pid].name or pr.pid) .. " error: " .. tostring(err) .. "\n")
+                    p.status = "error"; p.error = res; p.exitCode = 1
+                    io.stderr:write("[harness] " .. (p.name or pr.pid) .. " error: " .. tostring(res) .. "\n")
                     closeProcPipes(pr.pid)
                 elseif coroutine.status(pr.co) == "dead" then
-                    pr.status = "dead"
-                    procs[pr.pid].status = "dead"
+                    p.status = "dead"
+                    -- 协程返回值即退出码(与内核 process.onExit 一致)。
+                    if type(res) == "number" then p.exitCode = res end
                     closeProcPipes(pr.pid)
                 end
             end
@@ -403,6 +489,7 @@ local function setupRoot()
     w("/home/alice/x.txt", "alice file\n")
     -- /dev 占位
     os.execute("mkdir -p " .. ROOT .. "/dev " .. ROOT .. "/proc " .. ROOT .. "/sys/class/display")
+    os.execute("touch " .. ROOT .. "/dev/null") -- 占位(打开走 NULL_HANDLE, 使 ls /dev 一致)
     os.execute("mkdir -p " .. ROOT .. "/lib/modules/0.0.2")
 end
 

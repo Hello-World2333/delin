@@ -9,6 +9,7 @@
 
 local signal    = require("kernel.signal")
 local scheduler = require("kernel.scheduler")
+local tty       = require("kernel.tty")
 local vfs_api   = require("kernel.vfs_api")
 local modules   = require("kernel.modules")
 
@@ -18,6 +19,7 @@ process.next_pid = 0
 process.log = nil        -- boot 注入: fun(...)  受控 print
 local registry = {}      -- pid -> proc
 local children = {}      -- pid -> set of child pids
+local coPid = {}         -- coroutine -> pid (process.current() 的 O(1) 反查)
 
 -- 会话/进程组表 (POSIX 作业控制).
 --   sessions[sid] = { sid, leader, ctty, fgPgrp }
@@ -168,6 +170,7 @@ function process.spawn(src, name, ppid, uid, gid, argv, opts)
     end
 
     local co = coroutine.create(chunk)
+    coPid[co] = pid
     ---@type DelinProcess
     local proc = {
         pid = pid, ppid = ppid, name = name or ("proc#" .. pid),
@@ -181,9 +184,10 @@ function process.spawn(src, name, ppid, uid, gid, argv, opts)
 
     -- onExit: 更新 registry 里的规范 proc 表(status/exitCode), 不是调度器的临时 proc 对象。
     -- 否则 process.info(pid) 永远看到 status="running", proc.wait 无法感知子进程退出。
-    proc.onExit = function(_, status, err)
+    -- result 是协程的返回值: 数字即退出码(sh -c 'exit 3' -> 3), 其余(工具惯用的 "xx done")记 0。
+    proc.onExit = function(_, status, err, result)
         proc.status = status
-        proc.exitCode = (status == "dead") and 0 or nil
+        proc.exitCode = (status == "dead") and ((type(result) == "number") and result or 0) or nil
         -- 释放进程持有的 stdio 句柄: 对管道端会递减 writer/reader 计数, 使对端读到 EOF
         -- 或在 broken pipe 时中止; 对 tty/file 句柄 close 是幂等/无效的(pcall 兜底)。
         if proc.stdio then
@@ -193,6 +197,14 @@ function process.spawn(src, name, ppid, uid, gid, argv, opts)
         if status == "error" then
             proc.error = err
             if process.log then pcall(process.log, "[proc " .. pid .. " " .. tostring(name) .. "] ERROR: " .. tostring(err)) end
+        end
+        -- 会话首进程退出: 释放其控制终端, 使新的会话(如下一个 login)能重新收养该 tty。
+        if proc.sid == pid then
+            local sess = sessions[proc.sid]
+            if sess then
+                if sess.ctty and cttyOwners[sess.ctty] == sess.sid then cttyOwners[sess.ctty] = nil end
+                sessions[proc.sid] = nil
+            end
         end
         reparentOrphans(pid)
     end
@@ -221,11 +233,11 @@ end
 ---@return table
 function process.current()
     local co = coroutine.running()
-    if not co then return { pid = 0, uid = 0, gid = 0 } end -- 内核/主线程 -> root
-    for pid, p in pairs(registry) do
-        if p.co == co then return { pid = pid, uid = p.uid, gid = p.gid } end
-    end
-    return { pid = 0, uid = 0, gid = 0 }
+    local pid = co and coPid[co]
+    if not pid then return { pid = 0, uid = 0, gid = 0 } end -- 内核/主线程 -> root
+    local p = registry[pid]
+    if not p then return { pid = 0, uid = 0, gid = 0 } end
+    return { pid = pid, uid = p.uid, gid = p.gid }
 end
 
 --- 当前进程的 pgrp/sid(供 sh 作业控制查询)。
@@ -374,6 +386,27 @@ end
 function process.sessionForTty(ttyName)
     return cttyOwners[ttyName]
 end
+
+--- tty 读保护(POSIX SIGTTIN): 进程读自己的控制终端但不在前台进程组时, 投 SIGTTIN
+--- 并返回 true 让 tty 阻塞该读。tty 无归属会话 / 不是该进程会话的控制终端 / 就在前台
+--- 一律放行。
+---@param ttyName string
+---@return boolean
+function process.checkTtyRead(ttyName)
+    local cur = process.current()
+    local p = registry[cur.pid]
+    if not p then return false end
+    local sid = cttyOwners[ttyName]
+    if not sid then return false end
+    if p.sid ~= sid then return false end
+    local sess = sessions[sid]
+    if not sess or not sess.fgPgrp then return false end
+    if p.pgrp == sess.fgPgrp then return false end
+    p.sig.pending[signal.SIGTTIN] = true
+    return true
+end
+
+tty.readGuard = process.checkTtyRead
 
 --- 调度器在 resume 前投递信号。返回 "run"|"stop"|"dead"。
 ---   投递规则(fail-fast, 不防御性回退):
