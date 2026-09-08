@@ -146,6 +146,9 @@ local function scroll(ctx)
         ctx.grid[(ctx.rows - 1) * ctx.cols + col + 1] = { ch = " ", fg = ctx.fg, bg = ctx.bg }
     end
     for i = 1, ctx.rows * ctx.cols do markCell(ctx, i) end
+    -- 滚动后旧的 cursorRenderedIdx 已失效(grid 内容移位), 必须重置。
+    ctx.cursorRenderedIdx = nil
+    updateCursor(ctx)
 end
 
 local function putChar(ctx, ch)
