@@ -104,6 +104,7 @@ local function getVarVal(name)
     if name == "$" then return tostring(pid) end
     if name == "0" then return posArg0 end
     if name == "*" then return table.concat(posArgs, " ") end
+    if name == "@" then return table.concat(posArgs, " ") end
     local n = tonumber(name)
     if n then return posArgs[n] or "" end
     return vars[name] or ""
