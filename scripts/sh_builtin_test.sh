@@ -190,6 +190,13 @@ chkcontain xtrace_prefix "TRACE> echo traced" $T/xtrace_out
 sh -c 'echo before; set -v; echo VERBOSE_MARK; set +v' > $T/verbose_out
 chkcontain verbose_echo "echo VERBOSE_MARK" $T/verbose_out
 
+# ---------------------------------------------------------------
+# 10. 终端输出必须是 ASCII(CC 终端打印中文会乱码): help 输出里不允许出现非 ASCII 字节
+# ---------------------------------------------------------------
+help > $T/help_out
+grep -v "^[ -~]*$" $T/help_out > $T/help_nonascii
+chk ascii_help [ ! -s $T/help_nonascii ]
+
 echo "== summary =="
 if [ "$outcome" = "0" ]; then echo "all ok"; else echo "FAILURES"; fi
 exit $outcome

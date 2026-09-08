@@ -1102,8 +1102,8 @@ builtins.help = function(args)
     outln("           . set export unset break continue return shift")
     outln("external : ls cat rm mkdir cp mv touch head tail wc grep sed ed chmod chown login")
     outln("usage    : sh [-c cmd [name [args...]]] [script] [args...]   (no script => interactive/stdin)")
-    outln("options  : set -e(errexit) -u(nounset) -v(verbose) -x(xtrace) -o <name>; $- 为当前选项")
-    outln("vars     : PATH HOME PWD OLDPWD USER SHELL PPID PS1 PS2 PS3 PS4 IFS (export 后传给子进程)")
+    outln("options  : set -e(errexit) -u(nounset) -v(verbose) -x(xtrace) -o <name>; $- lists flags")
+    outln("vars     : PATH HOME PWD OLDPWD USER SHELL PPID PS1 PS2 PS3 PS4 IFS (export to pass to children)")
 end
 
 local ttyName = (stdin and stdin.getDeviceName) and stdin:getDeviceName() or nil
