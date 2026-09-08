@@ -54,6 +54,7 @@ local profiles = {
             ["kernel.blockdev"] = "src/kernel/blockdev.lua",
             ["kernel.ext2"]     = "src/kernel/ext2.lua",
             ["kernel.manifest"] = "src/kernel/manifest.lua",
+            ["kernel.dlubcfg"]  = "src/kernel/dlubcfg.lua",
             ["kernel.dlub"]     = "src/kernel/dlub.lua",
         },
         assets = {},

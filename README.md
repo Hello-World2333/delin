@@ -23,6 +23,7 @@
 | `/mnt/` | 挂载点（磁盘驱动、ext2 分区） |
 | `/parts/` | 引导盘分区清单 `manifest`（`<role> <path> <fstype>`，`#` 为注释） |
 | `/boot/` | 内核镜像 |
+| `/dlub.cfg` | DLUB 引导配置（电脑自身 FS）：`bootdisk <外设名>` 显式指定引导盘 |
 
 ### 接口与工具（POSIX + GNU 子集）
 
@@ -86,8 +87,11 @@ v0.0.1 的协程调度内核 + 进程树之后，已扩展为具备 VFS、块设
   `/mnt/<side>` → `registerConsole` 把电脑自身 `term` 注册为 `/dev/ttyN` 控制台 → `setupModules`
   从 `/lib/modules/<version>/` 装模块（`loadAll` + `loadAliases` + 按外设 autoload 驱动，
   modprobe 风格 `modules.use`）→ `sysfs.mount` 挂 `/sys/class/display` → `launch` 出 PID 1（init）。
-- **EXT2 根引导**（GRUB 风格，DLUB 独立文件）：先由 `dlub.lua` 找带 `/parts/manifest` 的引导盘，
-  按清单把 root 分区开成块设备、挂 ext2、读内核镜像并设 `_G.__boot_info`；`boot.boot()` 检测到
+- **EXT2 根引导**（GRUB 风格，DLUB 独立文件）：先由 `dlub.lua` 读**电脑自身 FS** 的 `/dlub.cfg`
+  （`bootdisk <外设名>`，如 `bootdisk left`）锁定引导盘——多磁盘时 `peripheral.getNames()` 顺序
+  不可靠（数据盘可能先被枚举到），因此**不扫描、不回退**：配置缺失/语法错误/该外设不是磁盘驱动/
+  盘上无 `/parts/manifest` 一律 fail-fast 报错。再读该盘 `/parts/manifest`，按清单把 root 分区开成
+  块设备、挂 ext2、读内核镜像并设 `_G.__boot_info`；`boot.boot()` 检测到
   `__boot_info` 即走 `bootExt2`——挂 ext2 根为 `/`，读 `/etc/passwd` 建用户库，模块只从 ext2 根镜像
   自带的 `/lib/modules/<version>/` 装载（自包含，fail-fast，绝不回退到引导盘/CC fs 的 `/lib`）。
 
@@ -122,7 +126,9 @@ lua5.1 tools/bundle.lua dlub     # 生成 dist/dlub.lua（DLUB 引导装载器�
 ```
 
 内核 bundle 复制到引导盘 `bootPath`（manifest 的 `boot` 行，默认 `/boot/delin.lua`）；DLUB 复制到
-引导盘的引导脚本入口。产物均以 Lua 5.2+ `_ENV` 技巧打包，每个模块包一层 `__require` 到内部 shim。
+引导盘的引导脚本入口。DLUB 还需在**电脑自身 FS** 写 `/dlub.cfg` 指定引导盘外设名（如 `bootdisk left`），
+缺失或非法时 DLUB 直接报错、不猜测。产物均以 Lua 5.2+ `_ENV` 技巧打包，每个模块包一层 `__require`
+到内部 shim。
 
 ## 约定
 
@@ -146,7 +152,8 @@ src/kernel/tty.lua         字符终端(/dev/ttyN): 行规程+回显+光标+滚�
 src/kernel/fb.lua          软件帧缓冲(/dev/fbN): 32 位 ARGB 像素缓冲+脏矩形 flush
 src/kernel/sysfs.lua       /sys/class/display 虚拟配置 fs(sysfs 风格, 读=查/写=设)
 src/kernel/manifest.lua    /parts/manifest 解析器(root/boot 行 + 分区表)
-src/kernel/dlub.lua        DLUB 引导装载器(GRUB 风格): 找盘->清单->开区->挂 ext2->载内核
+src/kernel/dlubcfg.lua     /dlub.cfg 解析器(bootdisk 行; 语法/未知键/重复键 fail-fast)
+src/kernel/dlub.lua        DLUB 引导装载器(GRUB 风格): /dlub.cfg 锁盘->清单->开区->挂 ext2->载内核
 src/kernel/boot.lua        入口: 日志->kprint->setupVfs/registerConsole->装模块->sysfs->launch init
 src/init/init.lua          CC-fs 引导的 PID 1(init)
 src/init/ext2_init.lua     EXT2 根引导的最小 PID 1(权限/显示/键盘/shell 自检)

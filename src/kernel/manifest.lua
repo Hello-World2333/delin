@@ -31,7 +31,7 @@ end
 ---@return table|nil partition
 function manifest.findRoot(m)
     for _, p in ipairs(m.partitions) do
-        if p.role == "root" or p.role == "boot" then return p end
+        if p.role == "root" then return p end
     end
     return nil
 end
