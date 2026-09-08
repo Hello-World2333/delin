@@ -146,8 +146,11 @@ local function readVarName(src, i)
     return nil, i
 end
 
+-- 词法: 返回 toks, inc。inc=true 表示输入在引号/行续接中结束 —— 即"输入不完整"
+-- (交互式应继续读下一行, 非交互式到 EOF 则是语法错误)。
 local function lex(src)
     local toks, i, n = {}, 1, #src
+    local inc = false
     while i <= n do
         local c = src:sub(i, i)
         if c == " " or c == "\t" or c == "\r" then
@@ -178,10 +181,19 @@ local function lex(src)
                 if cc == "&" and src:sub(i + 1, i + 1) == "&" then break end
                 if cc == "|" and src:sub(i + 1, i + 1) == "|" then break end
                 if operatorChars[cc] then break end
-                if cc == "'" then
+                if cc == "\\" then
+                    -- 行续接(POSIX 2.2.1): `\` + 换行 从输入中删除, 词不被打断。
+                    local nx = src:sub(i + 1, i + 1)
+                    if nx == "\n" then i = i + 2; if i > n then inc = true end -- 输入以续行结尾
+                    elseif nx == "\r" and src:sub(i + 2, i + 2) == "\n" then
+                        i = i + 3; if i > n then inc = true end
+                    elseif nx == "" then inc = true; i = i + 1 -- 行尾反斜杠: 等续行
+                    else rawbuf = rawbuf .. "\\" .. nx; raw = raw .. "\\" .. nx; i = i + 2 end
+                elseif cc == "'" then
                     flushRaw()
                     local j = i + 1
                     while j <= n and src:sub(j, j) ~= "'" do j = j + 1 end
+                    if j > n then inc = true end -- 引号未闭合: 跨行待续
                     segs[#segs + 1] = { sq = src:sub(i + 1, j - 1) }; raw = raw .. src:sub(i + 1, j - 1)
                     i = (j <= n) and (j + 1) or j
                 elseif cc == '"' then
@@ -191,6 +203,10 @@ local function lex(src)
                         local dc = src:sub(j, j)
                         if dc == "\\" and src:sub(j + 1, j + 1) == '"' then
                             dqsegs[#dqsegs + 1] = { raw = '"' }; raw = raw .. '"'; j = j + 2
+                        elseif dc == "\\" and src:sub(j + 1, j + 1) == "\n" then
+                            j = j + 2 -- 行续接: 双引号内 `\` + 换行 也被删除
+                        elseif dc == "\\" and src:sub(j + 1, j + 1) == "\r" and src:sub(j + 2, j + 2) == "\n" then
+                            j = j + 3
                         elseif dc == "$" then
                             local name, ni = readVarName(src, j + 1)
                             if name then
@@ -200,6 +216,7 @@ local function lex(src)
                             dqsegs[#dqsegs + 1] = { raw = dc }; raw = raw .. dc; j = j + 1
                         end
                     end
+                    if j > n then inc = true end -- 双引号未闭合(含行尾反斜杠): 跨行待续
                     segs[#segs + 1] = { dq = dqsegs }
                     i = (j <= n) and (j + 1) or j
                 elseif cc == "$" then
@@ -212,10 +229,11 @@ local function lex(src)
                 end
             end
             flushRaw()
-            toks[#toks + 1] = { t = "word", segs = segs, raw = raw }
+            -- 整词都是行续接时不产生空词(`echo \` + 换行 + `foo` 应为 2 个词)。
+            if #segs > 0 or raw ~= "" then toks[#toks + 1] = { t = "word", segs = segs, raw = raw } end
         end
     end
-    return toks
+    return toks, inc
 end
 
 local function expandGlue(segs)
@@ -293,6 +311,11 @@ local function isStop(t, stop)
     if t.t == "op" and stop[t.op] then return true end
     return false
 end
+-- 缺少关键字/操作数时的返回: 输入已到末尾 => 不完整(交互式继续读行 PS2), 否则语法错误。
+local function needMore(msg)
+    if not T[ti] then return nil, nil, true end
+    return nil, msg
+end
 
 local parseList, parseCommand, parseSimple, parseAndOr, parsePipeline, parseParse
 parseSimple = function()
@@ -306,7 +329,9 @@ parseSimple = function()
             if t.op == ">" or t.op == ">>" or t.op == "<" then
                 ti = ti + 1
                 local tgt = T[ti]
-                if not tgt or tgt.t ~= "word" then break end
+                if not tgt then return needMore("redirection target expected") end
+                -- 重定向目标必须与操作符同行(POSIX): 换行/其他操作符即语法错误。
+                if tgt.t ~= "word" then return nil, "redirection target expected" end
                 ti = ti + 1
                 redirects[#redirects + 1] = { fd = 0, op = t.op, target = tgt.segs }
             else break end
@@ -343,11 +368,13 @@ local function tryFuncDef()
         ti = ti + 3
         skipNl()
         local bt = T[ti]
-        if not (bt and isKw(bt, "{")) then return nil, "function body expected" end
+        if not bt then return nil, nil, true end
+        if not isKw(bt, "{") then return nil, "function body expected" end
         ti = ti + 1
         local body, err, inc = parseList({ ["}"] = true })
         if body == nil then return nil, err, inc end
-        if isKw(T[ti], "}") then ti = ti + 1 end
+        if not isKw(T[ti], "}") then return needMore("} expected") end
+        ti = ti + 1
         return { kind = "funcdef", name = fname, body = body }
     end
     return false
@@ -356,28 +383,30 @@ end
 local function parseFuncKeyword()
     -- 已看到 'function'
     local nameTok = T[ti]
-    if not nameTok or nameTok.t ~= "word" then return nil, "function name expected" end
+    if not nameTok then return nil, nil, true end
+    if nameTok.t ~= "word" then return nil, "function name expected" end
     ti = ti + 1
     if T[ti] and T[ti].t == "op" and T[ti].op == "(" then ti = ti + 1
         if T[ti] and T[ti].t == "op" and T[ti].op == ")" then ti = ti + 1 end end
     skipNl()
-    if not isKw(T[ti], "{") then return nil, "function body expected" end
+    if not isKw(T[ti], "{") then return needMore("function body expected") end
     ti = ti + 1
     local body, err, inc = parseList({ ["}"] = true })
     if body == nil then return nil, err, inc end
-    if isKw(T[ti], "}") then ti = ti + 1 end
+    if not isKw(T[ti], "}") then return needMore("} expected") end
+    ti = ti + 1
     return { kind = "funcdef", name = nameTok.raw, body = body }
 end
 
 parseCommand = function()
     local t = T[ti]
-    if not t then return nil end
+    if not t then return nil, nil, true end
     if isKw(t, "if") then
         ti = ti + 1
         local cond, err, inc = parseList({ ["then"] = true })
         if cond == nil then return nil, err, inc end
         skipNl()
-        if not isKw(T[ti], "then") then return nil, "then expected", nil end
+        if not isKw(T[ti], "then") then return needMore("then expected") end
         ti = ti + 1
         local thenb, e2, i2 = parseList({ ["elif"] = true, ["else"] = true, ["fi"] = true })
         if thenb == nil then return nil, e2, i2 end
@@ -387,6 +416,7 @@ parseCommand = function()
             local ec, e3, i3 = parseList({ ["then"] = true })
             if ec == nil then return nil, e3, i3 end
             skipNl()
+            if not isKw(T[ti], "then") then return needMore("then expected") end
             ti = ti + 1
             local eb, e4, i4 = parseList({ ["elif"] = true, ["else"] = true, ["fi"] = true })
             if eb == nil then return nil, e4, i4 end
@@ -394,13 +424,14 @@ parseCommand = function()
         end
         local elseb
         if isKw(T[ti], "else") then ti = ti + 1; elseb = parseList({ ["fi"] = true }) end
-        if not isKw(T[ti], "fi") then return nil, "fi expected", nil end
+        if not isKw(T[ti], "fi") then return needMore("fi expected") end
         ti = ti + 1
         return { kind = "if", cond = cond, thenb = thenb, elifs = elifs, elseb = elseb }
     elseif isKw(t, "for") then
         ti = ti + 1
         local v = T[ti]
-        if not v or v.t ~= "word" then return nil, "for variable expected" end
+        if not v then return nil, nil, true end
+        if v.t ~= "word" then return nil, "for variable expected" end
         local var = v.raw; ti = ti + 1
         local items
         if isKw(T[ti], "in") then
@@ -414,11 +445,11 @@ parseCommand = function()
             end
         end
         skipSep()
-        if not isKw(T[ti], "do") then return nil, "do expected", nil end
+        if not isKw(T[ti], "do") then return needMore("do expected") end
         ti = ti + 1
         local body, err, inc = parseList({ ["done"] = true })
         if body == nil then return nil, err, inc end
-        if not isKw(T[ti], "done") then return nil, "done expected", nil end
+        if not isKw(T[ti], "done") then return needMore("done expected") end
         ti = ti + 1
         return { kind = "for", var = var, items = items, body = body }
     elseif isKw(t, "while") or isKw(t, "until") then
@@ -426,20 +457,21 @@ parseCommand = function()
         local cond, err, inc = parseList({ ["do"] = true })
         if cond == nil then return nil, err, inc end
         skipSep()
-        if not isKw(T[ti], "do") then return nil, "do expected", nil end
+        if not isKw(T[ti], "do") then return needMore("do expected") end
         ti = ti + 1
         local body, e2, i2 = parseList({ ["done"] = true })
         if body == nil then return nil, e2, i2 end
-        if not isKw(T[ti], "done") then return nil, "done expected", nil end
+        if not isKw(T[ti], "done") then return needMore("done expected") end
         ti = ti + 1
         return { kind = isWhile and "while" or "until", cond = cond, body = body }
     elseif isKw(t, "case") then
         ti = ti + 1
         local w = T[ti]
-        if not w or w.t ~= "word" then return nil, "case word expected" end
+        if not w then return nil, nil, true end
+        if w.t ~= "word" then return nil, "case word expected" end
         local word = w.segs; ti = ti + 1
         skipNl()
-        if not isKw(T[ti], "in") then return nil, "in expected", nil end
+        if not isKw(T[ti], "in") then return needMore("in expected") end
         ti = ti + 1
         local cases = {}
         while true do
@@ -455,14 +487,18 @@ parseCommand = function()
                 elseif isKw(p, "esac") then break
                 else pats[#pats + 1] = p.segs; ti = ti + 1 end
             end
-            if not okPat then break end
+            if not okPat then
+                -- pattern 列表到末尾都没出现 ")": 待续(交互式 PS2); 否则是语法错误。
+                if not T[ti] then return nil, nil, true end
+                break
+            end
             skipNl()
             local body, err, inc = parseList({ [";;"] = true, ["esac"] = true })
             if body == nil then return nil, err, inc end
             cases[#cases + 1] = { pats = pats, body = body }
             if T[ti] and T[ti].t == "op" and T[ti].op == ";;" then ti = ti + 1 end
         end
-        if not isKw(T[ti], "esac") then return nil, "esac expected", nil end
+        if not isKw(T[ti], "esac") then return needMore("esac expected") end
         ti = ti + 1
         return { kind = "case", word = word, cases = cases }
     elseif isKw(t, "function") then
@@ -472,7 +508,8 @@ parseCommand = function()
         ti = ti + 1
         local body, err, inc = parseList({ ["}"] = true })
         if body == nil then return nil, err, inc end
-        if isKw(T[ti], "}") then ti = ti + 1 end
+        if not isKw(T[ti], "}") then return needMore("} expected") end
+        ti = ti + 1
         return { kind = "brace", body = body }
     else
         local fd, ferr, finc = tryFuncDef()
@@ -484,11 +521,12 @@ end
 parsePipeline = function()
     local node, err, inc = parseCommand()
     if node == nil then return nil, err, inc end
-    -- 管道: command ( | command )*, 优先级高于 &&/||。
+    -- 管道: command ( | command )*, 优先级高于 &&/||。`|` 后允许换行(POSIX)。
     if T[ti] and T[ti].t == "op" and T[ti].op == "|" then
         local items = { node }
         while T[ti] and T[ti].t == "op" and T[ti].op == "|" do
             ti = ti + 1
+            skipNl()
             local n2, e2, i2 = parseCommand()
             if n2 == nil then return nil, e2, i2 end
             items[#items + 1] = n2
@@ -506,6 +544,7 @@ parseAndOr = function()
         local items = { { node = node, op = "" } }
         while T[ti] and T[ti].t == "op" and (T[ti].op == "&&" or T[ti].op == "||") do
             local op = T[ti].op; ti = ti + 1
+            skipNl() -- `&&`/`||` 后允许换行(POSIX)
             local n2, e2, i2 = parsePipeline()
             if n2 == nil then return nil, e2, i2 end
             items[#items + 1] = { node = n2, op = op }
@@ -1085,14 +1124,16 @@ evalList = function(items)
 end
 
 local function evalProgram(src)
-    T = lex(src)
+    local toks, lexInc = lex(src)
+    T = toks
     ti = 1
+    -- 引号/行续接未闭合: 输入不完整, 什么也不执行(交互式继续读行)。
+    if lexInc then return nil, true end
     local items, err, inc = parseList(nil)
     if items == nil then
         if inc then return nil, true end
         return nil, false, err
     end
-    if inc then return nil, true end
     local rt, c = evalList(items)
     -- 把 "exit" 控制信号透传给顶层调用者(交互循环靠它终止 shell)。
     if c == "exit" then
@@ -1105,15 +1146,27 @@ end
 if interactive then
     local buf = ""
     while true do
-        local prompt = uname .. "@delin:" .. (cwd == "/" and "/" or cwd) .. "# "
+        -- PS1 在缓冲区为空时打印; 否则 PS2(`> `)表示命令跨行未结束。
+        local prompt = (#buf == 0)
+            and (uname .. "@delin:" .. (cwd == "/" and "/" or cwd) .. "# ")
+            or "> "
         if stdout and stdout.write then stdout:write(prompt) end
         local line = stdin and stdin.readLine and stdin:readLine()
-        if line == nil then break end
+        if line == nil then
+            -- EOF 时缓冲区里还有未完成的命令 -> 语法错误(与 dash 的 unexpected EOF 同义)。
+            if #buf > 0 then errln("sh: syntax error: unexpected end of file") end
+            break
+        end
         buf = buf .. line .. "\n"
         local ok, inc, err, ctrl = evalProgram(buf)
         if ctrl == "exit" then break end
-        if ok and not inc then buf = "" end
-        if ok == nil and not inc and err then errln("sh: " .. tostring(err)); buf = "" end
+        if inc then
+            -- 命令不完整: 保留缓冲区, 下一轮用 PS2 提示继续读。
+        elseif ok then
+            buf = ""
+        else
+            errln("sh: " .. tostring(err)); buf = ""
+        end
     end
 else
     -- 非交互: 指定了脚本文件则读该文件; 否则从 stdin(管道/重定向)读。
@@ -1136,8 +1189,10 @@ else
     end
     if src ~= "" then
         -- 非交互下 exit 已使 evalList 提前终止后续命令; 这里无需再 break。
-        local ok, inc, err, ctrl = evalProgram(src)
-        if ok == nil and not inc and err then errln("sh: " .. tostring(err)) end
+        -- 输入已到 EOF, 所以"不完整"在这里就是语法错误(不回退, 不猜测)。
+        local ok, inc, err = evalProgram(src)
+        if inc then errln("sh: syntax error: unexpected end of file")
+        elseif ok == nil and err then errln("sh: " .. tostring(err)) end
     end
 end
 

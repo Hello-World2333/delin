@@ -316,6 +316,37 @@ cat "$T/p1.txt" | grep beta | wc -l > "$T/p3.txt"
 grep "^1$" "$T/p3.txt" > "$T/p31.txt"
 chk pipe_3stage [ -s "$T/p31.txt" ]
 
+# ---------------------------------------------------------------
+# 5d. 多行命令: 行续接(`\` + 换行) 与跨行结构
+# ---------------------------------------------------------------
+# 行续接把两行拼成一条命令(参数可写在续行上)
+echo ML1 \
+     ML2 > "$T/ml1.txt"
+grep -F "ML1 ML2" "$T/ml1.txt" > "$T/ml1g.txt"
+chk multiline_cont_args [ -s "$T/ml1g.txt" ]
+
+# 行续接发生在词内部: foo\<换行>bar 是同一个词 "foobar"
+echo foo\
+bar > "$T/ml2.txt"
+grep -F "foobar" "$T/ml2.txt" > "$T/ml2g.txt"
+chk multiline_cont_in_word [ -s "$T/ml2g.txt" ]
+
+# 双引号内 `\` + 换行 也被删除(POSIX); 单引号内则是字面反斜杠 + 换行
+echo "dq\
+cont" > "$T/ml3.txt"
+grep -F "dqcont" "$T/ml3.txt" > "$T/ml3g.txt"
+chk multiline_cont_dquote [ -s "$T/ml3g.txt" ]
+
+# 管道连接符 `|` 之后可以换行(换行不算命令结束)
+echo pipe |
+    wc -l > "$T/ml4.txt"
+grep "^1" "$T/ml4.txt" > "$T/ml4g.txt"
+chk multiline_cont_pipe [ -s "$T/ml4g.txt" ]
+
+# `&&` 之后可以换行
+[ 1 = 1 ] &&
+    chk multiline_cont_and true
+
 # 清理
 rm -rf "$T"
 chk cleanup [ ! -e "$T" ]

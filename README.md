@@ -78,6 +78,9 @@ CC 没有裸块 API：磁盘驱动器只提供「盘上的 CC 原生文件系统
 `-e/-f/-d/-s/-x/-r/-w`、`!`）；`&&`/`||`/`;`；文件重定向（`>` `>>` `<`）；管道（`|`，每元素一个进程/内建，
 经内核 pipe 缓冲传递，`$?`=末元素退出码，生产端写满/消费端读空时让出调度器，broken pipe 中止写端）；内建
 `cd pwd echo exit help jobs fg bg kill test [ true false : break continue return shift`。
+**多行命令**：`\` + 换行 行续接（POSIX 2.2.1，从输入中删除；词内部与双引号内同样生效，单引号内是字面反斜杠）；
+`|` / `&&` / `||` 之后允许换行；交互式下跨行结构（`if`/`for`/`while`/`case`/函数体、未闭合引号、续行）用
+PS2 提示 `> ` 继续读行；脚本/管道输入到 EOF 仍不完整则报 `syntax error: unexpected end of file`。
 脚本执行：`sh script.sh [args...]` 或 `./script.sh [args...]`（需 `+x`，经 `#!` shebang），
 shebang 支持 `#!/bin/sh` / `#!/usr/bin/env sh` 等形式，env 特殊解释为查找后续程序名。
 无 shebang 的文件按 Delin Lua 程序直接 spawn（兼容 `/bin/*` 工具源码）。
@@ -86,7 +89,7 @@ shebang 支持 `#!/bin/sh` / `#!/usr/bin/env sh` 等形式，env 特殊解释为
 **已知偏离**：`grep`/`sed` 的正则用 **Lua pattern**（`%` 为转义符、`()` 为捕获）而非 POSIX ERE/BRE；
 替换区用 `&`=整串匹配、`\1..\9`=捕获组、`\n/\t`，不支持 BRE 风格 `\(...\)` 与模式内逆引用。
 注意 Lua pattern 里 `-` 是量词（非贪婪），要匹配字面连字符需 `%-`，与 GNU grep 的 `-`（字面）不同。
-不支持**命令替换 `$()`/反引号**、**算术 `$(( ))`**（暂未实现）。
+不支持**命令替换 `$()`/反引号**、**算术 `$(( ))`**、**here-doc `<<`**（暂未实现，遇到即语法错误）。
 因 CC 5.2 无位运算，`/etc/shadow` 哈希用盐+密码的 32 位滚动哈希（djb2）替代传统 `crypt`。
 
 ## 当前状态
@@ -101,7 +104,7 @@ v0.0.1 的协程调度内核 + 进程树之后，已扩展为具备 VFS、块设
 `mount`（挂载 `/dev/sdX`、`UUID=` 或镜像路径 / 无参列出）/ `umount` / `blkid` / `lsblk`；磁盘驱动器
 经 `devdisk` 抽象为 `/dev/sda`（整盘 ccdisk）与 `/dev/sdaN`（manifest 分区 ext2）设备节点，UUID 用磁盘 ID
 模拟，启动时不再自动挂载磁盘。`scripts/posix_test.sh` 在宿主
-与 Delin 上各跑一次逐项比对（92 项全过），`scripts/sysinfo.sh` 演示实用用法。可经
+与 Delin 上各跑一次逐项比对（97 项全过），`scripts/sysinfo.sh` 演示实用用法。可经
 `tools/harness.lua`（宿主）或 `tools/deploy.py`（真机）验证。
 
 ### 引导
@@ -214,7 +217,7 @@ src/modules/*.ko           内核模块: ccdisk(ccdisk fstype) ccmonitor(CC 显�
                            os.msleep) demo(演示) ext2(ext2 fstype) tom(Tom GPU 驱动) void(Void 全息驱动)
 src/modules/modules.alias  驱动别名(modprobe 风格): tm_gpu->tom hologram->void monitor->ccmonitor
 src/modules/manifest       默认装载模块清单: demo ext2 ccdisk
-scripts/posix_test.sh      可移植 POSIX 自检(host 与 Delin 各跑一次比对, 92 项全过)
+scripts/posix_test.sh      可移植 POSIX 自检(host 与 Delin 各跑一次比对, 97 项全过)
 scripts/sysinfo.sh         实用小工具: 系统信息(变量/函数/for/case/if/重定向/工具)
 tools/bundle.lua           打包 src/ -> dist/kernel.lua 或 dist/dlub.lua
 tools/harness.lua          host 测试台: 用真实 Delin 工具源码在宿主跑(fs/io/syscalls/spawn 桩)

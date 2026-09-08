@@ -405,6 +405,46 @@ do
     if fs.exists("/home/alice/nonx") then pcall(fs.delete, "/home/alice/nonx") end
 end
 
+-- 3b) 交互式多行命令: stdin 标记 isTTY -> sh 走交互模式; 命令跨行未结束时应打印
+--     PS2 续行提示(`> `)并继续读下一行, 而不是报 "then expected" 之类的语法错误。
+--     覆盖: if/for 跨行、行续接(`\` + 换行)、双引号内跨行。
+do
+    local lines = {
+        "if true",
+        "then",
+        "echo ML_IF_OK",
+        "fi",
+        "for i in x y",
+        "do",
+        "echo ML_LOOP $i",
+        "done",
+        "echo one \\",
+        "two",
+        'echo "a\\',
+        'b"',
+        "exit",
+    }
+    local li = 0
+    local inH = { isTTY = true, readLine = function(self) li = li + 1; return lines[li] end }
+    local outbuf = {}
+    local outH = {
+        write = function(self, s) outbuf[#outbuf + 1] = tostring(s); return #s end,
+        writeLine = function(self, s) outbuf[#outbuf + 1] = tostring(s) .. "\n"; return #s + 1 end,
+    }
+    syscalls["stdio.set"](inH, outH)
+    local spid = spawn(shSrc, "sh-multiline", nil, nil, { [0] = "/bin/sh" })
+    if spid then waitExit(spid, 10000) end
+    local out = table.concat(outbuf)
+    local function has(s) return out:find(s, 1, true) ~= nil end
+    print("ext2-init: multiline sh out=[" .. out .. "]")
+    print("ext2-init: multiline if=" .. tostring(has("ML_IF_OK"))
+        .. " for=" .. tostring(has("ML_LOOP x") and has("ML_LOOP y"))
+        .. " cont-args=" .. tostring(has("one two"))
+        .. " cont-dquote=" .. tostring(has("ab"))
+        .. " ps2=" .. tostring(has("> "))
+        .. " no-syntax-error=" .. tostring(not has("then expected") and not has("do expected")))
+end
+
 -- ═══════════ sed 真机自测(内存 stdio, 直接 spawn /bin/sed) ═══════════
 do
     local sh = fs.open("/bin/sed", "r")
