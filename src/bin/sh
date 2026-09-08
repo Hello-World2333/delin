@@ -5,6 +5,8 @@
 -- 不支持: 命令替换($() 与反引号)、算术 $(( ))。 正则用 Lua pattern(见 grep/sed)。
 -- 输出走 io.stdout(父进程把它指向控制台 tty 或文件), 绝不 print(kprint 走日志+term)。
 
+local msleep = os.msleep or function(ms) os.sleep(math.max(ms / 1000, 0.05)) end
+
 local stdin  = io.stdin()
 local stdout = io.stdout()
 local interactive = stdin and stdin.isTTY
@@ -605,7 +607,7 @@ local function pollWait(pidIn)
         if p.status == "dead" then return "exited", (p.termSig and -p.termSig) or (p.exitCode or 0)
         elseif p.status == "error" then return "error", p.error
         elseif p.status == "stopped" then return "stopped", p end
-        if os.sleep then os.sleep(0.05) end
+        if os.sleep then msleep(0) end
     end
 end
 local function resolveJob(ref)
@@ -913,6 +915,7 @@ evalNode = function(node)
             if c == "exit" then return rt end
             if c == "break" then break end
             lastst = rt  -- continue: 走到下一个迭代即可
+            msleep(0)
         end
         return lastst
     end
@@ -927,6 +930,7 @@ evalNode = function(node)
             if cc == "exit" then return rt end
             if cc == "break" then break end
             lastst = rt
+            msleep(0)
         end
         return lastst
     end

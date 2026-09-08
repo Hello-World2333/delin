@@ -1,4 +1,5 @@
 -- Delin 用户/权限测试(EXT2 根引导时跑)。 不交互, 用程序验证。
+local msleep = os.msleep or function(ms) os.sleep(math.max(ms / 1000, 0.05)) end
 print("ext2-init: pid=" .. pid .. " uid=" .. uid .. " gid=" .. gid)
 
 -- 准备测试文件权限(以 root, uid 0)
@@ -238,7 +239,7 @@ else
         local p = syscalls["proc.info"](spid)
         if not p then code = -1; break end
         if p.status == "dead" or p.status == "error" then code = p.exitCode or 0; break end
-        sleep(0.1); tries = tries + 1
+        msleep(0); tries = tries + 1
     end
     if code == nil then code = "TIMEOUT" end
     print("ext2-init: shell exited code=" .. tostring(code))
@@ -278,7 +279,7 @@ do
         local p = syscalls["proc.info"](spid)
         if not p then break end
         if p.status == "dead" or p.status == "error" then break end
-        sleep(0.1); tries = tries + 1
+        msleep(0); tries = tries + 1
     end
     local out = table.concat(outbuf)
     local function has(s) return out:find(s, 1, true) ~= nil end
@@ -320,7 +321,7 @@ do
         local p = syscalls["proc.info"](spid)
         if not p then break end
         if p.status == "dead" or p.status == "error" then break end
-        sleep(0.1); tries = tries + 1
+        msleep(0); tries = tries + 1
     end
     local out = table.concat(outbuf)
     local function has(s) return out:find(s, 1, true) ~= nil end
@@ -360,7 +361,7 @@ do
                 local p = syscalls["proc.info"](pid)
                 if not p then break end
                 if p.status == "dead" or p.status == "error" then break end
-                sleep(0.1); tries = tries + 1
+                msleep(0); tries = tries + 1
             end
             return table.concat(outbuf)
         end
@@ -564,7 +565,7 @@ do
                 local p = syscalls["proc.info"](spid)
                 if not p then break end
                 if p.status == "dead" or p.status == "error" then break end
-                sleep(0.1); tries = tries + 1
+                msleep(0); tries = tries + 1
             end
             print("ext2-init: " .. label .. " output:")
             for _, s in ipairs(outbuf) do print("  " .. s) end
