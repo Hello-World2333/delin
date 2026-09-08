@@ -607,7 +607,14 @@ local function pollWait(pidIn)
         if p.status == "dead" then return "exited", (p.termSig and -p.termSig) or (p.exitCode or 0)
         elseif p.status == "error" then return "error", p.error
         elseif p.status == "stopped" then return "stopped", p end
-        if os.sleep then msleep(0) end
+        -- ^C 中断: 杀子进程并返回。
+        if sigintPending then
+            sigintPending = false
+            syscalls["signal.kill"](pidIn, 9) -- SIGKILL
+            msleep(0) -- 等调度器处理退出
+            return "exited", -2
+        end
+        msleep(0)
     end
 end
 local function resolveJob(ref)
@@ -697,8 +704,8 @@ local function runExternal(cmd, argv, stdio)
         lastExit = (cerr == "command not found") and 127 or 126
         return
     end
-    local code = syscalls["proc.wait"](child)
-    lastExit = code or 0
+    local reason, code = pollWait(child)
+    lastExit = (reason == "exited") and (code or 0) or 1
     if lastExit > 0 then errln("sh: " .. cmd .. ": exit " .. tostring(lastExit)) end
 end
 
@@ -916,6 +923,7 @@ evalNode = function(node)
             if c == "break" then break end
             lastst = rt  -- continue: 走到下一个迭代即可
             msleep(0)
+            if sigintPending then sigintPending = false; break end
         end
         return lastst
     end
@@ -931,6 +939,7 @@ evalNode = function(node)
             if cc == "break" then break end
             lastst = rt
             msleep(0)
+            if sigintPending then sigintPending = false; break end
         end
         return lastst
     end
