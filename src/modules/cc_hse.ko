@@ -28,7 +28,12 @@ return {
             -- 四舍五入到 tick 粒度, 至少 1 tick
             local ticks = math.floor(ms * FREQ / 1000 + 0.5)
             if ticks < 1 then ticks = 1 end
-            rawset(_G, "__msleep_remaining", ticks)
+            -- 设在调用者的 _ENV 上(而非模块 _G), 供调度器 rawget(proc.co_env, ...) 读取。
+            -- getfenv(2) 取调用 msleep 的函数的环境(即进程 _ENV)。
+            local callerEnv = getfenv(2)
+            if callerEnv then
+                rawset(callerEnv, "__msleep_remaining", ticks)
+            end
             coroutine.yield("hse_tick")
         end
 
