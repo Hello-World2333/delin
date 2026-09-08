@@ -1,0 +1,807 @@
+-- Delin ed: POSIX ed 行编辑器 (较完整子集)。
+--   用法: ed [-p string] [-s] [file]
+--
+--   地址: . $ n /re/ ?re? 'x, +n -n 与其后缀运算; , = 1,$; ; = .+1,$。
+--   命令: a i c d j k l m n p r s t u z = e E f w W wq q Q g G v V h H P !
+--   输入模式(a/i/c)以单独一行 . 结束; 行尾 \ 续行。
+--   s 命令: s/re/rep/[g|N|p|l|n], 裸 s 重复上次替换; 空模式用上次正则。
+--   正则用 Lua pattern(与 grep/sed 一致): % 转义, () 捕获; 替换里 & = 整串匹配,
+--   \1..\9 = 捕获组, \n/\t, \\ 与 \& 转义。
+--   选项: -p 提示符(交互模式), -s 抑制 e/r/w 的字节数与 ! 后的 "!"。
+--   文件名与 ! 命令里的 % 展开为记忆文件名(\% 为字面 %)。
+--   r !cmd 读命令输出入缓冲, w !cmd 写缓冲入命令 stdin, !cmd 直接逃逸(sh, 经 /tmp 脚本)。
+--
+--   与真实 ed 的已知偏离: g 命令表内仅一条命令(单行); g 表内 m/t 反向移动不保证
+--   后续目标行定位(行身份用内部 id 追踪, d/a/s 等常规命令不受影响)。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+-- ---------------------------------------------------------------
+-- ed 内部错误: 打印 ? 并回到命令循环(可 h/H 看解释); 真错误照常抛出 fail-fast。
+-- ---------------------------------------------------------------
+local function ederror(msg) error({ ed = true, msg = msg }, 0) end
+
+-- ---------------------------------------------------------------
+-- 状态
+-- ---------------------------------------------------------------
+local lines = {} -- 缓冲: lines[1..n], 不含换行
+local ids = {}   -- 行身份 id(与 lines 平行; g 命令靠它定位目标行)
+local nextId = 0
+local cur = 0    -- 当前行 0..n
+local marks = {} -- 'x -> 行号
+local dirty = false
+local fname = nil -- 记忆文件名(用户给出的形式)
+local lastRe = nil
+local lastSub = nil
+local promptStr, promptOn = "", true
+local suppressCounts = false
+local helpOn, helpMsg = false, ""
+local zSize = 22
+local undoState = nil
+local inGlobal = false
+local quitting, qWarned = false, false
+local a1, a2, naddrs, cmdname -- execLine 每轮解析出的地址/命令名
+local execLine -- 前向声明(g/G/v/V 命令表回调)
+
+local stdin = io.stdin()
+local stdout = io.stdout()
+local interactive = stdin and stdin.isTTY
+
+local unpack = table.unpack or unpack
+
+local function out(s) stdout:write(s) end
+
+local function reportErr(msg)
+    helpMsg = msg
+    out("?\n")
+    if helpOn then out(msg .. "\n") end
+end
+
+local function newId() nextId = nextId + 1; return nextId end
+
+-- ---------------------------------------------------------------
+-- 缓冲原语(全部维护 ids): extractRange 摘除并返回区段; insertAt 在 pos 后插入
+-- ---------------------------------------------------------------
+local function extractRange(a1, a2)
+    local texts, segids = {}, {}
+    for i = a1, a2 do texts[#texts + 1] = lines[i]; segids[#segids + 1] = ids[i] end
+    local len = a2 - a1 + 1
+    local n = #lines
+    for i = a2 + 1, n do
+        lines[i - len] = lines[i]; ids[i - len] = ids[i]
+    end
+    for i = n - len + 1, n do lines[i] = nil; ids[i] = nil end
+    return texts, segids
+end
+
+local function insertAt(pos, texts, segids)
+    local len = #texts
+    local n = #lines
+    for i = n, pos + 1, -1 do
+        lines[i + len] = lines[i]; ids[i + len] = ids[i]
+    end
+    for k = 1, len do
+        lines[pos + k] = texts[k]
+        ids[pos + k] = (segids and segids[k]) or newId()
+    end
+end
+
+local function newIdsFor(n)
+    local t = {}
+    for i = 1, n do t[i] = newId() end
+    return t
+end
+
+local function splitText(text)
+    -- 按行拆分; 无尾换行视为最后一行
+    local t = {}
+    if text == "" then return t end
+    if text:sub(-1) ~= "\n" then text = text .. "\n" end
+    for l in text:gmatch("(.-)\n") do t[#t + 1] = l end
+    return t
+end
+
+local function loadText(text)
+    lines = splitText(text)
+    ids = newIdsFor(#lines)
+    cur = #lines
+end
+
+-- ---------------------------------------------------------------
+-- undo (u 命令: 交换当前与上次快照, 天然支持反复 u 振荡)
+-- ---------------------------------------------------------------
+local function saveUndo()
+    if inGlobal then return end
+    local sl, si = {}, {}
+    for i = 1, #lines do sl[i] = lines[i]; si[i] = ids[i] end
+    local sm = {}
+    for k, v in pairs(marks) do sm[k] = v end
+    undoState = { lines = sl, ids = si, cur = cur, marks = sm }
+end
+
+-- ---------------------------------------------------------------
+-- 输出格式
+-- ---------------------------------------------------------------
+local function listLine(s)
+    local col = 0
+    local i = 1
+    while i <= #s do
+        local c = s:sub(i, i)
+        local b = c:byte()
+        local t
+        if c == "\\" then t = "\\\\"
+        elseif c == "$" then t = "\\$"
+        elseif c == "\a" then t = "\\a"
+        elseif c == "\b" then t = "\\b"
+        elseif c == "\t" then t = "\\t"
+        elseif c == "\v" then t = "\\v"
+        elseif c == "\f" then t = "\\f"
+        elseif c == "\r" then t = "\\r"
+        elseif b < 32 or b == 127 then t = string.format("\\%03o", b)
+        else t = c end
+        if col + #t > 72 then out("\\\n"); col = 0 end
+        out(t); col = col + #t
+        i = i + 1
+    end
+    out("$\n")
+end
+
+local function printRange(r1, r2, mode)
+    for i = r1, r2 do
+        if mode == "n" then out(i .. "\t" .. lines[i] .. "\n")
+        elseif mode == "l" then listLine(lines[i])
+        else out(lines[i] .. "\n") end
+    end
+end
+
+-- ---------------------------------------------------------------
+-- 正则: Lua pattern 校验/查找/替换
+-- ---------------------------------------------------------------
+local function patValid(p)
+    if not pcall(string.find, "", p) then ederror("invalid pattern") end
+end
+
+local function doSearch(pat, backward)
+    patValid(pat)
+    local n = #lines
+    if backward then
+        for i = cur - 1, 1, -1 do if lines[i]:find(pat) then return i end end
+        for i = n, cur, -1 do if lines[i]:find(pat) then return i end end
+    else
+        for i = cur + 1, n do if lines[i]:find(pat) then return i end end
+        for i = 1, cur do if lines[i]:find(pat) then return i end end
+    end
+    ederror("invalid address")
+end
+
+local function buildRepl(repl, whole, caps)
+    local o = {}
+    local i = 1
+    while i <= #repl do
+        local c = repl:sub(i, i)
+        if c == "&" then o[#o + 1] = whole; i = i + 1
+        elseif c == "\\" then
+            local nx = repl:sub(i + 1, i + 1)
+            if nx:match("%d") then o[#o + 1] = caps[tonumber(nx)] or ""; i = i + 2
+            elseif nx == "&" then o[#o + 1] = "&"; i = i + 2
+            elseif nx == "\\" then o[#o + 1] = "\\"; i = i + 2
+            elseif nx == "n" then o[#o + 1] = "\n"; i = i + 2
+            elseif nx == "t" then o[#o + 1] = "\t"; i = i + 2
+            else o[#o + 1] = "\\" .. nx; i = i + 2 end
+        else o[#o + 1] = c; i = i + 1 end
+    end
+    return table.concat(o)
+end
+
+-- 对单行应用替换; 返回新行, 是否有变化。
+local function applyToLine(text, sub)
+    local parts, b, nm, changed = {}, 1, 0, false
+    while b <= #text + 1 do
+        local s0, e0 = text:find(sub.pat, b)
+        if not s0 then break end
+        nm = nm + 1
+        local doIt = (sub.count and nm == sub.count) or (not sub.count and (sub.g or nm == 1))
+        if doIt then
+            local whole = text:sub(s0, e0)
+            local caps = { text:match(sub.pat, s0) }
+            parts[#parts + 1] = text:sub(b, s0 - 1)
+            parts[#parts + 1] = buildRepl(sub.repl, whole, caps)
+            b = e0 + 1
+            if e0 < s0 then b = s0 + 1 end -- 空匹配防死循环
+            changed = true
+            if not sub.g then break end
+        end
+    end
+    if not changed then return text, false end
+    parts[#parts + 1] = text:sub(b)
+    return table.concat(parts), true
+end
+
+-- ---------------------------------------------------------------
+-- 文本扫描: 定界符内取正则(支持 \d 转义定界符; 末尾缺定界符亦可)
+-- ---------------------------------------------------------------
+local function scanDelim(s, from, d)
+    local o = {}
+    local i = from
+    while i <= #s do
+        local c = s:sub(i, i)
+        if c == "\\" and s:sub(i + 1, i + 1) == d then o[#o + 1] = d; i = i + 2
+        elseif c == "\\" then o[#o + 1] = c .. s:sub(i + 1, i + 1); i = i + 2
+        elseif c == d then return table.concat(o), i + 1, true
+        else o[#o + 1] = c; i = i + 1 end
+    end
+    return table.concat(o), i, false
+end
+
+-- ---------------------------------------------------------------
+-- 地址解析: 返回 addr, 新位置; 无地址返回 nil, pos
+-- ---------------------------------------------------------------
+local function parseAddrExpr(s, pos, n)
+    local i = pos
+    local a, any = nil, false
+    while true do
+        local c = s:sub(i, i)
+        if c == "+" or c == "-" then
+            local k = s:match("^%d+", i + 1)
+            local step = k and tonumber(k) or 1
+            a = (a or cur) + (c == "+" and step or -step)
+            i = i + 1 + (k and #k or 0)
+            any = true
+        elseif c == "." then a, i, any = cur, i + 1, true
+        elseif c == "$" then a, i, any = n, i + 1, true
+        elseif c:match("^%d") then
+            local k = s:match("^%d+", i)
+            a, i, any = tonumber(k), i + #k, true
+        elseif c == "/" or c == "?" then
+            local pat, np = scanDelim(s, i + 1, c)
+            if pat == "" then pat = lastRe or ederror("no previous regular expression")
+            else lastRe = pat end
+            a, i = doSearch(pat, c == "?"), np
+            any = true
+        elseif c == "'" then
+            local m = s:sub(i + 1, i + 1)
+            if not m:match("^%l") or not marks[m] then ederror("invalid address") end
+            a, i, any = marks[m], i + 2, true
+        else break end
+    end
+    if any then
+        if a < 0 or a > n then ederror("invalid address") end
+        return a, i
+    end
+    return nil, pos
+end
+
+-- ---------------------------------------------------------------
+-- 文件名/命令文本: 去空白 + % 展开
+-- ---------------------------------------------------------------
+local function trim(s) return s and s:match("^%s*(.-)%s*$") or "" end
+
+local function expandName(s)
+    local o, i = {}, 1
+    while i <= #s do
+        local c = s:sub(i, i)
+        if c == "\\" and s:sub(i + 1, i + 1) == "%" then o[#o + 1] = "%"; i = i + 2
+        elseif c == "%" then
+            if not fname then ederror("no file name yet") end
+            o[#o + 1] = fname; i = i + 1
+        else o[#o + 1] = c; i = i + 1 end
+    end
+    return table.concat(o)
+end
+
+local function readText(path)
+    local fh, err = fs.open(resolve(path), "r")
+    if not fh then return nil, err end
+    local text = fh.readAll()
+    fh.close()
+    return text or ""
+end
+
+-- ---------------------------------------------------------------
+-- shell 逃逸: 命令写入 /tmp 脚本, spawn /bin/sh 执行
+--   runShell(cmd): 输出到本进程 stdout, 等待退出。
+--   runShellPipe(cmd, pw): 输出到管道写端 pw(调用方 spawn 后自关以移交写端)。
+--   runShellIn(cmd, pr): 命令 stdin = 管道读端 pr。
+-- ---------------------------------------------------------------
+local function shScript(cmd)
+    local path = "/tmp/ed" .. pid .. ".sh"
+    local fh = fs.open(path, "w")
+    if not fh then ederror("cannot open " .. path) end
+    fh.write(cmd .. "\n")
+    fh.close()
+    local shf = fs.open("/bin/sh", "r")
+    if not shf then ederror("cannot execute shell") end
+    local src = shf.readAll(); shf.close()
+    return path, src
+end
+
+local function runShell(cmd)
+    local path, src = shScript(cmd)
+    local inH = fs.open(path, "r")
+    local child = spawn(src, "sh", nil, nil, { [0] = "/bin/sh", path }, { input = inH, output = stdout })
+    if not child then fs.delete(path); ederror("cannot execute shell") end
+    local code = syscalls["proc.wait"](child)
+    fs.delete(path)
+    return code
+end
+
+-- ---------------------------------------------------------------
+-- 输入模式: 逐行读到 . ; 行尾 \ 续行; EOF 报错
+-- ---------------------------------------------------------------
+local function readInput()
+    local acc = {}
+    while true do
+        local l = stdin:readLine()
+        if l == nil then return nil end
+        while l:sub(-1) == "\\" do
+            local rest = stdin:readLine()
+            if rest == nil then return nil end
+            l = l:sub(1, -2) .. rest
+        end
+        if l == "." then break end
+        acc[#acc + 1] = l
+    end
+    return acc
+end
+
+-- ---------------------------------------------------------------
+-- 执行一行命令
+-- ---------------------------------------------------------------
+local function norm2()
+    local r1, r2
+    if naddrs == 0 then r1, r2 = cur, cur
+    elseif naddrs == 1 then r1, r2 = a1, a1
+    else r1, r2 = a1, a2 end
+    if r2 < r1 or r1 < 1 or r2 > #lines then ederror("invalid address") end
+    return r1, r2
+end
+
+local function restEmpty(rest)
+    if trim(rest) ~= "" then ederror("invalid command suffix") end
+end
+
+local idIndex = function(want)
+    for k = 1, #ids do if ids[k] == want then return k end end
+    return nil
+end
+
+-- g/G/v/V: 预选目标行 id, 逐个 cur=目标 执行命令表
+local function globalExec(r1, r2, pat, rest, negate)
+    if inGlobal then ederror("cannot nest global commands") end
+    patValid(pat)
+    local targets = {}
+    for i = r1, r2 do
+        if (lines[i]:find(pat) ~= nil) ~= negate then targets[#targets + 1] = ids[i] end
+    end
+    if rest == "" then rest = "p" end
+    saveUndo()
+    inGlobal = true
+    local last = nil
+    for _, tid in ipairs(targets) do
+        local idx = idIndex(tid)
+        if idx then
+            cur = idx
+            if cmdname == "G" or cmdname == "V" then
+                out(lines[cur] .. "\n")
+                out("&")
+                local resp = stdin:readLine()
+                if resp == nil then break end
+                if trim(resp) ~= "" then execLine(resp) end
+            else
+                execLine(rest)
+            end
+            last = tid
+        end
+    end
+    inGlobal = false
+    if last then cur = idIndex(last) or cur end
+end
+
+execLine = function(line)
+    local n = #lines
+    local pos = 1
+    while line:sub(pos, pos) == " " or line:sub(pos, pos) == "\t" do pos = pos + 1 end
+    a1, pos = parseAddrExpr(line, pos, n)
+    naddrs = a1 and 1 or 0
+    a2 = nil
+    local sep = line:sub(pos, pos)
+    if sep == "," or sep == ";" then
+        pos = pos + 1
+        if sep == ";" and a1 then cur = a1 end
+        a2, pos = parseAddrExpr(line, pos, n)
+        a1 = a1 or (sep == ";" and (cur + 1) or 1)
+        a2 = a2 or n
+        naddrs = 2
+    end
+    while line:sub(pos, pos) == " " or line:sub(pos, pos) == "\t" do pos = pos + 1 end
+    local c = line:sub(pos, pos)
+    pos = pos + 1
+    local rest = line:sub(pos)
+
+    if c == "" then -- 裸换行: 打印下一行(或地址行)
+        local p
+        if naddrs > 0 then p = a1 else cur = cur + 1; p = cur end
+        if p < 1 or p > n then ederror("invalid address") end
+        cur = p
+        out(lines[p] .. "\n")
+    elseif c == "a" then
+        restEmpty(rest)
+        local addr = a1 or cur
+        local ins = readInput() or ederror("unexpected end-of-file")
+        if #ins > 0 then
+            saveUndo(); insertAt(addr, ins); cur = addr + #ins; dirty = true
+        end
+    elseif c == "i" then
+        if naddrs > 1 then ederror("invalid address") end
+        restEmpty(rest)
+        local addr = a1 or cur
+        local ins = readInput() or ederror("unexpected end-of-file")
+        if #ins > 0 then
+            saveUndo(); insertAt(math.max(addr - 1, 0), ins); cur = math.max(addr - 1, 0) + #ins; dirty = true
+        end
+    elseif c == "c" then
+        restEmpty(rest)
+        local r1, r2 = norm2()
+        local ins = readInput() or ederror("unexpected end-of-file")
+        saveUndo()
+        extractRange(r1, r2)
+        if #ins > 0 then
+            insertAt(r1 - 1, ins)
+            cur = r1 - 1 + #ins
+        else
+            cur = math.min(r1, #lines)
+        end
+        dirty = true
+    elseif c == "d" then
+        restEmpty(rest)
+        local r1, r2 = norm2()
+        saveUndo()
+        extractRange(r1, r2)
+        cur = math.min(r1, #lines)
+        dirty = true
+    elseif c == "j" then
+        restEmpty(rest)
+        local r1, r2
+        if naddrs == 0 then r1, r2 = cur, cur + 1
+        elseif naddrs == 1 then r1, r2 = a1, a1 + 1
+        else r1, r2 = a1, a2 end
+        if r1 < 1 or r2 > n or r2 < r1 or (naddrs == 2 and r1 == r2) then ederror("invalid address") end
+        saveUndo()
+        local parts = {}
+        for i = r1, r2 do parts[#parts + 1] = lines[i] end
+        lines[r1] = table.concat(parts)
+        extractRange(r1 + 1, r2)
+        cur = r1
+        dirty = true
+    elseif c == "k" then
+        local addr = a1 or cur
+        if addr < 1 then ederror("invalid address") end
+        local letter = rest:match("^%s*(%l)%s*$")
+        if not letter then ederror("invalid mark character") end
+        marks[letter] = addr
+    elseif c == "l" or c == "n" or c == "p" then
+        restEmpty(rest)
+        local r1, r2 = norm2()
+        cur = r2
+        printRange(r1, r2, c)
+    elseif c == "m" or c == "t" then
+        if naddrs > 2 then ederror("invalid address") end
+        local r1, r2 = norm2()
+        local dpos = 1
+        while rest:sub(dpos, dpos) == " " or rest:sub(dpos, dpos) == "\t" do dpos = dpos + 1 end
+        local dest, dend = parseAddrExpr(rest, dpos, n)
+        if not dest then ederror("destination required") end
+        restEmpty(rest:sub(dend))
+        if c == "m" and dest >= r1 and dest <= r2 then ederror("invalid destination") end
+        saveUndo()
+        if c == "m" then
+            local texts = extractRange(r1, r2)
+            local dest2 = dest > r2 and dest - (r2 - r1 + 1) or dest
+            insertAt(dest2, texts)
+            cur = dest2 + #texts
+        else
+            local texts, segids = {}, {}
+            for i = r1, r2 do texts[#texts + 1] = lines[i] end
+            insertAt(dest, texts, segids)
+            cur = dest + #texts
+        end
+        dirty = true
+    elseif c == "r" then
+        local addr = a1 or cur
+        local nm = expandName(trim(rest))
+        if nm == "" then nm = fname or ederror("no file name yet") end
+        local text
+        if nm:sub(1, 1) == "!" then
+            local cmd = expandName(nm:sub(2))
+            local pr, pw = syscalls["pipe.create"]()
+            local path, src = shScript(cmd)
+            local child = spawn(src, "sh", nil, nil, { [0] = "/bin/sh", path },
+                { input = fs.open(path, "r"), output = pw })
+            if not child then fs.delete(path); pw.close(); pr.close(); ederror("cannot execute shell") end
+            -- 不关自持写端引用: 子进程退出时内核 onExit 关闭其 stdio(output=本写端),
+            -- writers 归零后读端才见 EOF; 过早 close 会让 readAll 立即 EOF。
+            text = pr.readAll() or ""
+            pr.close()
+            fs.delete(path)
+        else
+            text = readText(nm) or ederror("cannot open input file")
+        end
+        local t = splitText(text)
+        if #t > 0 then
+            saveUndo()
+            insertAt(addr, t)
+            cur = addr + #t
+            dirty = true
+        end
+        if not suppressCounts then out(#text .. "\n") end
+    elseif c == "s" then
+        if naddrs > 2 then ederror("invalid address") end
+        local d = line:sub(pos, pos)
+        local sub
+        if d == "" or d:match("^%s") then
+            sub = lastSub or ederror("no previous substitution")
+        else
+            if d:match("^%d") or d:match("^%l") then ederror("invalid command suffix") end
+            local pat, p1, patClosed = scanDelim(line, pos + 1, d)
+            if not patClosed then ederror("invalid command suffix") end
+            local repl, p2, replClosed = scanDelim(line, p1, d)
+            local flags = replClosed and line:sub(p2) or ""
+            local g, count, pr, li, nu = false, nil, false, false, false
+            local fi = 1
+            while fi <= #flags do
+                local f = flags:sub(fi, fi)
+                if f == "g" then g = true
+                elseif f:match("%d") then
+                    local num = flags:match("^%d+", fi)
+                    count = tonumber(num); fi = fi + #num - 1
+                elseif f == "p" then pr = true
+                elseif f == "l" then li = true
+                elseif f == "n" then nu = true
+                else ederror("invalid command suffix") end
+                fi = fi + 1
+            end
+            if count and count < 1 then ederror("invalid command suffix") end
+            if pat == "" then pat = lastRe or ederror("no previous regular expression")
+            else lastRe = pat end
+            patValid(pat)
+            sub = { pat = pat, repl = repl, g = g, count = count, pr = pr, li = li, nu = nu }
+            lastSub = sub
+        end
+        local r1, r2 = norm2()
+        local changedTo = nil
+        for i = r1, r2 do
+            local nl, ch = applyToLine(lines[i], sub)
+            if ch then lines[i] = nl; changedTo = i end
+        end
+        if not changedTo then ederror("no match") end
+        saveUndo()
+        cur = changedTo
+        dirty = true
+        if sub.pr then printRange(cur, cur, "p")
+        elseif sub.li then printRange(cur, cur, "l")
+        elseif sub.nu then printRange(cur, cur, "n") end
+    elseif c == "t" then
+        -- t 已在 m/t 分支处理? 不: m/t 分支覆盖了 c == "t"。此分支不可达。
+        ederror("unknown command")
+    elseif c == "u" then
+        restEmpty(rest)
+        if not undoState then ederror("nothing to undo") end
+        local cur0 = cur
+        lines, undoState.lines = undoState.lines, lines
+        ids, undoState.ids = undoState.ids, ids
+        marks, undoState.marks = undoState.marks, marks
+        cur, undoState.cur = undoState.cur, cur0
+        dirty = true
+    elseif c == "z" then
+        local num = rest:match("^%s*(%d+)%s*$")
+        if num then
+            zSize = tonumber(num)
+        else
+            restEmpty(rest)
+        end
+        local start = a1 or cur
+        if start == 0 then start = 1 end
+        if start > n or n == 0 then ederror("invalid address") end
+        local e = math.min(start + zSize - 1, n)
+        for i = start, e do out(lines[i] .. "\n") end
+        cur = e
+    elseif c == "=" then
+        if naddrs > 1 then ederror("invalid address") end
+        restEmpty(rest)
+        out((a1 or cur) .. "\n")
+    elseif c == "e" or c == "E" then
+        if naddrs > 0 then ederror("invalid address") end
+        if c == "e" and dirty then ederror("warning: file modified") end
+        local nm = expandName(trim(rest))
+        if nm == "" then nm = fname or ederror("no file name yet") end
+        local text = readText(nm) or ederror("cannot open input file")
+        loadText(text)
+        fname = nm
+        dirty = false
+        marks = {}
+        undoState = nil
+        if not suppressCounts then out(#text .. "\n") end
+    elseif c == "f" then
+        if naddrs > 0 then ederror("invalid address") end
+        local nm = expandName(trim(rest))
+        if nm == "" then
+            if not fname then ederror("no file name yet") end
+            out(fname .. "\n")
+        else
+            fname = nm
+            out(fname .. "\n")
+        end
+    elseif c == "w" or c == "W" then
+        if naddrs > 2 then ederror("invalid address") end
+        local wq = false
+        if c == "w" and line:sub(pos, pos) == "q" then
+            wq = true
+            rest = line:sub(pos + 1)
+        end
+        local r1, r2
+        if naddrs == 0 then r1, r2 = 1, n
+        elseif naddrs == 1 then r1, r2 = a1, a1
+        else r1, r2 = a1, a2 end
+        if naddrs > 0 and (r1 < 1 or r2 > n or r2 < r1) then ederror("invalid address") end
+        local nm = expandName(trim(rest))
+        if nm == "" then nm = fname or ederror("no file name yet")
+        else fname = nm end
+        local text = ""
+        if n > 0 then text = table.concat(lines, "\n", r1, r2) .. "\n" end
+        if nm:sub(1, 1) == "!" then
+            local cmd = expandName(nm:sub(2))
+            local pr, pw = syscalls["pipe.create"]()
+            local path, src = shScript(cmd)
+            local child = spawn(src, "sh", nil, nil, { [0] = "/bin/sh", path },
+                { input = pr, output = stdout })
+            if not child then fs.delete(path); pr.close(); pw.close(); ederror("cannot execute shell") end
+            local wok = pw:write(text)
+            pw.close()
+            if not wok then ederror("broken pipe") end
+            syscalls["proc.wait"](child)
+            fs.delete(path)
+        else
+            local fh = fs.open(resolve(nm), (c == "W") and "a" or "w")
+            if not fh then ederror("cannot open output file") end
+            fh.write(text)
+            fh.close()
+        end
+        dirty = false
+        if not suppressCounts then out(#text .. "\n") end
+        if wq then quitting = true end
+    elseif c == "q" then
+        if naddrs > 0 then ederror("invalid address") end
+        restEmpty(rest)
+        if dirty and not qWarned then
+            qWarned = true
+            reportErr("warning: file modified")
+        else
+            quitting = true
+        end
+    elseif c == "Q" then
+        if naddrs > 0 then ederror("invalid address") end
+        restEmpty(rest)
+        quitting = true
+    elseif c == "g" or c == "G" or c == "v" or c == "V" then
+        if naddrs > 2 then ederror("invalid address") end
+        local r1, r2
+        if naddrs == 0 then r1, r2 = 1, n
+        else r1, r2 = norm2() end
+        local d = line:sub(pos, pos)
+        if d ~= "/" and d ~= "?" then ederror("invalid pattern") end
+        local pat, p1 = scanDelim(line, pos + 1, d)
+        if pat == "" then pat = lastRe or ederror("no previous regular expression")
+        else lastRe = pat end
+        if n == 0 and naddrs == 0 then ederror("invalid address") end
+        cmdname = c
+        globalExec(r1, r2, pat, line:sub(p1), (c == "v" or c == "V"))
+        cmdname = nil
+    elseif c == "h" then
+        restEmpty(rest)
+        out((helpMsg ~= "" and helpMsg or "?") .. "\n")
+    elseif c == "H" then
+        restEmpty(rest)
+        helpOn = not helpOn
+    elseif c == "P" then
+        restEmpty(rest)
+        promptOn = not promptOn
+    elseif c == "!" then
+        if naddrs > 0 then ederror("invalid address") end
+        local cmd = trim(expandName(rest))
+        if cmd == "" then ederror("no previous command") end
+        runShell(cmd)
+        if not suppressCounts then out("!\n") end
+    else
+        ederror("unknown command")
+    end
+end
+
+-- ---------------------------------------------------------------
+-- 命令行解析
+-- ---------------------------------------------------------------
+local fileArg = nil
+local noMore = false
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if noMore then
+        if fileArg then stderr("ed: usage: ed [-p string] [-s] [file]\n"); return 1 end
+        fileArg = a
+    elseif a == "--" then noMore = true
+    elseif a == "-s" or a == "--quiet" or a == "--silent" then suppressCounts = true
+    elseif a == "-p" or a == "--prompt" then
+        i = i + 1
+        if not args[i] then stderr("ed: option requires an argument -- p\n"); return 1 end
+        promptStr = args[i]
+    elseif a:match("^%-%-prompt=(.*)$") then
+        promptStr = a:match("^%-%-prompt=(.*)$")
+    elseif a:sub(1, 1) == "-" and #a > 1 then
+        stderr("ed: invalid option -- '" .. a .. "'\n")
+        return 1
+    else
+        if fileArg then stderr("ed: usage: ed [-p string] [-s] [file]\n"); return 1 end
+        fileArg = a
+    end
+    i = i + 1
+end
+
+-- ---------------------------------------------------------------
+-- 启动加载
+-- ---------------------------------------------------------------
+if fileArg then
+    fname = fileArg
+    local text = readText(fileArg)
+    if text then
+        loadText(text)
+        if not suppressCounts then out(#text .. "\n") end
+    else
+        reportErr("cannot open input file")
+    end
+end
+
+-- ---------------------------------------------------------------
+-- 主循环
+-- ---------------------------------------------------------------
+-- 在内层协程里执行命令: ederror 表/真错误经 resume 返回, 而命令内部的阻塞
+-- (tty 读/管道/proc.wait 的 os.sleep)yield 直接穿透到内核调度器——
+-- Lua 5.1 里 pcall 无法跨越 yield, 故不能用 pcall 包 execLine。
+local function callExec(line)
+    local co = coroutine.create(execLine)
+    local ok, filt = coroutine.resume(co, line)
+    while ok and coroutine.status(co) == "suspended" do
+        local ev = { coroutine.yield(filt) } -- 内层让出: 以同样 filter 让出给调度器
+        ok, filt = coroutine.resume(co, unpack(ev))
+    end
+    return ok, filt
+end
+
+while true do
+    if interactive and promptOn and promptStr ~= "" then out(promptStr) end
+    local line = stdin:readLine()
+    if line == nil then
+        if dirty then reportErr("warning: file modified") end
+        break
+    end
+    local ok, err = callExec(line)
+    if not ok then
+        if type(err) == "table" and err.ed then
+            reportErr(err.msg)
+        else
+            error(err, 0) -- 真 bug: 交给内核 fail-fast
+        end
+    end
+    if quitting then break end
+end

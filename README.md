@@ -42,7 +42,7 @@
 
 **工具**：`ls`、`cat`、`mkdir (-p)`、`rm (-r|-f)`、`cp (-r)`、`mv`、`touch`、`head (-n)`、`tail (-n)`、
 `wc (-l|-w|-c)`、`grep (-n|-i|-v)`、`sed`（GNU 子集：`s/y/d/p/q/a/i/c/=`、行号/`$`/正则地址与区间、
-`!` 取反、`-n -s -e -f -i`）、`kill`、`login`、`sh`。
+`!` 取反、`-n -s -e -f -i`）、`ed`（POSIX 子集：`a/i/c/d/p/n/l/s/t/m/r/w/q/u/g/v/=`、地址 `.` `$` n `/re/` `+n` `-n`、输入模式以 `.` 结束）、`kill`、`login`、`sh`。
 各工具支持 POSIX 的 **`--` 结束选项** 标记：`rm -- --help`、`touch -- -file`、`ls -- --ff` 等，用于操作以
 `-`/`--` 开头的文件名；单独的 `-` 视为普通操作数。
 
@@ -149,6 +149,7 @@ src/bin/tail               打印后 N 行 (-n N|-N)
 src/bin/wc                 统计行/词/字节 (-l|-w|-c)
 src/bin/grep               按 Lua 模式查找行 (-n|-i|-v)
 src/bin/sed                流式文本编辑器 (GNU 子集: s/y/d/p/q/a/i/c/=, 地址区间, -n -s -e -f -i)
+src/bin/ed                 行编辑器 (POSIX 子集: a/i/c/d/p/n/l/s/t/m/r/w/q/u/g/v/=, 正则地址与替换, 交互逐行读)
 src/bin/kill               发送信号到进程/进程组 (kill [-SIG] pid|-pgid; kill -l)
 src/bin/login              getty/login: 登录提示->验证->启动 sh->循环
 src/bin/sh                 交互/脚本 shell(POSIX 核心子集: 变量/引号/if/for/while/case/函数/test/[ ]/&&/|| /重定向)
