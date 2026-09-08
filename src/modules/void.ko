@@ -92,7 +92,17 @@ return {
                 end
                 return nil, "read-only or unknown config: " .. tostring(attr)
             end,
-            flush = function() pcall(hol.sync) end,
+            -- sync 每 tick 只生效一次, 同 tick 内重复调用浪费时间。
+            -- 用 os.clock() 去重: 同 0.05s 窗口内只 sync 一次。
+            flush = (function()
+                local lastSync = 0
+                return function()
+                    local now = os.clock()
+                    if now - lastSync < 0.05 then return end
+                    lastSync = now
+                    pcall(hol.sync)
+                end
+            end)(),
             release = function() pcall(hol.releaseFrameBuffer, fb) end,
         }
         kapi.registerDisplay(dev)
