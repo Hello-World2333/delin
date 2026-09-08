@@ -381,10 +381,20 @@ local function spawn(src, name, ppid, uid, gid, argv, opts)
     nextPid = nextPid + 1
     local pid = nextPid
     local stdio = (opts and opts.stdio) or curStdio
+    -- 环境块(与内核 process.spawn 一致): 继承父进程, opts.env 覆盖/追加(值为 nil 删除)。
+    local parent = procs[ppid]
+    local envvars = {}
+    if parent and parent.envvars then for k, v in pairs(parent.envvars) do envvars[k] = v end end
+    if opts and opts.env then
+        for k, v in pairs(opts.env) do
+            if v == nil then envvars[k] = nil else envvars[k] = tostring(v) end
+        end
+    end
     local env = setmetatable({
         pid = pid, ppid = ppid or 0, uid = uid or 0, gid = gid or 0,
         cwd = (opts and opts.cwd) or "/",
         argv = argv or {}, args = {}, argc = 0, arg0 = "",
+        env = envvars, getenv = function(n) return envvars[n] end,
         fs = F, io = makeIo(stdio), syscalls = syscalls,
         print = function(...) end,
         -- os.sleep 让出当前协程(调度器据此切换进程), 模拟内核按事件驱动恢复。
@@ -412,11 +422,10 @@ local function spawn(src, name, ppid, uid, gid, argv, opts)
         return nil, "load failed: " .. tostring(lerr)
     end
     -- 进程组/会话: 子进程继承父进程的 pgrp/sid(与内核 process.spawn 一致)。
-    local parent = procs[ppid]
     local pgrp = parent and parent.pgrp or pid
     local sid = parent and parent.sid or 0
     procs[pid] = { pid = pid, name = name, status = "running", exitCode = 0, stdio = stdio,
-                   pgrp = pgrp, sid = sid, handlers = {} }
+                   pgrp = pgrp, sid = sid, handlers = {}, envvars = envvars }
     running[#running + 1] = { pid = pid, co = coroutine.create(chunk) }
     return pid
 end
@@ -508,7 +517,9 @@ for i = 2, #argsIn do toolArgs[#toolArgs + 1] = argsIn[i] end
 local stdinBuf = {}
 for line in io.lines() do stdinBuf[#stdinBuf + 1] = line end
 local li = 0
-local inputHandle = { isTTY = false, readLine = function() li = li + 1; return stdinBuf[li] end }
+-- DELIN_HARNESS_TTY=1: 把 stdin 伪装成终端, 让 sh 走交互式分支(测 PS1/PS2 提示符)。
+local ttyMode = os.getenv("DELIN_HARNESS_TTY") == "1"
+local inputHandle = { isTTY = ttyMode, readLine = function() li = li + 1; return stdinBuf[li] end }
 inputHandle.read = function() end
 
 local outputHandle = Handle.new(io.stdout, "<stdout>")

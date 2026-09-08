@@ -20,18 +20,23 @@ end
 local stdin  = io.stdin()
 local stdout = io.stdout()
 
-local uname = "root"
-if syscalls and syscalls["user.byUid"] then
-    local u = syscalls["user.byUid"](uid)
-    if u then uname = u.name end
-end
+-- 当前用户(passwd 记录): $USER/$HOME/$SHELL 的缺省来源。
+local uinfo = nil
+if syscalls and syscalls["user.byUid"] then uinfo = syscalls["user.byUid"](uid) end
+local uname = (uinfo and uinfo.name) or "root"
 local lastExit = 0
 local lastBgPid = nil -- $! : 最近一个后台作业的 pid
 
 local cwd = "/"
-if syscalls and syscalls["user.byUid"] then
-    local u = syscalls["user.byUid"](uid)
-    if u and u.home and fs.isDir(u.home) then cwd = u.home end
+if uinfo and uinfo.home and fs.isDir(uinfo.home) then cwd = uinfo.home end
+
+-- 父进程导出的环境块(内核注入的全局 env 表)。startup 变量的优先级:
+-- 继承的环境 > passwd/内核信息 > 内置缺省(与 login(1) 先设 USER/HOME/SHELL 再起 sh 一致)。
+local inherited = (type(env) == "table") and env or {}
+local function initVar(name, default)
+    local v = inherited[name]
+    if v ~= nil then return tostring(v) end
+    return default
 end
 
 -- 位置参数(顶层脚本 argv; 函数体用独立 pos 表)。
@@ -42,7 +47,44 @@ local function setPos(argv)
     if argv then for i = 1, #argv do posArgs[i] = argv[i] end end
 end
 
-local vars = { IFS = " \t\n" } -- IFS 是真正的 shell 变量(POSIX 默认空白; 置空则不分割)
+local vars = {
+    IFS = " \t\n", -- IFS 是真正的 shell 变量(POSIX 默认空白; 置空则不分割)
+    PATH = initVar("PATH", "/bin"),
+    HOME = initVar("HOME", (uinfo and uinfo.home) or "/root"),
+    USER = initVar("USER", uname),
+    LOGNAME = initVar("LOGNAME", uname),
+    SHELL = initVar("SHELL", (uinfo and uinfo.shell) or "/bin/sh"),
+    PPID = tostring(ppid or 0), -- 内核给的父 pid(子 shell 也重新取, 不继承环境里的 PPID)
+    PWD = cwd, -- shell 维护: cd 后同步(见 builtins.cd)
+    PS1 = initVar("PS1", "\\u@\\h:\\w\\$ "),
+    PS2 = initVar("PS2", "> "),
+    PS3 = initVar("PS3", "#? "),
+    PS4 = initVar("PS4", "+ "),
+}
+-- 导出标记(export): 名字 -> true。只有被标记的变量经内核环境块传给子进程。
+local exported = {
+    PATH = true, HOME = true, USER = true, LOGNAME = true, SHELL = true, PWD = true, PPID = true,
+}
+-- 导出给子进程的环境块(内核 env 表): 只有 export 标记过且已赋值的变量。
+local function exportEnv()
+    local out = {}
+    for name in pairs(exported) do
+        local v = vars[name]
+        if v ~= nil then out[name] = v end
+    end
+    return out
+end
+-- shell 选项(set -e/-u/-v/-x)。定义在词法之前: $- 与 nounset 检查都要读它。
+local opt = { errexit = false, nounset = false, verbose = false, xtrace = false }
+local function optString()
+    local s = ""
+    if opt.errexit then s = s .. "e" end
+    if opt.nounset then s = s .. "u" end
+    if opt.verbose then s = s .. "v" end
+    if opt.xtrace then s = s .. "x" end
+    return s
+end
+-- 求值期致命错误(set -u 未定义变量)由 nounsetCheck 在命令执行前发现并返回 "exit" 控制。
 local funcSrcs = {} -- 函数名 -> 定义原文(后台子 shell 注入用)
 
 -- 规范化绝对路径: 折叠 . / .. , 去掉多余斜杠(相对路径以 cwd 起)。
@@ -110,6 +152,14 @@ local function errln(s)
     local e = io.stderr()
     if e and e.write then e:write(tostring(s or "") .. "\n") end
 end
+-- set -v(verbose): 回显命令原文到 stderr(POSIX)。Delin 一次性读入整段源码, 所以按"执行时回显"。
+local function outVerbose(s)
+    local e = io.stderr()
+    if e and e.write then
+        e:write(tostring(s or ""))
+        if tostring(s or ""):sub(-1) ~= "\n" then e:write("\n") end
+    end
+end
 if argErr then errln(argErr); return 2 end
 
 -- 运行脚本文件/命令行时不做交互(不读 tty): stdin 仍可能是终端(被父 sh 继承)。
@@ -141,11 +191,22 @@ local function getVarVal(name)
     if name == "$" then return tostring(pid) end
     if name == "!" then return lastBgPid and tostring(lastBgPid) or "" end
     if name == "0" then return posArg0 end
+    if name == "-" then return optString() end
     if name == "*" then return table.concat(posArgs, " ") end
     if name == "@" then return table.concat(posArgs, " ") end
     local n = tonumber(name)
     if n then return posArgs[n] or "" end
     return vars[name] or ""
+end
+-- 变量是否已赋值(set -u 判定用)。特殊参数/位置参数按是否真的有值算。
+local function isVarSet(name)
+    if name == "?" or name == "#" or name == "$" or name == "0" or name == "-" or name == "*" or name == "@" then
+        return true
+    end
+    if name == "!" then return lastBgPid ~= nil end
+    local n = tonumber(name)
+    if n then return posArgs[n] ~= nil end
+    return vars[name] ~= nil
 end
 
 -- ---------------------------------------------------------------
@@ -161,6 +222,7 @@ local function readVarName(src, i)
         return name, j + 1
     end
     if c == "?" then return "?", i + 1 end
+    if c == "-" then return "-", i + 1 end
     if c == "#" then return "#", i + 1 end
     if c == "!" then return "!", i + 1 end
     if c == "@" then return "@", i + 1 end
@@ -630,11 +692,12 @@ end
 -- 求值
 -- ---------------------------------------------------------------
 -- POSIX 特殊内建: 赋值前缀在它们身上留在当前环境(不恢复)。
-local specialBuiltins = { [":"] = true, ["exit"] = true, ["return"] = true,
-    ["shift"] = true, ["break"] = true, ["continue"] = true }
+local specialBuiltins = { [":"] = true, ["exit"] = true, ["return"] = true, ["shift"] = true,
+    ["break"] = true, ["continue"] = true, ["."] = true, ["set"] = true, ["export"] = true,
+    ["unset"] = true }
 
 local builtins = {}
-local evalNode, evalList, evalSimple, restoreRedir, matchGlob, evalPipe, spawnChild
+local evalNode, evalList, evalSimple, restoreRedir, matchGlob, evalPipe, spawnChild, evalProgram, promptExpand
 
 local function expandWords(words)
     local out = {}
@@ -644,16 +707,105 @@ local function expandWords(words)
     return out
 end
 local function tail(t) local r = {}; for i = 2, #t do r[#r + 1] = t[i] end return r end
+-- set -u(nounset): 在命令真正执行前检查它要展开的变量是否都已定义。
+-- 放在执行前(而非展开中)的原因: 未执行的分支(`if false; then echo $x; fi`)不该报错,
+-- 而一旦要执行, 整条命令就必须中止(不能带着空值去跑 `rm -rf $UNDEF`)。
+-- 交互式报错后只丢弃当前命令并继续(bash 行为); 非交互式返回 "exit" 让 shell 退出。
+local function unsetVarIn(segs)
+    if not opt.nounset then return nil end
+    for _, seg in ipairs(segs) do
+        if seg.var then
+            if not isVarSet(seg.var) then return seg.var end
+        elseif seg.dq then
+            for _, d in ipairs(seg.dq) do
+                if d.var and not isVarSet(d.var) then return d.var end
+            end
+        end
+    end
+    return nil
+end
+-- words: 一串词(每个词是一串 segs)。返回 (abort, ctrl)。
+local function nounsetCheck(words)
+    if not opt.nounset then return false end
+    for _, w in ipairs(words) do
+        local bad = unsetVarIn(w)
+        if bad then
+            errln("sh: " .. bad .. ": parameter not set")
+            lastExit = 1
+            -- 非交互式: 让 shell 退出; 交互式: 只丢弃当前命令(bash 行为)。
+            if interactive then return true end
+            return true, "exit"
+        end
+    end
+    return false
+end
+-- 一个 simple 节点的全部词(argv + 赋值值 + 重定向目标)。
+local function simpleWords(node)
+    local words = {}
+    for _, w in ipairs(node.argv) do words[#words + 1] = w end
+    for _, a in ipairs(node.assigns) do words[#words + 1] = a.value end
+    for _, r in ipairs(node.redirects) do words[#words + 1] = r.target end
+    return words
+end
+-- 可重输入的赋值文本(POSIX `set`/`export -p` 输出用): 总是单引号, 内部 ' 转义为 '\''。
+local function quoteAssign(s)
+    return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+end
+-- 可执行命令路径查找(POSIX PATH 语义):
+--   - 含 "/" 的名字按 cwd 解析, 不查 PATH;
+--   - 否则按 $PATH 逐目录查找(空条目 = 当前目录), PATH 未设置时用 /bin;
+--   - needExec 为真(命令查找)时优先可执行文件; 若只找到不可执行的候选, 返回它,
+--     由调用方给出 permission denied(与 bash 一致)。未找到返回 nil。
+local function searchPath(name, needExec)
+    if name:find("/") then
+        local p = resolve(name)
+        if fs.exists(p) then return p end
+        return nil
+    end
+    local path = vars.PATH
+    if path == nil then path = "/bin" end
+    if path == "" then return nil end
+    local fallback = nil
+    for dir in (path .. ":"):gmatch("([^:]*):") do
+        local cand = (dir == "") and resolve(name) or resolve(dir .. "/" .. name)
+        if fs.exists(cand) and not (fs.isDir and fs.isDir(cand)) then
+            if not needExec or fs.canExecute(cand) then return cand end
+            if not fallback then fallback = cand end
+        end
+    end
+    return fallback
+end
 
 builtins.pwd = function(args) outln(cwd) end
 builtins.echo = function(args) outln(table.concat(args, " ")) end
 builtins["true"] = function() end
 builtins["false"] = function() lastExit = 1 end
 builtins[":"] = function() end
+-- cd [dir] / cd - / cd : POSIX —— 无参进 $HOME, `-` 回 $OLDPWD 并打印新目录。
+-- PWD/OLDPWD 由 shell 维护(cd 后同步), 便于脚本与提示符使用。
 builtins.cd = function(args)
-    local target = resolve(args[1] or "/")
-    if not fs.isDir(target) then errln("cd: " .. (args[1] or "") .. ": No such directory"); lastExit = 1
-    else cwd = target; lastExit = 0 end
+    local arg = args[1]
+    local target
+    if arg == nil then
+        local home = vars.HOME
+        if not home or home == "" then errln("cd: HOME not set"); lastExit = 1; return end
+        target = resolve(home)
+    elseif arg == "-" then
+        local old = vars.OLDPWD
+        if not old or old == "" then errln("cd: OLDPWD not set"); lastExit = 1; return end
+        target = resolve(old)
+    else
+        target = resolve(arg)
+    end
+    if not fs.isDir(target) then
+        errln("cd: " .. (arg or "") .. ": No such directory"); lastExit = 1; return
+    end
+    vars.OLDPWD = cwd
+    exported.OLDPWD = true -- bash 也导出 OLDPWD
+    cwd = target
+    vars.PWD = cwd
+    if arg == "-" then outln(cwd) end
+    lastExit = 0
 end
 
 local function testEval(a)
@@ -710,6 +862,167 @@ builtins.shift = function(args)
     local np = {}
     for i = n + 1, #posArgs do np[#np + 1] = posArgs[i] end
     posArgs = np
+end
+
+-- ---------------------------------------------------------------
+-- set / export / unset / . (POSIX 特殊内建)
+-- ---------------------------------------------------------------
+-- 选项短名 -> 长名(set -o 用长名)。
+local optShort = { e = "errexit", u = "nounset", v = "verbose", x = "xtrace" }
+local optLong = { errexit = "e", nounset = "u", verbose = "v", xtrace = "x" }
+local optOrder = { "errexit", "nounset", "verbose", "xtrace" }
+
+-- 列出全部 shell 变量(POSIX `set` 无参输出: 可重输入的 name='value', 按名排序)。
+local function listVars()
+    local names = {}
+    for name in pairs(vars) do names[#names + 1] = name end
+    table.sort(names)
+    for _, name in ipairs(names) do outln(name .. "=" .. quoteAssign(vars[name])) end
+end
+-- 列出导出变量(export / export -p)。
+local function listExported()
+    local names = {}
+    for name in pairs(exported) do names[#names + 1] = name end
+    table.sort(names)
+    for _, name in ipairs(names) do outln("export " .. name .. "=" .. quoteAssign(vars[name] or "")) end
+end
+
+-- set: 无参列变量; `set -- a b` 设位置参数; -e/-u/-v/-x 与 -o 选项(POSIX)。
+-- 选项可合并(-ex); -/+ 分别开关; `set -o` 列选项状态, `set +o` 输出可重输入的 set 命令。
+builtins.set = function(args)
+    if #args == 0 then listVars(); lastExit = 0; return end
+    local operands, sawPos = {}, false
+    local i = 1
+    while i <= #args do
+        local a = args[i]
+        if a == "--" then
+            sawPos = true
+            for k = i + 1, #args do operands[#operands + 1] = args[k] end
+            break
+        elseif a == "-" then
+            opt.xtrace, opt.verbose = false, false -- POSIX: `set -` 关闭 -v/-x
+            i = i + 1
+        elseif a == "-o" or a == "+o" then
+            local on = (a == "-o")
+            local name = args[i + 1]
+            if name == nil then
+                if on then
+                    for _, n in ipairs(optOrder) do
+                        outln(string.format("%-15s %s", n, opt[n] and "on" or "off"))
+                    end
+                else
+                    for _, n in ipairs(optOrder) do outln("set " .. (opt[n] and "-" or "+") .. optLong[n]) end
+                end
+                lastExit = 0
+                return
+            end
+            if not optLong[name] then errln("set: " .. name .. ": invalid option name"); lastExit = 2; return end
+            opt[name] = on
+            i = i + 2
+        elseif a:match("^[%-%+][euvx]+$") then
+            local on = a:sub(1, 1) == "-"
+            for k = 2, #a do opt[optShort[a:sub(k, k)]] = on end
+            i = i + 1
+        elseif a:sub(1, 1) == "-" or a:sub(1, 1) == "+" then
+            errln("set: " .. a .. ": invalid option"); lastExit = 2; return
+        else
+            operands[#operands + 1] = a
+            sawPos = true
+            i = i + 1
+        end
+    end
+    -- 有位置参数操作数: 设位置参数(POSIX: `set a b` 等价于 `set -- a b`; `set --` 清空)。
+    if sawPos then
+        posArgs = operands
+        lastExit = 0
+    end
+end
+
+-- export [-p] [-n] [name[=value] ...]: 标记变量导出到子进程环境(内核环境块)。
+builtins.export = function(args)
+    local unexport, i = false, 1
+    while i <= #args do
+        local a = args[i]
+        if a == "-p" then
+            listExported(); lastExit = 0; return
+        elseif a == "-n" then unexport = true; i = i + 1
+        elseif a:match("^%-") and a ~= "-" then
+            errln("export: " .. a .. ": invalid option"); lastExit = 2; return
+        else
+            local name, value = a:match("^([^=]+)=(.*)$")
+            if not name then name = a end
+            if not name:match("^[%a_][%w_]*$") then
+                errln("export: " .. name .. ": not a valid identifier"); lastExit = 1; return
+            end
+            if value ~= nil then vars[name] = value end
+            if unexport then
+                exported[name] = nil
+            else
+                if vars[name] == nil then vars[name] = "" end -- POSIX: 未设置的变量按空值导出
+                exported[name] = true
+            end
+            i = i + 1
+        end
+    end
+    lastExit = 0
+end
+
+-- unset [-f] name...: 删除 shell 变量(默认)或函数(-f)。
+builtins.unset = function(args)
+    local func = false
+    local names = {}
+    for _, a in ipairs(args) do
+        if a == "-f" then func = true
+        elseif a == "-v" then func = false
+        elseif a:match("^%-") and a ~= "-" then
+            errln("unset: " .. a .. ": invalid option"); lastExit = 2; return
+        else names[#names + 1] = a end
+    end
+    for _, name in ipairs(names) do
+        if not name:match("^[%a_][%w_]*$") then
+            errln("unset: " .. name .. ": not a valid identifier"); lastExit = 1; return
+        end
+        if func then
+            if funcSrcs[name] then
+                funcSrcs[name] = nil
+                builtins[name] = nil
+            end
+        else
+            vars[name] = nil
+            exported[name] = nil
+        end
+    end
+    lastExit = 0
+end
+
+-- . file [args...] (POSIX 特殊内建): 在当前环境执行文件里的命令 —— 变量/函数/cd 都作用于
+-- 当前 shell(与 `sh file` 起子进程相对)。文件不必可执行, 只需可读; 名字不含 "/" 时查 $PATH。
+-- 给了参数则临时替换位置参数(执行完恢复; bash/POSIX 语义), $0 不变。
+builtins["."] = function(args)
+    local file = args[1]
+    if not file then errln("sh: .: filename argument required"); lastExit = 2; return end
+    local path = searchPath(file, false)
+    if not path then errln("sh: .: " .. file .. ": not found"); lastExit = 1; return end
+    local h = fs.open(path, "r")
+    if not h then errln("sh: .: " .. path .. ": cannot open"); lastExit = 1; return end
+    local src = (h.readAll and h.readAll()) or ""
+    h.close()
+    local saveArgs = posArgs
+    if #args > 1 then
+        local a = {}
+        for k = 2, #args do a[#a + 1] = args[k] end
+        posArgs = a
+    end
+    local ok, inc, perr, ctrl = evalProgram(src)
+    posArgs = saveArgs
+    if inc then
+        errln("sh: .: " .. path .. ": syntax error: unexpected end of file"); lastExit = 2; return
+    end
+    if not ok and perr then
+        errln("sh: .: " .. path .. ": " .. tostring(perr)); lastExit = 2; return
+    end
+    if ctrl then return ctrl end -- exit 等控制信号透传给当前 shell
+    return nil -- lastExit 已由文件里最后一条命令设置
 end
 -- read [-r] var...: 从当前 stdin 读一整行, 按 IFS 分割后赋给变量(POSIX read)。
 -- 无 -r 时反斜杠转义下一个字符(被转义的字符即使是 IFS 也不是分隔符), 行尾反斜杠为续行;
@@ -786,8 +1099,11 @@ end
 builtins.help = function(args)
     outln("Delin sh (POSIX core subset)")
     outln("builtins : cd pwd echo read exit help jobs fg bg wait kill test [ true false :")
+    outln("           . set export unset break continue return shift")
     outln("external : ls cat rm mkdir cp mv touch head tail wc grep sed ed chmod chown login")
     outln("usage    : sh [-c cmd [name [args...]]] [script] [args...]   (no script => interactive/stdin)")
+    outln("options  : set -e(errexit) -u(nounset) -v(verbose) -x(xtrace) -o <name>; $- 为当前选项")
+    outln("vars     : PATH HOME PWD OLDPWD USER SHELL PPID PS1 PS2 PS3 PS4 IFS (export 后传给子进程)")
 end
 
 local ttyName = (stdin and stdin.getDeviceName) and stdin:getDeviceName() or nil
@@ -872,9 +1188,17 @@ end
 local function subshellPrologue()
     local parts = {}
     for name, val in pairs(vars) do
-        if name:match("^[%a_][%w_]*$") then parts[#parts + 1] = name .. "=" .. quoteShell(val) end
+        -- PPID 不注入: 子 shell 用内核给的父 pid(否则 `sh -c 'echo $PPID'` 会报祖先进程)。
+        if name ~= "PPID" and name:match("^[%a_][%w_]*$") then
+            parts[#parts + 1] = name .. "=" .. quoteShell(val)
+        end
     end
     table.sort(parts) -- 确定性输出(便于真机日志比对)
+    -- 导出标记也要注入: 否则子 shell 里 export 过的变量对孙进程不可见。
+    local exp = {}
+    for name in pairs(exported) do exp[#exp + 1] = name end
+    table.sort(exp)
+    if #exp > 0 then parts[#parts + 1] = "export " .. table.concat(exp, " ") end
     for _, src in pairs(funcSrcs) do parts[#parts + 1] = src end
     return parts
 end
@@ -1057,10 +1381,9 @@ builtins.kill = function(args)
     end
 end
 
--- 解析命令为可执行路径: 含 "/" 按 cwd 解析(./script.sh, 绝对路径); 否则查 PATH(/bin)。
+-- 解析命令为可执行路径(POSIX PATH 查找, 见 searchPath)。找不到返回 nil。
 local function commandPath(cmd)
-    if cmd:find("/") then return resolve(cmd) end
-    return "/bin/" .. cmd
+    return searchPath(cmd, true)
 end
 
 -- 读首行(用于 shebang 检测)。
@@ -1088,10 +1411,11 @@ end
 --   - 带 shebang: 以解释器跑脚本 —— 解释器路径(绝对或 PATH)解析; `env` 特判取下一程序名。
 spawnChild = function(cmd, argv, stdio)
     local path = commandPath(cmd)
-    if not fs.exists(path) then return nil, "command not found" end
+    if not path then return nil, "command not found" end
     if not fs.canExecute(path) then return nil, "permission denied" end
-    local opts = { cwd = cwd }
-    if stdio then opts.stdio = stdio end
+    -- 子进程环境块 = 本 shell 导出的变量(export); 内核负责与父环境合并。
+    local sopts = { cwd = cwd, env = exportEnv() }
+    if stdio then sopts.stdio = stdio end
     local interp, iarg = parseShebang(firstLine(path))
     local f, src, cargv
     if interp then
@@ -1102,7 +1426,7 @@ spawnChild = function(cmd, argv, stdio)
             iarg = nil
         end
         local interpPath = commandPath(prog)
-        if not fs.exists(interpPath) then return nil, "shebang interpreter not found: " .. prog end
+        if not interpPath then return nil, "shebang interpreter not found: " .. prog end
         if not fs.canExecute(interpPath) then return nil, "shebang interpreter not executable: " .. prog end
         f = fs.open(interpPath, "r")
         if not f then return nil, "permission denied" end
@@ -1112,7 +1436,7 @@ spawnChild = function(cmd, argv, stdio)
         if iarg and iarg ~= "" then cargv[n] = iarg; n = n + 1 end
         cargv[n] = path; n = n + 1
         for i = 1, #argv do cargv[n] = argv[i]; n = n + 1 end
-        local child, cerr = spawn(src, interpPath, nil, nil, cargv, opts)
+        local child, cerr = spawn(src, interpPath, nil, nil, cargv, sopts)
         if not child then return nil, tostring(cerr) end
         return child
     end
@@ -1121,7 +1445,7 @@ spawnChild = function(cmd, argv, stdio)
     src = f.readAll(); f.close()
     cargv = { [0] = path }
     for i = 1, #argv do cargv[i] = argv[i] end
-    local child, cerr = spawn(src, cmd, nil, nil, cargv, opts)
+    local child, cerr = spawn(src, cmd, nil, nil, cargv, sopts)
     if not child then return nil, tostring(cerr) end
     return child
 end
@@ -1202,7 +1526,40 @@ local function undoAssigns(restore)
     if restore then for k, v in pairs(restore) do vars[k] = v end end
 end
 
+-- xtrace(-x): 每条命令展开后、执行前写一行到 stderr, 前缀是展开后的 PS4(bash 风格)。
+-- 仅记单词显示用: 含特殊字符的词加单引号, 不保证可重输入。
+local function quoteTrace(w)
+    if w == "" then return "''" end
+    if w:match("^[%w%-%._/:=@%+,]+$") then return w end
+    return "'" .. w:gsub("'", "'\\''") .. "'"
+end
+local function xtraceLine(parts)
+    if not opt.xtrace then return end
+    local e = io.stderr()
+    if e and e.write then e:write(promptExpand(vars.PS4 or "") .. table.concat(parts, " ") .. "\n") end
+end
+local function xtraceWords(words) -- words: 已展开的词, 逐个加显示用引号
+    if not opt.xtrace then return end
+    local parts = {}
+    for _, w in ipairs(words) do parts[#parts + 1] = quoteTrace(w) end
+    xtraceLine(parts)
+end
+local function xtraceCmd(node, argvs)
+    if not opt.xtrace then return end
+    local parts = {}
+    for _, a in ipairs(node.assigns) do parts[#parts + 1] = a.name .. "=" .. quoteTrace(expandGlue(a.value)) end
+    for _, w in ipairs(argvs) do parts[#parts + 1] = quoteTrace(w) end
+    for _, r in ipairs(node.redirects) do
+        parts[#parts + 1] = r.op
+        parts[#parts + 1] = quoteTrace(wordToStr(r.target))
+    end
+    xtraceLine(parts)
+end
+
 evalSimple = function(node)
+    -- set -u: 先查本命令要用的变量, 再动任何东西(重定向/赋值/执行)。
+    local abort, ctrl0 = nounsetCheck(simpleWords(node))
+    if abort then return lastExit, ctrl0 end
     local needOut, needIn = false, false
     local openOut, openIn = {}, {}
     for _, r in ipairs(node.redirects) do
@@ -1224,18 +1581,23 @@ evalSimple = function(node)
     local restore = applyAssigns(node)
     local ctrl
     if #node.argv == 0 then
+        xtraceCmd(node, {})
         lastExit = 0
     else
         -- 先展开 argv($? 等用上一条命令的退出码), 再为本命令重置 lastExit。
         local argvs = expandWords(node.argv)
         lastExit = 0
-        local cmd, rest = argvs[1], {}
-        for i = 2, #argvs do rest[#rest + 1] = argvs[i] end
-        if builtins[cmd] then
-            ctrl = builtins[cmd](rest)
-        else
-            local s = (needOut or needIn) and { input = inH, output = outH } or nil
-            runExternal(cmd, rest, s, node.src)
+        -- 展开成零个词(如无参数的 `"$@"`)是无操作(POSIX), 不是"找不到命令"。
+        if #argvs > 0 then
+            xtraceCmd(node, argvs)
+            local cmd, rest = argvs[1], {}
+            for i = 2, #argvs do rest[#rest + 1] = argvs[i] end
+            if builtins[cmd] then
+                ctrl = builtins[cmd](rest)
+            else
+                local s = (needOut or needIn) and { input = inH, output = outH } or nil
+                runExternal(cmd, rest, s, node.src)
+            end
         end
     end
     undoAssigns(restore)
@@ -1262,6 +1624,13 @@ evalPipe = function(node)
     local items = node.items
     local n = #items
     if n <= 1 then return evalNode(items[1]) end
+    -- set -u: 执行前先检查各 simple 元素要用的变量(复合元素的内部命令由 evalNode 自查)。
+    for i = 1, n do
+        if items[i].kind == "simple" then
+            local abort, ctrl = nounsetCheck(simpleWords(items[i]))
+            if abort then return lastExit, ctrl end
+        end
+    end
     local pipes = {}
     for i = 1, n - 1 do
         local r, w = syscalls["pipe.create"]()
@@ -1297,9 +1666,14 @@ evalPipe = function(node)
         local node = items[i]
         if node.kind == "simple" then
             local argvs = expandWords(node.argv)
-            local cmd, rest = argvs[1], {}
-            for k = 2, #argvs do rest[#rest + 1] = argvs[k] end
-            info[i] = { cmd = cmd, rest = rest, inH = inp, outH = outp, builtin = builtins[cmd] ~= nil, kind = "simple" }
+            if #argvs == 0 then
+                -- 展开成零个词: 无操作元素(只需让下游读到 EOF)。
+                info[i] = { noop = true, inH = inp, outH = outp, kind = "simple" }
+            else
+                local cmd, rest = argvs[1], {}
+                for k = 2, #argvs do rest[#rest + 1] = argvs[k] end
+                info[i] = { cmd = cmd, rest = rest, inH = inp, outH = outp, builtin = builtins[cmd] ~= nil, kind = "simple" }
+            end
         else
             -- 复合命令(if/for/while/case/funcdef/brace)作为管道元素: 内联运行, 经 inH/outH 连通管道。
             info[i] = { node = node, inH = inp, outH = outp, kind = "compound" }
@@ -1330,7 +1704,10 @@ evalPipe = function(node)
     -- Pass C: 运行内置/复合命令元素。
     for i = 1, n do
         local it = info[i]
-        if it.cmd and it.builtin then
+        if it.noop then
+            closePipeEl(i, n, pipes)
+            codes[i] = 0
+        elseif it.cmd and it.builtin then
             inH, outH = it.inH, it.outH
             lastExit = 0
             local restore = applyAssigns(items[i])
@@ -1381,6 +1758,9 @@ matchGlob = function(s, pat)
     return s == pat
 end
 
+-- 条件上下文深度: >0 时失败的命令不触发 set -e(if/while/until 的条件、&&/|| 的非末元素)。
+local condCtx = 0
+
 evalNode = function(node)
     if node.kind == "simple" then return evalSimple(node) end
     if node.kind == "pipe" then return evalPipe(node) end
@@ -1389,47 +1769,64 @@ evalNode = function(node)
         -- 用布尔"最近一条已执行命令是否成功"做左结合短路:
         --   A && B : A 失败则跳过 B;  A || B : A 成功则跳过 B。
         -- 但短路只在当步生效, 不中断整条链, 使 `A && B || C` 在 A 失败时仍执行 C。
+        -- set -e: 只有"最后一个 &&/|| 之后的命令"失败才退出; 短路造成的非零状态豁免。
         local lastst = 0
         local ok = nil -- nil=尚未执行任何命令
+        local exempt = false
+        local n = #node.items
         for idx, it in ipairs(node.items) do
             local run = true
             if ok ~= nil then
                 if (it.op == "&&" and not ok) or (it.op == "||" and ok) then run = false end
             end
+            local isLast = (idx == n)
             if run then
-                local rt, c = evalNode(it.node)
-                if c == "exit" then return rt, "exit" end
-                if c == "break" then return rt, "break" end
-                if c == "continue" then return rt, "continue" end
-                if c == "return" then return rt, "return" end
+                -- 非末元素处于条件上下文: 它失败不触发 set -e(POSIX)。
+                if not isLast then condCtx = condCtx + 1 end
+                local rt, c, ex = evalNode(it.node)
+                if not isLast then condCtx = condCtx - 1 end
+                if c then return rt, c end
                 lastExit = rt or 0; lastst = rt or 0
                 ok = (lastExit == 0)
+                exempt = (not isLast) or ex or false
+            else
+                -- 跳过的元素: 链的状态来自它而不是"末元素失败", set -e 豁免。
+                -- 不能 break —— 左结合语义要求继续看后面的 || (A && B || C 时 C 仍要跑)。
+                exempt = true
             end
         end
-        return lastst
+        return lastst, nil, exempt
     end
     if node.kind == "brace" then return evalList(node.body) end
     if node.kind == "if" then
-        local c = evalList(node.cond)
-        if type(c) == "string" then return c end
+        condCtx = condCtx + 1
+        local c, cctrl = evalList(node.cond)
+        condCtx = condCtx - 1
+        if cctrl then return c, cctrl end
         if c == 0 then return evalList(node.thenb) end
         for _, e in ipairs(node.elifs) do
-            local ec = evalList(e.cond)
-            if type(ec) == "string" then return ec end
+            condCtx = condCtx + 1
+            local ec, ectrl = evalList(e.cond)
+            condCtx = condCtx - 1
+            if ectrl then return ec, ectrl end
             if ec == 0 then return evalList(e.body) end
         end
         if node.elseb then return evalList(node.elseb) end
-        return c
+        return 0 -- POSIX: 没有条件成立且无 else 时, if 的退出状态为 0
     end
     if node.kind == "for" then
         local items
-        if node.items then items = expandWords(node.items)
+        if node.items then
+            local abort, ctrl = nounsetCheck(node.items)
+            if abort then return lastExit, ctrl end
+            items = expandWords(node.items)
         else items = {}; for i = 1, #posArgs do items[i] = posArgs[i] end end
         local lastst = 0
         for _, it in ipairs(items) do
             vars[node.var] = it
             local rt, c = evalList(node.body)
-            if c == "exit" then return rt end
+            if c == "exit" then return rt, "exit" end
+            if c == "return" then return rt, "return" end -- return 穿透循环(函数体里的 return)
             if c == "break" then break end
             lastst = rt  -- continue: 走到下一个迭代即可
             schedYield()
@@ -1440,12 +1837,15 @@ evalNode = function(node)
     if node.kind == "while" or node.kind == "until" then
         local lastst = 0
         while true do
-            local c = evalList(node.cond)
-            if type(c) == "string" then return c end
+            condCtx = condCtx + 1
+            local c, cctrl = evalList(node.cond)
+            condCtx = condCtx - 1
+            if cctrl then return c, cctrl end
             local take = (node.kind == "while") and (c == 0) or (node.kind == "until" and c ~= 0)
             if not take then break end
             local rt, cc = evalList(node.body)
-            if cc == "exit" then return rt end
+            if cc == "exit" then return rt, "exit" end
+            if cc == "return" then return rt, "return" end
             if cc == "break" then break end
             lastst = rt
             schedYield()
@@ -1454,12 +1854,16 @@ evalNode = function(node)
         return lastst
     end
     if node.kind == "case" then
+        local abort, ctrl = nounsetCheck({ node.word })
+        if abort then return lastExit, ctrl end
         local w = wordToStr(node.word)
         for _, cs in ipairs(node.cases) do
             for _, pat in ipairs(cs.pats) do
+                local pabort, pctrl = nounsetCheck({ pat })
+                if pabort then return lastExit, pctrl end
                 if matchGlob(w, wordToStr(pat)) then
                     local rt, c = evalList(cs.body)
-                    if c == "exit" then return rt end
+                    if c then return rt, c end
                     return rt
                 end
             end
@@ -1488,19 +1892,24 @@ end
 evalList = function(items)
     local lastst = 0
     for idx, it in ipairs(items) do
+        if opt.verbose and it.src then outVerbose(it.src) end
         if it.op == "&" then
             -- 异步列表: 起子 shell 后立即继续, 不等待(POSIX: $? 置 0)。
             startBackground(it.src)
             lastExit = lastExit or 0
             lastst = lastExit
         else
-            local rt, c = evalNode(it.node)
+            local rt, c, exempt = evalNode(it.node)
             if c == "exit" then lastExit = rt or lastExit; return rt or 0, "exit" end
             if c == "break" then return rt or 0, "break" end
             if c == "continue" then return rt or 0, "continue" end
             if c == "return" then lastExit = rt or lastExit; return rt or 0, "return" end
             lastExit = rt or 0
             lastst = rt or 0
+            -- set -e: 非条件上下文里失败的命令让 shell 立即退出(POSIX)。
+            if opt.errexit and not exempt and lastExit ~= 0 and condCtx == 0 then
+                return lastExit, "exit"
+            end
             local nxt = items[idx + 1]
             if nxt and it.op == "&&" and lastExit ~= 0 then return lastst end
             if nxt and it.op == "||" and lastExit == 0 then return lastst end
@@ -1509,7 +1918,7 @@ evalList = function(items)
     return lastst
 end
 
-local function evalProgram(src)
+evalProgram = function(src)
     local toks, lexInc = lex(src)
     T = toks
     ti = 1
@@ -1522,7 +1931,7 @@ local function evalProgram(src)
         return nil, false, err
     end
     local rt, c = evalList(items)
-    -- 把 "exit" 控制信号透传给顶层调用者(交互循环靠它终止 shell)。
+    -- 把 "exit" 控制信号透传给顶层调用者(交互循环/`.` 内建靠它终止/退出当前 shell)。
     if c == "exit" then
         lastExit = rt or lastExit
         return true, nil, nil, "exit"
@@ -1530,14 +1939,62 @@ local function evalProgram(src)
     return true
 end
 
+-- ---------------------------------------------------------------
+-- 提示符(PS1..PS4): bash 风格转义
+-- ---------------------------------------------------------------
+-- 主机名: /etc/hostname 首行; 缺失时用 "delin"。
+local hostname = "delin"
+do
+    local f = fs.open("/etc/hostname", "r")
+    if f then
+        local l = (f.readLine and f.readLine()) or ""
+        f.close()
+        l = l:gsub("^%s+", ""):gsub("%s+$", "")
+        if l ~= "" then hostname = l end
+    end
+end
+local cmdCount = 0 -- \# / \! : 本次 shell 的第几条命令(无历史, 用命令序号近似 bash 的 \!)
+
+-- 波浪号缩写: cwd 在 $HOME 之下时用 ~ 代替(bash 的 \w)。
+local function tildeDir(p)
+    local home = vars.HOME
+    if home and home ~= "/" and (p == home or p:sub(1, #home + 1) == home .. "/") then
+        return "~" .. p:sub(#home + 1)
+    end
+    return p
+end
+
+-- 提示符展开(bash 风格): \u 用户 \h 主机(短) \H 主机(全) \w cwd(带 ~) \W 基名
+-- \$ root 为 # 否则 $ \#/\! 命令序号 \s shell 名 \n 换行 \t 时间 \d 日期 \\ 反斜杠;
+-- 未知转义原样保留(与 bash 一致)。
+promptExpand = function(s)
+    return (tostring(s or ""):gsub("\\(.)", function(c)
+        if c == "u" then return uname
+        elseif c == "h" then return (hostname:match("^[^%.]+")) or hostname
+        elseif c == "H" then return hostname
+        elseif c == "w" then return tildeDir(cwd)
+        elseif c == "W" then return (tildeDir(cwd):match("[^/]+$")) or "/"
+        elseif c == "$" then return (uid == 0) and "#" or "$"
+        elseif c == "#" or c == "!" then return tostring(cmdCount)
+        elseif c == "s" then return "sh"
+        elseif c == "n" then return "\n"
+        elseif c == "t" then return os.date("%H:%M:%S")
+        elseif c == "d" then return os.date("%a %b %d")
+        elseif c == "\\" then return "\\"
+        else return "\\" .. c
+        end
+    end))
+end
+
 if interactive then
     local buf = ""
     while true do
         reapJobs(true) -- 提示符前报告已结束的后台作业(`[1]+ Done cmd`)
-        -- PS1 在缓冲区为空时打印; 否则 PS2(`> `)表示命令跨行未结束。
-        local prompt = (#buf == 0)
-            and (uname .. "@delin:" .. (cwd == "/" and "/" or cwd) .. "# ")
-            or "> "
+        -- 缓冲区为空: PS1(默认 \u@\h:\w\$ ); 跨行未结束: PS2(默认 "> ")。
+        if #buf == 0 then cmdCount = cmdCount + 1 end
+        local p = (#buf == 0) and vars.PS1 or vars.PS2
+        if p == nil then p = (#buf == 0) and "\\u@\\h:\\w\\$ " or "> " end
+        local prompt = promptExpand(p)
         if stdout and stdout.write then stdout:write(prompt) end
         local line = stdin and stdin.readLine and stdin:readLine()
         if line == nil then

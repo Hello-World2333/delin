@@ -36,7 +36,12 @@ def df(img, cmd, check=False):
     return run(DBG, "-w", "-R", cmd, img, check=check)
 
 def df_write(img, host_path, img_path):
-    df(img, "write %s %s" % (host_path, img_path), check=True)
+    # debugfs 的 write 不覆盖已存在的文件(只打印 "Ext2 file already exists" 且返回 0),
+    # 所以先删目标再写; 写完检查输出, 别把"没写进去"当成成功。
+    df(img, "rm %s" % img_path)
+    out = df(img, "write %s %s" % (host_path, img_path), check=True)
+    if "already exists" in out or "error" in out.lower():
+        raise RuntimeError("debugfs write failed: %s -> %s\n%s" % (host_path, img_path, out))
 
 def df_mkdir(img, path):
     df(img, "mkdir %s" % path)
@@ -113,6 +118,19 @@ def main():
     df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/verify.service")
     df_mkdir(out, "/mnt/rootcopy")
 
+    # 3e) verify-sh.service: sh 内建/变量自检(. set export unset PATH PSx cd) -> /var/log/sh_verify.log
+    for src, dst in (("scripts/sh_verify.sh", "/root/sh_verify.sh"),
+                     ("scripts/sh_builtin_test.sh", "/root/sh_builtin_test.sh")):
+        df_write(out, os.path.join(REPO, src), dst)
+        df(out, "set_inode_field %s mode 0100755" % dst)
+    unit_sh = os.path.join(work, "verify-sh.service")
+    with open(unit_sh, "w") as f:
+        f.write("[Unit]\nDescription=Real-machine sh builtin verification\nAfter=syslogd.service\n\n"
+                "[Service]\nType=oneshot\nExecStart=/bin/sh /root/sh_verify.sh\n\n"
+                "[Install]\nWantedBy=multi-user.target\n")
+    df_write(out, unit_sh, "/lib/systemd/system/verify-sh.service")
+    df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/verify-sh.service")
+
     # 3d) 安装到磁盘
     shutil.copy(out, os.path.join(DISK, "parts/root.img"))
     shutil.copy(data_img, os.path.join(DISK, "parts/data.img"))
@@ -146,7 +164,7 @@ def reboot_and_collect():
 
     # 5) 取回日志
     print("== collect logs ==")
-    logs = ["/var/log/verify.log", "/var/log/messages", "/var/log/messages.1",
+    logs = ["/var/log/verify.log", "/var/log/sh_verify.log", "/var/log/messages", "/var/log/messages.1",
             "/var/log/secure", "/var/log/kern.log"]
     for path in logs:
         dst = os.path.join(WORK, "dump-" + os.path.basename(path))

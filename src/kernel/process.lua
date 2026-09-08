@@ -54,7 +54,7 @@ end
 ---@param uid integer|nil
 ---@param gid integer|nil
 ---@param argv table|nil  参数表 { [0]=程序名, [1..]=位置参数 } (可缺省)
----@param opts table|nil  选项 { cwd= } (可缺省, 缺省继承父进程 cwd 或 "/")
+---@param opts table|nil  选项 { cwd=, env={NAME=value} } (可缺省, 缺省继承父进程 cwd 或 "/")
 ---@return table
 local function buildEnv(pid, ppid, uid, gid, argv, opts)
     -- argv 约定: [0]=程序名/[1..]=位置参数。args = 只含位置参数(不含 [0]).
@@ -64,6 +64,17 @@ local function buildEnv(pid, ppid, uid, gid, argv, opts)
     for i = 1, #argv do args[i] = argv[i] end
     -- 继承父进程 cwd(或默认 "/")。调用方(sh)用 opts.cwd 传自己的当前目录。
     local parentCwd = registry[ppid] and registry[ppid].cwd or "/"
+    -- 环境块: 子进程继承父进程导出的变量, opts.env 覆盖/追加(值为 nil 即删除)。
+    local envvars = {}
+    local parentEnvProc = registry[ppid]
+    if parentEnvProc and parentEnvProc.envvars then
+        for k, v in pairs(parentEnvProc.envvars) do envvars[k] = v end
+    end
+    if opts.env then
+        for k, v in pairs(opts.env) do
+            if v == nil then envvars[k] = nil else envvars[k] = tostring(v) end
+        end
+    end
     ---@type table
     local env = setmetatable({
         pid   = pid,
@@ -75,6 +86,9 @@ local function buildEnv(pid, ppid, uid, gid, argv, opts)
         args  = args,
         argc  = #args,
         arg0  = argv[0] or args[1] or "",
+        -- 环境变量表(name -> string) + 查询函数: 进程读环境变量的接口(export 的落点)。
+        env    = envvars,
+        getenv = function(name) return envvars[name] end,
         print = kprint,
         spawn = function(src, name, childUid, childGid, childArgv, childOpts)
             return process.spawn(src, name, pid, childUid, childGid, childArgv, childOpts)
@@ -180,6 +194,7 @@ function process.spawn(src, name, ppid, uid, gid, argv, opts)
         co = co, status = "running", exitCode = nil, termSig = nil,
         uid = uid, gid = gid,
         cwd = env.cwd,
+        envvars = env.env, -- 环境块(子进程 spawn 时继承)
         stdio = env.__stdio,
         pgrp = pgrp, sid = sid,
         sig = newSigState(),

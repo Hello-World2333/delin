@@ -79,11 +79,31 @@ CC 没有裸块 API：磁盘驱动器只提供「盘上的 CC 原生文件系统
 各工具支持 POSIX 的 **`--` 结束选项** 标记：`rm -- --help`、`touch -- -file`、`ls -- --ff` 等，用于操作以
 `-`/`--` 开头的文件名；单独的 `-` 视为普通操作数。
 
-**sh（POSIX 核心子集）**：变量与展开（`$x`/`${x}`/`$?`/`$#`/`$@`/`$*`/`$!`/`$1..`）；单/双引号；
+**sh（POSIX 核心子集）**：变量与展开（`$x`/`${x}`/`$?`/`$#`/`$@`/`$*`/`$!`/`$-`/`$1..`）；单/双引号；
 `if/elif/else`、`for`、`while`、`case`、函数（位置参数）、`[ ]`/`test`（`=` `!=` `-n` `-z` `-eq/-ne/-lt/-le/-gt/-ge`
 `-e/-f/-d/-s/-x/-r/-w`、`!`）；`&&`/`||`/`;`；文件重定向（`>` `>>` `<`）；管道（`|`，每元素一个进程/内建，
 经内核 pipe 缓冲传递，`$?`=末元素退出码，生产端写满/消费端读空时让出调度器，broken pipe 中止写端）；内建
-`cd pwd echo read exit help jobs fg bg wait kill test [ true false : break continue return shift`。
+`cd pwd echo read exit help jobs fg bg wait kill test [ true false : . set export unset break continue return shift`。
+**启动变量**（可在 shell 里读写，`export` 后才传给子进程）：`PATH`（默认 `/bin`，命令查找用）、
+`HOME`、`USER`、`LOGNAME`、`SHELL`（后两者取自 `/etc/passwd`）、`PPID`（内核给的父 pid）、
+`PWD`（由 shell 维护，`cd` 后同步）、`IFS`；优先级为**继承的环境 > passwd/内核信息 > 内置缺省**
+（`login` 先设 `USER`/`HOME`/`SHELL`/`PATH` 再起 `sh`，与 login(1) 一致）。
+**提示符**：`PS1`（默认 `\u@\h:\w\$ `）、`PS2`（默认 `> `，续行）、`PS3`（默认 `#? `，保留）、
+`PS4`（默认 `+ `，`set -x` 前缀）；展开 bash 风格转义 `\u \h \H \w \W \$ \# \! \s \n \t \d \\`，
+未知转义原样保留，`\h` 取 `/etc/hostname`（缺失为 `delin`），`\w` 把 `$HOME` 缩成 `~`。
+**`cd`**：无参进 `$HOME`，`cd -` 回 `$OLDPWD` 并打印新目录，`PWD`/`OLDPWD` 随 `cd` 更新。
+**`set`**（POSIX 特殊内建）：无参按名排序列出全部变量（`name='value'`，可重输入）；
+`set -- a b`（或 `set a b`）设位置参数，`set --` 清空；选项 `-e`（errexit）/`-u`（nounset）/
+`-v`（verbose，执行前回显命令原文）/`-x`（xtrace，执行前写 `PS4`+命令到 stderr），可合并（`set -ex`）、
+`+` 关闭、`set -` 清 `-v/-x`；`set -o` 列选项状态、`set +o` 输出可重输入的 `set` 命令、
+`set -o errexit` 按长名开关。`$-` 给出当前选项字母。
+**`export`**（特殊内建）：`export NAME=value` 赋值并标记导出、`export NAME` 标记已存在变量、
+`export -n NAME` 取消标记、`export`/`export -p` 列出（`export NAME='value'`）；导出的变量经内核
+环境块传给子进程（外部程序用 `env.NAME` / `getenv("NAME")` 读），`&` 子 shell 也会被重新标记导出。
+**`unset [-f] name...`**：删变量（默认）或函数（`-f`）。
+**`. file [args...]`**（特殊内建）：在当前环境执行文件（变量/函数/`cd` 都作用于当前 shell，与 `sh file`
+起子进程相对）；文件名不含 `/` 时查 `$PATH`；文件只需可读、不必可执行；给了参数则**临时**替换位置参数
+（执行完恢复，`$0` 不变）；文件不存在/不可读/语法错误返回非 0。
 **`read [-r] var...`**（POSIX）：从当前 stdin 读一行, 按 `IFS` 分割后赋值（多余字段全部归最后一个
 变量、去尾部 IFS 空白）；无 `-r` 时反斜杠转义下一字符、行尾反斜杠续行；EOF 时变量置空并返回 1。
 `IFS` 是真正的 shell 变量（默认空白；置空则不分割），`IFS=: read a b` 的赋值是命令作用域（不污染后续）。
@@ -97,11 +117,16 @@ Delin 无 fork：`&` 的作业用 `sh -c <命令原文>` 起子 shell（内置/�
 命令行执行：`sh -c '命令' [name [args...]]`（POSIX 2.5.3，`$0`=name）。
 **多行命令**：`\` + 换行 行续接（POSIX 2.2.1，从输入中删除；词内部与双引号内同样生效，单引号内是字面反斜杠）；
 `|` / `&&` / `||` 之后允许换行；交互式下跨行结构（`if`/`for`/`while`/`case`/函数体、未闭合引号、续行）用
-PS2 提示 `> ` 继续读行；脚本/管道输入到 EOF 仍不完整则报 `syntax error: unexpected end of file`。
+PS2 提示继续读行；脚本/管道输入到 EOF 仍不完整则报 `syntax error: unexpected end of file`。
+**命令查找**：含 `/` 的名字按 cwd 解析；否则按 `$PATH` 逐目录查（空条目 = 当前目录，`$PATH` 未设置时
+用 `/bin`，置空则查不到）；找到但无可执行位报 `permission denied`，找不到报 `command not found`（127）。
 脚本执行：`sh script.sh [args...]` 或 `./script.sh [args...]`（需 `+x`，经 `#!` shebang），
 shebang 支持 `#!/bin/sh` / `#!/usr/bin/env sh` 等形式，env 特殊解释为查找后续程序名。
 无 shebang 的文件按 Delin Lua 程序直接 spawn（兼容 `/bin/*` 工具源码）。
 `>>`/`>` 写文件在命令结束后 `close` 提交到 ext2（handle 写入可能缓冲，需关闭才落盘）。
+自检脚本：`scripts/posix_test.sh`（POSIX 可移植子集，宿主与真机各跑一次比对）、
+`scripts/sh_builtin_test.sh`（内建/变量/选项自检，宿主用 harness 跑，真机由
+`scripts/sh_verify.sh` + `verify-sh.service` 跑并写 `/var/log/sh_verify.log`）。
 
 **已知偏离**：`grep`/`sed` 的正则用 **Lua pattern**（`%` 为转义符、`()` 为捕获）而非 POSIX ERE/BRE；
 替换区用 `&`=整串匹配、`\1..\9`=捕获组、`\n/\t`，不支持 BRE 风格 `\(...\)` 与模式内逆引用。
@@ -110,7 +135,11 @@ shebang 支持 `#!/bin/sh` / `#!/usr/bin/env sh` 等形式，env 特殊解释为
 `&` 的子 shell 是重新执行的进程（无 fork）：父 shell 的变量与函数定义经赋值/定义语句注入，
 但 `$?` 在子 shell 里从 0 开始（不继承父 shell 的最后状态）。`VAR=value cmd` 的赋值在命令词
 展开**之前**生效（POSIX/bash 是展开之后，故 `x=0; x=1 echo $x` 在 Delin 打印 1、在 bash 打印 0）；
-外部命令拿不到环境变量（Delin 无环境块）；`read` 无法区分“末行无换行”（句柄 API 限制，按成功计）。
+`read` 无法区分“末行无换行”（句柄 API 限制，按成功计）。
+`set -x` 只跟踪**简单命令**（含赋值/重定向），不打印 `for`/`if` 这类复合关键字行；
+`set -u` 的检查发生在命令执行前（未执行的分支不报错），交互式只丢弃当前命令、非交互式退出；
+子 shell 的 `$PPID` 取内核给的父 pid（不继承环境里的 `PPID`）；`.` 的参数按 bash 语义临时替换位置参数
+（dash 忽略它们）；未实现 `export -f`（函数导出）、`readonly`、`$()`/反引号命令替换。
 因 CC 5.2 无位运算，`/etc/shadow` 哈希用盐+密码的 32 位滚动哈希（djb2）替代传统 `crypt`。
 
 ### init（systemd 风格服务管理器）
@@ -248,8 +277,12 @@ UUID 用磁盘 ID 模拟，磁盘不随启动自动挂载（改由 `/etc/fstab` 
   心跳，保证裸让出（`filter=nil`，如 `tty.readLine`）的进程在空闲期也能推进。
 - **隔离环境**：每个进程有自己的 `_ENV`（`load(src, name, "t", env)`），注入内核上下文
   `spawn`/`pid`/`ppid`/`uid`/`gid`/`syscalls`，`__index = _G` 兜底原始 API。
+- **环境块（`export` 的落点）**：进程环境里注入 `env`（`name -> string` 的表）与 `getenv(name)`；
+  spawn 时从父进程**继承**，`opts.env` 覆盖/追加（值为 `nil` 即删除）。`sh` 的 `export` 变量、
+  `login` 设置的 `USER`/`HOME`/`SHELL`/`PATH` 都走这里，外部程序用 `env.PATH` / `getenv("PATH")` 读。
 - **`spawn` 只收源码字符串**：`spawn(src, name?, uid?, gid?, argv?, opts?)` 在隔离 `_ENV` 里建子进程；
-  读文件由程序自己做；`argv`（`[0]`=程序名）与 `arg0`/`args`/`argc` 直接注入子进程环境。
+  读文件由程序自己做；`argv`（`[0]`=程序名）与 `arg0`/`args`/`argc` 直接注入子进程环境，
+  `opts = { cwd=, stdio={input=,output=}, env={NAME=value} }`。
 - **进程树 + 会话/进程组**：`{ pid, ppid, status, children, pgrp, sid, sig }`；父死子并入 init；
   信号经调度器在 resume 前投递（`setSignalCheck`）。
 - **print 覆盖**：内核自供 `print`（写 klog + 引导日志 + 终端），因 CC 自带 `print` 不走 `io.stdout`；

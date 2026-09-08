@@ -78,8 +78,14 @@ local function doLogin()
             if syscalls["user.verify"](name, pw) then
                 local u = syscalls["user.get"](name)
                 outln("Welcome, " .. name .. "!")
+                -- login(1) 语义: 按 passwd 设置登录环境, 再启动用户 shell。
+                local env = {
+                    USER = name, LOGNAME = name, PATH = "/bin",
+                    HOME = (u and u.home) or "/",
+                    SHELL = (u and u.shell) or "/bin/sh",
+                }
                 local child = spawn(shSrc, "sh", u and u.uid or 0, u and u.gid or 0,
-                    { [0] = "/bin/sh" })
+                    { [0] = "/bin/sh" }, { env = env })
                 if not child then
                     outln("login: failed to start shell for " .. name)
                 else
