@@ -42,7 +42,10 @@
 
 **工具**：`ls`、`cat`、`mkdir (-p)`、`rm (-r|-f)`、`cp (-r)`、`mv`、`touch`、`head (-n)`、`tail (-n)`、
 `wc (-l|-w|-c)`、`grep (-n|-i|-v)`、`sed`（GNU 子集：`s/y/d/p/q/a/i/c/=`、行号/`$`/正则地址与区间、
-`!` 取反、`-n -s -e -f -i`）、`ed`（POSIX 子集：`a/i/c/d/p/n/l/s/t/m/r/w/q/u/g/v/=`、地址 `.` `$` n `/re/` `+n` `-n`、输入模式以 `.` 结束）、`kill`、`login`、`sh`。
+`!` 取反、`-n -s -e -f -i`）、`ed`（POSIX 子集：`a/i/c/d/p/n/l/s/t/m/r/w/q/u/g/v/=`、地址 `.` `$` n `/re/` `+n` `-n`、输入模式以 `.` 结束）、`kill`、`login`、
+`chmod`（八进制 + 符号模式 `[ugoa]*[+-=][rwx]*` + `-R` 递归）、`chown`（`[OWNER][:[GROUP]]` + `-R`）、
+`mount`（挂载 ext2 块设备镜像，无参列出已挂载）、`umount`、
+`sh`。
 各工具支持 POSIX 的 **`--` 结束选项** 标记：`rm -- --help`、`touch -- -file`、`ls -- --ff` 等，用于操作以
 `-`/`--` 开头的文件名；单独的 `-` 视为普通操作数。
 
@@ -51,6 +54,9 @@
 `-e/-f/-d/-s/-x/-r/-w`、`!`）；`&&`/`||`/`;`；文件重定向（`>` `>>` `<`）；管道（`|`，每元素一个进程/内建，
 经内核 pipe 缓冲传递，`$?`=末元素退出码，生产端写满/消费端读空时让出调度器，broken pipe 中止写端）；内建
 `cd pwd echo exit help jobs fg bg kill test [ true false : break continue return shift`。
+脚本执行：`sh script.sh [args...]` 或 `./script.sh [args...]`（需 `+x`，经 `#!` shebang），
+shebang 支持 `#!/bin/sh` / `#!/usr/bin/env sh` 等形式，env 特殊解释为查找后续程序名。
+无 shebang 的文件按 Delin Lua 程序直接 spawn（兼容 `/bin/*` 工具源码）。
 `>>`/`>` 写文件在命令结束后 `close` 提交到 ext2（handle 写入可能缓冲，需关闭才落盘）。
 
 **已知偏离**：`grep`/`sed` 的正则用 **Lua pattern**（`%` 为转义符、`()` 为捕获）而非 POSIX ERE/BRE；
@@ -66,8 +72,10 @@ v0.0.1 的协程调度内核 + 进程树之后，已扩展为具备 VFS、块设
 内核上下文（`spawn`/`pid`/`ppid`/`uid`/`gid`/`syscalls`）访问内核能力，其余原始 CC API 直用。
 
 `src/bin/sh` 已升级为 POSIX 核心子集（变量/引号/if/for/while/case/函数/test/[ ]/&&/|| /文件重定向/管道
-`|`，无命令替换 `$()`、算术 `$(( ))`），`rm`/`mkdir` 补了 GNU `-r/-f`/`-p`；`scripts/posix_test.sh` 在宿主
-与 Delin 上各跑一次逐项比对（全部通过），`scripts/sysinfo.sh` 演示实用用法。可经
+`|`，无命令替换 `$()`、算术 `$(( ))`），支持脚本执行（`sh script.sh` / `./script.sh`，`#!` shebang）、
+`rm`/`mkdir` 补了 GNU `-r/-f`/`-p`；新增 `chmod`（八进制 + 符号模式 + `-R`）、`chown`（`owner:group` + `-R`）、
+`mount`（挂载 ext2 块设备镜像 / 无参列出）/ `umount`；`scripts/posix_test.sh` 在宿主
+与 Delin 上各跑一次逐项比对（92 项全过），`scripts/sysinfo.sh` 演示实用用法。可经
 `tools/harness.lua`（宿主）或 `tools/deploy.py`（真机）验证。
 
 ### 引导
@@ -151,13 +159,17 @@ src/bin/grep               按 Lua 模式查找行 (-n|-i|-v)
 src/bin/sed                流式文本编辑器 (GNU 子集: s/y/d/p/q/a/i/c/=, 地址区间, -n -s -e -f -i)
 src/bin/ed                 行编辑器 (POSIX 子集: a/i/c/d/p/n/l/s/t/m/r/w/q/u/g/v/=, 正则地址与替换, 交互逐行读)
 src/bin/kill               发送信号到进程/进程组 (kill [-SIG] pid|-pgid; kill -l)
+src/bin/chmod              修改文件权限 (八进制+符号模式 [ugoa]*[+-=][rwx]*, -R 递归)
+src/bin/chown              修改文件属主/属组 ([OWNER][:[GROUP]], -R 递归)
+src/bin/mount              挂载 ext2 块设备镜像; 无参列出已挂载 (mount [-t ext2] device dir)
+src/bin/umount             卸载已挂载文件系统 (umount dir)
 src/bin/login              getty/login: 登录提示->验证->启动 sh->循环
-src/bin/sh                 交互/脚本 shell(POSIX 核心子集: 变量/引号/if/for/while/case/函数/test/[ ]/&&/|| /重定向)
+src/bin/sh                 交互/脚本 shell(POSIX 核心子集: 变量/引号/if/for/while/case/函数/test/[ ]/&&/|| /重定向, 支持 shebang 脚本执行)
 src/modules/*.ko           内核模块: ccdisk(CC 原生 fs) ccmonitor(CC 显示器驱动) demo(演示)
                            ext2(ext2 挂载) tom(Tom GPU 驱动) void(Void 全息驱动)
 src/modules/modules.alias  驱动别名(modprobe 风格): tm_gpu->tom hologram->void monitor->ccmonitor
 src/modules/manifest       默认装载模块清单: demo ext2 ccdisk
-scripts/posix_test.sh      可移植 POSIX 自检(host 与 Delin 各跑一次比对, 51 项全过)
+scripts/posix_test.sh      可移植 POSIX 自检(host 与 Delin 各跑一次比对, 92 项全过)
 scripts/sysinfo.sh         实用小工具: 系统信息(变量/函数/for/case/if/重定向/工具)
 tools/bundle.lua           打包 src/ -> dist/kernel.lua 或 dist/dlub.lua
 tools/harness.lua          host 测试台: 用真实 Delin 工具源码在宿主跑(fs/io/syscalls/spawn 桩)

@@ -76,9 +76,39 @@ function F.combine(a, b)
     return norm(a .. "/" .. b)
 end
 function F.attributes(p)
-    local n, sz, mode = norm(p), F.getSize(p), "0644"
-    if F.isDir(p) then mode = "040755" end
-    return { size = sz, isDir = F.isDir(p), mode = tonumber(mode, 8), name = n:match("[^/]+$") or "", uid = 0, gid = 0 }
+    local n = norm(p)
+    local sz = F.getSize(p)
+    local typebits = F.isDir(p) and 0x4000 or 0x8000
+    -- 读宿主真实权限(八进制) -> 低 9 位, 与 ext2 的 mode 语义一致(低 12 位)。
+    local func = "stat -c %a -- " .. host(p) .. " 2>/dev/null"
+    local h = io.popen(func)
+    local perms = tonumber(((h:read("*a") or ""):gsub("%s+$", "")), 8)
+    h:close()
+    if not perms then perms = F.isDir(p) and tonumber("755", 8) or tonumber("644", 8) end
+    -- 读宿主真实 uid/gid, 便于 ls -l / chown 反映变化。
+    local hu = io.popen("stat -c %u -- " .. host(p) .. " 2>/dev/null")
+    local gu = io.popen("stat -c %g -- " .. host(p) .. " 2>/dev/null")
+    local uid = tonumber(((hu:read("*a") or ""):gsub("%s+$", ""))) or 0
+    local gid = tonumber(((gu:read("*a") or ""):gsub("%s+$", ""))) or 0
+    hu:close(); gu:close()
+    return { size = sz, isDir = F.isDir(p), mode = typebits + (perms % tonumber("1000", 8)),
+             name = n:match("[^/]+$") or "", uid = uid, gid = gid }
+end
+
+function F.chmod(p, mode)
+    local h = host(p)
+    local ok = os.execute("chmod " .. string.format("%o", (mode or 0) % tonumber("1000", 8)) .. " -- " .. h)
+    return ok == true or ok == 0
+end
+
+function F.chown(p, uid, gid)
+    local h = host(p)
+    local spec = ""
+    if uid ~= nil then spec = spec .. tostring(uid) end
+    if gid ~= nil then spec = spec .. ":" .. tostring(gid) end
+    if spec == "" then return true end
+    os.execute("chown " .. spec .. " -- " .. h .. " 2>/dev/null")
+    return true
 end
 
 -- 文件句柄: 同时支持 `.method` 与 `:method`(CC 原生句柄两者皆可)。
@@ -161,6 +191,7 @@ end
 -- ---------------------------------------------------------------
 local procs = {}
 local users = {}
+local groups = {}
 local syscalls = {}
 local PIPE = nil -- 内核 pipe 模块(lazy require), 提供 pipe.create
 local function pipeCreate()
@@ -205,7 +236,24 @@ syscalls["user.byUid"] = function(u)
     for _, usr in pairs(users) do if usr.uid == u then return usr end end
     return nil
 end
+syscalls["user.groupByName"] = function(name) return groups[name] end
 syscalls["user.register"] = function() end
+
+-- 挂载/卸载桩: 记录到内存表, 供 `mount`/`umount` 命令在宿主上验证参数与列表。
+local mountTable = {}
+syscalls["fs.mount"] = function(device, dir, fstype)
+    mountTable[#mountTable + 1] = { device = device, dir = dir, fstype = fstype or "ext2" }
+    return true
+end
+syscalls["fs.umount"] = function(dir)
+    for i = #mountTable, 1, -1 do if mountTable[i].dir == dir then table.remove(mountTable, i) end end
+    return true
+end
+syscalls["fs.mounts"] = function()
+    local out = {}
+    for _, m in ipairs(mountTable) do out[#out + 1] = { root = m.dir, device = m.device, fstype = m.fstype } end
+    return out
+end
 
 -- ---------------------------------------------------------------
 -- spawn: 以协程起一个 Delin 工具源码(独立 env), 由顶层的协作式调度器驱动。
@@ -294,7 +342,7 @@ local SRCBIN = "/home/worker/delin/src/bin"
 local function setupRoot()
     os.execute("rm -rf " .. ROOT .. " && mkdir -p " .. ROOT)
     os.execute("mkdir -p " .. ROOT .. "/bin " .. ROOT .. "/etc " .. ROOT .. "/home/alice " .. ROOT .. "/root " .. ROOT .. "/tmp")
-    for _, f in ipairs({ "cat","cp","ed","grep","head","kill","login","ls","mkdir","mv","rm","sed","sh","tail","touch","wc" }) do
+    for _, f in ipairs({ "cat","cp","ed","grep","head","kill","login","ls","mkdir","mv","rm","sed","sh","tail","touch","wc","chmod","chown","mount","umount" }) do
         os.execute("cp -f " .. SRCBIN .. "/" .. f .. " " .. ROOT .. "/bin/" .. f)
         os.execute("chmod 755 " .. ROOT .. "/bin/" .. f)
     end
@@ -302,6 +350,10 @@ local function setupRoot()
     users = {
         root  = { name = "root",  uid = 0,    gid = 0,    home = "/root",  shell = "/bin/sh" },
         alice = { name = "alice", uid = 1000, gid = 1000, home = "/home/alice", shell = "/bin/sh" },
+    }
+    groups = {
+        root  = { gid = 0,    members = "root" },
+        alice = { gid = 1000, members = "alice" },
     }
     local pw = "root:x:0:0:root:/root:/bin/sh\nalice:x:1000:1000:alice:/home/alice:/bin/sh\n"
     local gr = "root:x:0:root\nalice:x:1000:alice\n"

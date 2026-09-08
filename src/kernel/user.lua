@@ -86,6 +86,10 @@ function user.byUid(db, uid)
     return nil
 end
 
+function user.groupByName(db, name)
+    return db.groups and db.groups[name]
+end
+
 function user.list(db)
     local out = {}
     for name, u in pairs(db.users) do out[#out + 1] = name .. ":" .. u.uid end
@@ -110,6 +114,7 @@ function user.registerSyscalls(db)
     s["user.get"] = function(name) return user.get(db, name) end
     s["user.list"] = function() return user.list(db) end
     s["user.byUid"] = function(uid) return user.byUid(db, uid) end
+    s["user.groupByName"] = function(name) return user.groupByName(db, name) end
 end
 
 return user

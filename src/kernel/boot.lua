@@ -10,6 +10,7 @@ local vfs        = require("kernel.vfs")
 local vfs_api    = require("kernel.vfs_api")
 local modules    = require("kernel.modules")
 local ext2       = require("kernel.ext2")
+local blockdev   = require("kernel.blockdev")
 local tty        = require("kernel.tty")
 local fb         = require("kernel.fb")
 local display    = require("kernel.display")
@@ -114,6 +115,32 @@ local function registerRuntimeSyscalls()
     sc["stdio.set"] = function(input, output) return process.setStdio(input, output) end
     sc["tty.setFocus"] = function(name) return tty.setFocus(name) end
     sc["tty.console"] = function() return tty.getFocus() end
+    -- 挂载/卸载: 把块设备镜像(真实后端上的 /parts/*.img 等)挂为 ext2 到 VFS 目录。
+    --   fs.mount(device, dir, fstype): device 是 VFS 路径, 在真实后端上解析为真实路径;
+    --     若 device 本身已是真实路径(非 VFS 前缀), 直接当真实路径开块设备。
+    --   fs.umount(dir): 卸载; fs.mounts(): 列出当前挂载。
+    sc["fs.mount"] = function(device, dir, fstype)
+        if fstype and fstype ~= "ext2" then return nil, "unsupported fstype: " .. tostring(fstype) end
+        -- 解析 device 为真实路径: 必须落在真实后端(hdd/磁盘), 否则无法当作原始块设备打开。
+        local backend, rel, rerr = vfs.resolve(device)
+        if not backend then return nil, "mount: " .. tostring(rerr) end
+        if not backend.toReal then return nil, "mount: " .. tostring(device) .. " not on a real filesystem" end
+        local realPath = backend.toReal(rel)
+        local bd, berr = blockdev.file(realPath)
+        if not bd then return nil, "mount: " .. tostring(berr) end
+        local rfs, ferr = ext2.mount(bd)
+        if not rfs then return nil, "mount: " .. tostring(ferr) end
+        vfs.mount(dir, ext2.backend(rfs), { device = device, fstype = "ext2" })
+        return true
+    end
+    sc["fs.umount"] = function(dir) return vfs.unmount(dir) end
+    sc["fs.mounts"] = function()
+        local out = {}
+        for _, m in ipairs(vfs.list()) do
+            out[#out + 1] = { root = m.root, device = m.meta and m.meta.device, fstype = m.meta and m.meta.fstype or "?" }
+        end
+        return out
+    end
     -- 终端信号路由: ^C(SIGINT)/^Z(SIGTSTP) 发给 tty 前台进程组。
     tty.onSignal = function(sig)
         local fg = process.tcgetpgrp(tty.getFocus())

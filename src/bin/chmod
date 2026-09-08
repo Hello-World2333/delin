@@ -1,0 +1,213 @@
+-- Delin chmod: 修改文件权限 (POSIX 子集 + GNU -R/-v/-c/-f)。
+-- 用法: chmod [OPTION]... MODE FILE...
+--   MODE 可为八进制(如 755 / 0644 / 0o755) 或符号模式([ugoa]*[+-=][rwxX]*,...)
+--   --reference=RFILE  以 RFILE 的权限为准
+--   -R/-r, --recursive 递归
+--   -v, --verbose      对每个改动打印
+--   -c, --changes      只打印实际改动的
+--   -f, --silent       忽略错误
+--   --                 结束选项
+-- 权限走 VFS `fs.chmod`: ext2 后端把低 12 位(0o7777)写进 inode.mode, 保留类型位。
+local args = args or {}
+
+local cwd = (type(cwd) == "string" and cwd) or "/"
+-- 把相对/绝对(含 . / ..)路径折叠成规范绝对路径。
+local function resolve(p)
+    p = p or ""
+    if p == "" then return "/" end
+    if p:sub(1, 1) == "/" then
+        local full = p:gsub("/+", "/")
+        local stack = {}
+        for seg in full:gmatch("[^/]+") do
+            if seg == "." then -- skip
+            elseif seg == ".." then stack[#stack] = nil
+            else stack[#stack + 1] = seg end
+        end
+        return "/" .. table.concat(stack, "/")
+    end
+    local base = (cwd == "/") and "" or cwd
+    local full = (base .. "/" .. p):gsub("/+", "/")
+    local stack = {}
+    for seg in full:gmatch("[^/]+") do
+        if seg == "." then -- skip
+        elseif seg == ".." then stack[#stack] = nil
+        else stack[#stack + 1] = seg end
+    end
+    return "/" .. table.concat(stack, "/")
+end
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+-- ---------------------------------------------------------------
+-- 3 位小整数位运算(项目惯例: CC 5.2 无位运算符)
+-- ---------------------------------------------------------------
+local function bor(a, b)
+    local r = 0
+    for _, v in ipairs({ 4, 2, 1 }) do
+        if (a % (v * 2)) >= v or (b % (v * 2)) >= v then r = r + v end
+    end
+    return r
+end
+local function bandnot(a, b)
+    local r = 0
+    for _, v in ipairs({ 4, 2, 1 }) do
+        if (a % (v * 2)) >= v and not ((b % (v * 2)) >= v) then r = r + v end
+    end
+    return r
+end
+
+local classShift = { u = 2, g = 1, o = 0 }
+local permValue = { r = 4, w = 2, x = 1, X = 1 }
+local function O(s) return tonumber(s, 8) end
+local BASE_MODE = O("644") -- 符号模式基准: 0o644
+local function digit(v, sh) return math.floor(v / (8 ^ sh)) % 8 end
+local function setDigit(v, sh, d)
+    local place = 8 ^ sh
+    return v - digit(v, sh) * place + d * place
+end
+
+-- 对单个符号条款求值。返回新的低 12 位(0o7777)。
+local function symLow(low, clause)
+    local whoStr, op, permStr = clause:match("^([ugoa]*)([%+%-%=])([rwxX]*)$")
+    if not whoStr then
+        op, permStr = clause:match("^([%+%-%=])([rwxX]*)$")
+        whoStr = op and "a" or nil
+        if not op then return nil end
+    end
+    if whoStr == "" then whoStr = "a" end
+    local classes = {}
+    for c in whoStr:gmatch(".") do
+        if c == "a" then classes = { "u", "g", "o" } else classes[#classes + 1] = c end
+    end
+    local special = low - (low % 512) -- setuid/setgid/sticky 之上位, 保留
+    local cur = low % 512
+    local want = 0
+    for c in permStr:gmatch(".") do want = want + (permValue[c] or 0) end
+    for _, cls in ipairs(classes) do
+        local sh = classShift[cls]
+        local d = digit(cur, sh)
+        local nd
+        if op == "=" then nd = want
+        elseif op == "+" then nd = bor(d, want)
+        else nd = bandnot(d, want) end
+        cur = setDigit(cur, sh, nd)
+    end
+    return special + cur
+end
+
+-- 计算最终低 12 位。str 为八进制或符号; refLow 为非 nil 时优先(来自 --reference)。
+local function computeMode(path, str, refLow)
+    if refLow then return refLow end
+    local oct = tostring(str):gsub("^0[oO]", "")
+    if oct:match("^[0-7]+$") then return tonumber(oct, 8) end
+    local base = BASE_MODE
+    local a = fs.attributes(path)
+    if a and a.mode then base = a.mode % 4096 end
+    local low = base
+    for clause in tostring(str):gmatch("[^,]+") do
+        local nl = symLow(low, clause)
+        if not nl then return nil end
+        low = nl
+    end
+    return low
+end
+
+-- ---------------------------------------------------------------
+-- 选项解析
+-- ---------------------------------------------------------------
+local optRecursive, optVerbose, optChanges, optSilent = false, false, false, false
+local refFile = nil
+local positional, noMoreOpts = {}, false
+for _, a in ipairs(args) do
+    if noMoreOpts then
+        positional[#positional + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "-R" or a == "-r" or a == "--recursive" then optRecursive = true
+    elseif a == "-v" or a == "--verbose" then optVerbose = true
+    elseif a == "-c" or a == "--changes" then optChanges = true
+    elseif a == "-f" or a == "--silent" or a == "--quiet" then optSilent = true
+    elseif a:match("^%-%-reference=") then refFile = resolve(a:sub(#"--reference=" + 1))
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        for k = 2, #a do
+            local ch = a:sub(k, k)
+            if ch == "R" or ch == "r" then optRecursive = true
+            elseif ch == "v" then optVerbose = true
+            elseif ch == "c" then optChanges = true
+            elseif ch == "f" then optSilent = true
+            else if not optSilent then stderr("chmod: invalid option -- '" .. ch .. "'\n") end return end
+        end
+    else
+        positional[#positional + 1] = a
+    end
+end
+
+if refFile and not fs.exists(refFile) then
+    if not optSilent then stderr("chmod: " .. refFile .. ": No such file or directory\n") end
+    return
+end
+
+local modeStr, fileList
+if refFile then
+    modeStr = nil
+    fileList = positional
+else
+    modeStr = positional[1]
+    fileList = {}
+    for i = 2, #positional do fileList[#fileList + 1] = positional[i] end
+end
+if (not refFile and not modeStr) or #fileList == 0 then
+    if not optSilent then stderr("usage: chmod [OPTION]... MODE FILE...\n") end
+    return
+end
+local refLow
+if refFile then
+    local a = fs.attributes(refFile)
+    refLow = (a and a.mode and (a.mode % 4096)) or BASE_MODE
+end
+
+local function applyOne(path)
+    local mode = computeMode(path, modeStr, refLow)
+    if not mode then
+        if not optSilent then stderr("chmod: " .. path .. ": invalid mode '" .. tostring(modeStr or refFile) .. "'\n") end
+        return
+    end
+    local before = fs.attributes(path)
+    local ok, err = fs.chmod(path, mode)
+    if not ok then
+        if not optSilent then stderr("chmod: " .. path .. ": " .. tostring(err) .. "\n") end
+        return
+    end
+    if not optSilent and (optVerbose or (optChanges and before and before.mode and (before.mode % 512 ~= mode % 512))) then
+        stderr("mode of '" .. path .. "' changed\n")
+    end
+end
+
+-- 递归目录树(含目录本身)逐条目应用。
+local function walk(top)
+    if fs.isDir(top) then
+        applyOne(top)
+        local names = fs.list(top) or {}
+        table.sort(names)
+        for _, n in ipairs(names) do
+            local full = (top == "/") and ("/" .. n) or (top .. "/" .. n)
+            if fs.isDir(full) then walk(full) else applyOne(full) end
+        end
+    else
+        applyOne(top)
+    end
+end
+
+for _, raw in ipairs(fileList) do
+    local path = resolve(raw)
+    if not fs.exists(path) then
+        if not optSilent then stderr("chmod: " .. raw .. ": No such file or directory\n") end
+    elseif optRecursive then
+        walk(path)
+    else
+        applyOne(path)
+    end
+end

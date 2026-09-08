@@ -11,11 +11,12 @@ local mounts = {}
 --- 挂载一个文件系统。
 ---@param root string  VFS 相对根, 例如 "/" / "/dev" / "/mnt/disk/left"
 ---@param backend table  后端(real 或 virtual), 实现 list/exists/isDir/attributes/getSize/open/getDrive/getFreeSpace/getCapacity/makeDir/move/copy/delete/isReadOnly
-function vfs.mount(root, backend)
+---@param meta table|nil  可选挂载元数据(device/fstype), 供 `mount` 列出
+function vfs.mount(root, backend, meta)
     -- 规范化: 保证以 "/" 开头、去掉末尾斜杠(除非就是根)
     if root == "" then root = "/" end
     if root ~= "/" then root = root:gsub("/+$", "") end
-    mounts[#mounts + 1] = { root = root, backend = backend }
+    mounts[#mounts + 1] = { root = root, backend = backend, meta = meta }
 end
 
 function vfs.unmount(root)
@@ -29,6 +30,14 @@ end
 local function isPrefix(root, p)
     if root == "/" then return true end
     return p == root or (p:sub(1, #root) == root and (p:sub(#root + 1):sub(1, 1) == "/"))
+end
+
+--- 列出所有挂载(含元数据)。供 `mount` 命令无参列出。
+---@return table[] { root=, backend=, meta= }
+function vfs.list()
+    local out = {}
+    for _, m in ipairs(mounts) do out[#out + 1] = { root = m.root, backend = m.backend, meta = m.meta } end
+    return out
 end
 
 --- 解析路径到最长的挂载根。

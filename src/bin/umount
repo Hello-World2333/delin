@@ -1,0 +1,46 @@
+-- Delin umount: 卸载一个已挂载的文件系统 (POSIX 子集)。
+-- 用法: umount <dir>   (dir 为挂载点)
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+local operands, noMoreOpts = {}, false
+for _, a in ipairs(args) do
+    if noMoreOpts then
+        operands[#operands + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "-l" or a == "-f" or a == "-v" then
+        -- 简化: 忽略 -l/-f/-v
+    else
+        operands[#operands + 1] = a
+    end
+end
+
+if #operands == 0 then
+    stderr("umount: missing operand\n")
+    return
+elseif #operands > 1 then
+    stderr("umount: too many arguments\n")
+    return
+end
+
+local dir = operands[1]
+local list = (syscalls and syscalls["fs.mounts"] and syscalls["fs.mounts"]()) or {}
+local found = false
+for _, mt in ipairs(list) do
+    if mt.root == dir then found = true; break end
+end
+if not found then
+    stderr("umount: " .. dir .. ": not mounted\n")
+    return
+end
+local ok, err = syscalls["fs.umount"](dir)
+if not ok then
+    stderr("umount: " .. tostring(err) .. "\n")
+    return
+end
+io.write("unmounted " .. dir .. "\n")

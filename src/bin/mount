@@ -1,0 +1,92 @@
+-- Delin mount: 把块设备镜像挂为 ext2 到 VFS 目录 (POSIX 子集)。
+-- 用法:
+--   mount                        列出当前挂载
+--   mount [-t fstype] device dir 挂载; 仅支持 ext2
+-- device 是落在真实后端(hdd/磁盘)上的块设备镜像(VFS 路径, 如 /parts/root.img 或
+--   /mnt/left/parts/root.img)。内核把它开成块设备, 以 ext2 挂到 dir; 挂载点须为已存在目录。
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+local fstype = nil
+local operands, noMoreOpts = {}, false
+for _, a in ipairs(args) do
+    if noMoreOpts then
+        operands[#operands + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "-t" then
+        fstype = nil
+        operands[#operands + 1] = "@t"
+    elseif a:match("^%-%-type=") then
+        fstype = a:sub(#"--type=" + 1)
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        for k = 2, #a do
+            local ch = a:sub(k, k)
+            if ch ~= "f" and ch ~= "v" then stderr("mount: invalid option -- '" .. ch .. "'\n"); return end
+        end
+    else
+        operands[#operands + 1] = a
+    end
+end
+
+-- 把 "-t"'@t' 标记替换为其后参数(fstype/操作数)。
+local clean = {}
+local i = 1
+while i <= #operands do
+    local a = operands[i]
+    if a == "@t" then
+        if operands[i + 1] and operands[i + 1]:sub(1, 1) ~= "-" then
+            fstype = operands[i + 1]
+            i = i + 2
+        else
+            stderr("mount: option requires an argument -- 't'\n"); return
+        end
+    else
+        clean[#clean + 1] = a
+        i = i + 1
+    end
+end
+
+local function listMounts()
+    local m = syscalls and syscalls["fs.mounts"]
+    if not m then stderr("mount: fs.mounts syscall not available\n"); return end
+    local list = m() or {}
+    local lines = {}
+    for _, mt in ipairs(list) do
+        local dev = mt.device or ((mt.root == "/") and "rootfs" or "-")
+        lines[#lines + 1] = dev .. " on " .. mt.root .. " type " .. (mt.fstype or "?") .. " (rw)"
+    end
+    if #lines == 0 then lines[#lines + 1] = "(nothing mounted)" end
+    io.write(table.concat(lines, "\n") .. "\n")
+end
+
+local function doMount(device, dir)
+    if not fs.isDir(dir) then
+        stderr("mount: " .. dir .. ": No such file or directory\n")
+        return
+    end
+    if not (syscalls and syscalls["fs.mount"]) then
+        stderr("mount: fs.mount syscall not available\n")
+        return
+    end
+    local ok, err = syscalls["fs.mount"](device, dir, fstype or "ext2")
+    if not ok then
+        stderr("mount: " .. tostring(err) .. "\n")
+        return
+    end
+    io.write("mounted " .. device .. " on " .. dir .. "\n")
+end
+
+if #clean == 0 then
+    listMounts()
+elseif #clean == 1 then
+    stderr("mount: " .. clean[1] .. ": missing mount point\n")
+elseif #clean == 2 then
+    doMount(clean[1], clean[2])
+else
+    stderr("mount: too many arguments\n")
+end

@@ -9,7 +9,6 @@ local msleep = os.msleep or function(ms) os.sleep(math.max(ms / 1000, 0.05)) end
 
 local stdin  = io.stdin()
 local stdout = io.stdout()
-local interactive = stdin and stdin.isTTY
 
 local uname = "root"
 if syscalls and syscalls["user.byUid"] then
@@ -31,19 +30,50 @@ local function setPos(argv)
     posArgs = {}
     if argv then for i = 1, #argv do posArgs[i] = argv[i] end end
 end
-if argv then setPos(argv) end
 
 local vars = {}
 
+-- 规范化绝对路径: 折叠 . / .. , 去掉多余斜杠(相对路径以 cwd 起)。
 local function resolve(p)
     p = p or ""
-    if p:sub(1, 1) == "/" then
-        if p == "" then return "/" end
-        return p:gsub("/+$", "")
+    if p == "" then return "/" end
+    local base
+    if p:sub(1, 1) == "/" then base = "" else base = (cwd == "/") and "" or cwd end
+    local full = (base .. "/" .. p):gsub("/+", "/")
+    local stack = {}
+    for seg in full:gmatch("[^/]+") do
+        if seg == "." then -- 跳过
+        elseif seg == ".." then stack[#stack] = nil
+        else stack[#stack + 1] = seg end
     end
-    local base = (cwd == "/") and "" or cwd
-    return (base .. "/" .. p):gsub("/+", "/"):gsub("/+$", "")
+    if #stack == 0 then return "/" end
+    return "/" .. table.concat(stack, "/")
 end
+
+-- 脚本文件检测: `sh [args...] <script> [args...]`。shebang 解释器调用 sh 时 argv[1]=脚本路径,
+-- 因此本分支兼作"以解释器运行脚本"的入口 —— 非交互读取该脚本文件。
+local scriptPath, scriptArgs = nil, {}
+if argv and #argv >= 1 then
+    local idx = 1
+    while argv[idx] and argv[idx]:sub(1, 1) == "-" and argv[idx] ~= "-" and argv[idx] ~= "--" do idx = idx + 1 end
+    if argv[idx] == "--" then idx = idx + 1 end
+    if argv[idx] then
+        local cand = resolve(argv[idx])
+        if fs.exists(cand) and fs.isFile(cand) then
+            scriptPath = cand
+            for i = idx + 1, #argv do scriptArgs[#scriptArgs + 1] = argv[i] end
+        end
+    end
+end
+if scriptPath then
+    posArg0 = scriptPath
+    posArgs = scriptArgs
+elseif argv then
+    setPos(argv)
+end
+
+-- 运行脚本文件时不做交互(不读 tty): stdin 仍可能是终端(被父 sh 继承)。
+local interactive = stdin and stdin.isTTY and not scriptPath
 
 local outH, inH = stdout, stdin
 local function outln(s)
@@ -586,7 +616,7 @@ end
 builtins.help = function(args)
     outln("Delin sh (POSIX core subset)")
     outln("builtins : cd pwd echo exit help jobs fg bg kill test [ true false :")
-    outln("external : ls cat rm mkdir cp mv touch head tail wc grep sed login")
+    outln("external : ls cat rm mkdir cp mv touch head tail wc grep sed ed chmod chown login")
     outln("usage    : sh [script] [args...]   (no script => interactive/stdin)")
 end
 
@@ -680,18 +710,70 @@ builtins.kill = function(args)
     end
 end
 
--- 定位并 spawn 一个外部程序(不等待)。返回 pid, err。
+-- 解析命令为可执行路径: 含 "/" 按 cwd 解析(./script.sh, 绝对路径); 否则查 PATH(/bin)。
+local function commandPath(cmd)
+    if cmd:find("/") then return resolve(cmd) end
+    return "/bin/" .. cmd
+end
+
+-- 读首行(用于 shebang 检测)。
+local function firstLine(path)
+    local f = fs.open(path, "r")
+    if not f then return nil end
+    local line = (f.readLine and f.readLine()) or ""
+    f.close()
+    return line
+end
+
+-- 解析 shebang 行: `#!interp [arg]` -> interp, arg|nil。
+local function parseShebang(line)
+    if line and line:sub(1, 2) == "#!" then
+        local rest = line:sub(3):gsub("^%s+", "")
+        local interp, arg = rest:match("^(%S+)%s+(.-)%s*$")
+        if interp then return interp, (arg and arg ~= "" and arg or nil) end
+        if rest ~= "" then return rest, nil end
+    end
+    return nil, nil
+end
+
+-- 定位并 spawn 一个外部程序/脚本(不等待)。返回 pid, err。
+--   - 无 shebang: 视作 Delin Lua 程序(现有 /bin/* 行为)直接 spawn。
+--   - 带 shebang: 以解释器跑脚本 —— 解释器路径(绝对或 PATH)解析; `env` 特判取下一程序名。
 local function spawnChild(cmd, argv, stdio)
-    local path = (cmd:sub(1, 1) == "/") and cmd or ("/bin/" .. cmd)
+    local path = commandPath(cmd)
     if not fs.exists(path) then return nil, "command not found" end
     if not fs.canExecute(path) then return nil, "permission denied" end
-    local f = fs.open(path, "r")
-    if not f then return nil, "permission denied" end
-    local src = f.readAll(); f.close()
-    local cargv = { [0] = path }
-    for i = 1, #argv do cargv[i] = argv[i] end
     local opts = { cwd = cwd }
     if stdio then opts.stdio = stdio end
+    local interp, iarg = parseShebang(firstLine(path))
+    local f, src, cargv
+    if interp then
+        local prog = interp
+        if interp:match("[^/]+$") == "env" then
+            prog = iarg
+            if not prog then return nil, "shebang: env without a program" end
+            iarg = nil
+        end
+        local interpPath = commandPath(prog)
+        if not fs.exists(interpPath) then return nil, "shebang interpreter not found: " .. prog end
+        if not fs.canExecute(interpPath) then return nil, "shebang interpreter not executable: " .. prog end
+        f = fs.open(interpPath, "r")
+        if not f then return nil, "permission denied" end
+        src = f.readAll(); f.close()
+        cargv = { [0] = interpPath }
+        local n = 1
+        if iarg and iarg ~= "" then cargv[n] = iarg; n = n + 1 end
+        cargv[n] = path; n = n + 1
+        for i = 1, #argv do cargv[n] = argv[i]; n = n + 1 end
+        local child, cerr = spawn(src, interpPath, nil, nil, cargv, opts)
+        if not child then return nil, tostring(cerr) end
+        return child
+    end
+    f = fs.open(path, "r")
+    if not f then return nil, "permission denied" end
+    src = f.readAll(); f.close()
+    cargv = { [0] = path }
+    for i = 1, #argv do cargv[i] = argv[i] end
     local child, cerr = spawn(src, cmd, nil, nil, cargv, opts)
     if not child then return nil, tostring(cerr) end
     return child
@@ -1023,11 +1105,23 @@ if interactive then
         if ok == nil and not inc and err then errln("sh: " .. tostring(err)); buf = "" end
     end
 else
+    -- 非交互: 指定了脚本文件则读该文件; 否则从 stdin(管道/重定向)读。
     local src = ""
-    while true do
-        local line = stdin and stdin.readLine and stdin:readLine()
-        if line == nil then break end
-        src = src .. line .. "\n"
+    if scriptPath then
+        local f = fs.open(scriptPath, "r")
+        if f then
+            src = (f.readAll and f.readAll()) or ""
+            f.close()
+        else
+            errln("sh: " .. scriptPath .. ": cannot open")
+            return "sh done"
+        end
+    else
+        while true do
+            local line = stdin and stdin.readLine and stdin:readLine()
+            if line == nil then break end
+            src = src .. line .. "\n"
+        end
     end
     if src ~= "" then
         -- 非交互下 exit 已使 evalList 提前终止后续命令; 这里无需再 break。

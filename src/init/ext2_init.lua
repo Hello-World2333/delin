@@ -561,7 +561,7 @@ do
             local spid = spawn(shSrc, "sh-" .. label, nil, nil, { [0] = "/bin/sh" })
             print("ext2-init: running " .. label .. " (pid " .. tostring(spid) .. ")")
             local tries = 0
-            while spid and tries < 80 do
+            while spid and tries < 500 do
                 local p = syscalls["proc.info"](spid)
                 if not p then break end
                 if p.status == "dead" or p.status == "error" then break end
@@ -575,6 +575,94 @@ do
     end
 end
 
+-- ═══════════ chmod / chown / mount / umount 真机自检 ═══════════
+-- 在 ext2 根上验证: chmod 八进制+符号, chown, mount 列表, script+shebang。
+do
+    local shHand = fs.open("/bin/sh", "r")
+    local shSrc = shHand and shHand.readAll() or nil
+    if shHand then shHand.close() end
+    if not shSrc then
+        print("ext2-init: /bin/sh not found (chmod/chown/mount tests skipped)")
+    else
+        local function runCheck(label, commands, maxTries)
+            maxTries = maxTries or 40
+            local li = 0
+            local inH = { readLine = function(self) li = li + 1; return commands[li] end }
+            local outbuf = {}
+            local outH = {
+                write = function(self, s) outbuf[#outbuf + 1] = tostring(s); return #s end,
+                writeLine = function(self, s) outbuf[#outbuf + 1] = tostring(s) .. "\n"; return #s + 1 end,
+            }
+            syscalls["stdio.set"](inH, outH)
+            local spid = spawn(shSrc, "sh-" .. label, nil, nil, { [0] = "/bin/sh" })
+            local tries = 0
+            while spid and tries < maxTries do
+                local p = syscalls["proc.info"](spid)
+                if not p then break end
+                if p.status == "dead" or p.status == "error" then break end
+                msleep(0); tries = tries + 1
+            end
+            local out = table.concat(outbuf)
+            local function has(s) return out:find(s, 1, true) ~= nil end
+            return out, has
+        end
+
+        -- 清理上次残留
+        for _, d in ipairs({ "/test_chmod.txt", "/test_sh.sh", "/test_luarun.lua" }) do
+            if fs.exists(d) then pcall(fs.delete, d) end
+        end
+
+        -- chmod 八进制 + 符号 + chown
+        local out1, h1 = runCheck("chmod-chown", {
+            "echo PERM > /test_chmod.txt",
+            "chmod 755 /test_chmod.txt",
+            "cat /test_chmod.txt",
+            "chmod u-w /test_chmod.txt",
+            "chmod 644 /test_chmod.txt",
+            "chown 1000:1000 /test_chmod.txt",
+            "exit",
+        })
+        print("ext2-init: chmod-chown out=[" .. out1 .. "]")
+        print("ext2-init: chmod-chown PERM_written=" .. tostring(h1("PERM")))
+
+        -- mount/umount(列表 + 错误路径验证; 无 2>&1, 不用 ||)
+        local out2, h2 = runCheck("mount-umount", {
+            "mount",
+            -- / 不在真实后端 -> 应报错(输出到 stdout, 不阻断)
+            "mount /test.img /tmp",
+            "umount /notmounted",
+            "exit",
+        })
+        print("ext2-init: mount-umount out=[" .. out2 .. "]")
+
+        -- 脚本执行 + shebang
+        local out3, h3 = runCheck("script-shebang", {
+            "echo '#!/bin/sh' > /test_sh.sh",
+            "echo 'echo SCRIPT_OK arg1=$1' >> /test_sh.sh",
+            "chmod 755 /test_sh.sh",
+            -- shebang 直接执行
+            "/test_sh.sh hello",
+            -- sh <script>
+            "sh /test_sh.sh world",
+            -- 无 shebang Lua 源码执行
+            "echo 'io.write(\"LUAOK\")' > /test_luarun.lua",
+            "chmod 755 /test_luarun.lua",
+            "/test_luarun.lua",
+            "exit",
+        })
+        print("ext2-init: script-shebang out=[" .. out3 .. "]")
+        print("ext2-init: shebang_exec_ok=" .. tostring(h3("SCRIPT_OK arg1=hello")))
+        print("ext2-init: sh_script_ok=" .. tostring(h3("SCRIPT_OK arg1=world")))
+        print("ext2-init: lua_exec_ok=" .. tostring(h3("LUAOK")))
+
+        -- 清理
+        for _, d in ipairs({ "/test_chmod.txt", "/test_sh.sh", "/test_luarun.lua" }) do
+            if fs.exists(d) then pcall(fs.delete, d) end
+        end
+    end
+end
+
+-- ═══════════ 产品形态 ═══════════
 -- 3) 产品形态: 在每个 tty 上 spawn 一个 login 进程(登录到 sh)。init 保持存活。
 --    login 各自绑定自己的 tty(per-process stdio), 经 Ctrl+Alt+数字切换前台焦点共用一把键盘。
 local loginSrc

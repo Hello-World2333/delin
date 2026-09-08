@@ -321,6 +321,71 @@ rm -rf "$T"
 chk cleanup [ ! -e "$T" ]
 
 # ---------------------------------------------------------------
+# 6. chmod / chown / 脚本执行 + shebang / mount 列表
+# ---------------------------------------------------------------
+S=/tmp/delin_new
+rm -rf "$S"
+mkdir -p "$S"
+
+# chmod 八进制: 755 -> -rwxr-xr-x
+echo "perm" > "$S/perm.txt"
+chmod 755 "$S/perm.txt"
+ls -l "$S/perm.txt" > "$S/lsperm.txt"
+grep -F "rwxr-xr-x" "$S/lsperm.txt" > "$S/p1.txt"
+chk chmod_octal [ -s "$S/p1.txt" ]
+
+# chmod 符号: 755 上 u-w -> -r-xr-xr-x (555)
+chmod u-w "$S/perm.txt"
+ls -l "$S/perm.txt" > "$S/lsperm2.txt"
+grep -F "r-xr-xr-x" "$S/lsperm2.txt" > "$S/p2.txt"
+chk chmod_symbolic [ -s "$S/p2.txt" ]
+
+# chmod 644 -> -rw-r--r--
+chmod 644 "$S/perm.txt"
+ls -l "$S/perm.txt" > "$S/lsperm3.txt"
+grep -F "rw-r--r--" "$S/lsperm3.txt" > "$S/p3.txt"
+chk chmod_644 [ -s "$S/p3.txt" ]
+
+# chmod 递归: -R 应用到子目录内的文件
+mkdir -p "$S/sub"
+echo "x" > "$S/sub/f"
+chmod -R 700 "$S/sub"
+ls -l "$S/sub/f" > "$S/lsrec.txt"
+grep -F "rwx------" "$S/lsrec.txt" > "$S/p4.txt"
+chk chmod_recursive [ -s "$S/p4.txt" ]
+
+# chown: 数字/名字(宿主对改属主受限, 但命令应无错且解析正确)
+chown 1000:1000 "$S/perm.txt"
+chk chown_numeric [ -e "$S/perm.txt" ]
+chown alice "$S/perm.txt"
+chk chown_name [ -e "$S/perm.txt" ]
+
+# 脚本执行 + shebang: 直接以可执行文件跑(经解释器), 或以 sh <script> 跑。
+echo '#!/bin/sh' > "$S/my.sh"
+echo 'echo "SHEBANG_OK arg1=$1"' >> "$S/my.sh"
+chmod 755 "$S/my.sh"
+"$S/my.sh" hello > "$S/out1.txt"
+grep -F "SHEBANG_OK arg1=hello" "$S/out1.txt" > "$S/s1.txt"
+chk run_shebang_exec [ -s "$S/s1.txt" ]
+sh "$S/my.sh" world > "$S/out2.txt"
+grep -F "SHEBANG_OK arg1=world" "$S/out2.txt" > "$S/s2.txt"
+chk run_sh_script [ -s "$S/s2.txt" ]
+
+# 无 shebang 的 Lua 程序(./script 直接跑): 以 Lua 源码执行, 输出走 io.write(print 被内核接管)。
+echo 'io.write("LUAOK")' > "$S/prog.lua"
+chmod 755 "$S/prog.lua"
+"$S/prog.lua" > "$S/o3.txt"
+grep "LUAOK" "$S/o3.txt" > "$S/s3.txt"
+chk run_lua_exec [ -s "$S/s3.txt" ]
+
+# mount 无参应列出挂载(宿主/Delin 均至少有输出, 内容不必一致)。
+mount > "$S/mnt.txt"
+chk mount_list [ -s "$S/mnt.txt" ]
+
+rm -rf "$S"
+chk new_cleanup [ ! -e "$S" ]
+
+# ---------------------------------------------------------------
 # 汇总
 # ---------------------------------------------------------------
 echo "== summary =="

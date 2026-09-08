@@ -1,0 +1,163 @@
+-- Delin chown: 修改文件属主/属组 (POSIX 子集 + GNU -R/-v/-c/-f)。
+-- 用法: chown [OPTION]... [OWNER][:[GROUP]] FILE...
+--   OWNER/GROUP 可为名字(经 /etc/passwd,/etc/group syscalls 解析)或数字 uid/gid;
+--   省略则不变(如 :staff 仅改组, alice: 仅改主, alice:staff 两项都改)。
+--   --reference=RFILE  以 RFILE 的 uid/gid 为准
+--   -R/-r, --recursive 递归; -v/-c/-f 同 chmod; -- 结束选项。
+local args = args or {}
+
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return "/" end
+    if p:sub(1, 1) == "/" then
+        local full = p:gsub("/+", "/")
+        local stack = {}
+        for seg in full:gmatch("[^/]+") do
+            if seg == "." then -- skip
+            elseif seg == ".." then stack[#stack] = nil
+            else stack[#stack + 1] = seg end
+        end
+        return "/" .. table.concat(stack, "/")
+    end
+    local base = (cwd == "/") and "" or cwd
+    local full = (base .. "/" .. p):gsub("/+", "/")
+    local stack = {}
+    for seg in full:gmatch("[^/]+") do
+        if seg == "." then -- skip
+        elseif seg == ".." then stack[#stack] = nil
+        else stack[#stack + 1] = seg end
+    end
+    return "/" .. table.concat(stack, "/")
+end
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+-- 名字/数字 -> id。byName 是 syscall 查名字; 数字原样。
+local function parseId(s, byName)
+    s = tostring(s)
+    if s:match("^%d+$") then return tonumber(s) end
+    if byName then
+        local rec = byName(s)
+        if rec then
+            return rec.uid or rec.gid
+        end
+    end
+    return nil
+end
+
+-- ---------------------------------------------------------------
+-- 选项解析
+-- ---------------------------------------------------------------
+local optRecursive, optVerbose, optChanges, optSilent = false, false, false, false
+local refFile = nil
+local positional, noMoreOpts = {}, false
+for _, a in ipairs(args) do
+    if noMoreOpts then
+        positional[#positional + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "-R" or a == "-r" or a == "--recursive" then optRecursive = true
+    elseif a == "-v" or a == "--verbose" then optVerbose = true
+    elseif a == "-c" or a == "--changes" then optChanges = true
+    elseif a == "-f" or a == "--silent" or a == "--quiet" then optSilent = true
+    elseif a:match("^%-%-reference=") then refFile = resolve(a:sub(#"--reference=" + 1))
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        for k = 2, #a do
+            local ch = a:sub(k, k)
+            if ch == "R" or ch == "r" then optRecursive = true
+            elseif ch == "v" then optVerbose = true
+            elseif ch == "c" then optChanges = true
+            elseif ch == "f" then optSilent = true
+            else if not optSilent then stderr("chown: invalid option -- '" .. ch .. "'\n") end return end
+        end
+    else
+        positional[#positional + 1] = a
+    end
+end
+
+if refFile and not fs.exists(refFile) then
+    if not optSilent then stderr("chown: " .. refFile .. ": No such file or directory\n") end
+    return
+end
+
+local spec, fileList
+if refFile then
+    spec = nil
+    fileList = positional
+else
+    spec = positional[1]
+    fileList = {}
+    for i = 2, #positional do fileList[#fileList + 1] = positional[i] end
+end
+if (not refFile and not spec) or #fileList == 0 then
+    if not optSilent then stderr("usage: chown [OPTION]... [OWNER][:[GROUP]] FILE...\n") end
+    return
+end
+
+local uidKeep, gidKeep
+if refFile then
+    local a = fs.attributes(refFile)
+    uidKeep = (a and a.uid) or 0
+    gidKeep = (a and a.gid) or 0
+else
+    -- 解析 [OWNER][:[GROUP]]
+    local owner, group = spec:match("^([^:]*):(.*)$")
+    if owner then
+        -- 有冒号: owner(可空), group(可空)
+        if owner ~= "" then
+            local u = parseId(owner, syscalls and syscalls["user.get"] and function(n) local r = syscalls["user.get"](n); if r then return { uid = r.uid } end end)
+            if not u then if not optSilent then stderr("chown: invalid owner: '" .. owner .. "'\n") end return end
+            uidKeep = u
+        end
+        if group ~= "" then
+            local g = parseId(group, syscalls and syscalls["user.groupByName"] and function(n) local r = syscalls["user.groupByName"](n); if r then return { gid = r.gid } end end)
+            if not g then if not optSilent then stderr("chown: invalid group: '" .. group .. "'\n") end return end
+            gidKeep = g
+        end
+    else
+        local u = parseId(spec, syscalls and syscalls["user.get"] and function(n) local r = syscalls["user.get"](n); if r then return { uid = r.uid } end end)
+        if not u then if not optSilent then stderr("chown: invalid owner: '" .. spec .. "'\n") end return end
+        uidKeep = u
+    end
+end
+
+local function applyOne(path)
+    local before = fs.attributes(path)
+    local ok, err = fs.chown(path, uidKeep, gidKeep)
+    if not ok then
+        if not optSilent then stderr("chown: " .. path .. ": " .. tostring(err) .. "\n") end
+        return
+    end
+    if not optSilent and (optVerbose or (optChanges and before and ((before.uid or 0) ~= (uidKeep or 0) or (before.gid or 0) ~= (gidKeep or 0)))) then
+        stderr("ownership of '" .. path .. "' changed\n")
+    end
+end
+
+local function walk(top)
+    if fs.isDir(top) then
+        applyOne(top)
+        local names = fs.list(top) or {}
+        table.sort(names)
+        for _, n in ipairs(names) do
+            local full = (top == "/") and ("/" .. n) or (top .. "/" .. n)
+            if fs.isDir(full) then walk(full) else applyOne(full) end
+        end
+    else
+        applyOne(top)
+    end
+end
+
+for _, raw in ipairs(fileList) do
+    local path = resolve(raw)
+    if not fs.exists(path) then
+        if not optSilent then stderr("chown: " .. raw .. ": No such file or directory\n") end
+    elseif optRecursive then
+        walk(path)
+    else
+        applyOne(path)
+    end
+end
