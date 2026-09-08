@@ -1,0 +1,50 @@
+--@name cc_hse
+--@version 0.1.0
+--@description HSE clock acceleration: os.msleep(ms) for sub-tick sleep
+--@deps
+
+local FREQ = 2000  -- Hz, 每 tick 0.5ms
+
+return {
+    init = function(kapi, device)
+        local log = kapi.log
+        -- device = 外设 side 名 (如 "back")
+        local hse = peripheral.wrap(device)
+        if not hse then
+            error("cc_hse: cannot wrap peripheral '" .. tostring(device) .. "'", 2)
+        end
+
+        -- 设置频率并启用
+        hse.setFrequency(FREQ)
+        hse.setOn(true)
+        log("cc_hse: enabled on " .. device .. " @ " .. FREQ .. "Hz")
+
+        -- 注入 os.msleep 到全局 os 表, 所有进程通过 __index = _G 继承。
+        -- os.msleep(ms): 睡眠约 ms 毫秒, 四舍五入到 hse_tick 粒度。
+        -- 实现: 设 __msleep_remaining = ticks, yield "hse_tick",
+        --        调度器每收到一个 hse_tick 递减, 归零后 resume。
+        os.msleep = function(ms)
+            ms = tonumber(ms) or 0
+            -- 四舍五入到 tick 粒度, 至少 1 tick
+            local ticks = math.floor(ms * FREQ / 1000 + 0.5)
+            if ticks < 1 then ticks = 1 end
+            rawset(_G, "__msleep_remaining", ticks)
+            coroutine.yield("hse_tick")
+        end
+
+        log("cc_hse: os.msleep installed")
+    end,
+
+    exit = function()
+        -- 禁用时钟
+        for _, name in ipairs(peripheral.getNames()) do
+            if peripheral.getType(name) == "cc_hse" then
+                local hse = peripheral.wrap(name)
+                if hse then
+                    pcall(hse.setOn, false)
+                end
+            end
+        end
+        os.msleep = nil
+    end,
+}

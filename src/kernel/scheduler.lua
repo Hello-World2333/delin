@@ -62,6 +62,15 @@ function scheduler.run()
                     or proc.filter == event[1]
                     or event[1] == "terminate"
 
+                -- msleep 计数器: hse_tick 到来时, 若 __msleep_remaining > 0 则递减, 不 resume。
+                if shouldRun and proc.filter == "hse_tick" and event[1] == "hse_tick" then
+                    local rem = rawget(proc.co_env, "__msleep_remaining")
+                    if rem and rem > 0 then
+                        rawset(proc.co_env, "__msleep_remaining", rem - 1)
+                        shouldRun = false
+                    end
+                end
+
                 if shouldRun then
                     local ok, param
                     if not proc.started then
