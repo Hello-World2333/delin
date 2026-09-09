@@ -49,14 +49,18 @@ local function startPage(p)
     p.dev.setPageTitle(p.title)
 end
 
--- 换到下一行; 越过页底即打印本页(下次写时才开新页, 避免打出多余空页)。
+-- 换到下一行(列号必须复位到 1, 否则每行会往右偏一格, 打出来是斜线);
+-- 越过页底即打印本页(下次写时才开新页, 避免打出多余空页)。
 local function nextRow(p)
     startPage(p)
     p.page.row = p.page.row + 1
+    p.page.col = 1
     if p.page.row > p.page.h then endPage(p) end
 end
 
 -- 把一行文本写到当前行, 按页宽折行(折行处换行, 可能跨页)。
+-- 只有本行还有剩余字符时才换行 —— 否则"恰好占满一行"的文本会在这里换一次行,
+-- 行尾的 \n 再换一次, 结果白白跳掉一行。
 local function putLine(p, line)
     local rest = line
     while #rest > 0 do
@@ -68,7 +72,7 @@ local function putLine(p, line)
         p.dev.write(chunk)
         page.col = page.col + #chunk
         rest = rest:sub(#chunk + 1)
-        if page.col > page.w then
+        if page.col > page.w and #rest > 0 then
             page.col = 1
             nextRow(p)
         end

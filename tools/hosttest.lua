@@ -840,14 +840,15 @@ do
     local vfs = require("kernel.vfs")
     local sysfs = require("kernel.sysfs")
 
-    -- 桩 printer 外设: 记录调用与每页内容
+    -- 桩 printer 外设: 按光标坐标记录每页字符网格(忠实模拟真机: write 只写当前行,
+    -- 不折行, 光标右移文本长度)。曾经的 bug: 驱动换行时忘了把列号复位, 打出斜线。
     local calls, pages = {}, {}
-    local cur, curRow, curTitle
+    local cur, curX, curY, curTitle
     local fake = {
         newPage = function()
             if cur then return false end -- 真机上新开页会先打印旧页; 桩里直接拒绝
             calls[#calls + 1] = "newPage"
-            cur, curRow, curTitle = {}, 0, ""
+            cur, curX, curY, curTitle = {}, 1, 1, ""
             return true
         end,
         endPage = function()
@@ -860,17 +861,29 @@ do
         getPageSize = function() return 25, 3 end, -- 3 行小页, 便于测分页
         setCursorPos = function(x, y)
             calls[#calls + 1] = "pos " .. x .. "," .. y
-            curRow = y
+            curX, curY = x, y
         end,
         write = function(s)
             calls[#calls + 1] = "write '" .. s .. "'"
-            cur[curRow] = (cur[curRow] or "") .. s
+            local row = cur[curY] or {}
+            for i = 1, #s do row[curX + i - 1] = s:sub(i, i) end
+            cur[curY] = row
+            curX = curX + #s
         end,
         setPageTitle = function(t) curTitle = t; calls[#calls + 1] = "title '" .. t .. "'" end,
         getPaperLevel = function() return 5 end,
         getInkLevel = function() return 9 end,
     }
     _G.peripheral = { wrap = function() return fake end }
+
+    --- 把第 y 行的字符网格拼成字符串(右侧空白裁掉)。
+    local function rowStr(page, y)
+        local row = page.rows[y]
+        if not row then return "" end
+        local out = {}
+        for x = 1, 25 do out[x] = row[x] or " " end
+        return (table.concat(out):gsub("%s+$", ""))
+    end
 
     local device, cls
     local kapi = {
@@ -906,24 +919,36 @@ do
     -- 未开页时页尺寸未知(空属性读即 EOF)
     eq(openAttr("/sys/class/printer/lp0/size").readAll(), nil, "ccprinter: 未开页时 size 为空")
 
-    -- 4 行写进 3 行的页: 第 4 行触发自动翻页
+    -- 4 行写进 3 行的页: 第 4 行触发自动翻页; 每行都必须从第 1 列开始(曾经的 bug: 斜线)
     local h = device.handler.open("w")
     ok(h ~= nil, "ccprinter: 打开 /dev/lp0 写")
     h:write("a\nb\nc\nd\n")
     h:close()
     eq(#pages, 2, "ccprinter: 满 3 行自动 endPage 并开新页")
-    eq(pages[1].rows[1], "a", "ccprinter: 第 1 页第 1 行")
-    eq(pages[1].rows[3], "c", "ccprinter: 第 1 页第 3 行")
-    eq(pages[2].rows[1], "d", "ccprinter: 第 2 页第 1 行")
+    eq(rowStr(pages[1], 1), "a", "ccprinter: 第 1 页第 1 行")
+    eq(rowStr(pages[1], 2), "b", "ccprinter: 换行后第 2 行从第 1 列开始(不是斜线)")
+    eq(rowStr(pages[1], 3), "c", "ccprinter: 第 1 页第 3 行")
+    eq(pages[1].rows[2][1], "b", "ccprinter: 第 2 行首字符落在列 1")
+    eq(pages[1].rows[3][1], "c", "ccprinter: 第 3 行首字符落在列 1")
+    eq(rowStr(pages[2], 1), "d", "ccprinter: 第 2 页第 1 行")
     eq(openAttr("/sys/class/printer/lp0/size").readAll(), "25x3", "ccprinter: 开页后 sysfs size")
 
-    -- 超宽行折行: 30 字符 -> 25 + 5
+    -- 超宽行折行: 30 字符 -> 25 + 5, 折行后的续行也从第 1 列开始
     h = device.handler.open("w")
-    h:write(string.rep("x", 30) .. "\n")
+    h:write(string.rep("x", 30) .. "\n" .. "z\n")
     h:close()
     eq(#pages, 3, "ccprinter: 折行不额外翻页")
-    eq(string.len(pages[3].rows[1]), 25, "ccprinter: 折行第 1 行 25 字符")
-    eq(pages[3].rows[2], "xxxxx", "ccprinter: 折行余下 5 字符到第 2 行")
+    eq(rowStr(pages[3], 1), string.rep("x", 25), "ccprinter: 折行第 1 行 25 字符")
+    eq(rowStr(pages[3], 2), "xxxxx", "ccprinter: 折行余下 5 字符到第 2 行")
+    eq(pages[3].rows[2][1], "x", "ccprinter: 折行续行从列 1 开始")
+    eq(rowStr(pages[3], 3), "z", "ccprinter: 折行后的下一行从列 1 开始")
+
+    -- 恰好占满一页宽的行后接下一行: 不能白白跳掉一行
+    h = device.handler.open("w")
+    h:write(string.rep("y", 25) .. "\n" .. "z\n")
+    h:close()
+    eq(rowStr(pages[#pages], 1), string.rep("y", 25), "ccprinter: 恰好占满一行的文本")
+    eq(rowStr(pages[#pages], 2), "z", "ccprinter: 满行后的下一行不跳行")
 
     -- sysfs 状态
     eq(openAttr("/sys/class/printer/lp0/name").readAll(), "top", "ccprinter: sysfs name = 外设名")
