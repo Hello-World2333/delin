@@ -64,6 +64,24 @@ chk cd_home [ "$PWD" = "$HOME" ]
 chkneg cd_bad cd /nonexistent-xyz
 cd /tmp
 
+# 2b. cd 到 sysfs: 目录判定必须与"是否存在"一致。
+#     曾经的 bug: /sys/class/<任意名> 与 <名>/<任意条目> 一律 isDir=true,
+#     于是 cd 到任意不存在的 sysfs 路径都"成功"并切走了 cwd。
+cd /sys/class/display
+chk cd_sysfs_classdir [ "$PWD" = "/sys/class/display" ]
+chkneg cd_sysfs_bad_entry cd /sys/class/display/nosuch-entry-xyz
+chk cd_sysfs_entry_pwd [ "$PWD" = "/sys/class/display" ]
+chkneg cd_sysfs_bad_class cd /sys/class/nosuch-class-xyz
+chk cd_sysfs_class_pwd [ "$PWD" = "/sys/class/display" ]
+chkneg cd_sysfs_bad_rel cd nosuch-entry-xyz
+chk cd_sysfs_rel_pwd [ "$PWD" = "/sys/class/display" ]
+chkneg cd_sysfs_bad_attr cd /sys/class/display/nosuch-entry-xyz/name
+cd /sys
+chk cd_sysfs_root [ "$PWD" = "/sys" ]
+cd /sys/class
+chk cd_sysfs_class [ "$PWD" = "/sys/class" ]
+cd /tmp
+
 # ---------------------------------------------------------------
 # 3. `.` source
 # ---------------------------------------------------------------

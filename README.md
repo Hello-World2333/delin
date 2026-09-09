@@ -253,7 +253,7 @@ PID 1 现在是**用户态服务管理器**（`src/init/unit.lua` 单元解析 +
 用户态 `/dev/log`、`syslogd` 按 `/etc/syslog.conf` 写 `/var/log/*`（SIGHUP 重开、游标续读不重放）、
 `logrotate` + `logrotate.timer` 轮转、`logger`/`dmesg`。`/etc/fstab` 由 init 生成 mount 单元
 （`local-fs.target`），`mount -a` 复用同一解析器。init 里的自检代码已全部删除，验证改为
-宿主测试台 `tools/hosttest.lua`（160 项）与真机脚本 `tools/realmachine.py` +
+宿主测试台 `tools/hosttest.lua`（180 项）与真机脚本 `tools/realmachine.py` +
 `scripts/realmachine_verify.sh`。
 
 `src/bin/sh` 已升级为 POSIX 核心子集（变量/引号/if/for/while/case/函数/test/[ ]/&&/|| /文件重定向/管道
@@ -350,7 +350,7 @@ lua5.1 tools/bundle.lua dlub     # 生成 dist/dlub.lua（DLUB 引导装载器�
 验证：
 
 ```bash
-lua5.1 tools/hosttest.lua        # 宿主测试: init 引擎/fstab/syslogd/logrotate/systemctl/sysfs/ccprinter (160 项)
+lua5.1 tools/hosttest.lua        # 宿主测试: init 引擎/fstab/syslogd/logrotate/systemctl/sysfs/ccprinter (180 项)
 lua5.1 tools/harness.lua /bin/sh # 宿主上跑真实工具源码(sh/作业控制/管道; /sys 走真实 sysfs 后端)
 python3 tools/realmachine.py     # 真机: 打包->部署->重启电脑 #3->取回 /var/log/*
 python3 tools/realmachine.py --printer   # 真机 + 打印机(会实际打印页面): 探测 printer API + 验证 /dev/lp0
@@ -439,7 +439,7 @@ tools/bundle.lua           打包 src/ -> dist/kernel.lua 或 dist/dlub.lua(init
 tools/harness.lua          host 测试台: 用真实 Delin 工具源码在宿主跑(fs/io/syscalls/spawn 桩,
                            含信号/进程组语义: kill/killpg/SIGCONT/stopped, 供 sh 作业控制验证;
                            /sys 走真实 kernel.sysfs 后端 + 桩显示设备 + 桩 printer(/dev/lp0))
-tools/hosttest.lua         宿主测试: init 单元引擎/fstab 生成/syslogd 规则/logrotate 轮转/systemctl/sysfs/ccprinter(160 项)
+tools/hosttest.lua         宿主测试: init 单元引擎/fstab 生成/syslogd 规则/logrotate 轮转/systemctl/sysfs/ccprinter(180 项)
 tools/deploy.py            重建干净 ext2 根镜像(基镜像+内核/bin/单元/配置/标记)并部署到 disk
 tools/realmachine.py       真机流程: 打包->部署->注入第二分区与 verify.service->重启 #3->debugfs 取回日志
                            (--printer 额外注入打印机探测/验证服务)

@@ -828,6 +828,19 @@ do
     ok(not b.exists(r), "sysfs: 不存在的设备 exists=false")
     b, r = vfs.resolve("/sys/class/display/top/nosuch")
     ok(not b.exists(r), "sysfs: 不存在的属性 exists=false")
+
+    -- isDir 必须与 exists 一致(曾经的 bug: 任意 /sys/class/<名> 与 <名>/<条目> 都算目录,
+    -- 于是 cd /sys/class/display/<不存在的条目> 成功并切了 cwd)
+    b, r = vfs.resolve("/sys");                           ok(b.isDir(r), "sysfs: /sys 是目录")
+    b, r = vfs.resolve("/sys/class");                     ok(b.isDir(r), "sysfs: /sys/class 是目录")
+    b, r = vfs.resolve("/sys/class/display");             ok(b.isDir(r), "sysfs: 已注册 class 是目录")
+    b, r = vfs.resolve("/sys/class/display/top");         ok(b.isDir(r), "sysfs: 已存在条目是目录")
+    b, r = vfs.resolve("/sys/class/display/top/name");    ok(not b.isDir(r), "sysfs: 属性不是目录")
+    b, r = vfs.resolve("/sys/class/nosuchclass");         ok(not b.isDir(r), "sysfs: 未注册 class isDir=false")
+    b, r = vfs.resolve("/sys/class/nosuchclass/e");       ok(not b.isDir(r), "sysfs: 未注册 class 下条目 isDir=false")
+    b, r = vfs.resolve("/sys/class/display/nosuch");      ok(not b.isDir(r), "sysfs: 不存在的条目 isDir=false")
+    b, r = vfs.resolve("/sys/class/display/top/nosuch");  ok(not b.isDir(r), "sysfs: 不存在的属性 isDir=false")
+    b, r = vfs.resolve("/sys/nosuch");                    ok(not b.isDir(r), "sysfs: /sys 下未知路径 isDir=false")
 end
 
 -- ===============================================================
@@ -955,6 +968,14 @@ do
     eq(openAttr("/sys/class/printer/lp0/type").readAll(), "printer", "ccprinter: sysfs type")
     eq(openAttr("/sys/class/printer/lp0/paper").readAll(), "5", "ccprinter: sysfs paper")
     eq(openAttr("/sys/class/printer/lp0/ink").readAll(), "9", "ccprinter: sysfs ink")
+
+    -- 目录判定与 exists 一致(cd 依赖它: 不存在的条目不能算目录)
+    local pb, pr = vfs.resolve("/sys/class/printer/lp0")
+    ok(pb.isDir(pr), "ccprinter: /sys/class/printer/lp0 是目录")
+    pb, pr = vfs.resolve("/sys/class/printer/lp1")
+    ok(not pb.isDir(pr), "ccprinter: 不存在的 lp1 isDir=false")
+    pb, pr = vfs.resolve("/sys/class/printer/lp0/nosuch")
+    ok(not pb.isDir(pr), "ccprinter: 不存在的属性 isDir=false")
 
     -- 页标题: 可写, 并在开页时下发给外设
     local tw = openAttr("/sys/class/printer/lp0/title", "w")

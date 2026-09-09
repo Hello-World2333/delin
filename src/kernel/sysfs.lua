@@ -159,9 +159,14 @@ local backend = {
         if kind == "attr" then return attrExists(cls, entry, attr) end
         return false
     end,
+    -- 目录判定必须与 exists 一致: 不存在的 class / 条目不是目录。
+    -- 否则 cd /sys/class/<任意名> 会成功(POSIX: cd 只检查目标是否为已存在的目录)。
     isDir = function(rel)
-        local kind = parse(rel)
-        return kind == "root" or kind == "class" or kind == "classdir" or kind == "entry"
+        local kind, cls, entry = parse(rel)
+        if kind == "root" or kind == "class" then return true end
+        if kind == "classdir" then return classes[cls] ~= nil end
+        if kind == "entry" then return entryExists(cls, entry) end
+        return false
     end,
     attributes = function(rel)
         local kind, cls, entry, attr = parse(rel)
