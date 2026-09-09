@@ -2,7 +2,8 @@
      自包含: 读 /dlub.cfg 锁定引导盘 -> 读 /parts/manifest -> 开 root 分区为块设备
      -> 挂 ext2 -> 读内核镜像 -> 设 _G.__boot_info -> 运行内核。
      多磁盘: peripheral.getNames() 顺序不可靠, 引导盘只能由 /dlub.cfg 显式指定
-     (fail-fast, 不扫描不回退)。 ]]
+     (fail-fast, 不扫描不回退)。
+     rootfs 模式: 从电脑自带存储启动, 指定 ext2 根镜像路径(如 /parts/root.img)。 ]]
 
 local blockdev = require("kernel.blockdev")
 local ext2     = require("kernel.ext2")
@@ -30,6 +31,45 @@ function dlub.master()
         local cfg, cerr = dlubcfg.parse(cfgText)
         if not cfg then error("/dlub.cfg: " .. cerr, 0) end
 
+        -- 模式 1: 从电脑自带存储启动 (rootfs)
+        if cfg.rootfs then
+            local rootfs = cfg.rootfs
+            -- 确保路径以 / 开头
+            if rootfs:sub(1, 1) ~= "/" then rootfs = "/" .. rootfs end
+            if not fs.exists(rootfs) then
+                error("/dlub.cfg: rootfs " .. rootfs .. " not found", 0)
+            end
+            w("config /dlub.cfg rootfs=" .. rootfs)
+
+            local bd, err = blockdev.file(rootfs)
+            if not bd then error("blockdev: " .. tostring(err), 0) end
+            local rfs, ferr = ext2.mount(bd)
+            if not rfs then error("fs ext2: " .. tostring(ferr), 0) end
+
+            -- 查找内核镜像
+            local bootPath = "/boot/delin.lua"
+            local inode = ext2.lookup(rfs, bootPath)
+            local kernelSrc = inode and ext2.readFile(rfs, inode)
+            if not kernelSrc then
+                -- 尝试其他可能的内核路径
+                for _, path in ipairs({"/boot/delin.lua", "/boot/kernel.lua", "/boot.lua"}) do
+                    inode = ext2.lookup(rfs, path)
+                    kernelSrc = inode and ext2.readFile(rfs, inode)
+                    if kernelSrc then bootPath = path; break end
+                end
+                if not kernelSrc then error("no kernel at /boot/delin.lua", 0) end
+            end
+
+            w("rootfs=" .. rootfs .. " kernel=" .. bootPath .. " (" .. #kernelSrc .. " bytes)")
+            _G.__boot_info = { blockDevice = bd, rootFstype = "ext2", rootPath = rootfs, bootPath = bootPath }
+
+            local chunk, lerr = load(kernelSrc, bootPath, "t", _G)
+            if not chunk then error("kernel load: " .. tostring(lerr), 0) end
+            if log then log.close(); log = nil end
+            chunk() -- 运行内核(接管, 不返回)
+        end
+
+        -- 模式 2: 从外部磁盘启动 (bootdisk)
         local name = cfg.bootdisk
         if peripheral.getType(name) ~= "drive" then
             error("/dlub.cfg: bootdisk " .. name .. " is not a disk drive", 0)

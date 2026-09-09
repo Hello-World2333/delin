@@ -227,6 +227,29 @@ local function mountRealPath(path, dir, fst)
     return true, { device = path, fstype = fst }
 end
 
+--- 挂载电脑自带存储上的 ext2 分区。
+---@param path string 镜像路径(如 /parts/root.img)
+---@param dir string 挂载点
+---@param fstype string|nil 文件系统类型(默认 ext2)
+---@return boolean|nil ok, table|string 成功时第二值是 { device, fstype }
+function devdisk.mountLocal(path, dir, fstype)
+    if not vfs_api.fs.exists(path) then
+        return nil, path .. ": file not found"
+    end
+    local fst = fstype or "ext2"
+    -- 直接使用文件路径作为设备节点
+    local src = { img = path }
+    local handler = fstypes[fst]
+    if not handler then return nil, "unknown fstype: " .. fst end
+    local ok, b, meta = pcall(handler, src, dir)
+    if not ok then return nil, path .. ": " .. tostring(b) end
+    if not b then return nil, path .. ": " .. tostring(meta) end
+    meta = meta or {}
+    meta.device, meta.fstype = path, fst
+    vfs.mount(dir, b, meta)
+    return true, { device = path, fstype = fst }
+end
+
 --- 挂载一个文件系统。
 ---@param device string /dev/sdX | /dev/ccdiskN | UUID=<uuid> | 真实后端路径(兼容旧式)
 ---@param dir string 挂载点(VFS 目录, 必须已存在)

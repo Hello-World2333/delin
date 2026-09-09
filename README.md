@@ -349,18 +349,26 @@ sysfs 也从 display 专用泛化成 class 注册表（模块用 `kapi.registerS
   从 `/lib/modules/<version>/` 装模块（`loadAll` + `loadAliases` + 按外设 autoload 驱动，
   modprobe 风格 `modules.use`）→ `sysfs.mount` 挂 `/sys` → `launch` 出 PID 1（用户态 init）。
 - **EXT2 根引导**（GRUB 风格，DLUB 独立文件）：先由 `dlub.lua` 读**电脑自身 FS** 的 `/dlub.cfg`
-  （`bootdisk <外设名>`，如 `bootdisk left`）锁定引导盘——多磁盘时 `peripheral.getNames()` 顺序
-  不可靠（数据盘可能先被枚举到），因此**不扫描、不回退**：配置缺失/语法错误/该外设不是磁盘驱动/
-  盘上无 `/parts/manifest` 一律 fail-fast 报错。再读该盘 `/parts/manifest`，按清单把 root 分区开成
-  块设备、挂 ext2、读内核镜像并设 `_G.__boot_info`；`boot.boot()` 检测到
-  `__boot_info` 即走 `bootExt2`——挂 ext2 根为 `/`（挂载表里显示为对应的 `/dev/sdXN`），读
-  `/etc/passwd` 建用户库，模块只从 ext2 根镜像
-  自带的 `/lib/modules/<version>/` 装载（自包含，fail-fast，绝不回退到引导盘/CC fs 的 `/lib`）。
-  两条路径最后都 spawn 同一份 init 源码，随后由 init 启动 `default.target`。
+  配置文件，支持两种启动模式：
+  1. **外部磁盘启动**（`bootdisk <外设名>`，如 `bootdisk left`）：锁定引导盘——多磁盘时
+     `peripheral.getNames()` 顺序不可靠（数据盘可能先被枚举到），因此**不扫描、不回退**：
+     配置缺失/语法错误/该外设不是磁盘驱动/盘上无 `/parts/manifest` 一律 fail-fast 报错。
+  2. **电脑自带存储启动**（`rootfs <路径>`，如 `rootfs /parts/root.img`）：从电脑自带存储的
+     ext2 镜像启动，适用于需要从本地存储启动的场景。
+
+  两种模式都会读取 ext2 分区，挂载根文件系统，读内核镜像并设 `_G.__boot_info`；`boot.boot()`
+  检测到 `__boot_info` 即走 `bootExt2`——挂 ext2 根为 `/`，读 `/etc/passwd` 建用户库，
+  模块只从 ext2 根镜像自带的 `/lib/modules/<version>/` 装载（自包含，fail-fast，绝不回退到
+  引导盘/CC fs 的 `/lib`）。两条路径最后都 spawn 同一份 init 源码，随后由 init 启动
+  `default.target`。
 
 真机流程：`tools/realmachine.py`（**先关机** → 打包 → `tools/deploy.py` 重建 ext2 根镜像 → 注入第二个 ext2 分区
 供 fstab 测试 + `verify.service` → `e2fsck -fn` 门禁 → 装盘并按 md5 校验 → 开机 → 用 `debugfs`
 从镜像取回 `/var/log/*` → 再停机 fsck 一次）；`scripts/realmachine_verify.sh` 是它在真机上跑的验证脚本。
+
+部署到电脑4：`tools/deploy_to_computer4.py`（支持两种启动模式）：
+- `python3 tools/deploy_to_computer4.py --mode rootfs --rootfs /parts/root.img`（从电脑自带存储启动）
+- `python3 tools/deploy_to_computer4.py --mode bootdisk --bootdisk left`（从外部磁盘启动）
 
 **部署的两条硬约束**（踩过的事故，别改回去）：
 

@@ -29,6 +29,7 @@ MKFS = "/usr/sbin/mkfs.ext2"
 FSCK = "/usr/sbin/e2fsck"
 DISK = "/mnt/disk/0"
 COMPUTER = "/mnt/computer/3"
+COMPUTER4 = "/mnt/computer/4"
 RCON = "/home/worker/docs/tools/rcon.py"
 WAIT = 75
 WORK = "/tmp/delin-rm"
@@ -252,6 +253,33 @@ def main():
         print("   WARNING: %s 读回内容与 dist/dlub.lua 不一致(本环境电脑自身 FS 改写可能不生效)" % mainlua)
     print("installed root.img/data.img/manifest/kernel + DLUB -> %s/main.lua" % COMPUTER)
 
+    # 3h) 部署到电脑4 (rootfs 模式)
+    print("== deploy to computer 4 ==")
+    # 创建 /dlub.cfg
+    os.makedirs(COMPUTER4, exist_ok=True)
+    dlub_cfg = os.path.join(COMPUTER4, "dlub.cfg")
+    with open(dlub_cfg, "w") as f:
+        f.write("rootfs /parts/root.img\n")
+    print("   created %s with rootfs=/parts/root.img" % dlub_cfg)
+    
+    # 安装 DLUB 到电脑4的 /main.lua
+    mainlua4 = os.path.join(COMPUTER4, "main.lua")
+    shutil.copy(os.path.join(REPO, "dist/dlub.lua"), mainlua4)
+    print("   installed dlub.lua -> %s" % mainlua4)
+    
+    # 安装内核到电脑4的 /boot/
+    bootdir4 = os.path.join(COMPUTER4, "boot")
+    os.makedirs(bootdir4, exist_ok=True)
+    shutil.copy(os.path.join(REPO, "dist/kernel.lua"), os.path.join(bootdir4, "delin.lua"))
+    print("   installed kernel.lua -> %s/delin.lua" % bootdir4)
+    
+    # 安装根镜像到电脑4
+    rootfs_path = "/parts/root.img"
+    dst_path = os.path.join(COMPUTER4, "parts/root.img")
+    os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+    shutil.copy(out, dst_path)
+    print("   installed root.img -> %s" % dst_path)
+
     if not reboot:
         print("--no-reboot: stopping here (computer #3 已关机)")
         return
@@ -266,6 +294,14 @@ def reboot_and_collect(printer=False):
     run("python3", RCON, "computercraft turn-on #3", check=False)
     print("waiting %ds for boot ..." % WAIT)
     time.sleep(WAIT)
+
+    # 4b) 重启电脑 #4
+    print("== reboot computer #4 ==")
+    run("python3", RCON, "computercraft shutdown #4", check=False)
+    time.sleep(2)
+    run("python3", RCON, "computercraft turn-on #4", check=False)
+    print("waiting 30s for boot ...")
+    time.sleep(30)
 
     # 5) 取回日志
     print("== collect logs ==")

@@ -294,10 +294,15 @@ local function bootExt2(bi)
         if e.type == "part" and e.img == bi.blockDevice.path then rootDev = e; break end
     end
     if not rootDev then
-        kprint("FATAL: boot partition has no /dev node: " .. tostring(bi.blockDevice.path))
-        return
+        -- 从电脑自带存储启动时, 根分区可能没有对应的 /dev 节点
+        -- 使用虚拟设备节点
+        kprint("ext2 boot: no /dev node for root partition, using virtual device")
+        local device = bi.rootPath or "rootfs"
+        local uuid = nil
+        vfs.mount("/", ext2.backend(rfs), { device = device, fstype = "ext2", uuid = uuid })
+    else
+        vfs.mount("/", ext2.backend(rfs), { device = rootDev.node, fstype = rootDev.fstype, uuid = rootDev.uuid })
     end
-    vfs.mount("/", ext2.backend(rfs), { device = rootDev.node, fstype = rootDev.fstype, uuid = rootDev.uuid })
     vfs_api.setStdio(
         { read = function(self, ...) return read(...) end },
         { write = function(self, s) return write(s) end, writeLine = function(self, s) return write(s .. "\n") end, flush = function(self) return true end }
