@@ -1,6 +1,6 @@
 --@name demo
 --@version 0.1.0
---@description A demo module registering a syscall, a /dev device and a /proc fs
+--@description A demo module registering a syscall and a /dev device
 --@deps
 
 return {
@@ -43,58 +43,5 @@ return {
                 }
             end,
         })
-
-        -- fs: /proc (虚拟)
-        local procBackend = {
-            kind = "virtual",
-            list = function() return { "cpu", "mem" } end,
-            exists = function(rel)
-                local n = rel:gsub("^/+", "")
-                return n == "" or n == "cpu" or n == "mem"
-            end,
-            isDir = function(rel) return rel:gsub("^/+", "") == "" end,
-            attributes = function(rel)
-                local n = rel:gsub("^/+", "")
-                return { size = 0, isDir = (n == ""), isReadOnly = true, name = n }
-            end,
-            getSize = function() return 0 end,
-            getDrive = function() return "proc" end,
-            getFreeSpace = function() return 0 end,
-            getCapacity = function() return 0 end,
-            isReadOnly = function() return true end,
-            open = function(rel)
-                local n = rel:gsub("^/+", "")
-                local content = (n == "cpu") and "cpu: 1 @ 100%" or ((n == "mem") and "mem: 64k" or "")
-                local pos = 0
-                return {
-                    -- 单行内容: 读完一次即 EOF(nil), 否则 cat/grep 会无限重复打印。
-                    read = function(_, cnt)
-                        if pos >= #content then return nil end
-                        if type(cnt) ~= "number" then pos = #content; return content end
-                        local chunk = content:sub(pos + 1, pos + cnt)
-                        pos = pos + #chunk
-                        return chunk
-                    end,
-                    readLine = function()
-                        if pos >= #content then return nil end
-                        pos = #content
-                        return content
-                    end,
-                    readAll = function()
-                        if pos >= #content then return nil end
-                        pos = #content
-                        return content
-                    end,
-                    write = function() end,
-                    writeLine = function() end,
-                    close = function() end,
-                }
-            end,
-            makeDir = function() error("read-only fs", 2) end,
-            move = function() error("read-only fs", 2) end,
-            copy = function() error("read-only fs", 2) end,
-            delete = function() error("read-only fs", 2) end,
-        }
-        kapi.registerFS("/proc", procBackend, { device = "proc", fstype = "proc" })
     end,
 }

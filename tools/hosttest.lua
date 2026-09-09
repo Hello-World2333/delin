@@ -1247,5 +1247,132 @@ do
     end
 end
 
+-- ===============================================================
+-- K. procfs: /proc/<pid>/{cmdline,comm,cwd,stat,status} + /proc/self + 系统信息文件
+-- ===============================================================
+do
+    local vfs = require("kernel.vfs")
+    os.version = os.version or function() return "CraftOS 1.8" end
+
+    local procs = {
+        [1]  = { pid = 1, ppid = 0, name = "init", status = "running", uid = 0, gid = 0,
+                 pgrp = 1, sid = 1, cwd = "/", argv = { [0] = "/bin/init" } },
+        [7]  = { pid = 7, ppid = 1, name = "/bin/sh", status = "running", uid = 1000, gid = 1000,
+                 pgrp = 7, sid = 7, cwd = "/home/alice",
+                 argv = { [0] = "/bin/sh", [1] = "-c", [2] = "ps" } },
+        [9]  = { pid = 9, ppid = 1, name = "sleep", status = "stopped", uid = 0, gid = 0,
+                 pgrp = 9, sid = 1, cwd = "/", argv = {} },
+        [11] = { pid = 11, ppid = 1, name = "gone", status = "dead", uid = 0, gid = 0,
+                 pgrp = 11, sid = 1, cwd = "/", argv = {} },
+        [12] = { pid = 12, ppid = 1, name = "probe", status = "running", uid = 1001, gid = 1001,
+                 pgrp = 12, sid = 1, cwd = "/", argv = {} },
+    }
+    local selfPid = 7 -- 当前"进程"(决定 /proc/self 与 R/S 状态)
+
+    -- 桩: kernel.process(procfs 只用到 current/info/list/ttyFor/fgPgrpFor)
+    package.loaded["kernel.process"] = {
+        current = function()
+            local p = procs[selfPid]
+            return { pid = selfPid, uid = p.uid, gid = p.gid }
+        end,
+        info = function(pid) return procs[pid] end,
+        list = function()
+            local out = {}
+            for _, p in pairs(procs) do
+                if p.status == "running" or p.status == "stopped" then out[#out + 1] = p end
+            end
+            table.sort(out, function(a, b) return a.pid < b.pid end)
+            return out
+        end,
+        ttyFor = function(pid)
+            if pid == 1 then return nil end
+            return "/dev/tty0"
+        end,
+        fgPgrpFor = function(pid)
+            if pid == 1 then return nil end
+            return 7
+        end,
+    }
+    require("kernel.procfs").mount(0, "0.0.2") -- bootMs=0
+
+    local function openAt(path)
+        local b, r = vfs.resolve(path)
+        local fh, err = b.open(r, "r")
+        ok(fh ~= nil, "procfs: 打开 " .. path, err)
+        return fh
+    end
+
+    -- 根目录: 存活 pid + self + 系统信息文件(退出的进程没有节点)
+    local b, r = vfs.resolve("/proc")
+    ok(b.isDir(r), "procfs: /proc 是目录")
+    local names = {}
+    for _, n in ipairs(b.list(r)) do names[n] = true end
+    ok(names["1"] and names["7"] and names["9"], "procfs: /proc 列出存活进程")
+    ok(not names["11"], "procfs: 已退出进程不出现在 /proc")
+    ok(names["self"] and names["uptime"] and names["version"] and names["mounts"],
+       "procfs: /proc 列出 self/uptime/version/mounts")
+
+    -- /proc/self 是调用者 pid 的别名; comm 取 name 的 basename
+    eq(openAt("/proc/self/comm").readAll(), "sh\n", "procfs: /proc/self 解析到调用者")
+    eq(openAt("/proc/7/comm").readAll(), "sh\n", "procfs: comm 取 name 的 basename")
+
+    -- stat: Linux 字段 1..8(pid comm state ppid pgrp session tty tpgid)
+    eq(openAt("/proc/7/stat").readAll(), "7 (sh) R 1 7 7 tty0 7\n", "procfs: stat 字段 1..8")
+    eq(openAt("/proc/1/stat").readAll(), "1 (init) S 0 1 1 0 -1\n",
+       "procfs: 无控制终端 tty=0 tpgid=-1")
+    eq(openAt("/proc/9/stat").readAll(), "9 (sleep) T 1 9 1 tty0 7\n", "procfs: stopped -> T")
+
+    -- status: 多行, 逐行读到 EOF
+    local fh = openAt("/proc/7/status")
+    eq(fh.readLine(), "Name:\tsh", "procfs: status Name")
+    eq(fh.readLine(), "State:\tR (running)", "procfs: status State(自己=R)")
+    eq(fh.readLine(), "Tgid:\t7", "procfs: status Tgid")
+    eq(fh.readLine(), "Pid:\t7", "procfs: status Pid")
+    eq(fh.readLine(), "PPid:\t1", "procfs: status PPid")
+    eq(fh.readLine(), "Pgrp:\t7", "procfs: status Pgrp")
+    eq(fh.readLine(), "Session:\t7", "procfs: status Session")
+    eq(fh.readLine(), "Uid:\t1000", "procfs: status Uid")
+    eq(fh.readLine(), "Gid:\t1000", "procfs: status Gid")
+    eq(fh.readLine(), nil, "procfs: status 读完即 EOF")
+
+    -- cmdline: argv 以 NUL 分隔 + 结尾 NUL; 空 argv 是空文件
+    eq(openAt("/proc/7/cmdline").readAll(), "/bin/sh\0-c\0ps\0", "procfs: cmdline NUL 分隔")
+    eq(openAt("/proc/9/cmdline").readAll(), nil, "procfs: 空 argv 的 cmdline 为空")
+
+    -- cwd: 属主或 root 可读(Linux 语义)
+    eq(openAt("/proc/7/cwd").readAll(), "/home/alice\n", "procfs: cwd = 进程 cwd")
+    selfPid = 9 -- uid 0(root)
+    eq(openAt("/proc/7/cwd").readAll(), "/home/alice\n", "procfs: root 可读他人 cwd")
+    selfPid = 12 -- uid 1001(既非属主也非 root)
+    b, r = vfs.resolve("/proc/7/cwd")
+    local dfh, derr = b.open(r, "r")
+    ok(dfh == nil and tostring(derr):find("permission"), "procfs: 他人 cwd 拒绝读", derr)
+    selfPid = 7
+
+    -- 只读 + 不存在的路径
+    b, r = vfs.resolve("/proc/7/stat")
+    local wfh, werr = b.open(r, "w")
+    ok(wfh == nil and tostring(werr):find("read%-only"), "procfs: 拒绝写打开", werr)
+    b, r = vfs.resolve("/proc/99999/stat")
+    ok(not b.exists(r), "procfs: 不存在的 pid exists=false")
+    ok(not b.isDir(r), "procfs: 不存在的 pid isDir=false")
+    b, r = vfs.resolve("/proc/11/stat")
+    ok(not b.exists(r), "procfs: 已退出进程的节点不存在")
+    b, r = vfs.resolve("/proc/7/nosuch")
+    ok(not b.exists(r), "procfs: 不存在的文件 exists=false")
+    b, r = vfs.resolve("/proc/7/stat")
+    ok(not b.isDir(r), "procfs: stat 不是目录")
+    b, r = vfs.resolve("/proc/7")
+    ok(b.isDir(r), "procfs: /proc/<pid> 是目录")
+
+    -- 系统信息文件
+    local up = openAt("/proc/uptime").readAll()
+    ok(up and up:match("^%d+%.%d+\n$"), "procfs: uptime 是秒数", up)
+    ok(tostring(openAt("/proc/version").readAll()):find("Delin OS", 1, true) ~= nil,
+       "procfs: version 含 Delin OS")
+    local mounts = openAt("/proc/mounts").readAll() or ""
+    ok(mounts:find("proc /proc proc ro 0 0", 1, true) ~= nil, "procfs: mounts 含 /proc 条目", mounts)
+end
+
 io.write(string.format("\n%d passed, %d failed\n", pass, fail))
 os.exit(fail == 0 and 0 or 1)

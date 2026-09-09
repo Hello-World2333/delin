@@ -72,4 +72,19 @@ clear > /tmp/clear_out
 wc -c < /tmp/clear_out >> $LOG
 grep '%c' /tmp/clear_out > /tmp/clear_hit
 if [ -s /tmp/clear_hit ]; then echo "clear_esc=ok" >> $LOG; else echo "clear_esc=ng" >> $LOG; fi
+echo "-- procfs /proc --" >> $LOG
+ls /proc >> $LOG
+cat /proc/version >> $LOG
+cat /proc/uptime >> $LOG
+cat /proc/mounts >> $LOG
+cat /proc/1/stat >> $LOG
+cat /proc/1/status >> $LOG
+cat /proc/self/comm >> $LOG
+echo "-- ps --" >> $LOG
+ps -e >> $LOG
+ps -ef >> $LOG
+ps aux >> $LOG
+ps -e -o pid,ppid,user,group,stat,tty,comm,cmd >> $LOG
+echo "-- proc_test.sh (/proc + ps/pgrep/pkill/killall 自检) --" >> $LOG
+sh /root/proc_test.sh >> $LOG
 echo "=== verify done ===" >> $LOG

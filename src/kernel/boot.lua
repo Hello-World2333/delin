@@ -20,6 +20,7 @@ local tty        = require("kernel.tty")
 local fb         = require("kernel.fb")
 local display    = require("kernel.display")
 local sysfs      = require("kernel.sysfs")
+local procfs     = require("kernel.procfs")
 local pipe       = require("kernel.pipe")
 local klog       = require("kernel.klog")
 local fstab      = require("kernel.fstab")
@@ -51,13 +52,14 @@ local function kprint(...) return emit(PRI_KERN, ...) end
 --- 进程 print(facility=user)。Delin 的内核 print 是控制台, 不是进程 stdout。
 local function userprint(...) return emit(PRI_USER, ...) end
 
---- 挂载: 根 hdd + /dev(+占位 /proc)。磁盘驱动器不自动挂载 —— 只作为 /dev/sdX 设备节点
+--- 挂载: 根 hdd + /dev + /proc(procfs)。磁盘驱动器不自动挂载 —— 只作为 /dev/sdX 设备节点
 --- 暴露(见 setupDevices), 由 fstab/mount 显式挂载。
 local function setupVfs()
     -- 根 = 电脑 hdd(真实路径即 "/...")
     vfs.mount("/", vfs.real(""), { device = "rootfs", fstype = "ccdisk" })
     vfs_api.mountDev()
     klog.register() -- /dev/kmsg + /dev/log
+    procfs.mount(bootMs, modules.version) -- /proc: 进程/系统信息
 
     -- 终端 stdio(io.write/read 兜底)。用冒号调用(io.write 经 stdio.output:write)。
     vfs_api.setStdio(
@@ -185,6 +187,7 @@ local function registerRuntimeSyscalls()
                 device = m.meta and m.meta.device,
                 fstype = m.meta and m.meta.fstype,
                 uuid = m.meta and m.meta.uuid,
+                ro = m.backend.isReadOnly("") and true or false,
             }
         end
         return out
@@ -282,6 +285,7 @@ local function bootExt2(bi)
     if not rfs then kprint("FATAL: root ext2 mount: " .. tostring(ferr)); return end
     vfs_api.mountDev()
     klog.register()
+    procfs.mount(bootMs, modules.version) -- /proc: 进程/系统信息
     registerConsole() -- 电脑自身 term 控制台(键盘输入焦点)
     setupDevices()    -- /dev/sdX 设备节点(磁盘不自动挂载)
     -- 根分区对上设备节点, 使 mount/lsblk 里根挂载显示为 /dev/sdXN 而不是 "rootfs"。

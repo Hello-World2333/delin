@@ -53,7 +53,7 @@ local function listMounts()
     local lines = {}
     for _, mt in ipairs(list) do
         local dev = mt.device or ((mt.root == "/") and "rootfs" or "-")
-        local line = dev .. " on " .. mt.root .. " type " .. (mt.fstype or "?") .. " (rw)"
+        local line = dev .. " on " .. mt.root .. " type " .. (mt.fstype or "?") .. (mt.ro and " (ro)" or " (rw)")
         if mt.uuid then line = line .. " uuid=" .. mt.uuid end
         lines[#lines + 1] = line
     end

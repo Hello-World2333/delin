@@ -316,6 +316,10 @@ syscalls["user.byUid"] = function(u)
     return nil
 end
 syscalls["user.groupByName"] = function(name) return groups[name] end
+syscalls["user.groupByGid"] = function(gid)
+    for _, g in pairs(groups) do if g.gid == gid then return g end end
+    return nil
+end
 syscalls["user.register"] = function() end
 
 -- 挂载/卸载桩: 记录到内存表, 供 `mount`/`umount` 命令在宿主上验证参数与列表。
@@ -424,8 +428,10 @@ local function spawn(src, name, ppid, uid, gid, argv, opts)
     -- 进程组/会话: 子进程继承父进程的 pgrp/sid(与内核 process.spawn 一致)。
     local pgrp = parent and parent.pgrp or pid
     local sid = parent and parent.sid or 0
-    procs[pid] = { pid = pid, name = name, status = "running", exitCode = 0, stdio = stdio,
-                   pgrp = pgrp, sid = sid, handlers = {}, envvars = envvars }
+    procs[pid] = { pid = pid, ppid = ppid or 0, name = name, status = "running", exitCode = 0,
+                   stdio = stdio, pgrp = pgrp, sid = sid, handlers = {}, envvars = envvars,
+                   uid = uid or 0, gid = gid or 0, argv = argv or {},
+                   cwd = (opts and opts.cwd) or "/" }
     running[#running + 1] = { pid = pid, co = coroutine.create(chunk) }
     return pid
 end
@@ -475,7 +481,7 @@ local SRCBIN = "/home/worker/delin/src/bin"
 local function setupRoot()
     os.execute("rm -rf " .. ROOT .. " && mkdir -p " .. ROOT)
     os.execute("mkdir -p " .. ROOT .. "/bin " .. ROOT .. "/etc " .. ROOT .. "/home/alice " .. ROOT .. "/root " .. ROOT .. "/tmp " .. ROOT .. "/mnt/cc")
-    for _, f in ipairs({ "cat","clear","cp","ed","grep","head","kill","login","ls","mkdir","mv","rm","sed","sh","sleep","tail","touch","wc","chmod","chown","mount","umount","blkid","lsblk","lp" }) do
+    for _, f in ipairs({ "cat","clear","cp","ed","grep","head","kill","login","ls","mkdir","mv","rm","sed","sh","sleep","tail","touch","wc","chmod","chown","mount","umount","blkid","lsblk","lp","ps","pgrep","pkill","killall" }) do
         os.execute("cp -f " .. SRCBIN .. "/" .. f .. " " .. ROOT .. "/bin/" .. f)
         os.execute("chmod 755 " .. ROOT .. "/bin/" .. f)
     end
@@ -485,8 +491,8 @@ local function setupRoot()
         alice = { name = "alice", uid = 1000, gid = 1000, home = "/home/alice", shell = "/bin/sh" },
     }
     groups = {
-        root  = { gid = 0,    members = "root" },
-        alice = { gid = 1000, members = "alice" },
+        root  = { name = "root",  gid = 0,    members = "root" },
+        alice = { name = "alice", gid = 1000, members = "alice" },
     }
     local pw = "root:x:0:0:root:/root:/bin/sh\nalice:x:1000:1000:alice:/home/alice:/bin/sh\n"
     local gr = "root:x:0:root\nalice:x:1000:alice\n"
@@ -521,37 +527,63 @@ package.loaded["kernel.display"] = {
 local vfs = require("kernel.vfs")
 require("kernel.sysfs").mount()
 
---- /sys 下的路径走 sysfs 后端, 其余仍走宿主文件。
-local function sysfsFor(p)
+-- ---------------------------------------------------------------
+-- /proc: 用真实内核 procfs 后端 + 桩进程表(本 harness 的 procs/curPid),
+-- 让 ps/pgrep/pkill/killall 在宿主上走与真机完全一致的文件接口。
+-- ---------------------------------------------------------------
+REAL_G.os.version = REAL_G.os.version or function() return "CraftOS 1.8" end
+package.loaded["kernel.process"] = {
+    current = function()
+        local p = curPid and procs[curPid]
+        return { pid = curPid or 0, uid = (p and p.uid) or 0, gid = (p and p.gid) or 0 }
+    end,
+    info = function(pid) return procs[pid] end,
+    list = function()
+        local out = {}
+        for _, p in pairs(procs) do
+            if p.status == "running" or p.status == "stopped" then out[#out + 1] = p end
+        end
+        table.sort(out, function(a, b) return a.pid < b.pid end)
+        return out
+    end,
+    ttyFor = function(pid) return procs[pid] and "/dev/tty0" or nil end,
+    fgPgrpFor = function(pid) return procs[pid] and procs[pid].pgrp or nil end,
+}
+require("kernel.procfs").mount(os.epoch("utc"), "0.0.2")
+
+--- /sys 与 /proc 下的路径走虚拟后端, 其余仍走宿主文件。
+local function vfsFor(p)
     p = norm(p)
-    if p ~= "/sys" and p:sub(1, 5) ~= "/sys/" then return nil end
+    local underSys = (p == "/sys" or p:sub(1, 5) == "/sys/")
+    local underProc = (p == "/proc" or p:sub(1, 6) == "/proc/")
+    if not underSys and not underProc then return nil end
     return vfs.resolve(p)
 end
 
 local hostList, hostExists, hostIsDir, hostIsFile = F.list, F.exists, F.isDir, F.isFile
 local hostAttrs, hostSize, hostReadOnly, hostOpen = F.attributes, F.getSize, F.isReadOnly, F.open
 function F.list(p)
-    local b, r = sysfsFor(p)
+    local b, r = vfsFor(p)
     if b then return b.list(r) end
     return hostList(p)
 end
 function F.exists(p)
-    local b, r = sysfsFor(p)
+    local b, r = vfsFor(p)
     if b then return b.exists(r) end
     return hostExists(p)
 end
 function F.isDir(p)
-    local b, r = sysfsFor(p)
+    local b, r = vfsFor(p)
     if b then return b.isDir(r) end
     return hostIsDir(p)
 end
 function F.isFile(p)
-    local b, r = sysfsFor(p)
+    local b, r = vfsFor(p)
     if b then return b.exists(r) and not b.isDir(r) end
     return hostIsFile(p)
 end
 function F.attributes(p)
-    local b, r = sysfsFor(p)
+    local b, r = vfsFor(p)
     if b then
         local a = b.attributes(r)
         if a then a.uid, a.gid, a.mode = 0, 0, a.isDir and tonumber("40555", 8) or tonumber("100444", 8) end
@@ -560,17 +592,17 @@ function F.attributes(p)
     return hostAttrs(p)
 end
 function F.getSize(p)
-    local b, r = sysfsFor(p)
+    local b, r = vfsFor(p)
     if b then return b.getSize(r) end
     return hostSize(p)
 end
 function F.isReadOnly(p)
-    local b, r = sysfsFor(p)
+    local b, r = vfsFor(p)
     if b then return b.isReadOnly(r) end
     return hostReadOnly(p)
 end
 function F.open(p, mode)
-    local b, r = sysfsFor(p)
+    local b, r = vfsFor(p)
     if b then return b.open(r, mode or "r") end
     return hostOpen(p, mode)
 end

@@ -1,0 +1,165 @@
+-- Delin killall: 按进程名给所有同名进程发信号 (psmisc killall 子集)。
+-- 数据源 = /proc。用法:
+--   killall [-SIGNAL | -s SIGNAL | -l] [-e] [-q] [-u USER] NAME...
+--   NAME 必须与进程名(comm)完全相同; 默认信号 SIGTERM。
+--   -l  列出信号名;  -e 打印被杀的进程;  -q 名字没匹配到进程时不报错
+--   -u USER  只杀该用户的进程(用户名或 uid)
+-- 退出码: 0 = 每个 NAME 都至少匹配到一个进程; 1 = 有 NAME 没匹配到; 2 = 用法错误。
+-- killall 不杀自己(pgrep/pkill 的同一约定)。
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+local function readFile(path)
+    local h = fs.open(path, "r")
+    if not h then return nil end
+    local c = h.readAll()
+    h.close()
+    return c
+end
+
+local function parseStatus(text)
+    local t = {}
+    for line in text:gmatch("[^\n]+") do
+        local k, v = line:match("^(%w+):%s*(.*)$")
+        if k then t[k] = v end
+    end
+    return t
+end
+
+local function selfPid()
+    local st = readFile("/proc/self/stat")
+    if not st then return nil end
+    return tonumber(st:match("^(%d+)"))
+end
+
+--- 枚举 /proc 下的进程: { pid, comm }。
+local function candidates()
+    local out = {}
+    for _, e in ipairs(fs.list("/proc") or {}) do
+        local pid = tonumber(e)
+        if pid then
+            local comm = readFile("/proc/" .. pid .. "/comm")
+            if comm then
+                out[#out + 1] = { pid = pid, comm = (comm:gsub("\n$", "")) }
+            end
+        end
+    end
+    table.sort(out, function(a, b) return a.pid < b.pid end)
+    return out
+end
+
+local function resolveUser(spec)
+    local n = tonumber(spec)
+    if n then return n end
+    local u = syscalls and syscalls["user.get"] and syscalls["user.get"](spec)
+    if not u then return nil end
+    return u.uid
+end
+
+local function resolveSignal(spec)
+    local t = tostring(spec):gsub("^%-", "")
+    if t:match("^%d+$") then return tonumber(t) end
+    if t:match("^SIG") then t = t:sub(4) end
+    return syscalls["signal.number"](t)
+end
+
+local sig = 15
+local optE, optQ, optUser = false, false, nil
+local names = {}
+
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if a == "--" then
+        for k = i + 1, #args do names[#names + 1] = args[k] end
+        break
+    elseif a:sub(1, 2) == "--" then
+        local name, val = a:match("^%-%-([%w-]+)=?(.*)$")
+        if name == "signal" then
+            if val == "" then i = i + 1; val = args[i] end
+            if not val then stderr("killall: option '--signal' requires an argument\n"); return 2 end
+            sig = resolveSignal(val)
+            if not sig then stderr("killall: unknown signal " .. val .. "\n"); return 2 end
+        else
+            stderr("killall: unrecognized option '" .. a .. "'\n")
+            return 2
+        end
+    elseif a:sub(1, 1) == "-" and #a > 1 then
+        local j = 2
+        while j <= #a do
+            local c = a:sub(j, j)
+            if c == "e" then optE = true
+            elseif c == "q" then optQ = true
+            elseif c == "l" then
+                local t = {}
+                for _, n in ipairs(syscalls["signal.list"]()) do
+                    t[#t + 1] = syscalls["signal.name"](n)
+                end
+                io.write(table.concat(t, " ") .. "\n")
+                return 0
+            elseif c == "s" then
+                local val = a:sub(j + 1)
+                if val == "" then i = i + 1; val = args[i] end
+                if not val then stderr("killall: option requires an argument -- 's'\n"); return 2 end
+                sig = resolveSignal(val)
+                if not sig then stderr("killall: unknown signal " .. val .. "\n"); return 2 end
+                j = #a
+            elseif c == "u" then
+                local val = a:sub(j + 1)
+                if val == "" then i = i + 1; val = args[i] end
+                if not val then stderr("killall: option requires an argument -- 'u'\n"); return 2 end
+                optUser = resolveUser(val)
+                if optUser == nil then stderr("killall: user '" .. val .. "' does not exist\n"); return 2 end
+                j = #a
+            elseif c:match("%d") or c:match("%u") then
+                sig = resolveSignal(a:sub(j))
+                if not sig then stderr("killall: unknown signal " .. a:sub(j) .. "\n"); return 2 end
+                j = #a
+            else
+                stderr("killall: invalid option -- '" .. c .. "'\n")
+                return 2
+            end
+            j = j + 1
+        end
+    else
+        names[#names + 1] = a
+    end
+    i = i + 1
+end
+
+if #names == 0 then stderr("usage: killall [-SIGNAL] [-e] [-q] [-u user] name...\n"); return 2 end
+
+local self = selfPid()
+local procs = candidates()
+local outcome = 0
+for _, name in ipairs(names) do
+    local sent = 0
+    for _, p in ipairs(procs) do
+        if p.pid ~= self and p.comm == name then
+            local uidOk = true
+            if optUser ~= nil then
+                local s = parseStatus(readFile("/proc/" .. p.pid .. "/status") or "")
+                uidOk = (tonumber(s.Uid) or -1) == optUser
+            end
+            if uidOk then
+                local ok, err = syscalls["signal.kill"](p.pid, sig)
+                if ok then
+                    sent = sent + 1
+                    if optE then io.write(p.comm .. " killed (pid " .. p.pid .. ")\n") end
+                else
+                    stderr("killall: " .. p.pid .. ": " .. tostring(err) .. "\n")
+                end
+            end
+        end
+    end
+    if sent == 0 then
+        if not optQ then stderr("killall: " .. name .. ": no process found\n") end
+        outcome = 1
+    end
+end
+
+return outcome

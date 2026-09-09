@@ -48,6 +48,7 @@ local profiles = {
             ["kernel.tty"]       = "src/kernel/tty.lua",
             ["kernel.fb"]        = "src/kernel/fb.lua",
             ["kernel.sysfs"]     = "src/kernel/sysfs.lua",
+            ["kernel.procfs"]    = "src/kernel/procfs.lua",
         },
         assets = {},
         -- PID 1 用户态源码: 顺序敏感(unit -> service -> main), 内部 __require。

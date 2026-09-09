@@ -150,6 +150,7 @@ function process.spawn(src, name, ppid, uid, gid, argv, opts)
     local parent = registry[ppid]
     uid = uid or (parent and parent.uid) or 0
     gid = gid or (parent and parent.gid) or 0
+    argv = argv or {} -- proc.argv 与 env.argv 共用同一张表(/proc/<pid>/cmdline 的数据源)
 
     local pid = nextPid()
     -- 会话/进程组: 子进程继承父进程的 pgrp/sid(或内核会话 0)。
@@ -194,6 +195,7 @@ function process.spawn(src, name, ppid, uid, gid, argv, opts)
         co = co, status = "running", exitCode = nil, termSig = nil,
         uid = uid, gid = gid,
         cwd = env.cwd,
+        argv = argv,      -- [0]=程序名, [1..]=位置参数(/proc/<pid>/cmdline)
         envvars = env.env, -- 环境块(子进程 spawn 时继承)
         stdio = env.__stdio,
         pgrp = pgrp, sid = sid,
@@ -254,6 +256,41 @@ end
 ---@return DelinProcess|nil
 function process.info(pid)
     return registry[pid]
+end
+
+--- 列出仍存活的进程(running|stopped), 按 pid 升序。
+--- Delin 无 zombie 语义: 已退出(dead/error)的进程不进此表, 因此也不出现在 /proc 里
+--- (Linux 保留 zombie 直到父进程 wait)。
+---@return DelinProcess[]
+function process.list()
+    local out = {}
+    for _, p in pairs(registry) do
+        if p.status == "running" or p.status == "stopped" then out[#out + 1] = p end
+    end
+    table.sort(out, function(a, b) return a.pid < b.pid end)
+    return out
+end
+
+--- 进程的控制终端名(如 "/dev/tty0"); 无控制终端返回 nil。
+---@param pid integer
+---@return string|nil
+function process.ttyFor(pid)
+    local p = registry[pid]
+    if not p then return nil end
+    local sess = sessions[p.sid]
+    if not sess then return nil end
+    return sess.ctty
+end
+
+--- 进程所在会话的前台进程组(供 /proc/<pid>/stat 的 tpgid 字段); 无则 nil。
+---@param pid integer
+---@return integer|nil
+function process.fgPgrpFor(pid)
+    local p = registry[pid]
+    if not p then return nil end
+    local sess = sessions[p.sid]
+    if not sess then return nil end
+    return sess.fgPgrp
 end
 
 --- 注册子进程退出钩子(init 用): fn(pid, status, exitCode, termSig)。

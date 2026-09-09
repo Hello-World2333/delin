@@ -14,10 +14,10 @@
 
 | 路径 | 作用 |
 |---|---|
-| `/bin/` | 用户工具：`cat ls mkdir rm cp mv touch head tail wc grep sed kill login sh clear sleep systemctl syslogd logrotate logger dmesg mount umount lp` |
+| `/bin/` | 用户工具：`cat ls mkdir rm cp mv touch head tail wc grep sed kill ps pgrep pkill killall login sh clear sleep systemctl syslogd logrotate logger dmesg mount umount lp` |
 | `/dev/` | 设备文件：`/dev/ttyN`（字符终端）、`/dev/fbN`（像素帧缓冲）、`/dev/sdX`（磁盘，见下）、`/dev/lpN`（打印机字符设备，只写，见下）、`/dev/null`（读 EOF/写丢弃）、`/dev/console`（系统控制台 = 控制台 tty）、`/dev/kmsg`（内核 ring buffer 只读流）、`/dev/log`（用户态 syslog 输入） |
 | `/etc/` | 系统配置：`passwd` `shadow` `group`、`fstab`、`syslog.conf`、`logrotate.conf`、`systemd/system/`（管理员单元与 enable 标记） |
-| `/proc/` | 虚拟进程/系统信息 fs（由模块提供） |
+| `/proc/` | 虚拟进程/系统信息 fs（procfs，内核提供，见下）：`/proc/<pid>/{cmdline,comm,cwd,stat,status}`、`/proc/self`、`/proc/{mounts,uptime,version}` |
 | `/sys/` | sysfs 挂载点（虚拟）：`/sys/class/<class>/<条目>/<属性>`，class 由内核/模块注册 —— `display`（每显示设备一项，`name/type/size` 只读，分辨率/位置/旋转/缩放 可读写）与 `printer`（每打印设备一项，见下）；属性文件是单行值，读一次即 EOF |
 | `/lib/modules/<version>/` | 内核模块目录：`.ko` 模块 + 纯文本 `manifest` + `modules.alias` |
 | `/lib/systemd/system/` | 厂商单元文件（`.service` `.target` `.timer` `.mount`） |
@@ -44,7 +44,8 @@ CC 没有裸块 API：磁盘驱动器只提供「盘上的 CC 原生文件系统
 - **UUID**：CC 没有文件系统 UUID，用**磁盘 ID 模拟**——整盘为 `<磁盘ID>`，分区为 `<磁盘ID>-<分区号>`
   （如磁盘 ID 1 的第一个分区是 `1-1`）；无 ID 的介质（电脑盘/海龟盘）没有 UUID，不能用 `UUID=` 挂载。
 - **挂载**：`mount /dev/sda1 /mnt`（无 `-t` 时按节点自带类型）、`mount -t ccdisk /dev/sda /mnt`、
-  `mount UUID=1-1 /mnt`；`umount` 接受挂载点或设备节点。`mount` 无参列出挂载（含设备节点与 uuid），
+  `mount UUID=1-1 /mnt`；`umount` 接受挂载点或设备节点。`mount` 无参列出挂载
+  （设备节点/挂载点/类型/`ro|rw`/uuid，与 `/proc/mounts` 同一来源），
   `blkid` 列出设备的 UUID/TYPE/LABEL，`lsblk` 以树状列出设备与挂载点。
 - **原始字节**：分区节点可当字节设备打开（`fs.open("/dev/sda1","r")` 读镜像原始字节）；整盘是 CC 原生
   文件系统（目录树，不是字节流），打开会被拒绝，只能挂载。
@@ -74,6 +75,42 @@ Linux `lp(4)` 风格的**字符设备**：写入的字节流 = 交给打印机�
   （已写入内容仍成页打印，不留悬挂页），退出码 130。
 - 真机实测的打印机原始语义（`write` 不折行、`\n` 是普通字符、开页即扣 1 纸 + 1 墨、`endPage` 出纸盘满即失败）
   记录在 `scripts/printer_probe.lua` 的输出里。
+
+### procfs（`/proc`）与进程管理
+
+内核提供的进程/系统信息虚拟 fs（`src/kernel/procfs.lua`，boot 挂载；与 `/sys` 同层，**不由模块提供**）。
+全部只读，文件内容是打开时的快照，读尽即 EOF（与 sysfs 属性句柄同一语义）。
+
+| 路径 | 内容 |
+|---|---|
+| `/proc/<pid>/{cmdline,comm,cwd,stat,status}` | 单个进程的信息；进程退出后该目录立即消失 |
+| `/proc/self/...` | 调用者自身 pid 的别名（Linux 是符号链接，Delin 无 symlink，当目录解析） |
+| `/proc/mounts` | 挂载表：`<device> <mountpoint> <fstype> <options> 0 0` |
+| `/proc/uptime` | 自引导起的秒数（Linux 还有第二个 idle 字段，Delin 不统计 idle，不提供） |
+| `/proc/version` | `Delin OS <版本> (CraftOS <os.version>, Lua <_VERSION>)` |
+
+- `stat` = Linux 字段 **1..8**：`pid (comm) state ppid pgrp session tty tpgid`。
+  `state` 是 `R`（当前正在跑的那个进程）/`S`（存活但阻塞在事件上——Delin 无真正并发）/`T`（停止）；
+  `tty` 是 tty 名（如 `tty0`）或 `0`（无控制终端；Linux 这里是 dev_t 编码）。
+- `status` = Linux 的 `Name/State/Tgid/Pid/PPid/Pgrp/Session/Uid/Gid` 行；Delin 只有一个 uid/gid，
+  因此 `Uid`/`Gid` 行只有一列（Linux 是 real/effective/saved/fs 四列）。
+- `cmdline` = argv 以 NUL 分隔 + 结尾 NUL（Linux 语义）；`cwd` 是普通只读文件（Linux 是符号链接），
+  仅属主或 root 可读。
+- **不提供** `meminfo`/`cpuinfo`/`loadavg`/`fd` 等 —— Delin 没有对应数据源，不造假；
+  `ps` 因此也没有 `TIME`/`%CPU`/`%MEM`/`VSZ`/`RSS`/`STIME` 列。
+- **无 zombie 语义**：进程退出后其 `/proc/<pid>` 立即消失（Linux 保留 zombie 直到父进程 `wait`）。
+
+**进程管理工具**：`ps`（POSIX ps + procps/GNU/BSD 常用子集，纯 `/proc` 消费者）、`pgrep`/`pkill`
+（procps：按进程名/命令行查找、发信号）、`killall`（psmisc：按进程名发信号），加上已有的 `kill`。
+`ps` 默认列出**本控制终端上属于本用户的进程**（POSIX 选择规则）；`-e`/`-A`/`ax` 全部，`-a` 带终端的
+全部（不含会话首进程），`-x` 本用户全部，`-f`/`-l`/`u`(aux) 选格式，`-p PID`/`-t TTY`/`-u USER` 选择，
+`-o FIELD,...` 自定义列（`pid ppid pgrp pgid sess uid user gid group stat state tty comm cmd args cwd`），
+`--no-headers` 去表头；未知选项/未知列名 fail-fast（退出码 2）。默认输出 `PID TTY STAT COMMAND`，
+`-f` 是 `UID PID PPID STAT TTY COMMAND`，`-l` 是 `STAT UID PID PPID PGRP SESS TTY COMMAND`，
+`u`/`aux` 是 `USER PID PPID STAT TTY COMMAND`（无 TIME/%CPU/%MEM/VSZ/RSS/STIME 列）。
+`pgrep`/`pkill` 的模式用 **Lua pattern**（与 grep/sed 同一约定，不是 POSIX ERE），`-x` 锚定整串、
+`-f` 匹配完整命令行、`-n`/`-o` 取最新/最老（Delin 无启动时间，按 pid 大小）、`-u USER` 过滤用户，
+两者都不匹配自己（Linux 语义）；`pkill` 默认 `SIGTERM`，`killall` 要求进程名完全相同（不杀自己）。
 
 ### 接口与工具（POSIX + GNU 子集）
 
@@ -111,9 +148,10 @@ Linux `lp(4)` 风格的**字符设备**：写入的字节流 = 交给打印机�
 **工具**：`ls`、`cat`、`mkdir (-p)`、`rm (-r|-f)`、`cp (-r)`、`mv`、`touch`、`head (-n)`、`tail (-n)`、
 `sleep`（GNU 风格：小数秒 + `s/m/h/d` 后缀 + 多操作数求和；50ms 分片睡眠，信号可及时打断）、
 `wc (-l|-w|-c)`、`grep (-n|-i|-v)`、`sed`（GNU 子集：`s/y/d/p/q/a/i/c/=`、行号/`$`/正则地址与区间、
-`!` 取反、`-n -s -e -f -i`）、`ed`（POSIX 子集：`a/i/c/d/p/n/l/s/t/m/r/w/q/u/g/v/=`、地址 `.` `$` n `/re/` `+n` `-n`、输入模式以 `.` 结束）、`kill`、`login`、
+`!` 取反、`-n -s -e -f -i`）、`ed`（POSIX 子集：`a/i/c/d/p/n/l/s/t/m/r/w/q/u/g/v/=`、地址 `.` `$` n `/re/` `+n` `-n`、输入模式以 `.` 结束）、`kill`、
+`ps`/`pgrep`/`pkill`/`killall`（进程管理，见上文「procfs 与进程管理」）、`login`、
 `chmod`（八进制 + 符号模式 `[ugoa]*[+-=][rwx]*` + `-R` 递归）、`chown`（`[OWNER][:[GROUP]]` + `-R`）、
-`mount`（挂载 `/dev/sdX`、`UUID=<uuid>` 或镜像路径；无 `-t` 时按设备类型；无参列出挂载）、`umount`、
+`mount`（挂载 `/dev/sdX`、`UUID=<uuid>` 或镜像路径；无 `-t` 时按设备类型；无参列出挂载含 `ro|rw`）、`umount`、
 `blkid`（列出设备 UUID/TYPE/LABEL）、`lsblk`（树状列出设备/大小/类型/挂载点）、
 `systemctl`（init 控制）、`syslogd`/`logger`/`dmesg`/`logrotate`（日志）、
 `lp`（打印文件到 `/dev/lpN`）、`clear`（清屏：写 ANSI 复位+清屏+归位）、`sh`。
@@ -271,7 +309,7 @@ PID 1 现在是**用户态服务管理器**（`src/init/unit.lua` 单元解析 +
 用户态 `/dev/log`、`syslogd` 按 `/etc/syslog.conf` 写 `/var/log/*`（SIGHUP 重开、游标续读不重放）、
 `logrotate` + `logrotate.timer` 轮转、`logger`/`dmesg`。`/etc/fstab` 由 init 生成 mount 单元
 （`local-fs.target`），`mount -a` 复用同一解析器。init 里的自检代码已全部删除，验证改为
-宿主测试台 `tools/hosttest.lua`（264 项）与真机脚本 `tools/realmachine.py` +
+宿主测试台 `tools/hosttest.lua`（311 项）与真机脚本 `tools/realmachine.py` +
 `scripts/realmachine_verify.sh`。
 
 `src/bin/sh` 已升级为 POSIX 核心子集（变量/引号/if/for/while/case/函数/test/[ ]/&&/|| /文件重定向/管道
@@ -293,12 +331,19 @@ UUID 用磁盘 ID 模拟，磁盘不随启动自动挂载（改由 `/etc/fstab` 
 满页翻页由内核负责）+ `/sys/class/printer/<lpN>` 状态与页标题，`/bin/lp` 是 POSIX lp(1) 子集。
 sysfs 也从 display 专用泛化成 class 注册表（模块用 `kapi.registerSysfsClass` 注册自己的类）。
 
+进程可见性落地：内核 `procfs`（`/proc/<pid>/{cmdline,comm,cwd,stat,status}` + `/proc/self` +
+`/proc/{mounts,uptime,version}`，boot 挂载，只读、读尽即 EOF），配套 `ps`（默认/`-e`/`-f`/`-l`/`aux`/
+`-p`/`-t`/`-u`/`-o`/`--no-headers`）、`pgrep`/`pkill`（`-f`/`-x`/`-v`/`-n`/`-o`/`-u` + 信号）、
+`killall`（`-e`/`-q`/`-u`/`-l`）—— 全部是 `/proc` 的消费者，不额外开 syscall。
+`scripts/proc_test.sh`（41 项）在宿主 harness 与真机上各跑一次逐项比对。
+
 ### 引导
 
 代码经 `tools/bundle.lua` 打包成自包含 Lua 文件部署。两条引导路径：
 
 - **CC-fs 引导**（默认）：`kernel.lua` 直接跑 `boot.boot()`——`setupVfs` 挂根 hdd 到 `/` +
-  `mountDev` + `klog.register`（`/dev/kmsg`、`/dev/log`）→ `setupDevices` 扫描磁盘驱动器注册
+  `mountDev` + `klog.register`（`/dev/kmsg`、`/dev/log`）+ `procfs.mount` 挂 `/proc` →
+  `setupDevices` 扫描磁盘驱动器注册
   `/dev/sdX` 节点（不自动挂载）→ `registerConsole` 把电脑自身 `term` 注册为 `/dev/ttyN` 控制台
   （并派生 `/dev/console`）→ `setupModules`
   从 `/lib/modules/<version>/` 装模块（`loadAll` + `loadAliases` + 按外设 autoload 驱动，
@@ -384,8 +429,9 @@ lua5.1 tools/bundle.lua dlub     # 生成 dist/dlub.lua（DLUB 引导装载器�
 验证：
 
 ```bash
-lua5.1 tools/hosttest.lua        # 宿主测试: init 引擎/fstab/syslogd/logrotate/systemctl/sysfs/ccprinter/tty-ANSI (264 项)
-lua5.1 tools/harness.lua /bin/sh # 宿主上跑真实工具源码(sh/作业控制/管道; /sys 走真实 sysfs 后端)
+lua5.1 tools/hosttest.lua        # 宿主测试: init 引擎/fstab/syslogd/logrotate/systemctl/sysfs/ccprinter/procfs/tty-ANSI (311 项)
+lua5.1 tools/harness.lua /bin/sh # 宿主上跑真实工具源码(sh/作业控制/管道; /sys 走真实 sysfs 后端, /proc 走真实 procfs 后端)
+lua5.1 tools/harness.lua /bin/sh < scripts/proc_test.sh   # /proc + ps/pgrep/pkill/killall 自检(与真机比对)
 lua5.1 tools/ext2test.lua        # ext2 驱动宿主回归: 真实镜像上跑目录增删, 再用宿主 e2fsck -fn 判定
 python3 tools/realmachine.py --base /mnt/bak/root.base.img   # 真机: 先关机->打包->部署->重启 #3->取回 /var/log/*
 python3 tools/realmachine.py --printer   # 真机 + 打印机(会实际打印页面): 探测 printer API + 验证 /dev/lp0
@@ -423,6 +469,8 @@ src/kernel/tty.lua         字符终端(/dev/ttyN): 行规程+回显+光标+滚�
                             + ANSI 转义(SGR 颜色/ED-EL 清屏/CUP 定位/光标显隐与保存恢复)
 src/kernel/fb.lua          软件帧缓冲(/dev/fbN): 32 位 ARGB 像素缓冲+脏矩形 flush
 src/kernel/sysfs.lua       /sys 虚拟配置 fs(sysfs 风格, class/display 子树, 读=查/写=设)
+src/kernel/procfs.lua      /proc 虚拟进程/系统信息 fs: <pid>/{cmdline,comm,cwd,stat,status} + self
+                           + {mounts,uptime,version}, 只读, 读尽即 EOF(ps/pgrep/pkill/killall 的数据源)
 src/kernel/manifest.lua    /parts/manifest 解析器(root/boot 行 + 分区表)
 src/kernel/dlubcfg.lua     /dlub.cfg 解析器(bootdisk 行; 语法/未知键/重复键 fail-fast)
 src/kernel/dlub.lua        DLUB 引导装载器(GRUB 风格): /dlub.cfg 锁盘->清单->开区->挂 ext2->载内核
@@ -444,6 +492,11 @@ src/bin/grep               按 Lua 模式查找行 (-n|-i|-v)
 src/bin/sed                流式文本编辑器 (GNU 子集: s/y/d/p/q/a/i/c/=, 地址区间, -n -s -e -f -i)
 src/bin/ed                 行编辑器 (POSIX 子集: a/i/c/d/p/n/l/s/t/m/r/w/q/u/g/v/=, 正则地址与替换, 交互逐行读)
 src/bin/kill               发送信号到进程/进程组 (kill [-SIG] pid|-pgid; kill -l)
+src/bin/ps                 报告进程状态, 数据源 /proc (POSIX ps + procps/GNU/BSD 常用子集:
+                           默认/-e/-A/-a/-x/-f/-l/u(aux)/-p/-t/-u/-o/--no-headers; 无 TIME/%CPU/%MEM 列)
+src/bin/pgrep              按进程名/命令行查找进程 (procps pgrep 子集: -f -x -v -l -a -n -o -u; Lua pattern)
+src/bin/pkill              按进程名/命令行发信号 (procps pkill 子集: -SIG/-s/--signal + pgrep 的选择项)
+src/bin/killall            按进程名给所有同名进程发信号 (psmisc killall 子集: -SIG/-s/-l/-e/-q/-u)
 src/bin/chmod              修改文件权限 (八进制+符号模式 [ugoa]*[+-=][rwx]*, -R 递归)
 src/bin/chown              修改文件属主/属组 ([OWNER][:[GROUP]], -R 递归)
 src/bin/mount              挂载 /dev/sdX、UUID=<uuid> 或镜像路径 (-a 按 fstab; 无 -t 按设备类型; 无参列出)
@@ -472,14 +525,16 @@ src/modules/manifest       默认装载模块清单: demo ext2 ccdisk
 scripts/posix_test.sh      可移植 POSIX 自检(host 与 Delin 各跑一次比对, 111 项全过)
 scripts/jobctl_test.sh     作业控制自检(& / $! / jobs / fg / bg / wait / kill %job, host 与真机各跑一次)
 scripts/sysinfo.sh         实用小工具: 系统信息(变量/函数/for/case/if/重定向/工具)
+scripts/proc_test.sh       /proc + ps/pgrep/pkill/killall 自检(host harness 与真机各跑一次比对, 41 项)
 scripts/realmachine_verify.sh  真机验证脚本(由 verify.service 以 oneshot 运行, 结果写 /var/log/verify.log)
 scripts/printer_probe.lua  真机探测 CC printer 原始 API 语义(页尺寸/写不折行/开页扣纸墨), 写 /var/log/printer_probe.log
 scripts/printer_verify.sh  真机验证 ccprinter 模块(/dev/lp0 + /sys/class/printer, 会实际打印), 写 /var/log/printer_verify.log
 tools/bundle.lua           打包 src/ -> dist/kernel.lua 或 dist/dlub.lua(init 多文件拼成一个 chunk)
 tools/harness.lua          host 测试台: 用真实 Delin 工具源码在宿主跑(fs/io/syscalls/spawn 桩,
                            含信号/进程组语义: kill/killpg/SIGCONT/stopped, 供 sh 作业控制验证;
-                           /sys 走真实 kernel.sysfs 后端 + 桩显示设备 + 桩 printer(/dev/lp0))
-tools/hosttest.lua         宿主测试: init 单元引擎/fstab 生成/syslogd 规则/logrotate 轮转/systemctl/sysfs/ccprinter/tty-ANSI(264 项)
+                           /sys 与 /proc 走真实 kernel.sysfs/kernel.procfs 后端 + 桩显示设备
+                           + 桩 printer(/dev/lp0) + 桩进程表(ps/pgrep/pkill/killall))
+tools/hosttest.lua         宿主测试: init 单元引擎/fstab 生成/syslogd 规则/logrotate 轮转/systemctl/sysfs/ccprinter/procfs/tty-ANSI(311 项)
 tools/ext2test.lua         宿主 ext2 回归: 真实镜像上跑目录增删(空洞/links/回收), 宿主 e2fsck -fn 判定
 tools/deploy.py            重建干净 ext2 根镜像(基镜像+内核/bin/单元/配置/标记), 属主按基镜像逐条写回;
                            基镜像损坏/rdump 漏文件/构建后 fsck 不过一律 fail-fast

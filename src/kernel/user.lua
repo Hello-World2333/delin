@@ -65,7 +65,7 @@ function user.parse(passwd, shadow, group)
         line = trim(line)
         if line ~= "" and line:sub(1, 1) ~= "#" then
             local gname, x, gid, members = line:match("^([^:]+):([^:]*):([^:]+):(.*)$")
-            if gname then db.groups[gname] = { gid = tonumber(gid), members = trim(members or "") } end
+            if gname then db.groups[gname] = { name = gname, gid = tonumber(gid), members = trim(members or "") } end
         end
     end
 
@@ -88,6 +88,11 @@ end
 
 function user.groupByName(db, name)
     return db.groups and db.groups[name]
+end
+
+function user.groupByGid(db, gid)
+    for _, g in pairs(db.groups or {}) do if g.gid == gid then return g end end
+    return nil
 end
 
 function user.list(db)
@@ -115,6 +120,7 @@ function user.registerSyscalls(db)
     s["user.list"] = function() return user.list(db) end
     s["user.byUid"] = function(uid) return user.byUid(db, uid) end
     s["user.groupByName"] = function(name) return user.groupByName(db, name) end
+    s["user.groupByGid"] = function(gid) return user.groupByGid(db, gid) end
 end
 
 return user
