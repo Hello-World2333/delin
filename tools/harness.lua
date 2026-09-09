@@ -475,7 +475,7 @@ local SRCBIN = "/home/worker/delin/src/bin"
 local function setupRoot()
     os.execute("rm -rf " .. ROOT .. " && mkdir -p " .. ROOT)
     os.execute("mkdir -p " .. ROOT .. "/bin " .. ROOT .. "/etc " .. ROOT .. "/home/alice " .. ROOT .. "/root " .. ROOT .. "/tmp " .. ROOT .. "/mnt/cc")
-    for _, f in ipairs({ "cat","cp","ed","grep","head","kill","login","ls","mkdir","mv","rm","sed","sh","sleep","tail","touch","wc","chmod","chown","mount","umount","blkid","lsblk" }) do
+    for _, f in ipairs({ "cat","cp","ed","grep","head","kill","login","ls","mkdir","mv","rm","sed","sh","sleep","tail","touch","wc","chmod","chown","mount","umount","blkid","lsblk","lp" }) do
         os.execute("cp -f " .. SRCBIN .. "/" .. f .. " " .. ROOT .. "/bin/" .. f)
         os.execute("chmod 755 " .. ROOT .. "/bin/" .. f)
     end
@@ -498,7 +498,7 @@ local function setupRoot()
     w("/home/alice/x.txt", "alice file\n")
     -- /dev 占位
     os.execute("mkdir -p " .. ROOT .. "/dev " .. ROOT .. "/proc " .. ROOT .. "/sys/class/display")
-    os.execute("touch " .. ROOT .. "/dev/null") -- 占位(打开走 NULL_HANDLE, 使 ls /dev 一致)
+    os.execute("touch " .. ROOT .. "/dev/null " .. ROOT .. "/dev/lp0") -- 占位(打开走设备桩, 使 ls /dev 一致)
     os.execute("mkdir -p " .. ROOT .. "/lib/modules/0.0.2")
 end
 
@@ -578,6 +578,56 @@ end
 setupRoot()
 
 -- ---------------------------------------------------------------
+-- 桩 printer: /dev/lp0 的写入落到 ROOT/printer.out, /sys/class/printer/lp0 提供状态与可写标题。
+-- 让 /bin/lp 在宿主上跑完整路径(ccprinter 内核驱动的分页逻辑由 tools/hosttest.lua 单测)。
+-- ---------------------------------------------------------------
+local printerOut = assert(io.open(ROOT .. "/printer.out", "w"))
+local printerTitle = ""
+require("kernel.sysfs").registerClass("printer", {
+    list = function() return { "lp0" } end,
+    attrs = function(e)
+        if e ~= "lp0" then return nil end
+        return { "name", "type", "size", "paper", "ink", "title" }
+    end,
+    writable = function(_, a) return a == "title" end,
+    get = function(e, a)
+        if e ~= "lp0" then return nil end
+        if a == "name" then return "top" end
+        if a == "type" then return "printer" end
+        if a == "size" then return "25x21" end
+        if a == "paper" then return "10" end
+        if a == "ink" then return "10" end
+        if a == "title" then return printerTitle end
+        return nil
+    end,
+    set = function(e, a, v)
+        if e ~= "lp0" then return nil, "no such printer: " .. tostring(e) end
+        if a ~= "title" then return nil, "read-only attribute: " .. tostring(a) end
+        printerTitle = v
+        local tf = io.open(ROOT .. "/printer.title", "w")
+        tf:write(v)
+        tf:close()
+        return true
+    end,
+})
+local LP_HANDLE = {
+    write = function(_, s) printerOut:write(s); return #tostring(s) end,
+    writeLine = function(_, s) printerOut:write(s .. "\n"); return #tostring(s) + 1 end,
+    flush = function() return true end,
+    close = function() printerOut:close(); return true end,
+    read = function() return nil end,
+    readLine = function() return nil end,
+}
+local openBeforeLp = F.open
+function F.open(p, mode)
+    if norm(p) == "/dev/lp0" then
+        if mode and (mode:find("w") or mode:find("a")) then return LP_HANDLE end
+        return nil, "write-only device: /dev/lp0"
+    end
+    return openBeforeLp(p, mode)
+end
+
+-- ---------------------------------------------------------------
 -- 运行工具: 顶层进程。argv[0] = 工具名(参数1), args = 其余。
 -- ---------------------------------------------------------------
 local argsIn = {}
@@ -608,10 +658,13 @@ local src = tsrc:readAll(); tsrc:close()
 
 local argv0 = { [0] = toolPath }
 for i = 1, #toolArgs do argv0[i] = toolArgs[i] end
-spawn(src, toolPath, nil, nil, nil, argv0, { cwd = "/" })
+local topPid = spawn(src, toolPath, nil, nil, nil, argv0, { cwd = "/" })
 
 -- 运行协作式调度器, 驱动顶层进程及其 spawn 出的子进程(管道/作业控制)。
 schedulerRun()
 
 -- flush
 io.stdout:flush()
+-- 顶层进程的退出码 = 工具的退出码(与内核一致), 便于脚本按 $? 断言。
+local top = procs[topPid]
+os.exit((top and top.exitCode) or 0)

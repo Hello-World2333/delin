@@ -1,0 +1,122 @@
+-- Delin lp: 打印文件 (POSIX lp(1) 子集)。
+-- 用法: lp [-d dest] [-t title] [--] [file ...]
+--   -d dest   打印机设备节点(默认 /dev/lp0; 可写 lp0 或 /dev/lp0)
+--   -t title  页标题(写 /sys/class/printer/<节点>/title, 由 ccprinter 内核模块提供)
+-- 无 file 或 file 为 "-" 时读 stdin。多个文件连接成一个打印流(一个打印任务)。
+-- 内容按行写入设备, 内核按页宽折行/满页翻页, 关闭设备时打印最后一页。
+-- 退出码: 0 成功; 1 出错(文件/设备打不开、标题设置失败); 130 被 ^C 中断。
+-- 让出调度器: 同 cat, 每累计 ~50ms CPU 时间让出一次, 防止长打印饿死事件循环。
+local _msleep = os.msleep or function(ms) os.sleep(math.max((ms or 0) / 1000, 0.05)) end
+local _sliceAt = os.epoch("utc")
+local function yieldCheck(_n)
+    local now = os.epoch("utc")
+    if now - _sliceAt >= 50 then
+        _sliceAt = now
+        _msleep(0)
+    end
+end
+
+-- ^C 时停止喂数据并关闭设备: 已写入的内容仍会成页打印, 不留悬挂的进行中页面。
+local _interrupted = false
+if syscalls and syscalls["signal.install"] then
+    syscalls["signal.install"](2, function() _interrupted = true end)
+end
+
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+local function resolve(p)
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+
+local dest, title = "/dev/lp0", nil
+local files = {}
+local noMoreOpts = false
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if noMoreOpts then
+        files[#files + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "-d" and args[i + 1] then
+        i = i + 1; dest = args[i]
+    elseif a:match("^%-%-destination=") then
+        dest = a:sub(15)
+    elseif a == "-t" and args[i + 1] then
+        i = i + 1; title = args[i]
+    elseif a:match("^%-%-title=") then
+        title = a:sub(9)
+    elseif a == "--help" or a == "-h" then
+        io.write("usage: lp [-d dest] [-t title] [file ...]\n")
+        return 0
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        stderr("lp: invalid option '" .. a .. "'\n")
+        return 1
+    else
+        files[#files + 1] = a
+    end
+    i = i + 1
+end
+if #files == 0 then files = { "-" } end
+
+-- "lp0" 与 "/dev/lp0" 都接受
+if dest:sub(1, 1) ~= "/" then dest = "/dev/" .. dest end
+
+-- 页标题必须在第一行数据之前设好(内核在首次写入时开页)。
+if title then
+    local node = dest:match("([^/]+)$")
+    local tf, terr = fs.open("/sys/class/printer/" .. node .. "/title", "w")
+    if not tf then
+        stderr("lp: " .. dest .. ": cannot set title: " .. tostring(terr) .. "\n")
+        return 1
+    end
+    tf:writeLine(title)
+    tf:close()
+end
+
+local out, oerr = fs.open(dest, "w")
+if not out then
+    stderr("lp: " .. dest .. ": " .. tostring(oerr) .. "\n")
+    return 1
+end
+
+local rc = 0
+for _, f in ipairs(files) do
+    if _interrupted then break end
+    local inHandle
+    if f == "-" then
+        inHandle = io.stdin()
+    else
+        local fh, ferr = fs.open(resolve(f), "r")
+        if not fh then
+            stderr("lp: " .. f .. ": " .. tostring(ferr) .. "\n")
+            rc = 1
+            break
+        end
+        inHandle = fh
+    end
+    while not _interrupted do
+        local line = inHandle.readLine()
+        if line == nil then break end
+        out:write(line .. "\n")
+        yieldCheck(#line + 1)
+    end
+    if f ~= "-" then inHandle:close() end
+end
+
+-- close = 打印最后一页(内核 endPage); 无论成功/出错/中断都必须关闭, 否则页面悬挂。
+out:close()
+if _interrupted then return 130 end
+return rc

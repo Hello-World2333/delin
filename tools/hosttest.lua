@@ -830,5 +830,128 @@ do
     ok(not b.exists(r), "sysfs: 不存在的属性 exists=false")
 end
 
+-- ===============================================================
+-- I. ccprinter: /dev/lpN 流式写 -> 折行/分页, /sys/class/printer/<lpN> 状态
+--    (sysfs 已泛化为 class 注册表; 用桩 printer 外设验证驱动的分页逻辑)
+--    真机实测的打印机语义见 scripts/printer_probe.lua: 页 25x21, write 不折行,
+--    \n 是普通字符, 开页即扣 1 纸 + 1 墨。
+-- ===============================================================
+do
+    local vfs = require("kernel.vfs")
+    local sysfs = require("kernel.sysfs")
+
+    -- 桩 printer 外设: 记录调用与每页内容
+    local calls, pages = {}, {}
+    local cur, curRow, curTitle
+    local fake = {
+        newPage = function()
+            if cur then return false end -- 真机上新开页会先打印旧页; 桩里直接拒绝
+            calls[#calls + 1] = "newPage"
+            cur, curRow, curTitle = {}, 0, ""
+            return true
+        end,
+        endPage = function()
+            if not cur then return false end
+            calls[#calls + 1] = "endPage"
+            pages[#pages + 1] = { title = curTitle, rows = cur }
+            cur = nil
+            return true
+        end,
+        getPageSize = function() return 25, 3 end, -- 3 行小页, 便于测分页
+        setCursorPos = function(x, y)
+            calls[#calls + 1] = "pos " .. x .. "," .. y
+            curRow = y
+        end,
+        write = function(s)
+            calls[#calls + 1] = "write '" .. s .. "'"
+            cur[curRow] = (cur[curRow] or "") .. s
+        end,
+        setPageTitle = function(t) curTitle = t; calls[#calls + 1] = "title '" .. t .. "'" end,
+        getPaperLevel = function() return 5 end,
+        getInkLevel = function() return 9 end,
+    }
+    _G.peripheral = { wrap = function() return fake end }
+
+    local device, cls
+    local kapi = {
+        log = function() end,
+        registerDevice = function(n, h) device = { name = n, handler = h } end,
+        unregisterDevice = function() end,
+        registerSysfsClass = function(n, ops) cls = { name = n, ops = ops }; sysfs.registerClass(n, ops) end,
+        unregisterSysfsClass = function(n) sysfs.unregisterClass(n) end,
+    }
+
+    local src = assert(readFile(REPO .. "/src/modules/ccprinter.ko"))
+    local env = setmetatable({ require = require }, { __index = _G })
+    local chunk
+    if _VERSION == "Lua 5.1" then
+        chunk = assert(loadstring(src, "ccprinter"))
+        setfenv(chunk, env)
+    else
+        chunk = assert(load(src, "ccprinter", "t", env))
+    end
+    local mod = chunk()
+    mod.init(kapi, "top")
+
+    eq(device and device.name, "lp0", "ccprinter: 注册 /dev/lp0")
+    eq(cls and cls.name, "printer", "ccprinter: 注册 sysfs printer 类")
+
+    local function openAttr(path, mode)
+        local b, r = vfs.resolve(path)
+        local fh, err = b.open(r, mode or "r")
+        ok(fh ~= nil, "ccprinter: 打开 " .. path, err)
+        return fh
+    end
+
+    -- 未开页时页尺寸未知(空属性读即 EOF)
+    eq(openAttr("/sys/class/printer/lp0/size").readAll(), nil, "ccprinter: 未开页时 size 为空")
+
+    -- 4 行写进 3 行的页: 第 4 行触发自动翻页
+    local h = device.handler.open("w")
+    ok(h ~= nil, "ccprinter: 打开 /dev/lp0 写")
+    h:write("a\nb\nc\nd\n")
+    h:close()
+    eq(#pages, 2, "ccprinter: 满 3 行自动 endPage 并开新页")
+    eq(pages[1].rows[1], "a", "ccprinter: 第 1 页第 1 行")
+    eq(pages[1].rows[3], "c", "ccprinter: 第 1 页第 3 行")
+    eq(pages[2].rows[1], "d", "ccprinter: 第 2 页第 1 行")
+    eq(openAttr("/sys/class/printer/lp0/size").readAll(), "25x3", "ccprinter: 开页后 sysfs size")
+
+    -- 超宽行折行: 30 字符 -> 25 + 5
+    h = device.handler.open("w")
+    h:write(string.rep("x", 30) .. "\n")
+    h:close()
+    eq(#pages, 3, "ccprinter: 折行不额外翻页")
+    eq(string.len(pages[3].rows[1]), 25, "ccprinter: 折行第 1 行 25 字符")
+    eq(pages[3].rows[2], "xxxxx", "ccprinter: 折行余下 5 字符到第 2 行")
+
+    -- sysfs 状态
+    eq(openAttr("/sys/class/printer/lp0/name").readAll(), "top", "ccprinter: sysfs name = 外设名")
+    eq(openAttr("/sys/class/printer/lp0/type").readAll(), "printer", "ccprinter: sysfs type")
+    eq(openAttr("/sys/class/printer/lp0/paper").readAll(), "5", "ccprinter: sysfs paper")
+    eq(openAttr("/sys/class/printer/lp0/ink").readAll(), "9", "ccprinter: sysfs ink")
+
+    -- 页标题: 可写, 并在开页时下发给外设
+    local tw = openAttr("/sys/class/printer/lp0/title", "w")
+    tw:write("Hello\n")
+    tw:close()
+    eq(openAttr("/sys/class/printer/lp0/title").readAll(), "Hello", "ccprinter: title 可写")
+    h = device.handler.open("w")
+    h:write("t\n")
+    h:close()
+    eq(pages[#pages].title, "Hello", "ccprinter: 开页时把标题下发外设")
+
+    -- 只读属性拒绝写; 设备只写
+    local b, r = vfs.resolve("/sys/class/printer/lp0/paper")
+    local bad, badErr = b.open(r, "w")
+    ok(bad == nil and tostring(badErr):find("read%-only"), "ccprinter: paper 只读", badErr)
+    local dh, derr = device.handler.open("r")
+    ok(dh == nil and tostring(derr):find("write%-only"), "ccprinter: /dev/lp0 只写", derr)
+
+    -- /sys/class 同时列出两个类
+    b, r = vfs.resolve("/sys/class")
+    eq(table.concat(b.list(r), ","), "display,printer", "sysfs: /sys/class 列出 display 与 printer")
+end
+
 io.write(string.format("\n%d passed, %d failed\n", pass, fail))
 os.exit(fail == 0 and 0 or 1)

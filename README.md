@@ -14,11 +14,11 @@
 
 | 路径 | 作用 |
 |---|---|
-| `/bin/` | 用户工具：`cat ls mkdir rm cp mv touch head tail wc grep sed kill login sh sleep systemctl syslogd logrotate logger dmesg mount umount` |
-| `/dev/` | 设备文件：`/dev/ttyN`（字符终端）、`/dev/fbN`（像素帧缓冲）、`/dev/sdX`（磁盘，见下）、`/dev/null`（读 EOF/写丢弃）、`/dev/console`（系统控制台 = 控制台 tty）、`/dev/kmsg`（内核 ring buffer 只读流）、`/dev/log`（用户态 syslog 输入） |
+| `/bin/` | 用户工具：`cat ls mkdir rm cp mv touch head tail wc grep sed kill login sh sleep systemctl syslogd logrotate logger dmesg mount umount lp` |
+| `/dev/` | 设备文件：`/dev/ttyN`（字符终端）、`/dev/fbN`（像素帧缓冲）、`/dev/sdX`（磁盘，见下）、`/dev/lpN`（打印机字符设备，只写，见下）、`/dev/null`（读 EOF/写丢弃）、`/dev/console`（系统控制台 = 控制台 tty）、`/dev/kmsg`（内核 ring buffer 只读流）、`/dev/log`（用户态 syslog 输入） |
 | `/etc/` | 系统配置：`passwd` `shadow` `group`、`fstab`、`syslog.conf`、`logrotate.conf`、`systemd/system/`（管理员单元与 enable 标记） |
 | `/proc/` | 虚拟进程/系统信息 fs（由模块提供） |
-| `/sys/` | sysfs 挂载点（虚拟）；`/sys/class/display/` 下每设备一个目录，`name/type/size` 只读，分辨率/位置/旋转/缩放 可读写；属性文件是单行值，读一次即 EOF |
+| `/sys/` | sysfs 挂载点（虚拟）：`/sys/class/<class>/<条目>/<属性>`，class 由内核/模块注册 —— `display`（每显示设备一项，`name/type/size` 只读，分辨率/位置/旋转/缩放 可读写）与 `printer`（每打印设备一项，见下）；属性文件是单行值，读一次即 EOF |
 | `/lib/modules/<version>/` | 内核模块目录：`.ko` 模块 + 纯文本 `manifest` + `modules.alias` |
 | `/lib/systemd/system/` | 厂商单元文件（`.service` `.target` `.timer` `.mount`） |
 | `/run/` | 运行时状态（真实目录，非 tmpfs —— Delin 无 tmpfs）：pid 文件等 |
@@ -50,6 +50,31 @@ CC 没有裸块 API：磁盘驱动器只提供「盘上的 CC 原生文件系统
   文件系统（目录树，不是字节流），打开会被拒绝，只能挂载。
 - 磁盘插入/弹出（CC `disk` / `disk_eject` 事件）时内核重新扫描并刷新 `/dev` 节点。
 
+### 打印机设备（`/dev/lpN`）
+
+CC 打印机的原始 API 是「页」式的（`newPage`/`write`/`setCursorPos`/`endPage`），内核把它抽象成
+Linux `lp(4)` 风格的**字符设备**：写入的字节流 = 交给打印机打印的文本。
+
+| 节点 | 含义 |
+|---|---|
+| `/dev/lp0`、`/dev/lp1` … | 打印机字符设备（只写）；`cat f > /dev/lp0` 或 `lp f` 即打印 |
+
+- **写语义**：内核按页宽（真机实测 25 列）折行、写满一页（21 行）立即 `endPage` 打印并开新页，
+  `close` 时把当前未满的页也打印出来 —— 因此一次 `cat`/`lp` 就是一次完整打印，不会留下悬挂的
+  「进行中页面」（CC 的进行中页无法取消，且随方块状态跨重启残留；真机上 `newPage` 会先把旧页打出来，
+  所以上次崩溃留下的悬挂页会在下次打印时自动补打）。
+- **状态与控制**：`/sys/class/printer/<节点>/` 下 `name`（外设名）、`type`、`size`（页尺寸 `WxH`，
+  首次开页后才可知，之前为空）、`paper`、`ink` 只读；`title` 可写（页标题，对已开始的页立即生效，
+  否则用于下一页）。
+- **fail-fast**：纸/墨不足或出纸盘满时 `newPage`/`endPage` 返回 false，驱动直接报错，不静默丢数据。
+  注意 CC 打印机的**出纸盘只有 6 格**，满了之后 `endPage` 会失败（页出不来），必须先取出打印页；
+  此时留下的「进行中页」会在下次开页时自动补打，不需要额外恢复。
+- **`/bin/lp`**：POSIX lp(1) 子集 —— `lp [-d dest] [-t title] [file...]`，`-d` 默认 `/dev/lp0`
+  （也接受 `lp0`），无文件或 `-` 读 stdin，多个文件连接成一个打印流；`^C` 时停止喂数据并关闭设备
+  （已写入内容仍成页打印，不留悬挂页），退出码 130。
+- 真机实测的打印机原始语义（`write` 不折行、`\n` 是普通字符、开页即扣 1 纸 + 1 墨、`endPage` 出纸盘满即失败）
+  记录在 `scripts/printer_probe.lua` 的输出里。
+
 ### 接口与工具（POSIX + GNU 子集）
 
 **进程模型**：`pid/ppid/uid/gid`；`argv`（`[0]`=程序名，`[1..]`=位置参数）；会话（`sid`）与进程组
@@ -75,7 +100,8 @@ CC 没有裸块 API：磁盘驱动器只提供「盘上的 CC 原生文件系统
 `chmod`（八进制 + 符号模式 `[ugoa]*[+-=][rwx]*` + `-R` 递归）、`chown`（`[OWNER][:[GROUP]]` + `-R`）、
 `mount`（挂载 `/dev/sdX`、`UUID=<uuid>` 或镜像路径；无 `-t` 时按设备类型；无参列出挂载）、`umount`、
 `blkid`（列出设备 UUID/TYPE/LABEL）、`lsblk`（树状列出设备/大小/类型/挂载点）、
-`systemctl`（init 控制）、`syslogd`/`logger`/`dmesg`/`logrotate`（日志）、`sh`。
+`systemctl`（init 控制）、`syslogd`/`logger`/`dmesg`/`logrotate`（日志）、
+`lp`（打印文件到 `/dev/lpN`）、`sh`。
 各工具支持 POSIX 的 **`--` 结束选项** 标记：`rm -- --help`、`touch -- -file`、`ls -- --ff` 等，用于操作以
 `-`/`--` 开头的文件名；单独的 `-` 视为普通操作数。
 
@@ -227,7 +253,7 @@ PID 1 现在是**用户态服务管理器**（`src/init/unit.lua` 单元解析 +
 用户态 `/dev/log`、`syslogd` 按 `/etc/syslog.conf` 写 `/var/log/*`（SIGHUP 重开、游标续读不重放）、
 `logrotate` + `logrotate.timer` 轮转、`logger`/`dmesg`。`/etc/fstab` 由 init 生成 mount 单元
 （`local-fs.target`），`mount -a` 复用同一解析器。init 里的自检代码已全部删除，验证改为
-宿主测试台 `tools/hosttest.lua`（113 项）与真机脚本 `tools/realmachine.py` +
+宿主测试台 `tools/hosttest.lua`（160 项）与真机脚本 `tools/realmachine.py` +
 `scripts/realmachine_verify.sh`。
 
 `src/bin/sh` 已升级为 POSIX 核心子集（变量/引号/if/for/while/case/函数/test/[ ]/&&/|| /文件重定向/管道
@@ -241,6 +267,10 @@ UUID 用磁盘 ID 模拟，磁盘不随启动自动挂载（改由 `/etc/fstab` 
 新增 `read` 内建（POSIX，跟随 `IFS` 变量）与 `/bin/sleep`（GNU 风格，分片睡眠便于信号打断）。
 `scripts/posix_test.sh`（111 项）与 `scripts/jobctl_test.sh` 在宿主与 Delin 上各跑一次逐项比对，
 `scripts/sysinfo.sh` 演示实用用法。
+
+打印机经 `ccprinter` 模块抽象成 `/dev/lpN` 字符设备（`cat f > /dev/lp0` / `lp f` 即打印，折行与
+满页翻页由内核负责）+ `/sys/class/printer/<lpN>` 状态与页标题，`/bin/lp` 是 POSIX lp(1) 子集。
+sysfs 也从 display 专用泛化成 class 注册表（模块用 `kapi.registerSysfsClass` 注册自己的类）。
 
 ### 引导
 
@@ -289,6 +319,10 @@ UUID 用磁盘 ID 模拟，磁盘不随启动自动挂载（改由 `/etc/fstab` 
   进程 `print` 记 user.info，内核消息记 kern.info。
 - **stdio 按进程隔离**：每个进程有自己的 `stdin/stdout`；spawn 时从父进程继承（或 boot 默认终端），
   `stdio.set` 只改当前进程；`io.write/read` 经 `vfs_api.setStdio` 兜底到终端。
+  进程退出时内核**只关带 `.pipe` 标记的管道端**（递减 writer/reader 计数，让对端读到 EOF）——
+  重定向的文件/设备句柄是父进程打开后共享给子进程的，子进程退出只让引用消失，由打开者自己关
+  （POSIX fd 语义；`cat f > /dev/lp0` 的 `endPage` 因此由 sh 在进程上下文里触发，
+  而不是内核的退出清理——CC 的 mainThread 外设方法在内核上下文里调用会挂住机器）。
 - **tty 焦点切换**：只有前台 tty 接收键盘。`Ctrl+Alt+1..0` 切换前台 tty，多 tty 共用一把键盘；
   行缓冲 + 回显（canonical 行规程），焦点 tty 收到 `^C`/`^Z` 时把信号投给其前台进程组。
 - **getty/login**：init 为每个 `/dev/ttyN` 实例化 `getty@ttyN.service`（`ExecStart=/bin/login %I`）；
@@ -316,9 +350,10 @@ lua5.1 tools/bundle.lua dlub     # 生成 dist/dlub.lua（DLUB 引导装载器�
 验证：
 
 ```bash
-lua5.1 tools/hosttest.lua        # 宿主测试: init 引擎/fstab/syslogd/logrotate/systemctl/sysfs (131 项)
+lua5.1 tools/hosttest.lua        # 宿主测试: init 引擎/fstab/syslogd/logrotate/systemctl/sysfs/ccprinter (160 项)
 lua5.1 tools/harness.lua /bin/sh # 宿主上跑真实工具源码(sh/作业控制/管道; /sys 走真实 sysfs 后端)
 python3 tools/realmachine.py     # 真机: 打包->部署->重启电脑 #3->取回 /var/log/*
+python3 tools/realmachine.py --printer   # 真机 + 打印机(会实际打印页面): 探测 printer API + 验证 /dev/lp0
 ```
 
 ## 约定
@@ -383,25 +418,30 @@ src/bin/syslogd            系统日志守护进程: /dev/kmsg+/dev/log -> /etc/
 src/bin/logrotate          日志轮转 (logrotate(8) 子集: size/daily/rotate/create/notifempty/missingok)
 src/bin/logger             写一条消息到 /dev/log (util-linux logger 子集)
 src/bin/dmesg              打印内核 ring buffer (/dev/kmsg)
+src/bin/lp                 打印文件 (POSIX lp(1) 子集: -d 设备 -t 标题, 无文件读 stdin)
 src/bin/sh                 交互/脚本 shell(POSIX 核心子集: 变量/IFS/引号/if/for/while/case/函数/test/[ ]/&&/||
                            /重定向/管道/作业控制(& jobs fg bg wait kill %job)/read, 支持 -c 与 shebang 脚本)
 src/units/*                厂商单元文件 -> /lib/systemd/system/ (default/multi-user/local-fs/getty/timers
                            target, syslogd.service, getty@.service, logrotate.service/.timer)
 src/etc/{fstab,syslog.conf,logrotate.conf}  系统配置 -> /etc/
-src/modules/*.ko           内核模块: ccdisk(ccdisk fstype) ccmonitor(CC 显示器驱动) cc_hse(HSE 时钟拉模式
-                           os.msleep) demo(演示) ext2(ext2 fstype) tom(Tom GPU 驱动) void(Void 全息驱动)
-src/modules/modules.alias  驱动别名(modprobe 风格): tm_gpu->tom hologram->void monitor->ccmonitor
+src/modules/*.ko           内核模块: ccdisk(ccdisk fstype) ccmonitor(CC 显示器驱动) ccprinter(CC 打印机 ->
+                           /dev/lpN + sysfs printer 类) cc_hse(HSE 时钟拉模式 os.msleep) demo(演示)
+                           ext2(ext2 fstype) tom(Tom GPU 驱动) void(Void 全息驱动)
+src/modules/modules.alias  驱动别名(modprobe 风格): tm_gpu->tom hologram->void monitor->ccmonitor printer->ccprinter
 src/modules/manifest       默认装载模块清单: demo ext2 ccdisk
 scripts/posix_test.sh      可移植 POSIX 自检(host 与 Delin 各跑一次比对, 111 项全过)
 scripts/jobctl_test.sh     作业控制自检(& / $! / jobs / fg / bg / wait / kill %job, host 与真机各跑一次)
 scripts/sysinfo.sh         实用小工具: 系统信息(变量/函数/for/case/if/重定向/工具)
 scripts/realmachine_verify.sh  真机验证脚本(由 verify.service 以 oneshot 运行, 结果写 /var/log/verify.log)
+scripts/printer_probe.lua  真机探测 CC printer 原始 API 语义(页尺寸/写不折行/开页扣纸墨), 写 /var/log/printer_probe.log
+scripts/printer_verify.sh  真机验证 ccprinter 模块(/dev/lp0 + /sys/class/printer, 会实际打印), 写 /var/log/printer_verify.log
 tools/bundle.lua           打包 src/ -> dist/kernel.lua 或 dist/dlub.lua(init 多文件拼成一个 chunk)
 tools/harness.lua          host 测试台: 用真实 Delin 工具源码在宿主跑(fs/io/syscalls/spawn 桩,
                            含信号/进程组语义: kill/killpg/SIGCONT/stopped, 供 sh 作业控制验证;
-                           /sys 走真实 kernel.sysfs 后端 + 桩显示设备)
-tools/hosttest.lua         宿主测试: init 单元引擎/fstab 生成/syslogd 规则/logrotate 轮转/systemctl/sysfs(131 项)
+                           /sys 走真实 kernel.sysfs 后端 + 桩显示设备 + 桩 printer(/dev/lp0))
+tools/hosttest.lua         宿主测试: init 单元引擎/fstab 生成/syslogd 规则/logrotate 轮转/systemctl/sysfs/ccprinter(160 项)
 tools/deploy.py            重建干净 ext2 根镜像(基镜像+内核/bin/单元/配置/标记)并部署到 disk
 tools/realmachine.py       真机流程: 打包->部署->注入第二分区与 verify.service->重启 #3->debugfs 取回日志
+                           (--printer 额外注入打印机探测/验证服务)
 dist/                      生成物(不提交)
 ```

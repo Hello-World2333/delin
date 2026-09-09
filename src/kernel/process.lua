@@ -206,11 +206,14 @@ function process.spawn(src, name, ppid, uid, gid, argv, opts)
     proc.onExit = function(_, status, err, result)
         proc.status = status
         proc.exitCode = (status == "dead") and ((type(result) == "number") and result or 0) or nil
-        -- 释放进程持有的 stdio 句柄: 对管道端会递减 writer/reader 计数, 使对端读到 EOF
-        -- 或在 broken pipe 时中止; 对 tty/file 句柄 close 是幂等/无效的(pcall 兜底)。
+        -- 释放进程持有的管道端: 只关带 .pipe 标记的句柄(管道端 close 递减 writer/reader
+        -- 计数, 使对端读到 EOF 或在 broken pipe 时中止)。重定向的文件/设备句柄是父进程
+        -- 打开后共享给子进程的, 子进程退出只让引用消失, 不该关掉父进程还在用的句柄
+        -- (POSIX 语义; 否则父进程的句柄被误关, 且 close 会在内核上下文里跑)。
         if proc.stdio then
-            if proc.stdio.output and proc.stdio.output.close then pcall(proc.stdio.output.close) end
-            if proc.stdio.input  and proc.stdio.input.close  then pcall(proc.stdio.input.close)  end
+            local out, inp = proc.stdio.output, proc.stdio.input
+            if out and out.pipe and out.close then pcall(out.close) end
+            if inp and inp.pipe and inp.close then pcall(inp.close) end
         end
         if status == "error" then
             proc.error = err

@@ -1,0 +1,192 @@
+--@name ccprinter
+--@version 0.1.0
+--@description CC:Tweaked printer 驱动: /dev/lpN 字符设备(流式写, 满页自动翻页, close 打印末页)
+--             + /sys/class/printer/<lpN> 状态(paper/ink/size)与页标题(title)。
+--@deps
+
+--[[ 抽象(对齐 Linux lp(4) 的打印机字符设备):
+     写 /dev/lpN 的字节流 = 交给打印机打印的文本。驱动负责把文本流排到 CC 打印机的
+     "页"上: 按页宽折行, 写满一页立即 endPage 打印, close 时把当前未满的页也 endPage
+     打印 —— 因此 cat f > /dev/lp0 / lp f 就是一次完整打印, 不会留下悬挂的"进行中页面"
+     (CC 打印机进行中页面无法取消, 且随方块状态跨重启残留)。
+     页标题经 /sys/class/printer/<lpN>/title 设置(对已开始的页立即生效, 否则用于下一页)。
+     纸/墨不足或出纸盘满时 newPage/endPage 返回 false, 驱动 fail-fast 报错, 不静默丢数据。
+
+     真机实测(CC:Tweaked, 见 scripts/printer_probe.lua)确认了以下几点, 驱动据此设计:
+       - 页尺寸 25x21; 开页(newPage)立即扣 1 纸 + 1 墨, 故只在真要写内容时才开页。
+       - write() 不折行: 只把字符写进当前行(超出页宽被裁剪), 然后把光标右移文本长度;
+         所以折行必须由驱动自己做(每行只写 <= 页宽 个字符, 并显式 setCursorPos)。
+       - write() 里的 \n 是普通字符(会占一格), 换行必须由驱动自己拆行。
+       - newPage() 在有进行中页时会先把该页打印出来再开新页 —— 于是上一次崩溃/重启
+         留下的悬挂页会在下次打印时自动补打, 无需特殊恢复逻辑。
+       - newPage()/endPage() 是 CC 的 mainThread 方法(要在服务器线程上跑), 只能在进程
+         上下文里调用; 设备句柄的 close 因此只会由进程自己(sh 的重定向收尾 / lp)触发。 ]]
+
+local printers = {} -- node -> PrinterDevice
+local nextIndex = 0
+local activeKapi = nil
+local activeLog = nil
+
+local function endPage(p)
+    if not p.page then return end
+    p.page = nil
+    if not p.dev.endPage() then
+        -- close 常被调用方 pcall 包着, 光靠 error 可能看不到, 故同时写内核日志。
+        if activeLog then activeLog("ccprinter: " .. p.node .. ": endPage failed (output tray full?)") end
+        error("ccprinter: " .. p.node .. ": endPage failed (output tray full?)")
+    end
+end
+
+local function startPage(p)
+    if p.page then return end
+    -- 开页即扣 1 纸 + 1 墨; 失败 = 纸/墨用尽或出纸盘满(或上一次的悬挂页打不出来)。
+    if not p.dev.newPage() then
+        error("ccprinter: " .. p.node .. ": cannot start a page (out of paper or ink, or output tray full)")
+    end
+    local w, h = p.dev.getPageSize()
+    p.page = { w = w, h = h, row = 1, col = 1 }
+    p.size = w .. "x" .. h
+    p.dev.setPageTitle(p.title)
+end
+
+-- 换到下一行; 越过页底即打印本页(下次写时才开新页, 避免打出多余空页)。
+local function nextRow(p)
+    startPage(p)
+    p.page.row = p.page.row + 1
+    if p.page.row > p.page.h then endPage(p) end
+end
+
+-- 把一行文本写到当前行, 按页宽折行(折行处换行, 可能跨页)。
+local function putLine(p, line)
+    local rest = line
+    while #rest > 0 do
+        startPage(p)
+        local page = p.page
+        local room = page.w - page.col + 1
+        local chunk = rest:sub(1, room)
+        p.dev.setCursorPos(page.col, page.row)
+        p.dev.write(chunk)
+        page.col = page.col + #chunk
+        rest = rest:sub(#chunk + 1)
+        if page.col > page.w then
+            page.col = 1
+            nextRow(p)
+        end
+    end
+end
+
+local function writeText(p, s)
+    s = tostring(s)
+    local pos = 1
+    local n = #s
+    while pos <= n do
+        local nl = s:find("\n", pos, true)
+        local line
+        if nl then
+            line = s:sub(pos, nl - 1)
+            pos = nl + 1
+        else
+            line = s:sub(pos)
+            pos = n + 1
+        end
+        if line:sub(-1) == "\r" then line = line:sub(1, -2) end
+        putLine(p, line)
+        if nl then nextRow(p) end
+    end
+end
+
+return {
+    init = function(kapi, device)
+        local side = device
+        local pr = peripheral.wrap(side)
+
+        ---@class PrinterDevice
+        ---@field node string     设备节点名(如 lp0)
+        ---@field side string     外设名
+        ---@field dev table       CC printer 外设
+        ---@field page table|nil  进行中的页 { w, h, row, col }
+        ---@field size string|nil 页尺寸缓存("WxH", 首次开页后可知)
+        ---@field title string    下一页使用的标题
+
+        local node = "lp" .. nextIndex
+        nextIndex = nextIndex + 1
+
+        local p = { node = node, side = side, dev = pr, page = nil, size = nil, title = "" }
+        printers[node] = p
+
+        -- /dev/lpN: 写 = 打印文本流
+        kapi.registerDevice(node, {
+            writable = true,
+            open = function(mode)
+                if not (mode and (mode:find("w") or mode:find("a"))) then
+                    return nil, "write-only device: /dev/" .. node
+                end
+                return {
+                    write = function(_, s)
+                        writeText(p, s)
+                        return #tostring(s)
+                    end,
+                    writeLine = function(_, s)
+                        writeText(p, tostring(s) .. "\n")
+                        return #tostring(s) + 1
+                    end,
+                    flush = function() return true end,
+                    -- 关闭 = 结束当前页(打印)。CC 打印机没有取消进行中页的办法, 故必须 endPage。
+                    close = function()
+                        endPage(p)
+                        return true
+                    end,
+                    read = function() return nil end,
+                    readLine = function() return nil end,
+                }
+            end,
+        })
+
+        -- /sys/class/printer/<lpN>
+        kapi.registerSysfsClass("printer", {
+            list = function()
+                local out = {}
+                for n in pairs(printers) do out[#out + 1] = n end
+                table.sort(out)
+                return out
+            end,
+            attrs = function(entry)
+                if not printers[entry] then return nil end
+                return { "name", "type", "size", "paper", "ink", "title" }
+            end,
+            writable = function(entry, attr) return attr == "title" end,
+            get = function(entry, attr)
+                local d = printers[entry]
+                if not d then return nil end
+                if attr == "name" then return d.side end
+                if attr == "type" then return "printer" end
+                if attr == "size" then return d.size or "" end
+                if attr == "paper" then return tostring(d.dev.getPaperLevel()) end
+                if attr == "ink" then return tostring(d.dev.getInkLevel()) end
+                if attr == "title" then return d.title end
+                return nil
+            end,
+            set = function(entry, attr, value)
+                local d = printers[entry]
+                if not d then return nil, "no such printer: " .. entry end
+                if attr ~= "title" then return nil, "read-only attribute: " .. attr end
+                d.title = value
+                if d.page then d.dev.setPageTitle(value) end
+                return true
+            end,
+        })
+
+        activeKapi, activeLog = kapi, kapi.log
+        kapi.log("ccprinter: /dev/" .. node .. " registered (side " .. side .. ")")
+    end,
+
+    exit = function()
+        if not activeKapi then return end
+        for node in pairs(printers) do
+            activeKapi.unregisterDevice(node)
+            printers[node] = nil
+        end
+        activeKapi.unregisterSysfsClass("printer")
+        activeKapi, activeLog = nil, nil
+    end,
+}

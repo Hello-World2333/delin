@@ -50,6 +50,8 @@ def main():
     base = os.path.join(DISK, "parts/root.img")
     reboot = True
     skip_deploy = False
+    printer = False
+    probe_only = False
     args = sys.argv[1:]
     while args:
         a = args.pop(0)
@@ -59,12 +61,16 @@ def main():
             reboot = False
         elif a == "--reboot-only":
             skip_deploy = True
+        elif a == "--printer":
+            printer = True
+        elif a == "--printer-probe":
+            printer, probe_only = True, True
         else:
             raise SystemExit("unknown arg: " + a)
 
     if skip_deploy:
         print("--reboot-only: skipping build/deploy")
-        reboot_and_collect()
+        reboot_and_collect(printer)
         return
 
     # 1) 打包
@@ -131,6 +137,41 @@ def main():
     df_write(out, unit_sh, "/lib/systemd/system/verify-sh.service")
     df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/verify-sh.service")
 
+    # 3f) --printer: ccprinter 模块端到端验证; --printer-probe 额外注入原始 printer API 探测。
+    #     默认不注入: 它们会实际打印页面, 只在需要验证打印机时消耗纸张。
+    #     先清掉上一次部署残留在基础镜像里的打印机负载 —— 否则残留的 .wants 标记会让
+    #     探测/验证服务在之后每次启动时都跑一遍, 白白耗纸。
+    for unit, path in (("printer-probe.service", "/root/printer_probe.lua"),
+                       ("printer-verify.service", "/root/printer_verify.sh")):
+        df(out, "rm /etc/systemd/system/multi-user.target.wants/" + unit, check=False)
+        df(out, "rm /lib/systemd/system/" + unit, check=False)
+        df(out, "rm " + path, check=False)
+
+    if printer:
+        if probe_only:
+            probe = os.path.join(REPO, "scripts/printer_probe.lua")
+            df_write(out, probe, "/root/printer_probe.lua")
+            df(out, "set_inode_field /root/printer_probe.lua mode 0100755")
+            unit_p = os.path.join(work, "printer-probe.service")
+            with open(unit_p, "w") as f:
+                f.write("[Unit]\nDescription=CC printer raw API probe\nAfter=syslogd.service\n\n"
+                        "[Service]\nType=oneshot\nExecStart=/root/printer_probe.lua\n\n"
+                        "[Install]\nWantedBy=multi-user.target\n")
+            df_write(out, unit_p, "/lib/systemd/system/printer-probe.service")
+            df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/printer-probe.service")
+
+        pverify = os.path.join(REPO, "scripts/printer_verify.sh")
+        if os.path.exists(pverify) and not probe_only:
+            df_write(out, pverify, "/root/printer_verify.sh")
+            df(out, "set_inode_field /root/printer_verify.sh mode 0100755")
+            unit_pv = os.path.join(work, "printer-verify.service")
+            with open(unit_pv, "w") as f:
+                f.write("[Unit]\nDescription=ccprinter module verification\nAfter=syslogd.service\n\n"
+                        "[Service]\nType=oneshot\nExecStart=/bin/sh /root/printer_verify.sh\n\n"
+                        "[Install]\nWantedBy=multi-user.target\n")
+            df_write(out, unit_pv, "/lib/systemd/system/printer-verify.service")
+            df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/printer-verify.service")
+
     # 3d) 安装到磁盘
     shutil.copy(out, os.path.join(DISK, "parts/root.img"))
     shutil.copy(data_img, os.path.join(DISK, "parts/data.img"))
@@ -150,10 +191,10 @@ def main():
     if not reboot:
         print("--no-reboot: stopping here")
         return
-    reboot_and_collect()
+    reboot_and_collect(printer)
 
 
-def reboot_and_collect():
+def reboot_and_collect(printer=False):
     # 4) 重启电脑 #3
     print("== reboot computer #3 ==")
     run("python3", RCON, "computercraft shutdown #3", check=False)
@@ -166,6 +207,8 @@ def reboot_and_collect():
     print("== collect logs ==")
     logs = ["/var/log/verify.log", "/var/log/sh_verify.log", "/var/log/messages", "/var/log/messages.1",
             "/var/log/secure", "/var/log/kern.log"]
+    if printer:
+        logs += ["/var/log/printer_probe.log", "/var/log/printer_verify.log"]
     for path in logs:
         dst = os.path.join(WORK, "dump-" + os.path.basename(path))
         if os.path.exists(dst):

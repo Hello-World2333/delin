@@ -2,4 +2,5 @@
 tm_gpu   tom
 hologram void
 monitor  ccmonitor
+printer  ccprinter
 cc_hse   cc_hse
