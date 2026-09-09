@@ -75,6 +75,26 @@ local COLOR_BIT = {
 
 local DEFAULT_FG, DEFAULT_BG = 0xf, 0x0
 
+-- ANSI SGR 颜色码(30-37/90-97 前景, 40-47/100-107 背景) -> tty 色索引(VGA 风格 16 色)。
+-- 索引 1..8 = 30..37 / 40..47, 9..16 = 90..97 / 100..107:
+--   黑 红 绿 棕(暗黄) 蓝 紫 青 浅灰 | 灰 粉(亮红) 黄绿(亮绿) 黄 浅蓝(亮蓝) 品红 青(亮青) 白
+-- CC 没有亮红/亮青/亮蓝, 取色相最接近的粉/青/浅蓝(见 README「终端 ANSI 转义」)。
+local ANSI_COLOR = {
+    [1] = 0x0, [2] = 0x7, [3] = 0x4, [4] = 0x6, [5] = 0x2, [6] = 0x1, [7] = 0x3, [8] = 0x9,
+    [9] = 0x8, [10] = 0xa, [11] = 0x5, [12] = 0xb, [13] = 0xe, [14] = 0xd, [15] = 0x3, [16] = 0xf,
+}
+
+-- SGR 1(粗体): CC 无粗体字形, 按 16 色终端惯例渲染成亮色(仅列出会变亮的色)。
+local BOLD = {
+    [0x0] = 0x8, [0x7] = 0xa, [0x4] = 0x5, [0x6] = 0xb,
+    [0x2] = 0xe, [0x1] = 0xd, [0x3] = 0x3, [0x9] = 0xf,
+}
+
+--- 当前有效前景色(粗体按亮色渲染)。
+local function effFg(ctx)
+    return ctx.bold and (BOLD[ctx.fg] or ctx.fg) or ctx.fg
+end
+
 --- 构造一个控制台上下文。
 ---@param dev table ScreenDevice (mode="term"|"pixel"; getSize; text; flush)
 local function newCtx(dev)
@@ -110,10 +130,25 @@ local function newCtx(dev)
     ctx.eof = false
     ctx.intr = false
     ctx.reading = false -- 是否有进程正阻塞在 readLine 上(判断 ^C 是否要打断读)
-    -- 光标: cursorOn 当前是否显示(闪烁 tick 翻转); cursorRenderedIdx 已按光标反显渲染的单元格。
+    -- 光标: cursorOn 当前是否显示(闪烁 tick 翻转); cursorHidden 是程序用 ?25l 隐藏的常驻开关;
+    -- cursorRenderedIdx 已按光标反显渲染的单元格。
     ctx.cursorOn = true
+    ctx.cursorHidden = false
     ctx.cursorRenderedIdx = nil
+    -- ANSI 转义状态机: escState=nil(普通)/"esc"/"csi"/"osc"/"osc_esc"/"charset";
+    -- escParams/escInter 收集 CSI 的参数字节与中间字节(序列可跨多次 write)。
+    ctx.escState = nil
+    ctx.escParams = ""
+    ctx.escInter = ""
+    ctx.bold = false
+    ctx.reverse = false
+    ctx.saved = nil -- 保存的光标/属性(ESC 7 / CSI s)
     return ctx
+end
+
+--- 光标当前是否应该显示(闪烁开 且 程序没隐藏它)。
+local function cursorVisible(ctx)
+    return ctx.cursorOn and not ctx.cursorHidden
 end
 
 --- 标记单元格(flat index)为脏。
@@ -133,7 +168,7 @@ end
 --- 调用后需 flushDirty 才能真正画到设备。
 local function updateCursor(ctx)
     local old = ctx.cursorRenderedIdx
-    local new = ctx.cursorOn and (ctx.cursorY * ctx.cols + ctx.cursorX + 1) or nil
+    local new = cursorVisible(ctx) and (ctx.cursorY * ctx.cols + ctx.cursorX + 1) or nil
     if old then markCell(ctx, old) end
     if new then markCell(ctx, new) end
     ctx.cursorRenderedIdx = new
@@ -147,7 +182,8 @@ local function scroll(ctx)
         end
     end
     for col = 0, ctx.cols - 1 do
-        ctx.grid[(ctx.rows - 1) * ctx.cols + col + 1] = { ch = " ", fg = ctx.fg, bg = ctx.bg }
+        ctx.grid[(ctx.rows - 1) * ctx.cols + col + 1] =
+            { ch = " ", fg = effFg(ctx), bg = ctx.bg, rev = ctx.reverse }
     end
     for i = 1, ctx.rows * ctx.cols do markCell(ctx, i) end
     -- 滚动后旧的 cursorRenderedIdx 已失效(grid 内容移位), 必须重置。
@@ -173,7 +209,7 @@ local function putChar(ctx, ch)
     else
         local idx = ctx.cursorY * ctx.cols + ctx.cursorX + 1
         if idx <= ctx.rows * ctx.cols then
-            ctx.grid[idx] = { ch = ch, fg = ctx.fg, bg = ctx.bg }
+            ctx.grid[idx] = { ch = ch, fg = effFg(ctx), bg = ctx.bg, rev = ctx.reverse }
             markCell(ctx, idx)
         end
         ctx.cursorX = ctx.cursorX + 1
@@ -204,7 +240,8 @@ local function flushDirty(ctx)
         local col = (idx - 1) % ctx.cols
         local row = math.floor((idx - 1) / ctx.cols)
         local fg, bg = cell.fg, cell.bg
-        if ctx.cursorOn and cursorAt(ctx, idx) then fg, bg = bg, fg end -- 光标反显
+        if cell.rev then fg, bg = bg, fg end -- SGR 7 反显(单元格级)
+        if cursorAt(ctx, idx) and cursorVisible(ctx) then fg, bg = bg, fg end -- 光标反显
         if ctx.mode == "term" then
             -- term 型: 传给 dev.text 的是 CC blit 色码序号(hex() 会用), 需从 tty 色序换算。
             dev.text(col, row, cell.ch, TO_CC[fg], TO_CC[bg])
@@ -226,6 +263,223 @@ local function flushDirty(ctx)
     ctx.dirty = {}
     ctx.dirtyList = {}
     dev.flush()
+end
+
+-- ---------------------------------------------------------------
+-- ANSI 转义序列(核心集, 见 README「终端 ANSI 转义」)
+--   颜色: SGR 0/1/7/22/27/30-37/39/40-47/49/90-97/100-107
+--   清屏: ED(J 0/1/2)、EL(K 0/1/2)
+--   定位: CUP(H/f)、CUU/CUD/CUF/CUB(A/B/C/D)、CHA(G)、VPA(d)、CNL(E)、CPL(F)
+--   光标: ?25h/?25l 显隐、ESC 7/ESC 8 与 CSI s/CSI u 保存恢复、ESC c 复位(RIS)
+-- 序列可跨多次 write()(状态机在 ctx 上); 未知/不支持的序列按真实终端惯例静默忽略 ——
+-- 这是终端协议的一部分(程序常发本机不认识的能力探测), 不是错误。
+-- ---------------------------------------------------------------
+
+--- 擦除用的空格: 用当前背景色(BCE 语义), 前景取默认色。
+local function blankCell(ctx)
+    return { ch = " ", fg = DEFAULT_FG, bg = ctx.bg }
+end
+
+--- 用背景色填满整屏(设备级填充, 不逐格重画)。光标位置由调用方决定。
+local function eraseScreen(ctx)
+    for i = 1, ctx.rows * ctx.cols do ctx.grid[i] = blankCell(ctx) end
+    if ctx.mode == "term" then
+        ctx.dev.fill(COLOR_BIT[ctx.bg])
+    else
+        ctx.dev.fill(PALETTE[ctx.bg])
+    end
+    ctx.dev.flush()
+    ctx.dirty = {}
+    ctx.dirtyList = {}
+    ctx.cursorRenderedIdx = nil
+end
+
+local function saveCursor(ctx)
+    ctx.saved = {
+        x = ctx.cursorX, y = ctx.cursorY,
+        fg = ctx.fg, bg = ctx.bg, bold = ctx.bold, reverse = ctx.reverse,
+    }
+end
+
+local function restoreCursor(ctx)
+    local s = ctx.saved
+    if not s then return end
+    ctx.cursorX, ctx.cursorY = s.x, s.y
+    ctx.fg, ctx.bg, ctx.bold, ctx.reverse = s.fg, s.bg, s.bold, s.reverse
+    updateCursor(ctx)
+end
+
+--- 定位光标(0-based, 越界裁剪)。
+local function moveCursor(ctx, x, y)
+    ctx.cursorX = math.max(0, math.min(ctx.cols - 1, x))
+    ctx.cursorY = math.max(0, math.min(ctx.rows - 1, y))
+    updateCursor(ctx)
+end
+
+--- ED(J): 0=光标到屏幕末尾, 1=屏幕开头到光标, 2=整屏。ED 不移动光标(ECMA-48)。
+local function eraseInDisplay(ctx, mode)
+    local n = ctx.rows * ctx.cols
+    if mode == 2 then
+        eraseScreen(ctx)
+        updateCursor(ctx)
+        flushDirty(ctx)
+        return
+    end
+    local cur = ctx.cursorY * ctx.cols + ctx.cursorX + 1
+    local from, to = cur, n
+    if mode == 1 then from, to = 1, cur end
+    for i = from, to do
+        ctx.grid[i] = blankCell(ctx)
+        markCell(ctx, i)
+    end
+    updateCursor(ctx)
+end
+
+--- EL(K): 0=光标到行尾, 1=行首到光标, 2=整行。
+local function eraseInLine(ctx, mode)
+    local base = ctx.cursorY * ctx.cols
+    local from, to = ctx.cursorX, ctx.cols - 1
+    if mode == 1 then from, to = 0, ctx.cursorX
+    elseif mode == 2 then from, to = 0, ctx.cols - 1 end
+    for c = from, to do
+        local idx = base + c + 1
+        ctx.grid[idx] = blankCell(ctx)
+        markCell(ctx, idx)
+    end
+    updateCursor(ctx)
+end
+
+--- SGR(m): 设置字符属性。未列出的属性(4 下划线 / 未知)无 CC 对应能力, 忽略。
+local function setSgr(ctx, params)
+    for i = 1, #params do
+        local p = params[i]
+        if p == 0 then
+            ctx.fg, ctx.bg, ctx.bold, ctx.reverse = DEFAULT_FG, DEFAULT_BG, false, false
+        elseif p == 1 then
+            ctx.bold = true
+        elseif p == 7 then
+            ctx.reverse = true
+        elseif p == 22 then
+            ctx.bold = false
+        elseif p == 27 then
+            ctx.reverse = false
+        elseif p >= 30 and p <= 37 then
+            ctx.fg = ANSI_COLOR[p - 29]
+        elseif p == 39 then
+            ctx.fg = DEFAULT_FG
+        elseif p >= 40 and p <= 47 then
+            ctx.bg = ANSI_COLOR[p - 39]
+        elseif p == 49 then
+            ctx.bg = DEFAULT_BG
+        elseif p >= 90 and p <= 97 then
+            ctx.fg = ANSI_COLOR[p - 81]
+        elseif p >= 100 and p <= 107 then
+            ctx.bg = ANSI_COLOR[p - 91]
+        end
+    end
+end
+
+--- RIS(ESC c): 复位终端 —— 清屏、属性回默认、光标回左上并恢复显示。
+local function resetTerm(ctx)
+    ctx.fg, ctx.bg, ctx.bold, ctx.reverse = DEFAULT_FG, DEFAULT_BG, false, false
+    ctx.cursorHidden = false
+    ctx.saved = nil
+    eraseScreen(ctx)
+    ctx.cursorX, ctx.cursorY = 0, 0
+    updateCursor(ctx)
+    flushDirty(ctx)
+end
+
+--- CSI 参数字节 -> 数字数组(空参数记 0, 缺省由各序列自行按 1 处理)。
+local function parseParams(s)
+    local out = {}
+    for p in (s .. ";"):gmatch("([^;]*);") do out[#out + 1] = tonumber(p) or 0 end
+    return out
+end
+
+--- 计数参数: 缺省/0 视为 1(ECMA-48 约定)。
+local function count1(p)
+    return (p and p ~= 0) and p or 1
+end
+
+--- CSI 终结字节分发。priv 为私有标记("?"/"<"/"="...); 带中间字节的序列不支持。
+local function handleCsi(ctx, final, priv, params, inter)
+    if #inter > 0 then return end
+    local p1, p2 = params[1], params[2]
+    if final == "m" then
+        setSgr(ctx, params)
+    elseif final == "J" then
+        eraseInDisplay(ctx, p1)
+    elseif final == "K" then
+        eraseInLine(ctx, p1)
+    elseif final == "H" or final == "f" then
+        moveCursor(ctx, count1(p2) - 1, count1(p1) - 1)
+    elseif final == "A" then
+        moveCursor(ctx, ctx.cursorX, ctx.cursorY - count1(p1))
+    elseif final == "B" then
+        moveCursor(ctx, ctx.cursorX, ctx.cursorY + count1(p1))
+    elseif final == "C" then
+        moveCursor(ctx, ctx.cursorX + count1(p1), ctx.cursorY)
+    elseif final == "D" then
+        moveCursor(ctx, ctx.cursorX - count1(p1), ctx.cursorY)
+    elseif final == "E" then
+        moveCursor(ctx, 0, ctx.cursorY + count1(p1))
+    elseif final == "F" then
+        moveCursor(ctx, 0, ctx.cursorY - count1(p1))
+    elseif final == "G" then
+        moveCursor(ctx, count1(p1) - 1, ctx.cursorY)
+    elseif final == "d" then
+        moveCursor(ctx, ctx.cursorX, count1(p1) - 1)
+    elseif final == "s" then
+        saveCursor(ctx)
+    elseif final == "u" then
+        restoreCursor(ctx)
+    elseif priv == "?" and p1 == 25 then
+        ctx.cursorHidden = (final == "l")
+        updateCursor(ctx)
+    end
+end
+
+--- 喂一个字节: 普通字符落屏, 转义序列进状态机(跨 write 保持)。
+local function feedByte(ctx, ch)
+    local st = ctx.escState
+    if st == nil then
+        if ch == "\27" then
+            ctx.escState, ctx.escParams, ctx.escInter = "esc", "", ""
+        else
+            putChar(ctx, ch)
+        end
+        return
+    end
+    local b = string.byte(ch)
+    if st == "esc" then
+        if ch == "[" then ctx.escState = "csi"
+        elseif ch == "]" then ctx.escState = "osc"
+        elseif ch == "(" or ch == ")" or ch == "*" or ch == "+" then ctx.escState = "charset"
+        elseif ch == "7" then ctx.escState = nil; saveCursor(ctx)
+        elseif ch == "8" then ctx.escState = nil; restoreCursor(ctx)
+        elseif ch == "c" then ctx.escState = nil; resetTerm(ctx)
+        else ctx.escState = nil end -- 未知单字符转义: 忽略
+    elseif st == "charset" then
+        ctx.escState = nil -- ESC ( <ch>: 字符集指定, 忽略(CC 只有一种字体)
+    elseif st == "osc" then
+        if ch == "\7" then ctx.escState = nil -- BEL 结束
+        elseif ch == "\27" then ctx.escState = "osc_esc" end
+    elseif st == "osc_esc" then
+        ctx.escState = nil -- ESC \ (ST) 结束; 其它字符同样结束
+    elseif b >= 0x30 and b <= 0x3f then
+        ctx.escParams = ctx.escParams .. ch
+    elseif b >= 0x20 and b <= 0x2f then
+        ctx.escInter = ctx.escInter .. ch
+    elseif b >= 0x40 and b <= 0x7e then
+        ctx.escState = nil
+        local ps, priv = ctx.escParams, ""
+        local marker = ps:match("^([?<>=])")
+        if marker then priv = marker; ps = ps:sub(2) end
+        handleCsi(ctx, ch, priv, parseParams(ps), ctx.escInter)
+    else
+        ctx.escState = nil -- 非法参数字节: 放弃本序列
+    end
 end
 
 -- ---------------------------------------------------------------
@@ -423,7 +677,7 @@ local function openHandle(ctx, mode)
         write = function(self, s)
             if ctx.closed then return nil, "device closed" end
             s = tostring(s or "")
-            for i = 1, #s do putChar(ctx, s:sub(i, i)) end
+            for i = 1, #s do feedByte(ctx, s:sub(i, i)) end
             flushDirty(ctx)
             return #s
         end,
@@ -436,20 +690,8 @@ local function openHandle(ctx, mode)
         clear = function(self, color)
             if ctx.closed then return nil, "device closed" end
             ctx.bg = color or ctx.bg
-            for i = 1, ctx.rows * ctx.cols do
-                ctx.grid[i] = { ch = " ", fg = DEFAULT_FG, bg = ctx.bg }
-            end
-            -- 用设备填充整屏背景, 避免逐格重画(慢)
-            if ctx.mode == "term" then
-                ctx.dev.fill(COLOR_BIT[ctx.bg]) -- CC 位掩码(供 setBackgroundColor)
-            else
-                ctx.dev.fill(PALETTE[ctx.bg])
-            end
-            ctx.dev.flush()
+            eraseScreen(ctx)
             ctx.cursorX, ctx.cursorY = 0, 0
-            ctx.dirty = {}
-            ctx.dirtyList = {}
-            ctx.cursorRenderedIdx = nil
             updateCursor(ctx)
             flushDirty(ctx) -- 清屏后立即在 (0,0) 显示光标
             return true

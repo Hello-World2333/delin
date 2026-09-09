@@ -14,7 +14,7 @@
 
 | 路径 | 作用 |
 |---|---|
-| `/bin/` | 用户工具：`cat ls mkdir rm cp mv touch head tail wc grep sed kill login sh sleep systemctl syslogd logrotate logger dmesg mount umount lp` |
+| `/bin/` | 用户工具：`cat ls mkdir rm cp mv touch head tail wc grep sed kill login sh clear sleep systemctl syslogd logrotate logger dmesg mount umount lp` |
 | `/dev/` | 设备文件：`/dev/ttyN`（字符终端）、`/dev/fbN`（像素帧缓冲）、`/dev/sdX`（磁盘，见下）、`/dev/lpN`（打印机字符设备，只写，见下）、`/dev/null`（读 EOF/写丢弃）、`/dev/console`（系统控制台 = 控制台 tty）、`/dev/kmsg`（内核 ring buffer 只读流）、`/dev/log`（用户态 syslog 输入） |
 | `/etc/` | 系统配置：`passwd` `shadow` `group`、`fstab`、`syslog.conf`、`logrotate.conf`、`systemd/system/`（管理员单元与 enable 标记） |
 | `/proc/` | 虚拟进程/系统信息 fs（由模块提供） |
@@ -93,6 +93,21 @@ Linux `lp(4)` 风格的**字符设备**：写入的字节流 = 交给打印机�
 
 **显示抽象**：进程面向设备文件而非库接口——`/dev/ttyN`（控制台）、`/dev/fbN`（帧缓冲）。
 
+**终端（ANSI / `$TERM=linux`）**：每个 `/dev/ttyN` 都是 16 色 ANSI 字符终端，`write` 里的转义序列由
+内核 tty 层解释（跨多次 `write` 保持状态；**未知/不支持的序列按真实终端惯例静默忽略**）：
+
+| 能力 | 序列 |
+|---|---|
+| 颜色/属性 | `SGR(m)`：`0` 复位、`1` 粗体、`7`/`27` 反显、`22` 关粗体、`30-37`/`90-97` 前景、`40-47`/`100-107` 背景、`39`/`49` 回默认 |
+| 清屏 | `ED(J)` `0` 光标到屏尾 / `1` 屏首到光标 / `2` 整屏（不移动光标）；`EL(K)` 同理按行 |
+| 定位 | `CUP(H/f)` `行;列`（1 起，越界裁剪）、`CUU/CUD/CUF/CUB(A/B/C/D)`、`CHA(G)`、`VPA(d)`、`CNL(E)`、`CPL(F)` |
+| 光标 | `?25h`/`?25l` 显示/隐藏、`ESC 7`/`ESC 8` 与 `CSI s`/`CSI u` 保存/恢复（位置+属性）、`ESC c` 复位（RIS） |
+
+颜色按 VGA 风格 16 色映射到 CC 的 16 色：`30-37` → 黑/红/绿/棕/蓝/紫/青/浅灰，
+`90-97` → 灰/粉/亮绿/黄/浅蓝/品红/青/白（CC 无亮红/亮青，取色相最近的粉/青）；
+粗体（`1`）因 CC 无粗体字形而渲染成亮色。`$TERM` 固定为 `linux`（login 设置并随环境导出），
+`login` 每次显示登录提示前写 `ESC[0m ESC[2J ESC[H` 清屏（agetty 语义）。
+
 **工具**：`ls`、`cat`、`mkdir (-p)`、`rm (-r|-f)`、`cp (-r)`、`mv`、`touch`、`head (-n)`、`tail (-n)`、
 `sleep`（GNU 风格：小数秒 + `s/m/h/d` 后缀 + 多操作数求和；50ms 分片睡眠，信号可及时打断）、
 `wc (-l|-w|-c)`、`grep (-n|-i|-v)`、`sed`（GNU 子集：`s/y/d/p/q/a/i/c/=`、行号/`$`/正则地址与区间、
@@ -101,7 +116,7 @@ Linux `lp(4)` 风格的**字符设备**：写入的字节流 = 交给打印机�
 `mount`（挂载 `/dev/sdX`、`UUID=<uuid>` 或镜像路径；无 `-t` 时按设备类型；无参列出挂载）、`umount`、
 `blkid`（列出设备 UUID/TYPE/LABEL）、`lsblk`（树状列出设备/大小/类型/挂载点）、
 `systemctl`（init 控制）、`syslogd`/`logger`/`dmesg`/`logrotate`（日志）、
-`lp`（打印文件到 `/dev/lpN`）、`sh`。
+`lp`（打印文件到 `/dev/lpN`）、`clear`（清屏：写 ANSI 复位+清屏+归位）、`sh`。
 各工具支持 POSIX 的 **`--` 结束选项** 标记：`rm -- --help`、`touch -- -file`、`ls -- --ff` 等，用于操作以
 `-`/`--` 开头的文件名；单独的 `-` 视为普通操作数。
 
@@ -111,12 +126,15 @@ Linux `lp(4)` 风格的**字符设备**：写入的字节流 = 交给打印机�
 经内核 pipe 缓冲传递，`$?`=末元素退出码，生产端写满/消费端读空时让出调度器，broken pipe 中止写端）；内建
 `cd pwd echo read exit help jobs fg bg wait kill test [ true false : . set export unset break continue return shift`。
 **启动变量**（可在 shell 里读写，`export` 后才传给子进程）：`PATH`（默认 `/bin`，命令查找用）、
-`HOME`、`USER`、`LOGNAME`、`SHELL`（后两者取自 `/etc/passwd`）、`PPID`（内核给的父 pid）、
+`HOME`、`USER`、`LOGNAME`、`SHELL`（后两者取自 `/etc/passwd`）、`TERM`（默认 `linux`，随环境导出）、
+`PPID`（内核给的父 pid）、
 `PWD`（由 shell 维护，`cd` 后同步）、`IFS`；优先级为**继承的环境 > passwd/内核信息 > 内置缺省**
-（`login` 先设 `USER`/`HOME`/`SHELL`/`PATH` 再起 `sh`，与 login(1) 一致）。
+（`login` 先设 `USER`/`HOME`/`SHELL`/`PATH`/`TERM` 再起 `sh`，与 login(1) 一致）。
 **提示符**：`PS1`（默认 `\u@\h:\w\$ `）、`PS2`（默认 `> `，续行）、`PS3`（默认 `#? `，保留）、
-`PS4`（默认 `+ `，`set -x` 前缀）；展开 bash 风格转义 `\u \h \H \w \W \$ \# \! \s \n \t \d \\`，
+`PS4`（默认 `+ `，`set -x` 前缀）；展开 bash 风格转义 `\u \h \H \w \W \$ \# \! \s \n \t \d \e \\`，
 未知转义原样保留，`\h` 取 `/etc/hostname`（缺失为 `delin`），`\w` 把 `$HOME` 缩成 `~`。
+**`echo`**：POSIX + 扩展 `-n`（不换行）/ `-e`（解释转义 `\a \b \c \e \f \n \r \t \v \\ \0nnn \xHH`，
+`\c` 截断且不换行，未知转义原样保留），例如 `echo -e '\e[31mred\e[0m'`。
 **`cd`**：无参进 `$HOME`，`cd -` 回 `$OLDPWD` 并打印新目录，`PWD`/`OLDPWD` 随 `cd` 更新。
 **`set`**（POSIX 特殊内建）：无参按名排序列出全部变量（`name='value'`，可重输入）；
 `set -- a b`（或 `set a b`）设位置参数，`set --` 清空；选项 `-e`（errexit）/`-u`（nounset）/
@@ -253,7 +271,7 @@ PID 1 现在是**用户态服务管理器**（`src/init/unit.lua` 单元解析 +
 用户态 `/dev/log`、`syslogd` 按 `/etc/syslog.conf` 写 `/var/log/*`（SIGHUP 重开、游标续读不重放）、
 `logrotate` + `logrotate.timer` 轮转、`logger`/`dmesg`。`/etc/fstab` 由 init 生成 mount 单元
 （`local-fs.target`），`mount -a` 复用同一解析器。init 里的自检代码已全部删除，验证改为
-宿主测试台 `tools/hosttest.lua`（180 项）与真机脚本 `tools/realmachine.py` +
+宿主测试台 `tools/hosttest.lua`（264 项）与真机脚本 `tools/realmachine.py` +
 `scripts/realmachine_verify.sh`。
 
 `src/bin/sh` 已升级为 POSIX 核心子集（变量/引号/if/for/while/case/函数/test/[ ]/&&/|| /文件重定向/管道
@@ -265,6 +283,9 @@ UUID 用磁盘 ID 模拟，磁盘不随启动自动挂载（改由 `/etc/fstab` 
 `&` 后台作业 + `jobs`/`fg`/`bg`/`wait`/`kill %job`/`$!`、
 前台作业进程组与 `^C`/`^Z` 路由、后台进程组读 tty 的 `SIGTTIN`、`/dev/null`、`sh -c`；
 新增 `read` 内建（POSIX，跟随 `IFS` 变量）与 `/bin/sleep`（GNU 风格，分片睡眠便于信号打断）。
+终端侧：tty 层解释 ANSI 转义（SGR 16 色/ED-EL 清屏/CUP 定位/光标显隐与保存恢复，见上文
+「终端（ANSI / `$TERM=linux`）」），`$TERM=linux` 随环境导出，`echo` 支持 `-n`/`-e`，新增 `/bin/clear`，
+`login` 每次提示前清屏。
 `scripts/posix_test.sh`（111 项）与 `scripts/jobctl_test.sh` 在宿主与 Delin 上各跑一次逐项比对，
 `scripts/sysinfo.sh` 演示实用用法。
 
@@ -326,7 +347,8 @@ sysfs 也从 display 专用泛化成 class 注册表（模块用 `kapi.registerS
 - **tty 焦点切换**：只有前台 tty 接收键盘。`Ctrl+Alt+1..0` 切换前台 tty，多 tty 共用一把键盘；
   行缓冲 + 回显（canonical 行规程），焦点 tty 收到 `^C`/`^Z` 时把信号投给其前台进程组。
 - **getty/login**：init 为每个 `/dev/ttyN` 实例化 `getty@ttyN.service`（`ExecStart=/bin/login %I`）；
-  login 验证后按用户 `uid/gid` 起 `sh`（同 tty stdio），`sh` 退出后回到 login 循环；
+  login 每次显示登录提示前用 ANSI 清屏（`ESC[0m ESC[2J ESC[H`，agetty 语义），验证后按用户
+  `uid/gid` 起 `sh`（同 tty stdio，环境含 `TERM=linux`），`sh` 退出后回到 login 循环；
   getty 退出由 init 按 `Restart=always` 重新拉起。
 - **服务是 init 的孩子**：`proc.spawnFile` 支持 `opts.ppid`，服务统一挂在 PID 1 名下（与 systemd 一致）；
   子进程退出经内核 `proc.onExit` 钩子同步通知 init（不轮询）。
@@ -350,7 +372,7 @@ lua5.1 tools/bundle.lua dlub     # 生成 dist/dlub.lua（DLUB 引导装载器�
 验证：
 
 ```bash
-lua5.1 tools/hosttest.lua        # 宿主测试: init 引擎/fstab/syslogd/logrotate/systemctl/sysfs/ccprinter (180 项)
+lua5.1 tools/hosttest.lua        # 宿主测试: init 引擎/fstab/syslogd/logrotate/systemctl/sysfs/ccprinter/tty-ANSI (264 项)
 lua5.1 tools/harness.lua /bin/sh # 宿主上跑真实工具源码(sh/作业控制/管道; /sys 走真实 sysfs 后端)
 python3 tools/realmachine.py     # 真机: 打包->部署->重启电脑 #3->取回 /var/log/*
 python3 tools/realmachine.py --printer   # 真机 + 打印机(会实际打印页面): 探测 printer API + 验证 /dev/lp0
@@ -382,6 +404,7 @@ src/kernel/ext2.lua        EXT2 读写: 超级块/inode(uid/gid/mode/硬链接/�
 src/kernel/user.lua        用户库: /etc/passwd|shadow|group, salt+hash, chmod/chown 权限
 src/kernel/display.lua     显示设备注册表: 统一 ScreenDevice -> /dev/ttyN + /dev/fbN
 src/kernel/tty.lua         字符终端(/dev/ttyN): 行规程+回显+光标+滚动+焦点切换 + 按名打开(别名设备)
+                            + ANSI 转义(SGR 颜色/ED-EL 清屏/CUP 定位/光标显隐与保存恢复)
 src/kernel/fb.lua          软件帧缓冲(/dev/fbN): 32 位 ARGB 像素缓冲+脏矩形 flush
 src/kernel/sysfs.lua       /sys 虚拟配置 fs(sysfs 风格, class/display 子树, 读=查/写=设)
 src/kernel/manifest.lua    /parts/manifest 解析器(root/boot 行 + 分区表)
@@ -411,7 +434,8 @@ src/bin/mount              挂载 /dev/sdX、UUID=<uuid> 或镜像路径 (-a 按
 src/bin/umount             卸载文件系统 (umount <dir>|<-device>)
 src/bin/blkid              列出块设备的 UUID/TYPE/LABEL (util-linux blkid 子集)
 src/bin/lsblk              树状列出块设备: NAME/SIZE/TYPE/MOUNTPOINT (util-linux lsblk 子集)
-src/bin/login              getty/login: 登录提示->验证->启动 sh->循环
+src/bin/login              getty/login: 清屏+登录提示->验证->启动 sh->循环
+src/bin/clear              清屏 (POSIX clear(1): 写 ANSI 复位+ED 2+CUP 归位)
 src/bin/sleep              暂停指定时间 (GNU 风格: 小数秒 + s/m/h/d 后缀 + 多操作数求和)
 src/bin/systemctl          控制 init: list-units/status/start/stop/restart/enable/disable/is-active/daemon-reload
 src/bin/syslogd            系统日志守护进程: /dev/kmsg+/dev/log -> /etc/syslog.conf 规则 -> /var/log/*
@@ -439,7 +463,7 @@ tools/bundle.lua           打包 src/ -> dist/kernel.lua 或 dist/dlub.lua(init
 tools/harness.lua          host 测试台: 用真实 Delin 工具源码在宿主跑(fs/io/syscalls/spawn 桩,
                            含信号/进程组语义: kill/killpg/SIGCONT/stopped, 供 sh 作业控制验证;
                            /sys 走真实 kernel.sysfs 后端 + 桩显示设备 + 桩 printer(/dev/lp0))
-tools/hosttest.lua         宿主测试: init 单元引擎/fstab 生成/syslogd 规则/logrotate 轮转/systemctl/sysfs/ccprinter(180 项)
+tools/hosttest.lua         宿主测试: init 单元引擎/fstab 生成/syslogd 规则/logrotate 轮转/systemctl/sysfs/ccprinter/tty-ANSI(264 项)
 tools/deploy.py            重建干净 ext2 根镜像(基镜像+内核/bin/单元/配置/标记)并部署到 disk
 tools/realmachine.py       真机流程: 打包->部署->注入第二分区与 verify.service->重启 #3->debugfs 取回日志
                            (--printer 额外注入打印机探测/验证服务)

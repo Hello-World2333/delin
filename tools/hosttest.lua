@@ -999,5 +999,253 @@ do
     eq(table.concat(b.list(r), ","), "display,printer", "sysfs: /sys/class 列出 display 与 printer")
 end
 
+-- ===============================================================
+-- J. tty: ANSI 转义序列(颜色/清屏/定位/光标)
+--    用真实 src/kernel/tty.lua + 录制型 term 设备(CC 无屏幕读回 API, 宿主可直读 ctx.grid)。
+--    色索引是 tty 内部色序(0=black..f=white), 与 CC blit 色码的换算见 TO_CC。
+-- ===============================================================
+do
+    local tty = require("kernel.tty")
+
+    --- 录制型 term 设备(ScreenDevice)。
+    local function newTermDev(w, h)
+        local dev -- 先声明再建表: 闭包里的 dev 必须指向这个局部变量(不是全局)
+        dev = {
+            id = "test:term", type = "monitor", mode = "term", name = "test",
+            width = w, height = h, fills = 0, flushes = 0, calls = {},
+            getSize = function() return w, h end,
+            text = function(x, y, s, fg, bg)
+                dev.calls[#dev.calls + 1] = { x = x, y = y, s = s, fg = fg, bg = bg }
+                dev.lastText = { x = x, y = y, s = s, fg = fg, bg = bg }
+            end,
+            blit = function(x, y, s, fg, bg) dev.lastBlit = { x = x, y = y, s = s, fg = fg, bg = bg } end,
+            fill = function(color) dev.fills = dev.fills + 1; dev.lastFill = color end,
+            rect = function() end,
+            flush = function() dev.flushes = dev.flushes + 1 end,
+            release = function() end,
+        }
+        return dev
+    end
+
+    local function newTty(w, h)
+        local dev = newTermDev(w, h)
+        local name = tty.registerDevice(dev)
+        return tty.open(name, "rw"), tty.get(name), dev
+    end
+
+    local function cell(ctx, col, row) return ctx.grid[row * ctx.cols + col + 1] end
+    local function rowText(ctx, row)
+        local t = {}
+        for c = 0, ctx.cols - 1 do t[#t + 1] = cell(ctx, c, row).ch end
+        return table.concat(t)
+    end
+
+    -- 普通文本: 落屏/换行/列推进与 ANSI 引入前一致
+    do
+        local h, ctx = newTty(20, 5)
+        h:write("ab\ncd")
+        eq(rowText(ctx, 0), "ab" .. string.rep(" ", 18), "tty ansi: 普通文本第 1 行")
+        eq(rowText(ctx, 1), "cd" .. string.rep(" ", 18), "tty ansi: 普通文本第 2 行")
+        eq(ctx.cursorX, 2, "tty ansi: 换行后光标列")
+        eq(ctx.cursorY, 1, "tty ansi: 换行后光标行")
+    end
+
+    -- SGR: 前景/背景/复位/亮色
+    do
+        local h, ctx = newTty(20, 5)
+        h:write("\27[31mX")
+        eq(cell(ctx, 0, 0).fg, 0x7, "tty ansi: SGR 31 红")
+        h:write("\27[44mY")
+        eq(cell(ctx, 1, 0).bg, 0x2, "tty ansi: SGR 44 蓝底")
+        eq(cell(ctx, 1, 0).fg, 0x7, "tty ansi: SGR 44 不改前景")
+        h:write("\27[0mZ")
+        eq(cell(ctx, 2, 0).fg, 0xf, "tty ansi: SGR 0 复位前景")
+        eq(cell(ctx, 2, 0).bg, 0x0, "tty ansi: SGR 0 复位背景")
+        h:write("\27[91mA")
+        eq(cell(ctx, 3, 0).fg, 0xa, "tty ansi: SGR 91 亮红 -> 粉")
+        h:write("\27[100mB")
+        eq(cell(ctx, 4, 0).bg, 0x8, "tty ansi: SGR 100 亮黑 -> 灰底")
+        h:write("\27[39;49mC")
+        eq(cell(ctx, 5, 0).fg, 0xf, "tty ansi: SGR 39 默认前景")
+        eq(cell(ctx, 5, 0).bg, 0x0, "tty ansi: SGR 49 默认背景")
+        h:write("\27[37mD")
+        eq(cell(ctx, 6, 0).fg, 0x9, "tty ansi: SGR 37 白 -> 浅灰")
+        h:write("\27[97mE")
+        eq(cell(ctx, 7, 0).fg, 0xf, "tty ansi: SGR 97 亮白 -> 白")
+    end
+
+    -- SGR 粗体(映射亮色) 与反显
+    do
+        local h, ctx, dev = newTty(20, 5)
+        h:write("\27[1;32mX")
+        eq(cell(ctx, 0, 0).fg, 0x5, "tty ansi: 粗体绿 -> 亮绿")
+        h:write("\27[22;32mY")
+        eq(cell(ctx, 1, 0).fg, 0x4, "tty ansi: SGR 22 关粗体")
+        h:write("\27[31;47mR")
+        eq(cell(ctx, 2, 0).fg, 0x7, "tty ansi: 反显前前景")
+        eq(cell(ctx, 2, 0).bg, 0x9, "tty ansi: 反显前背景")
+        eq(cell(ctx, 2, 0).rev, false, "tty ansi: 未开反显时 rev=false")
+        h:write("\27[7mS")
+        eq(cell(ctx, 3, 0).fg, 0x7, "tty ansi: SGR 7 不改前景色")
+        eq(cell(ctx, 3, 0).bg, 0x9, "tty ansi: SGR 7 不改背景色")
+        eq(cell(ctx, 3, 0).rev, true, "tty ansi: SGR 7 置反显标记")
+        -- 渲染时前后景互换: dev.text 收 CC blit 色码, TO_CC[0x9]=8 / TO_CC[0x7]=e
+        local drawn
+        for _, c in ipairs(dev.calls) do
+            if c.x == 3 and c.y == 0 and c.s == "S" then drawn = c end
+        end
+        ok(drawn ~= nil and drawn.fg == 0x8 and drawn.bg == 0xe,
+            "tty ansi: 反显渲染时前后景互换", drawn and (drawn.fg .. "/" .. drawn.bg))
+        h:write("\27[27mT")
+        eq(cell(ctx, 4, 0).rev, false, "tty ansi: SGR 27 取消反显")
+        eq(cell(ctx, 4, 0).fg, 0x7, "tty ansi: SGR 27 前景不变")
+        eq(cell(ctx, 4, 0).bg, 0x9, "tty ansi: SGR 27 背景不变")
+        h:write("\27[7m\27[0mU")
+        eq(cell(ctx, 5, 0).rev, false, "tty ansi: SGR 0 清除反显")
+    end
+
+    -- 光标定位: CUP / CUU / CUD / CUF / CUB / CHA / VPA / CNL / CPL
+    do
+        local h, ctx = newTty(20, 5)
+        h:write("\27[3;5HX")
+        eq(cell(ctx, 4, 2).ch, "X", "tty ansi: CUP 定位后落字")
+        eq(ctx.cursorX, 5, "tty ansi: CUP 后光标列")
+        eq(ctx.cursorY, 2, "tty ansi: CUP 后光标行")
+        h:write("\27[2A")
+        eq(ctx.cursorY, 0, "tty ansi: CUU 上移")
+        h:write("\27[3B")
+        eq(ctx.cursorY, 3, "tty ansi: CUD 下移")
+        h:write("\27[4C")
+        eq(ctx.cursorX, 9, "tty ansi: CUF 右移")
+        h:write("\27[2D")
+        eq(ctx.cursorX, 7, "tty ansi: CUB 左移")
+        h:write("\27[1G")
+        eq(ctx.cursorX, 0, "tty ansi: CHA 绝对列")
+        h:write("\27[2d")
+        eq(ctx.cursorY, 1, "tty ansi: VPA 绝对行")
+        h:write("\27[E")
+        eq(ctx.cursorY, 2, "tty ansi: CNL 下一行")
+        eq(ctx.cursorX, 0, "tty ansi: CNL 列归零")
+        h:write("\27[F")
+        eq(ctx.cursorY, 1, "tty ansi: CPL 上一行")
+        -- 缺省参数(1) 与 0 视作 1; 越界裁剪
+        h:write("\27[H")
+        eq(ctx.cursorX, 0, "tty ansi: CUP 缺省列")
+        eq(ctx.cursorY, 0, "tty ansi: CUP 缺省行")
+        h:write("\27[99;99H")
+        eq(ctx.cursorX, 19, "tty ansi: CUP 列越界裁剪")
+        eq(ctx.cursorY, 4, "tty ansi: CUP 行越界裁剪")
+        h:write("\27[9A")
+        eq(ctx.cursorY, 0, "tty ansi: CUU 越界裁剪")
+    end
+
+    -- ED(J): 0=光标到末尾, 1=开头到光标, 2=整屏(不移动光标)
+    -- 用 8 列屏幕 + 每行 5 字符, 避开 6 列满行自动换行(putChar 的 wrap 语义)。
+    do
+        local h, ctx = newTty(8, 3)
+        h:write("abcde\nfghij\nklmno")
+        h:write("\27[2;3H\27[0J")
+        eq(rowText(ctx, 0), "abcde   ", "tty ansi: ED 0 不动光标之前的行")
+        eq(rowText(ctx, 1), "fg      ", "tty ansi: ED 0 从光标清到行尾")
+        eq(rowText(ctx, 2), "        ", "tty ansi: ED 0 清后续行")
+
+        local h2, ctx2 = newTty(8, 3)
+        h2:write("abcde\nfghij\nklmno")
+        h2:write("\27[2;4H\27[1J")
+        eq(rowText(ctx2, 0), "        ", "tty ansi: ED 1 清光标之前的行")
+        eq(rowText(ctx2, 1), "    j   ", "tty ansi: ED 1 清行首到光标")
+        eq(rowText(ctx2, 2), "klmno   ", "tty ansi: ED 1 不动光标之后的行")
+
+        local h3, ctx3, dev3 = newTty(8, 3)
+        h3:write("abcde\nfghij")
+        h3:write("\27[2J")
+        eq(rowText(ctx3, 0), "        ", "tty ansi: ED 2 清屏")
+        eq(ctx3.cursorX, 5, "tty ansi: ED 2 不移动光标(列)")
+        eq(ctx3.cursorY, 1, "tty ansi: ED 2 不移动光标(行)")
+        ok(dev3.fills >= 1, "tty ansi: ED 2 走设备级填充")
+    end
+
+    -- EL(K): 0=光标到行尾, 1=行首到光标, 2=整行
+    do
+        local h, ctx = newTty(8, 3)
+        h:write("abcde\nfghij")
+        h:write("\27[1;3H\27[0K")
+        eq(rowText(ctx, 0), "ab      ", "tty ansi: EL 0 清到行尾")
+        h:write("\27[2;4H\27[1K")
+        eq(rowText(ctx, 1), "    j   ", "tty ansi: EL 1 清行首到光标")
+        h:write("\27[2K")
+        eq(rowText(ctx, 1), "        ", "tty ansi: EL 2 清整行")
+    end
+
+    -- 光标显隐(?25l / ?25h)
+    do
+        local h, ctx = newTty(6, 3)
+        h:write("\27[?25l")
+        ok(ctx.cursorHidden, "tty ansi: ?25l 隐藏光标")
+        eq(ctx.cursorRenderedIdx, nil, "tty ansi: 隐藏后不渲染光标块")
+        h:write("\27[?25h")
+        ok(not ctx.cursorHidden, "tty ansi: ?25h 恢复显示")
+        ok(ctx.cursorRenderedIdx ~= nil, "tty ansi: 恢复后光标块已标记")
+    end
+
+    -- 保存/恢复: CSI s/u 与 ESC 7/ESC 8(位置 + 属性)
+    do
+        local h, ctx = newTty(6, 3)
+        h:write("\27[2;3H\27[31m\27[s")
+        h:write("\27[H\27[0m\27[u")
+        eq(ctx.cursorX, 2, "tty ansi: CSI u 恢复光标列")
+        eq(ctx.cursorY, 1, "tty ansi: CSI u 恢复光标行")
+        eq(ctx.fg, 0x7, "tty ansi: CSI u 恢复前景")
+        h:write("\27[1;1H\27[32m\27" .. "7")
+        h:write("\27[3;3H\27[0m\27" .. "8")
+        eq(ctx.cursorX, 0, "tty ansi: ESC 8 恢复光标列")
+        eq(ctx.cursorY, 0, "tty ansi: ESC 8 恢复光标行")
+        eq(ctx.fg, 0x4, "tty ansi: ESC 8 恢复前景")
+    end
+
+    -- RIS(ESC c): 清屏 + 复位属性/光标
+    do
+        local h, ctx = newTty(6, 3)
+        h:write("abc\27[31m\27[?25l\27c")
+        eq(rowText(ctx, 0), "      ", "tty ansi: RIS 清屏")
+        eq(ctx.cursorX, 0, "tty ansi: RIS 光标归位(列)")
+        eq(ctx.cursorY, 0, "tty ansi: RIS 光标归位(行)")
+        eq(ctx.fg, 0xf, "tty ansi: RIS 复位前景")
+        ok(not ctx.cursorHidden, "tty ansi: RIS 恢复光标显示")
+    end
+
+    -- 跨 write 的序列 / 未知序列忽略 / OSC 与字符集指定 / 非法字节
+    do
+        local h, ctx = newTty(12, 3)
+        h:write("\27[")
+        h:write("3")
+        h:write("1m")
+        h:write("X")
+        eq(cell(ctx, 0, 0).fg, 0x7, "tty ansi: 序列跨 write 保持状态")
+        eq(cell(ctx, 0, 0).ch, "X", "tty ansi: 跨 write 序列后正常落字")
+        h:write("\27[999zY")
+        eq(cell(ctx, 1, 0).ch, "Y", "tty ansi: 未知 CSI 忽略")
+        h:write("\27]0;title\7Z")
+        eq(cell(ctx, 2, 0).ch, "Z", "tty ansi: OSC 标题被吞掉")
+        h:write("\27(0q")
+        eq(cell(ctx, 3, 0).ch, "q", "tty ansi: 字符集指定吞掉一个字节")
+        h:write("b")
+        eq(cell(ctx, 4, 0).ch, "b", "tty ansi: 字符集指定后继续正常输出")
+        h:write("c\27d")
+        eq(cell(ctx, 5, 0).ch, "c", "tty ansi: 未知单字符转义忽略")
+        eq(ctx.cursorX, 6, "tty ansi: 转义序列不推进光标")
+    end
+
+    -- clear() 句柄: 清屏 + 光标归位
+    do
+        local h, ctx = newTty(6, 3)
+        h:write("abc\ndef")
+        h:clear()
+        eq(rowText(ctx, 0), "      ", "tty: clear() 清屏")
+        eq(ctx.cursorX, 0, "tty: clear() 光标归位(列)")
+        eq(ctx.cursorY, 0, "tty: clear() 光标归位(行)")
+    end
+end
+
 io.write(string.format("\n%d passed, %d failed\n", pass, fail))
 os.exit(fail == 0 and 0 or 1)

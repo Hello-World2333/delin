@@ -61,4 +61,15 @@ echo "-- systemctl restart syslogd --" >> $LOG
 systemctl restart syslogd.service >> $LOG
 sleep 2
 systemctl is-active syslogd.service >> $LOG
+echo "-- ANSI 终端能力: TERM / echo -e / clear --" >> $LOG
+echo "TERM=$TERM" >> $LOG
+sh -c 'echo "TERM_child=$TERM"' >> $LOG
+echo -e 'a\eb' > /tmp/ansi_esc
+wc -c < /tmp/ansi_esc >> $LOG
+grep '%c' /tmp/ansi_esc > /tmp/ansi_hit
+if [ -s /tmp/ansi_hit ]; then echo "echo_e_esc=ok" >> $LOG; else echo "echo_e_esc=ng" >> $LOG; fi
+clear > /tmp/clear_out
+wc -c < /tmp/clear_out >> $LOG
+grep '%c' /tmp/clear_out > /tmp/clear_hit
+if [ -s /tmp/clear_hit ]; then echo "clear_esc=ok" >> $LOG; else echo "clear_esc=ng" >> $LOG; fi
 echo "=== verify done ===" >> $LOG

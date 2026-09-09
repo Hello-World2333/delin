@@ -215,6 +215,64 @@ help > $T/help_out
 grep -v "^[ -~]*$" $T/help_out > $T/help_nonascii
 chk ascii_help [ ! -s $T/help_nonascii ]
 
+# ---------------------------------------------------------------
+# 11. $TERM + ANSI 终端能力: echo -e/-n 与 /bin/clear
+#     grep 用 Lua pattern, "%c" 匹配控制字符(ESC/TAB 都是); 字节数用 wc -c 断言。
+# ---------------------------------------------------------------
+chk var_term [ "$TERM" = "linux" ]
+sh -c 'echo $TERM' > $T/term_child
+chkcontain term_child "linux" $T/term_child
+
+# echo -e 解释 \t(制表符=控制字符); 不加 -e 时 \t 原样是两个字符
+echo -e 'A\tB' > $T/echo_e_tab
+grep '%c' $T/echo_e_tab > $T/echo_e_tab_hit
+chk echo_e_tab [ -s $T/echo_e_tab_hit ]
+echo 'A\tB' > $T/echo_plain_tab
+grep '%c' $T/echo_plain_tab > $T/echo_plain_tab_hit
+chk echo_plain_tab [ ! -s $T/echo_plain_tab_hit ]
+
+# \e / \033 / \x1b 都产生 ESC(0x1B), 按输出字节数断言
+echo -e 'a\eb' > $T/echo_e_esc
+wc -c < $T/echo_e_esc > $T/echo_e_esc_n
+chkcontain echo_e_esc_bytes "^4$" $T/echo_e_esc_n
+echo -e '\033[31m' > $T/echo_e_oct
+wc -c < $T/echo_e_oct > $T/echo_e_oct_n
+chkcontain echo_e_oct_bytes "^6$" $T/echo_e_oct_n
+echo -e '\x1b[0m' > $T/echo_e_hex
+wc -c < $T/echo_e_hex > $T/echo_e_hex_n
+chkcontain echo_e_hex_bytes "^5$" $T/echo_e_hex_n
+
+# -n 不追加换行; \c 截断且不换行; 选项可合并(-ne)
+echo -n X > $T/echo_n
+wc -c < $T/echo_n > $T/echo_n_n
+chkcontain echo_n_bytes "^1$" $T/echo_n_n
+echo -e 'abc\cdef' > $T/echo_c
+wc -c < $T/echo_c > $T/echo_c_n
+chkcontain echo_c_bytes "^3$" $T/echo_c_n
+echo -ne 'a\tb' > $T/echo_ne
+wc -c < $T/echo_ne > $T/echo_ne_n
+chkcontain echo_ne_bytes "^3$" $T/echo_ne_n
+
+# clear: 写 ANSI 复位+清屏+归位(11 字节), 且不依赖 tty(重定向到文件也有内容)
+clear > $T/clear_out
+wc -c < $T/clear_out > $T/clear_n
+chkcontain clear_bytes "^11$" $T/clear_n
+grep '%c' $T/clear_out > $T/clear_hit
+chk clear_has_esc [ -s $T/clear_hit ]
+
+# ---------------------------------------------------------------
+# 12. 双引号内反斜杠(POSIX): 只有 \$ \` \" \\ 去掉反斜杠, 其它原样保留
+#     (曾经的 bug: "\$TERM" 输出 "\linux", "a\\b" 输出两个反斜杠)
+# ---------------------------------------------------------------
+dq1="a\$TERM"
+chk dq_dollar_literal [ "$dq1" = 'a$TERM' ]
+dq2="a\\b"
+chk dq_backslash [ "$dq2" = 'a\b' ]
+dq3="a\tb"
+chk dq_keep_backslash [ "$dq3" = 'a\tb' ]
+dq4="a\"b"
+chk dq_quote [ "$dq4" = 'a"b' ]
+
 echo "== summary =="
 if [ "$outcome" = "0" ]; then echo "all ok"; else echo "FAILURES"; fi
 exit $outcome

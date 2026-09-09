@@ -1,0 +1,6 @@
+-- Delin clear: 清屏并把光标归位 (POSIX clear(1))。
+-- Delin 无 terminfo, 终端能力固定($TERM=linux): 直接写 ANSI ——
+-- SGR 0 复位属性 + ED 2 清全屏 + CUP 归位(ncurses clear 的等价输出)。
+-- 与 clear(1) 一致写 stdout: 重定向到文件时同样写转义字节。
+local out = io.stdout()
+out:write("\27[0m\27[2J\27[H")

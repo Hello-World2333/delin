@@ -65,6 +65,9 @@ end
 
 local function doLogin()
     while true do
+        -- 清屏(agetty 语义): 显示登录提示前清空屏幕, 去掉引导日志/上次会话的残留。
+        -- 用 ANSI(复位属性 + ED 2 清屏 + CUP 归位), 与 $TERM=linux 的终端语义一致。
+        if stdout and stdout.write then stdout:write("\27[0m\27[2J\27[H") end
         outln("Delin OS " .. tostring(ttyName) .. " login:")
         outln("  switch to this console: Ctrl+Alt+" .. tostring(swkey))
         if stdout and stdout.write then stdout:write("login: ") end
@@ -80,7 +83,7 @@ local function doLogin()
                 outln("Welcome, " .. name .. "!")
                 -- login(1) 语义: 按 passwd 设置登录环境, 再启动用户 shell。
                 local env = {
-                    USER = name, LOGNAME = name, PATH = "/bin",
+                    USER = name, LOGNAME = name, PATH = "/bin", TERM = "linux",
                     HOME = (u and u.home) or "/",
                     SHELL = (u and u.shell) or "/bin/sh",
                 }

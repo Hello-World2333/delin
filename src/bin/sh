@@ -56,6 +56,7 @@ local vars = {
     SHELL = initVar("SHELL", (uinfo and uinfo.shell) or "/bin/sh"),
     PPID = tostring(ppid or 0), -- 内核给的父 pid(子 shell 也重新取, 不继承环境里的 PPID)
     PWD = cwd, -- shell 维护: cd 后同步(见 builtins.cd)
+    TERM = initVar("TERM", "linux"), -- 终端类型: Delin tty 是 16 色 ANSI 终端(login 也设这个)
     PS1 = initVar("PS1", "\\u@\\h:\\w\\$ "),
     PS2 = initVar("PS2", "> "),
     PS3 = initVar("PS3", "#? "),
@@ -64,6 +65,7 @@ local vars = {
 -- 导出标记(export): 名字 -> true。只有被标记的变量经内核环境块传给子进程。
 local exported = {
     PATH = true, HOME = true, USER = true, LOGNAME = true, SHELL = true, PWD = true, PPID = true,
+    TERM = true, -- $TERM 必须传给程序(终端能力协商), 与真实 shell 一致
 }
 -- 导出给子进程的环境块(内核 env 表): 只有 export 标记过且已赋值的变量。
 local function exportEnv()
@@ -293,12 +295,14 @@ local function lex(src)
                     flushRaw()
                     local j, dqsegs = i + 1, {}
                     while j <= n and src:sub(j, j) ~= '"' do
-                        local dc = src:sub(j, j)
-                        if dc == "\\" and src:sub(j + 1, j + 1) == '"' then
-                            dqsegs[#dqsegs + 1] = { raw = '"' }; raw = raw .. '"'; j = j + 2
-                        elseif dc == "\\" and src:sub(j + 1, j + 1) == "\n" then
+                        local dc, nx = src:sub(j, j), src:sub(j + 1, j + 1)
+                        -- POSIX: 双引号内反斜杠仅在 \$ \` \" \\ 和换行前有特殊含义(去掉反斜杠),
+                        -- 其它位置原样保留(如 "\t" 就是反斜杠+t)。
+                        if dc == "\\" and (nx == '"' or nx == "$" or nx == "\\" or nx == "`") then
+                            dqsegs[#dqsegs + 1] = { raw = nx }; raw = raw .. nx; j = j + 2
+                        elseif dc == "\\" and nx == "\n" then
                             j = j + 2 -- 行续接: 双引号内 `\` + 换行 也被删除
-                        elseif dc == "\\" and src:sub(j + 1, j + 1) == "\r" and src:sub(j + 2, j + 2) == "\n" then
+                        elseif dc == "\\" and nx == "\r" and src:sub(j + 2, j + 2) == "\n" then
                             j = j + 3
                         elseif dc == "$" then
                             local name, ni = readVarName(src, j + 1)
@@ -777,7 +781,74 @@ local function searchPath(name, needExec)
 end
 
 builtins.pwd = function(args) outln(cwd) end
-builtins.echo = function(args) outln(table.concat(args, " ")) end
+
+-- echo 的转义(bash/XSI 风格, -e 时生效)。\c 停止输出(不换行), 未知转义原样保留。
+local ECHO_ESC = {
+    a = "\a", b = "\b", e = "\27", E = "\27", f = "\f",
+    n = "\n", r = "\r", t = "\t", v = "\v", ["\\"] = "\\",
+}
+--- 解释 -e 转义: 返回 (文本, 是否继续输出换行)。八进制 \0nnn / 十六进制 \xHH 按字节。
+local function echoEscapes(s)
+    local out, i, n = {}, 1, #s
+    while i <= n do
+        local c = s:sub(i, i)
+        if c ~= "\\" then
+            out[#out + 1] = c
+            i = i + 1
+        else
+            local d = s:sub(i + 1, i + 1)
+            if d == "" then
+                out[#out + 1] = "\\"
+                i = i + 1
+            elseif d == "c" then
+                return table.concat(out), false
+            elseif d == "0" then
+                local oct = s:match("^[0-7][0-7]?[0-7]?", i + 2) or ""
+                out[#out + 1] = string.char((tonumber(oct, 8) or 0) % 256)
+                i = i + 2 + #oct
+            elseif d == "x" then
+                local hex = s:match("^%x%x", i + 2)
+                if hex then
+                    out[#out + 1] = string.char(tonumber(hex, 16))
+                    i = i + 4
+                else
+                    out[#out + 1] = "\\x"
+                    i = i + 2
+                end
+            elseif ECHO_ESC[d] then
+                out[#out + 1] = ECHO_ESC[d]
+                i = i + 2
+            else
+                out[#out + 1] = "\\" .. d
+                i = i + 2
+            end
+        end
+    end
+    return table.concat(out), true
+end
+
+--- echo: POSIX + 扩展 -n(不换行) / -e(解释转义), 可合并(-ne)。选项须在操作数之前; `--` 结束选项。
+builtins.echo = function(args)
+    local i, newline, escapes = 1, true, false
+    while i <= #args do
+        local a = args[i]
+        if a == "--" then i = i + 1; break end
+        if not a:match("^%-[ne]+$") then break end
+        for k = 2, #a do
+            if a:sub(k, k) == "n" then newline = false else escapes = true end
+        end
+        i = i + 1
+    end
+    local parts = {}
+    for k = i, #args do parts[#parts + 1] = args[k] end
+    local s = table.concat(parts, " ")
+    if escapes then
+        local cont
+        s, cont = echoEscapes(s)
+        newline = newline and cont -- \c 截断时不换行, 且不覆盖 -n
+    end
+    if outH and outH.write then outH:write(s .. (newline and "\n" or "")) end
+end
 builtins["true"] = function() end
 builtins["false"] = function() lastExit = 1 end
 builtins[":"] = function() end
@@ -1100,10 +1171,11 @@ builtins.help = function(args)
     outln("Delin sh (POSIX core subset)")
     outln("builtins : cd pwd echo read exit help jobs fg bg wait kill test [ true false :")
     outln("           . set export unset break continue return shift")
-    outln("external : ls cat rm mkdir cp mv touch head tail wc grep sed ed chmod chown login")
+    outln("external : ls cat rm mkdir cp mv touch head tail wc grep sed ed chmod chown login clear")
     outln("usage    : sh [-c cmd [name [args...]]] [script] [args...]   (no script => interactive/stdin)")
     outln("options  : set -e(errexit) -u(nounset) -v(verbose) -x(xtrace) -o <name>; $- lists flags")
-    outln("vars     : PATH HOME PWD OLDPWD USER SHELL PPID PS1 PS2 PS3 PS4 IFS (export to pass to children)")
+    outln("vars     : PATH HOME PWD OLDPWD USER SHELL TERM PPID PS1 PS2 PS3 PS4 IFS (export to pass to children)")
+    outln("terminal : $TERM=linux (16-color ANSI); echo -e '\\e[31mred' ; clear")
 end
 
 local ttyName = (stdin and stdin.getDeviceName) and stdin:getDeviceName() or nil
@@ -1965,8 +2037,8 @@ local function tildeDir(p)
 end
 
 -- 提示符展开(bash 风格): \u 用户 \h 主机(短) \H 主机(全) \w cwd(带 ~) \W 基名
--- \$ root 为 # 否则 $ \#/\! 命令序号 \s shell 名 \n 换行 \t 时间 \d 日期 \\ 反斜杠;
--- 未知转义原样保留(与 bash 一致)。
+-- \$ root 为 # 否则 $ \#/\! 命令序号 \s shell 名 \n 换行 \t 时间 \d 日期 \e ESC(ANSI 配色)
+-- \\ 反斜杠; 未知转义原样保留(与 bash 一致)。
 promptExpand = function(s)
     return (tostring(s or ""):gsub("\\(.)", function(c)
         if c == "u" then return uname
@@ -1980,6 +2052,7 @@ promptExpand = function(s)
         elseif c == "n" then return "\n"
         elseif c == "t" then return os.date("%H:%M:%S")
         elseif c == "d" then return os.date("%a %b %d")
+        elseif c == "e" or c == "E" then return "\27"
         elseif c == "\\" then return "\\"
         else return "\\" .. c
         end
