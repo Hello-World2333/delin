@@ -18,7 +18,7 @@
 | `/dev/` | 设备文件：`/dev/ttyN`（字符终端）、`/dev/fbN`（像素帧缓冲）、`/dev/sdX`（磁盘，见下）、`/dev/null`（读 EOF/写丢弃）、`/dev/console`（系统控制台 = 控制台 tty）、`/dev/kmsg`（内核 ring buffer 只读流）、`/dev/log`（用户态 syslog 输入） |
 | `/etc/` | 系统配置：`passwd` `shadow` `group`、`fstab`、`syslog.conf`、`logrotate.conf`、`systemd/system/`（管理员单元与 enable 标记） |
 | `/proc/` | 虚拟进程/系统信息 fs（由模块提供） |
-| `/sys/` | sysfs 挂载点（虚拟）；`/sys/class/display/` 下每设备一个目录，`name/type/size` 只读，分辨率/位置/旋转/缩放 可读写 |
+| `/sys/` | sysfs 挂载点（虚拟）；`/sys/class/display/` 下每设备一个目录，`name/type/size` 只读，分辨率/位置/旋转/缩放 可读写；属性文件是单行值，读一次即 EOF |
 | `/lib/modules/<version>/` | 内核模块目录：`.ko` 模块 + 纯文本 `manifest` + `modules.alias` |
 | `/lib/systemd/system/` | 厂商单元文件（`.service` `.target` `.timer` `.mount`） |
 | `/run/` | 运行时状态（真实目录，非 tmpfs —— Delin 无 tmpfs）：pid 文件等 |
@@ -316,8 +316,8 @@ lua5.1 tools/bundle.lua dlub     # 生成 dist/dlub.lua（DLUB 引导装载器�
 验证：
 
 ```bash
-lua5.1 tools/hosttest.lua        # 宿主测试: init 引擎/fstab/syslogd/logrotate/systemctl (113 项)
-lua5.1 tools/harness.lua /bin/sh # 宿主上跑真实工具源码(sh/作业控制/管道)
+lua5.1 tools/hosttest.lua        # 宿主测试: init 引擎/fstab/syslogd/logrotate/systemctl/sysfs (131 项)
+lua5.1 tools/harness.lua /bin/sh # 宿主上跑真实工具源码(sh/作业控制/管道; /sys 走真实 sysfs 后端)
 python3 tools/realmachine.py     # 真机: 打包->部署->重启电脑 #3->取回 /var/log/*
 ```
 
@@ -398,8 +398,9 @@ scripts/sysinfo.sh         实用小工具: 系统信息(变量/函数/for/case/
 scripts/realmachine_verify.sh  真机验证脚本(由 verify.service 以 oneshot 运行, 结果写 /var/log/verify.log)
 tools/bundle.lua           打包 src/ -> dist/kernel.lua 或 dist/dlub.lua(init 多文件拼成一个 chunk)
 tools/harness.lua          host 测试台: 用真实 Delin 工具源码在宿主跑(fs/io/syscalls/spawn 桩,
-                           含信号/进程组语义: kill/killpg/SIGCONT/stopped, 供 sh 作业控制验证)
-tools/hosttest.lua         宿主测试: init 单元引擎/fstab 生成/syslogd 规则/logrotate 轮转/systemctl(113 项)
+                           含信号/进程组语义: kill/killpg/SIGCONT/stopped, 供 sh 作业控制验证;
+                           /sys 走真实 kernel.sysfs 后端 + 桩显示设备)
+tools/hosttest.lua         宿主测试: init 单元引擎/fstab 生成/syslogd 规则/logrotate 轮转/systemctl/sysfs(131 项)
 tools/deploy.py            重建干净 ext2 根镜像(基镜像+内核/bin/单元/配置/标记)并部署到 disk
 tools/realmachine.py       真机流程: 打包->部署->注入第二分区与 verify.service->重启 #3->debugfs 取回日志
 dist/                      生成物(不提交)

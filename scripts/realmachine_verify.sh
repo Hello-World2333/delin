@@ -1,10 +1,21 @@
 #!/bin/sh
 # Delin 真机验证脚本 —— 由 verify.service(oneshot)在启动时运行, 结果写 /var/log/verify.log。
 # 覆盖: systemd-like init 的服务/依赖序、systemctl 控制、fstab 自动挂载、mount -a/noauto、
-#       syslogd 规则落盘、logger、dmesg、logrotate 轮转 + SIGHUP 重开。
+#       syslogd 规则落盘、logger、dmesg、logrotate 轮转 + SIGHUP 重开、
+#       sysfs 属性读取(cat 必须单行, 曾经的 bug: 无 EOF 导致无限重复)。
 # 用法(仅测试用): 部署时把本脚本放进 /root/, 并启用 verify.service; 宿主机读回 /var/log/verify.log。
 LOG=/var/log/verify.log
 echo "=== Delin real-machine verify ===" > $LOG
+echo "-- sysfs /sys/class/display --" >> $LOG
+ls /sys/class/display >> $LOG
+# cat 一个属性文件必须只输出一行(曾经的 bug: 属性句柄无 EOF, 无限重复当前值)。
+cat /sys/class/display/back/name >> $LOG
+cat /sys/class/display/back/type >> $LOG
+cat /sys/class/display/back/size >> $LOG
+cat /sys/class/display/right/name >> $LOG
+cat /sys/class/display/right/size >> $LOG
+cat /sys/class/display/term/name >> $LOG
+echo "sysfs: done" >> $LOG
 echo "-- systemctl list-units --" >> $LOG
 systemctl list-units >> $LOG
 echo "-- systemctl status syslogd.service --" >> $LOG

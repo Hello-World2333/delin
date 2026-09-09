@@ -74,7 +74,11 @@ local function isWritable(dev, attr)
 end
 
 --- 打开属性文件句柄。
+--- 属性内容是单行当前值(sysfs 语义): 读完一次即 EOF(nil)。否则按 readLine 循环到 nil
+--- 的工具(cat/grep/sed/head)会无限重复打印同一个值。
 local function openAttr(dev, attr)
+    local pos = 0 -- 已读字节偏移
+    local function content() return getAttr(dev, attr) or "" end
     local function writeImpl(s)
         if not isWritable(dev, attr) then return nil, "read-only attribute" end
         local v = s:gsub("[\r\n]+$", "")
@@ -87,9 +91,24 @@ local function openAttr(dev, attr)
         if ok then return #s else return nil, err end
     end
     return {
-        read     = function() return getAttr(dev, attr) or "" end,
-        readLine = function() return getAttr(dev, attr) or "" end,
-        readAll  = function() return getAttr(dev, attr) or "" end,
+        read = function(_, n)
+            local c = content()
+            if pos >= #c then return nil end
+            if type(n) ~= "number" then pos = #c; return c end
+            local chunk = c:sub(pos + 1, pos + n)
+            pos = pos + #chunk
+            return chunk
+        end,
+        readLine = function()
+            if pos >= #content() then return nil end
+            pos = #content()
+            return content()
+        end,
+        readAll = function()
+            if pos >= #content() then return nil end
+            pos = #content()
+            return content()
+        end,
         write    = function(self, s) return writeImpl(s) end,
         writeLine = function(self, s) return writeImpl(s .. "\n") end,
         close    = function() end,

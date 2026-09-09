@@ -770,5 +770,65 @@ do
     end
 end
 
+-- ===============================================================
+-- H. sysfs: /sys/class/display/<设备>/<属性> 的读写语义
+--    (曾经的 bug: 属性句柄的 readLine 永远返回当前值, cat/grep 无限重复打印)
+-- ===============================================================
+do
+    local vfs = require("kernel.vfs")
+
+    -- 桩: kernel.display(sysfs 只用到 list/get/byName/resize)
+    local dev = {
+        id = "monitor:top", type = "monitor", mode = "term", name = "top",
+        width = 51, height = 19, scale = 1,
+        getSize = function() return 51, 19 end,
+    }
+    package.loaded["kernel.display"] = {
+        list = function() return { dev.id } end,
+        get = function(id) return id == dev.id and dev or nil end,
+        byName = function(n) return n == "top" and dev or nil end,
+        resize = function() return true end,
+    }
+    local sysfs = require("kernel.sysfs")
+    sysfs.mount()
+
+    local function openAttr(path)
+        local b, r = vfs.resolve(path)
+        local fh, err = b.open(r, "r")
+        ok(fh ~= nil, "sysfs: 打开 " .. path, err)
+        return fh
+    end
+
+    local fh = openAttr("/sys/class/display/top/name")
+    eq(fh.readLine(), "top", "sysfs: name 首行 = 设备名")
+    eq(fh.readLine(), nil, "sysfs: name 读完即 EOF")
+    eq(fh.readAll(), nil, "sysfs: EOF 后 readAll = nil")
+
+    fh = openAttr("/sys/class/display/top/size")
+    eq(fh.readAll(), "51x19", "sysfs: size = WxH")
+    eq(fh.readAll(), nil, "sysfs: size 读完即 EOF")
+
+    fh = openAttr("/sys/class/display/top/type")
+    eq(fh.read(), "monitor", "sysfs: read() 无参返回整行")
+    eq(fh.read(), nil, "sysfs: read() 再次 EOF")
+    fh = openAttr("/sys/class/display/top/name")
+    eq(fh:read(2), "to", "sysfs: read(n) 按字节")
+    eq(fh:read(2), "p", "sysfs: read(n) 读到末尾")
+    eq(fh:read(2), nil, "sysfs: read(n) 到末尾后 EOF")
+
+    -- 只读属性拒绝写
+    local b, r = vfs.resolve("/sys/class/display/top/name")
+    local wfh, werr = b.open(r, "w")
+    ok(wfh == nil and tostring(werr):find("read%-only"), "sysfs: 只读属性拒绝写打开", werr)
+
+    -- 目录与不存在的路径
+    b, r = vfs.resolve("/sys/class/display")
+    eq(#b.list(r), 1, "sysfs: /sys/class/display 列出设备")
+    b, r = vfs.resolve("/sys/class/display/nosuch/name")
+    ok(not b.exists(r), "sysfs: 不存在的设备 exists=false")
+    b, r = vfs.resolve("/sys/class/display/top/nosuch")
+    ok(not b.exists(r), "sysfs: 不存在的属性 exists=false")
+end
+
 io.write(string.format("\n%d passed, %d failed\n", pass, fail))
 os.exit(fail == 0 and 0 or 1)

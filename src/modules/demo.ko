@@ -12,14 +12,31 @@ return {
             return table.concat(parts, " ")
         end)
 
-        -- device: /dev/demo (回显写入的内容)
+        -- device: /dev/demo (回显写入的内容; 读一次到 EOF, 与内核虚拟设备一致)
         kapi.registerDevice("demo", {
             open = function(mode)
                 local out = {}
+                local pos = 0
+                local function content() return table.concat(out) end
                 return {
-                    read = function() return table.concat(out) end,
-                    readLine = function() return table.concat(out) end,
-                    readAll = function() return table.concat(out) end,
+                    read = function(_, n)
+                        local c = content()
+                        if pos >= #c then return nil end
+                        if type(n) ~= "number" then pos = #c; return c end
+                        local chunk = c:sub(pos + 1, pos + n)
+                        pos = pos + #chunk
+                        return chunk
+                    end,
+                    readLine = function()
+                        if pos >= #content() then return nil end
+                        pos = #content()
+                        return content()
+                    end,
+                    readAll = function()
+                        if pos >= #content() then return nil end
+                        pos = #content()
+                        return content()
+                    end,
                     write = function(s) out[#out + 1] = s; return #s end,
                     writeLine = function(s) out[#out + 1] = s .. "\n"; return #s + 1 end,
                     close = function() end,
@@ -48,10 +65,26 @@ return {
             open = function(rel)
                 local n = rel:gsub("^/+", "")
                 local content = (n == "cpu") and "cpu: 1 @ 100%" or ((n == "mem") and "mem: 64k" or "")
+                local pos = 0
                 return {
-                    read = function() return content end,
-                    readLine = function() return content end,
-                    readAll = function() return content end,
+                    -- 单行内容: 读完一次即 EOF(nil), 否则 cat/grep 会无限重复打印。
+                    read = function(_, cnt)
+                        if pos >= #content then return nil end
+                        if type(cnt) ~= "number" then pos = #content; return content end
+                        local chunk = content:sub(pos + 1, pos + cnt)
+                        pos = pos + #chunk
+                        return chunk
+                    end,
+                    readLine = function()
+                        if pos >= #content then return nil end
+                        pos = #content
+                        return content
+                    end,
+                    readAll = function()
+                        if pos >= #content then return nil end
+                        pos = #content
+                        return content
+                    end,
                     write = function() end,
                     writeLine = function() end,
                     close = function() end,

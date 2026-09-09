@@ -502,6 +502,79 @@ local function setupRoot()
     os.execute("mkdir -p " .. ROOT .. "/lib/modules/0.0.2")
 end
 
+-- ---------------------------------------------------------------
+-- /sys: 用真实内核 sysfs 后端(src/kernel/sysfs.lua)取代宿主目录,
+-- 让 `cat /sys/class/display/top/name` 这类命令在宿主上得到与真机一致的行为。
+-- 显示设备用一个桩(kernel.display 只被 sysfs 用于 list/get/byName/resize)。
+-- ---------------------------------------------------------------
+package.path = "/home/worker/delin/src/?.lua;" .. package.path
+local sysfsDev = {
+    id = "monitor:top", type = "monitor", mode = "term", name = "top",
+    getSize = function() return 51, 19 end,
+}
+package.loaded["kernel.display"] = {
+    list = function() return { sysfsDev.id } end,
+    get = function(id) return id == sysfsDev.id and sysfsDev or nil end,
+    byName = function(n) return n == "top" and sysfsDev or nil end,
+    resize = function() return true end,
+}
+local vfs = require("kernel.vfs")
+require("kernel.sysfs").mount()
+
+--- /sys 下的路径走 sysfs 后端, 其余仍走宿主文件。
+local function sysfsFor(p)
+    p = norm(p)
+    if p ~= "/sys" and p:sub(1, 5) ~= "/sys/" then return nil end
+    return vfs.resolve(p)
+end
+
+local hostList, hostExists, hostIsDir, hostIsFile = F.list, F.exists, F.isDir, F.isFile
+local hostAttrs, hostSize, hostReadOnly, hostOpen = F.attributes, F.getSize, F.isReadOnly, F.open
+function F.list(p)
+    local b, r = sysfsFor(p)
+    if b then return b.list(r) end
+    return hostList(p)
+end
+function F.exists(p)
+    local b, r = sysfsFor(p)
+    if b then return b.exists(r) end
+    return hostExists(p)
+end
+function F.isDir(p)
+    local b, r = sysfsFor(p)
+    if b then return b.isDir(r) end
+    return hostIsDir(p)
+end
+function F.isFile(p)
+    local b, r = sysfsFor(p)
+    if b then return b.exists(r) and not b.isDir(r) end
+    return hostIsFile(p)
+end
+function F.attributes(p)
+    local b, r = sysfsFor(p)
+    if b then
+        local a = b.attributes(r)
+        if a then a.uid, a.gid, a.mode = 0, 0, a.isDir and tonumber("40555", 8) or tonumber("100444", 8) end
+        return a
+    end
+    return hostAttrs(p)
+end
+function F.getSize(p)
+    local b, r = sysfsFor(p)
+    if b then return b.getSize(r) end
+    return hostSize(p)
+end
+function F.isReadOnly(p)
+    local b, r = sysfsFor(p)
+    if b then return b.isReadOnly(r) end
+    return hostReadOnly(p)
+end
+function F.open(p, mode)
+    local b, r = sysfsFor(p)
+    if b then return b.open(r, mode or "r") end
+    return hostOpen(p, mode)
+end
+
 setupRoot()
 
 -- ---------------------------------------------------------------
