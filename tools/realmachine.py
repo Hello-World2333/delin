@@ -179,7 +179,9 @@ def main():
     # 3e) verify-sh.service: sh 内建/变量自检(. set export unset PATH PSx cd) -> /var/log/sh_verify.log
     for src, dst in (("scripts/sh_verify.sh", "/root/sh_verify.sh"),
                      ("scripts/sh_builtin_test.sh", "/root/sh_builtin_test.sh"),
-                     ("scripts/proc_test.sh", "/root/proc_test.sh")):
+                     ("scripts/proc_test.sh", "/root/proc_test.sh"),
+                     ("scripts/redstone_test.sh", "/root/redstone_test.sh"),
+                     ("scripts/redstone_verify.lua", "/root/redstone_verify.lua")):
         df_write(out, os.path.join(REPO, src), dst)
         df(out, "set_inode_field %s mode 0100755" % dst)
     unit_sh = os.path.join(work, "verify-sh.service")
@@ -306,7 +308,7 @@ def reboot_and_collect(printer=False):
     # 5) 取回日志
     print("== collect logs ==")
     logs = ["/var/log/verify.log", "/var/log/sh_verify.log", "/var/log/messages", "/var/log/messages.1",
-            "/var/log/secure", "/var/log/kern.log"]
+            "/var/log/secure", "/var/log/kern.log", "/var/log/redstone_verify.log"]
     if printer:
         logs += ["/var/log/printer_probe.log", "/var/log/printer_verify.log"]
     for path in logs:

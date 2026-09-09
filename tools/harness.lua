@@ -660,6 +660,43 @@ function F.open(p, mode)
 end
 
 -- ---------------------------------------------------------------
+-- 桩 CC redstone API + 真实的 redstone.ko 模块源码: /sys/class/redstone/<side>/{...}。
+-- 宿主上没有红石, 输入恒 0; 输出状态由桩保存, 使写-读回路径与真机一致,
+-- 于是 scripts/redstone_test.sh 在宿主与真机上输出相同(真机与真实 API 的核对见
+-- scripts/redstone_verify.lua)。
+-- ---------------------------------------------------------------
+local rs = { input = {}, analogIn = {}, bundledIn = {}, output = {}, analogOut = {}, bundledOut = {} }
+local RS_SIDES = { "top", "bottom", "left", "right", "front", "back" }
+local function rsNum(t, s) return t[s] or 0 end
+_G.redstone = {
+    getSides = function() return RS_SIDES end,
+    getInput = function(s) return rs.input[s] == true end,
+    getAnalogInput = function(s) return rsNum(rs.analogIn, s) end,
+    getBundledInput = function(s) return rsNum(rs.bundledIn, s) end,
+    getOutput = function(s) return rs.output[s] == true end,
+    getAnalogOutput = function(s) return rsNum(rs.analogOut, s) end,
+    getBundledOutput = function(s) return rsNum(rs.bundledOut, s) end,
+    setOutput = function(s, on)
+        rs.output[s] = on and true or false
+        rs.analogOut[s] = on and 15 or 0
+    end,
+    setAnalogOutput = function(s, v) rs.analogOut[s] = v; rs.output[s] = v > 0 end,
+    setBundledOutput = function(s, v) rs.bundledOut[s] = v end,
+}
+do
+    local f = assert(io.open("/home/worker/delin/src/modules/redstone.ko"))
+    local src = f:read("*a"); f:close()
+    local env = setmetatable({ require = require }, { __index = _G })
+    local chunk = assert(loadstring(src, "redstone")); setfenv(chunk, env)
+    local sysfs = require("kernel.sysfs")
+    chunk().init({
+        log = function() end,
+        registerSysfsClass = function(n, ops) sysfs.registerClass(n, ops) end,
+        unregisterSysfsClass = function(n) sysfs.unregisterClass(n) end,
+    })
+end
+
+-- ---------------------------------------------------------------
 -- 运行工具: 顶层进程。argv[0] = 工具名(参数1), args = 其余。
 -- ---------------------------------------------------------------
 local argsIn = {}

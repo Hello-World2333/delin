@@ -18,7 +18,7 @@
 | `/dev/` | 设备文件：`/dev/ttyN`（字符终端）、`/dev/fbN`（像素帧缓冲）、`/dev/sdX`（磁盘，见下）、`/dev/lpN`（打印机字符设备，只写，见下）、`/dev/null`（读 EOF/写丢弃）、`/dev/console`（系统控制台 = 控制台 tty）、`/dev/kmsg`（内核 ring buffer 只读流）、`/dev/log`（用户态 syslog 输入） |
 | `/etc/` | 系统配置：`passwd` `shadow` `group`、`fstab`、`syslog.conf`、`logrotate.conf`、`systemd/system/`（管理员单元与 enable 标记） |
 | `/proc/` | 虚拟进程/系统信息 fs（procfs，内核提供，见下）：`/proc/<pid>/{cmdline,comm,cwd,stat,status}`、`/proc/self`、`/proc/{mounts,uptime,version}` |
-| `/sys/` | sysfs 挂载点（虚拟）：`/sys/class/<class>/<条目>/<属性>`，class 由内核/模块注册 —— `display`（每显示设备一项，`name/type/size` 只读，分辨率/位置/旋转/缩放 可读写）与 `printer`（每打印设备一项，见下）；属性文件是单行值，读一次即 EOF |
+| `/sys/` | sysfs 挂载点（虚拟）：`/sys/class/<class>/<条目>/<属性>`，class 由内核/模块注册 —— `display`（每显示设备一项，`name/type/size` 只读，分辨率/位置/旋转/缩放 可读写）、`printer`（每打印设备一项，见下）与 `redstone`（每个红石面一项，见下）；属性文件是单行值，读一次即 EOF |
 | `/lib/modules/<version>/` | 内核模块目录：`.ko` 模块 + 纯文本 `manifest` + `modules.alias` |
 | `/lib/systemd/system/` | 厂商单元文件（`.service` `.target` `.timer` `.mount`） |
 | `/run/` | 运行时状态（真实目录，非 tmpfs —— Delin 无 tmpfs）：pid 文件等 |
@@ -75,6 +75,35 @@ Linux `lp(4)` 风格的**字符设备**：写入的字节流 = 交给打印机�
   （已写入内容仍成页打印，不留悬挂页），退出码 130。
 - 真机实测的打印机原始语义（`write` 不折行、`\n` 是普通字符、开页即扣 1 纸 + 1 墨、`endPage` 出纸盘满即失败）
   记录在 `scripts/printer_probe.lua` 的输出里。
+
+### 红石（`redstone.ko`）
+
+CC 的红石 API 是函数式的（`redstone.getInput(side)` / `redstone.setAnalogOutput(side, v)`），
+`redstone.ko` 把它摊成 Linux gpio 风格的 **sysfs 属性文件**（对应 `/sys/class/gpio/gpioN/{direction,value}`），
+于是 shell 里 `cat` / `echo` 就能直接和红石打交道，不需要写 Lua 也不需要任何工具：
+
+| 路径 | 含义 |
+|---|---|
+| `/sys/class/redstone/<side>/input` | 该面输入，读 `0`/`1`（`getInput`） |
+| `/sys/class/redstone/<side>/analog_input` | 该面模拟输入，读 `0..15`（`getAnalogInput`） |
+| `/sys/class/redstone/<side>/bundled_input` | 该面集束输入，读 `0..65535` 位掩码（`getBundledInput`） |
+| `/sys/class/redstone/<side>/output` | 该面输出，读写 `0`/`1`（`getOutput`/`setOutput`） |
+| `/sys/class/redstone/<side>/analog_output` | 该面模拟输出，读写 `0..15`（`getAnalogOutput`/`setAnalogOutput`） |
+| `/sys/class/redstone/<side>/bundled_output` | 该面集束输出，读写 `0..65535` 位掩码（`getBundledOutput`/`setBundledOutput`） |
+
+`<side>` 是 CC 的六个面 `top bottom left right front back` —— 六个面恒定存在（CC 电脑六面都能收发红石），
+因此没有 Linux gpio 的 `export`/`unexport`。
+
+- **用法**：`cat /sys/class/redstone/left/analog_input`、`echo 15 > /sys/class/redstone/left/analog_output`、
+  `echo 32768 > /sys/class/redstone/back/bundled_output`（`black` = 32768，与 `colors.black` 一致；
+  读也输出十进制掩码，与 `colors.combine`/`colors.subtract` 是同一套位掩码）。
+- **输出语义与 CC 一致**：`output` 与 `analog_output` 是同一份输出状态 —— 写 `output=1` 后读
+  `analog_output` 得 `15`，写 `analog_output=0` 后读 `output` 得 `0`。
+- **写校验 fail-fast**：值必须是十进制整数且在范围内（`0x10`/`1e2`/负数/小数一律拒绝），
+  非法写返回错误且**不改动**输出状态；`sh` 的 `echo` 把它报成 `echo: write error: invalid ...`
+  并置退出码 1（见下文 `echo`），不会被静默吞掉。
+- **事件**：不提供阻塞读（没有 `/dev/kmsg` 那种语义），要等红石变化就轮询；
+  事件驱动的程序直接用 CC 的 `redstone` API（`os.pullEvent("redstone")`）。
 
 ### procfs（`/proc`）与进程管理
 
@@ -172,7 +201,9 @@ Linux `lp(4)` 风格的**字符设备**：写入的字节流 = 交给打印机�
 `PS4`（默认 `+ `，`set -x` 前缀）；展开 bash 风格转义 `\u \h \H \w \W \$ \# \! \s \n \t \d \e \\`，
 未知转义原样保留，`\h` 取 `/etc/hostname`（缺失为 `delin`），`\w` 把 `$HOME` 缩成 `~`。
 **`echo`**：POSIX + 扩展 `-n`（不换行）/ `-e`（解释转义 `\a \b \c \e \f \n \r \t \v \\ \0nnn \xHH`，
-`\c` 截断且不换行，未知转义原样保留），例如 `echo -e '\e[31mred\e[0m'`。
+`\c` 截断且不换行，未知转义原样保留），例如 `echo -e '\e[31mred\e[0m'`；写失败（设备/属性文件/管道
+句柄返回 `nil, err`）报 `echo: write error: ...` 并置退出码 1（POSIX），
+因此 `echo 15 > /sys/class/redstone/left/analog_output` 的失败不会被静默吞掉。
 **`cd`**：无参进 `$HOME`，`cd -` 回 `$OLDPWD` 并打印新目录，`PWD`/`OLDPWD` 随 `cd` 更新。
 **`set`**（POSIX 特殊内建）：无参按名排序列出全部变量（`name='value'`，可重输入）；
 `set -- a b`（或 `set a b`）设位置参数，`set --` 清空；选项 `-e`（errexit）/`-u`（nounset）/
@@ -309,7 +340,7 @@ PID 1 现在是**用户态服务管理器**（`src/init/unit.lua` 单元解析 +
 用户态 `/dev/log`、`syslogd` 按 `/etc/syslog.conf` 写 `/var/log/*`（SIGHUP 重开、游标续读不重放）、
 `logrotate` + `logrotate.timer` 轮转、`logger`/`dmesg`。`/etc/fstab` 由 init 生成 mount 单元
 （`local-fs.target`），`mount -a` 复用同一解析器。init 里的自检代码已全部删除，验证改为
-宿主测试台 `tools/hosttest.lua`（311 项）与真机脚本 `tools/realmachine.py` +
+宿主测试台 `tools/hosttest.lua`（361 项）与真机脚本 `tools/realmachine.py` +
 `scripts/realmachine_verify.sh`。
 
 `src/bin/sh` 已升级为 POSIX 核心子集（变量/引号/if/for/while/case/函数/test/[ ]/&&/|| /文件重定向/管道
@@ -336,6 +367,12 @@ sysfs 也从 display 专用泛化成 class 注册表（模块用 `kapi.registerS
 `-p`/`-t`/`-u`/`-o`/`--no-headers`）、`pgrep`/`pkill`（`-f`/`-x`/`-v`/`-n`/`-o`/`-u` + 信号）、
 `killall`（`-e`/`-q`/`-u`/`-l`）—— 全部是 `/proc` 的消费者，不额外开 syscall。
 `scripts/proc_test.sh`（41 项）在宿主 harness 与真机上各跑一次逐项比对。
+
+红石经 `redstone` 模块摊成 sysfs 属性文件 `/sys/class/redstone/<side>/{input,output,analog_input,
+analog_output,bundled_input,bundled_output}`（六个面恒定存在），`cat`/`echo` 即读写；
+写值严格校验（十进制整数 + 范围），非法写 fail-fast 且不改动输出状态。
+`scripts/redstone_test.sh`（50 项）在宿主 harness 与真机上各跑一次逐项比对，
+`scripts/redstone_verify.lua` 在真机上以 CC 原始 `redstone` API 为真值逐项交叉核对。
 
 ### 引导
 
@@ -437,9 +474,10 @@ lua5.1 tools/bundle.lua dlub     # 生成 dist/dlub.lua（DLUB 引导装载器�
 验证：
 
 ```bash
-lua5.1 tools/hosttest.lua        # 宿主测试: init 引擎/fstab/syslogd/logrotate/systemctl/sysfs/ccprinter/procfs/tty-ANSI (311 项)
+lua5.1 tools/hosttest.lua        # 宿主测试: init 引擎/fstab/syslogd/logrotate/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone (361 项)
 lua5.1 tools/harness.lua /bin/sh # 宿主上跑真实工具源码(sh/作业控制/管道; /sys 走真实 sysfs 后端, /proc 走真实 procfs 后端)
 lua5.1 tools/harness.lua /bin/sh < scripts/proc_test.sh   # /proc + ps/pgrep/pkill/killall 自检(与真机比对)
+lua5.1 tools/harness.lua /bin/sh < scripts/redstone_test.sh   # /sys/class/redstone 读写/校验自检(与真机比对)
 lua5.1 tools/ext2test.lua        # ext2 驱动宿主回归: 真实镜像上跑目录增删, 再用宿主 e2fsck -fn 判定
 python3 tools/realmachine.py --base /mnt/bak/root.base.img   # 真机: 先关机->打包->部署->重启 #3->取回 /var/log/*
 python3 tools/realmachine.py --printer   # 真机 + 打印机(会实际打印页面): 探测 printer API + 验证 /dev/lp0
@@ -527,13 +565,17 @@ src/units/*                厂商单元文件 -> /lib/systemd/system/ (default/m
 src/etc/{fstab,syslog.conf,logrotate.conf}  系统配置 -> /etc/
 src/modules/*.ko           内核模块: ccdisk(ccdisk fstype) ccmonitor(CC 显示器驱动) ccprinter(CC 打印机 ->
                            /dev/lpN + sysfs printer 类) cc_hse(HSE 时钟拉模式 os.msleep) demo(演示)
-                           ext2(ext2 fstype) tom(Tom GPU 驱动) void(Void 全息驱动)
+                           ext2(ext2 fstype) redstone(CC 红石 -> sysfs redstone 类) tom(Tom GPU 驱动)
+                           void(Void 全息驱动)
 src/modules/modules.alias  驱动别名(modprobe 风格): tm_gpu->tom hologram->void monitor->ccmonitor printer->ccprinter
-src/modules/manifest       默认装载模块清单: demo ext2 ccdisk
+src/modules/manifest       默认装载模块清单: demo ext2 ccdisk redstone
 scripts/posix_test.sh      可移植 POSIX 自检(host 与 Delin 各跑一次比对, 111 项全过)
 scripts/jobctl_test.sh     作业控制自检(& / $! / jobs / fg / bg / wait / kill %job, host 与真机各跑一次)
 scripts/sysinfo.sh         实用小工具: 系统信息(变量/函数/for/case/if/重定向/工具)
 scripts/proc_test.sh       /proc + ps/pgrep/pkill/killall 自检(host harness 与真机各跑一次比对, 41 项)
+scripts/redstone_test.sh   /sys/class/redstone 读写/校验自检(host harness 与真机各跑一次比对, 50 项)
+scripts/redstone_verify.lua  真机交叉核对: /sys/class/redstone/* 与 CC 原始 redstone API 逐项一致
+                           (写 /var/log/redstone_verify.log; 由 realmachine_verify.sh 调用)
 scripts/realmachine_verify.sh  真机验证脚本(由 verify.service 以 oneshot 运行, 结果写 /var/log/verify.log)
 scripts/printer_probe.lua  真机探测 CC printer 原始 API 语义(页尺寸/写不折行/开页扣纸墨), 写 /var/log/printer_probe.log
 scripts/printer_verify.sh  真机验证 ccprinter 模块(/dev/lp0 + /sys/class/printer, 会实际打印), 写 /var/log/printer_verify.log
@@ -541,8 +583,9 @@ tools/bundle.lua           打包 src/ -> dist/kernel.lua 或 dist/dlub.lua(init
 tools/harness.lua          host 测试台: 用真实 Delin 工具源码在宿主跑(fs/io/syscalls/spawn 桩,
                            含信号/进程组语义: kill/killpg/SIGCONT/stopped, 供 sh 作业控制验证;
                            /sys 与 /proc 走真实 kernel.sysfs/kernel.procfs 后端 + 桩显示设备
-                           + 桩 printer(/dev/lp0) + 桩进程表(ps/pgrep/pkill/killall))
-tools/hosttest.lua         宿主测试: init 单元引擎/fstab 生成/syslogd 规则/logrotate 轮转/systemctl/sysfs/ccprinter/procfs/tty-ANSI(311 项)
+                           + 桩 printer(/dev/lp0) + 桩 redstone API(加载真实 redstone.ko)
+                           + 桩进程表(ps/pgrep/pkill/killall))
+tools/hosttest.lua         宿主测试: init 单元引擎/fstab 生成/syslogd 规则/logrotate 轮转/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone(361 项)
 tools/ext2test.lua         宿主 ext2 回归: 真实镜像上跑目录增删(空洞/links/回收), 宿主 e2fsck -fn 判定
 tools/deploy.py            重建干净 ext2 根镜像(基镜像+内核/bin/单元/配置/标记), 属主按基镜像逐条写回;
                            基镜像损坏/rdump 漏文件/构建后 fsck 不过一律 fail-fast

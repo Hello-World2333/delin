@@ -1,0 +1,120 @@
+--@name redstone
+--@version 0.1.0
+--@description CC 红石驱动: /sys/class/redstone/<side>/{input,output,analog_input,analog_output,
+--             bundled_input,bundled_output}; 读 = 当前信号, 写 output/analog_output/bundled_output = 设输出。
+--@deps
+
+--[[ 抽象(对齐 Linux gpio 的 sysfs 接口 /sys/class/gpio/gpioN/{direction,value}):
+     CC 的红石 API 是函数式的(redstone.getInput(side) / redstone.setAnalogOutput(side, v)),
+     本驱动把它摊成文件 —— 每个面一个目录, 属性文件是单行值, 读一次即 EOF(sysfs 语义):
+
+       /sys/class/redstone/<side>/input          读 0|1        (getInput)
+       /sys/class/redstone/<side>/analog_input   读 0..15      (getAnalogInput)
+       /sys/class/redstone/<side>/bundled_input  读 0..65535   (getBundledInput, 16 色位掩码)
+       /sys/class/redstone/<side>/output         读写 0|1      (getOutput / setOutput)
+       /sys/class/redstone/<side>/analog_output  读写 0..15    (getAnalogOutput / setAnalogOutput)
+       /sys/class/redstone/<side>/bundled_output 读写 0..65535 (getBundledOutput / setBundledOutput)
+
+     于是 shell 里就是 `cat /sys/class/redstone/left/analog_input` 与
+     `echo 15 > /sys/class/redstone/left/analog_output`, 不需要 Lua 也不需要任何工具。
+
+     语义与 CC 一致: output 与 analog_output 是同一份输出状态 —— 写 output=1 后读
+     analog_output 得 15, 写 analog_output=0 后读 output 得 0。bundled 用十进制位掩码
+     (colors.white=1 .. colors.black=32768), 读也输出掩码, 与 colors.combine/subtract 对齐。
+
+     写校验 fail-fast: 值必须是十进制整数且在范围内, 否则返回错误且**不改动**输出状态
+     (属性文件是内核接口, 不做 "0x10"/"1e2"/负数/小数的模糊解析)。六个面恒定存在
+     (CC 电脑六面都能收发红石), 因此没有 Linux gpio 的 export/unexport。 ]]
+
+local ATTRS = { "input", "output", "analog_input", "analog_output", "bundled_input", "bundled_output" }
+local WRITABLE = { output = true, analog_output = true, bundled_output = true }
+
+local SIDES = nil
+
+--- 六个面的稳定顺序(按名排序, 使 ls /sys/class/redstone 与真机/宿主一致)。
+local function sides()
+    if not SIDES then
+        local out = {}
+        for _, s in ipairs(redstone.getSides()) do out[#out + 1] = s end
+        table.sort(out)
+        SIDES = out
+    end
+    return SIDES
+end
+
+local function isSide(entry)
+    for _, s in ipairs(sides()) do
+        if s == entry then return true end
+    end
+    return false
+end
+
+--- 解析属性值: 严格十进制整数, 0..max。
+---@return number|nil, string|nil
+local function parseValue(value, max, what)
+    local text = tostring(value)
+    local n = text:match("^%d+$") and tonumber(text) or nil
+    if not n or n > max then
+        return nil, "invalid " .. what .. ": '" .. text .. "' (expected decimal integer 0.." .. max .. ")"
+    end
+    return n
+end
+
+local function get(entry, attr)
+    if attr == "input" then return redstone.getInput(entry) and "1" or "0" end
+    if attr == "output" then return redstone.getOutput(entry) and "1" or "0" end
+    if attr == "analog_input" then return tostring(redstone.getAnalogInput(entry)) end
+    if attr == "analog_output" then return tostring(redstone.getAnalogOutput(entry)) end
+    if attr == "bundled_input" then return tostring(redstone.getBundledInput(entry)) end
+    if attr == "bundled_output" then return tostring(redstone.getBundledOutput(entry)) end
+    return nil
+end
+
+local function set(entry, attr, value)
+    if attr == "output" then
+        local n, err = parseValue(value, 1, "output")
+        if not n then return nil, err end
+        redstone.setOutput(entry, n == 1)
+        return true
+    end
+    if attr == "analog_output" then
+        local n, err = parseValue(value, 15, "analog_output")
+        if not n then return nil, err end
+        redstone.setAnalogOutput(entry, n)
+        return true
+    end
+    if attr == "bundled_output" then
+        local n, err = parseValue(value, 65535, "bundled_output")
+        if not n then return nil, err end
+        redstone.setBundledOutput(entry, n)
+        return true
+    end
+    return nil, "read-only attribute: " .. tostring(attr)
+end
+
+local activeKapi = nil
+
+return {
+    init = function(kapi)
+        activeKapi = kapi
+        kapi.registerSysfsClass("redstone", {
+            list = function() return sides() end,
+            attrs = function(entry)
+                if not isSide(entry) then return nil end
+                return ATTRS
+            end,
+            writable = function(entry, attr)
+                return isSide(entry) and WRITABLE[attr] == true
+            end,
+            get = get,
+            set = set,
+        })
+        kapi.log("redstone: /sys/class/redstone registered (" .. #sides() .. " sides)")
+    end,
+
+    exit = function()
+        if not activeKapi then return end
+        activeKapi.unregisterSysfsClass("redstone")
+        activeKapi = nil
+    end,
+}

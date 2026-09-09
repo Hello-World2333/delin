@@ -1374,5 +1374,174 @@ do
     ok(mounts:find("proc /proc proc ro 0 0", 1, true) ~= nil, "procfs: mounts 含 /proc 条目", mounts)
 end
 
+-- ===============================================================
+-- L. redstone: /sys/class/redstone/<side>/{input,output,analog_*,bundled_*}
+--    用桩 CC redstone API 验证驱动的读写/校验语义(真机与真实 API 的交叉核对见
+--    scripts/redstone_verify.lua, shell 接口见 scripts/redstone_test.sh)。
+-- ===============================================================
+do
+    local vfs = require("kernel.vfs")
+    local sysfs = require("kernel.sysfs")
+
+    -- 桩 redstone API: 忠实模拟 CC 的语义(output 与 analog_output 是同一份状态)。
+    local st = { input = {}, analogIn = {}, bundledIn = {}, output = {}, analogOut = {}, bundledOut = {} }
+    local SIDE_LIST = { "top", "bottom", "left", "right", "front", "back" }
+    local function num(t, s) return t[s] or 0 end
+    _G.redstone = {
+        getSides = function() return SIDE_LIST end,
+        getInput = function(s) return st.input[s] == true end,
+        getAnalogInput = function(s) return num(st.analogIn, s) end,
+        getBundledInput = function(s) return num(st.bundledIn, s) end,
+        getOutput = function(s) return st.output[s] == true end,
+        getAnalogOutput = function(s) return num(st.analogOut, s) end,
+        getBundledOutput = function(s) return num(st.bundledOut, s) end,
+        setOutput = function(s, on)
+            st.output[s] = on and true or false
+            st.analogOut[s] = on and 15 or 0
+        end,
+        setAnalogOutput = function(s, v) st.analogOut[s] = v; st.output[s] = v > 0 end,
+        setBundledOutput = function(s, v) st.bundledOut[s] = v end,
+    }
+
+    local cls, clsName
+    local kapi = {
+        log = function() end,
+        registerSysfsClass = function(n, ops) clsName = n; cls = ops; sysfs.registerClass(n, ops) end,
+        unregisterSysfsClass = function(n) sysfs.unregisterClass(n) end,
+    }
+
+    local src = assert(readFile(REPO .. "/src/modules/redstone.ko"))
+    local env = setmetatable({ require = require }, { __index = _G })
+    local chunk
+    if _VERSION == "Lua 5.1" then
+        chunk = assert(loadstring(src, "redstone"))
+        setfenv(chunk, env)
+    else
+        chunk = assert(load(src, "redstone", "t", env))
+    end
+    local mod = chunk()
+    mod.init(kapi)
+
+    eq(clsName, "redstone", "redstone: 注册 sysfs redstone 类")
+    local b, r = vfs.resolve("/sys/class/redstone")
+    eq(table.concat(b.list(r), ","), "back,bottom,front,left,right,top",
+       "redstone: 六个面按名排序(getSides 顺序无关)")
+    eq(table.concat(cls.attrs("left"), ","), "input,output,analog_input,analog_output,bundled_input,bundled_output",
+       "redstone: 属性清单")
+    eq(cls.attrs("middle"), nil, "redstone: 不存在的面没有属性")
+
+    local function openAttr(path, mode)
+        local bk, rl = vfs.resolve(path)
+        local fh, err = bk.open(rl, mode or "r")
+        ok(fh ~= nil, "redstone: 打开 " .. path, err)
+        return fh
+    end
+
+    -- 读: 输入/输出/模拟量/集束量都取自 API 当前值
+    st.input.left, st.input.top = true, false
+    st.analogIn.left, st.bundledIn.left = 9, 32769
+    eq(openAttr("/sys/class/redstone/left/input").readAll(), "1", "redstone: input=1")
+    eq(openAttr("/sys/class/redstone/top/input").readAll(), "0", "redstone: input=0")
+    eq(openAttr("/sys/class/redstone/left/analog_input").readAll(), "9", "redstone: analog_input")
+    eq(openAttr("/sys/class/redstone/left/bundled_input").readAll(), "32769", "redstone: bundled_input 位掩码")
+
+    -- 属性文件是单行值: 读一次即 EOF
+    local fh = openAttr("/sys/class/redstone/left/input")
+    eq(fh.readAll(), "1", "redstone: 首次读得值")
+    eq(fh.readAll(), nil, "redstone: 读完即 EOF")
+
+    -- 写 output: 与 CC 一样落到 15, analog_output 读回 15
+    eq(cls.set("left", "output", "1"), true, "redstone: 写 output=1")
+    eq(st.output.left, true, "redstone: output 落到 API")
+    eq(openAttr("/sys/class/redstone/left/output").readAll(), "1", "redstone: 读回 output")
+    eq(openAttr("/sys/class/redstone/left/analog_output").readAll(), "15", "redstone: output=1 即 analog 15")
+
+    -- 写 analog_output: 0 关掉 output, 中间值保持 output=1
+    eq(cls.set("left", "analog_output", "7"), true, "redstone: 写 analog_output=7")
+    eq(openAttr("/sys/class/redstone/left/analog_output").readAll(), "7", "redstone: 读回 analog_output")
+    eq(openAttr("/sys/class/redstone/left/output").readAll(), "1", "redstone: analog 7 -> output 1")
+    cls.set("left", "analog_output", "0")
+    eq(openAttr("/sys/class/redstone/left/output").readAll(), "0", "redstone: analog 0 -> output 0")
+
+    -- 写 bundled_output: 十进制位掩码
+    eq(cls.set("left", "bundled_output", "32768"), true, "redstone: 写 bundled_output")
+    eq(openAttr("/sys/class/redstone/left/bundled_output").readAll(), "32768", "redstone: 读回 bundled_output")
+    cls.set("left", "bundled_output", "0")
+
+    -- 非法值 fail-fast, 且不改动输出状态
+    st.analogOut.left = 3
+    local bad = { { "analog_output", "16" }, { "analog_output", "abc" }, { "analog_output", "1e2" },
+                  { "analog_output", "-1" }, { "analog_output", "0x10" },
+                  { "output", "2" }, { "bundled_output", "65536" } }
+    for _, c in ipairs(bad) do
+        local okw, werr = cls.set("left", c[1], c[2])
+        ok(okw == nil and tostring(werr):find("invalid") ~= nil,
+           "redstone: 拒绝非法值 " .. c[1] .. "=" .. c[2], werr)
+    end
+    eq(st.analogOut.left, 3, "redstone: 非法值不改动输出状态")
+
+    -- 只读属性: 声明为不可写, 写打开被 sysfs 拒绝; class 的 set 也拒绝
+    local bk, rl = vfs.resolve("/sys/class/redstone/left/input")
+    local roh, roerr = bk.open(rl, "w")
+    ok(roh == nil and tostring(roerr):find("read%-only"), "redstone: input 只读(写打开失败)", roerr)
+    local sok, serr = cls.set("left", "input", "1")
+    ok(sok == nil and tostring(serr):find("read%-only"), "redstone: set 拒绝只读属性", serr)
+
+    -- 经 VFS 句柄写入(含末尾换行被剥掉), 非法值同样报错
+    local outH = openAttr("/sys/class/redstone/left/analog_output", "w")
+    outH:writeLine("12")
+    eq(st.analogOut.left, 12, "redstone: 句柄写入剥掉换行")
+    local wok, wrerr = outH:write("99\n")
+    ok(wok == nil and tostring(wrerr):find("invalid") ~= nil, "redstone: 句柄非法写入报错", wrerr)
+    eq(st.analogOut.left, 12, "redstone: 句柄非法写入不改状态")
+
+    -- 不存在的面: 不是目录, 属性也不存在
+    b, r = vfs.resolve("/sys/class/redstone/middle")
+    ok(not b.exists(r) and not b.isDir(r), "redstone: 不存在的面 exists/isDir=false")
+    b, r = vfs.resolve("/sys/class/redstone/middle/input")
+    ok(not b.exists(r), "redstone: 不存在面的属性 exists=false")
+
+    -- 真机交叉核对脚本(scripts/redstone_verify.lua)的逻辑回归: 同一份源码在真机上以
+    -- CC 原始 API 为真值, 这里先拿桩 API 跑一遍, 保证脚本自身(面/属性/校验/复位)没写错。
+    -- 日志写入换成内存句柄(宿主没有 /var/log 挂载), 其余 fs 调用走真实 VFS。
+    local vlog = {}
+    local vlogHandle = {
+        write = function(_, s) vlog[#vlog + 1] = tostring(s); return #tostring(s) end,
+        close = function() return true end,
+    }
+    local vfsFs = {
+        open = function(p, mode)
+            if p == "/var/log/redstone_verify.log" then return vlogHandle end
+            local bk, rl = vfs.resolve(p)
+            return bk.open(rl, mode)
+        end,
+        list = function(p) local bk, rl = vfs.resolve(p); return bk.list(rl) end,
+        isDir = function(p) local bk, rl = vfs.resolve(p); return bk.isDir(rl) end,
+        isFile = function(p)
+            local bk, rl = vfs.resolve(p)
+            return bk.exists(rl) and not bk.isDir(rl)
+        end,
+    }
+    local vsrc = assert(readFile(REPO .. "/scripts/redstone_verify.lua"))
+    local venv = setmetatable({ fs = vfsFs, redstone = _G.redstone, io = { write = function() end } },
+                              { __index = _G })
+    local vchunk
+    if _VERSION == "Lua 5.1" then
+        vchunk = assert(loadstring(vsrc, "redstone_verify"))
+        setfenv(vchunk, venv)
+    else
+        vchunk = assert(load(vsrc, "redstone_verify", "t", venv))
+    end
+    eq(vchunk(), 0, "redstone: scripts/redstone_verify.lua 在桩 API 上全部通过")
+    ok(table.concat(vlog):find("redstone verify: all ok", 1, true) ~= nil,
+       "redstone: verify 脚本写出汇总行")
+
+    -- 卸载模块后整个 class 子树消失
+    mod.exit()
+    b, r = vfs.resolve("/sys/class/redstone")
+    ok(not b.exists(r), "redstone: exit 注销 class")
+    _G.redstone = nil
+end
+
 io.write(string.format("\n%d passed, %d failed\n", pass, fail))
 os.exit(fail == 0 and 0 or 1)
