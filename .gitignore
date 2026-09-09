@@ -3,3 +3,6 @@ dist/
 
 # Lua compilation intermediate
 *.luac
+
+# Python bytecode
+__pycache__/

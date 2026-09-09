@@ -313,9 +313,21 @@ sysfs 也从 display 专用泛化成 class 注册表（模块用 `kapi.registerS
   自带的 `/lib/modules/<version>/` 装载（自包含，fail-fast，绝不回退到引导盘/CC fs 的 `/lib`）。
   两条路径最后都 spawn 同一份 init 源码，随后由 init 启动 `default.target`。
 
-真机流程：`tools/realmachine.py`（打包 → `tools/deploy.py` 重建 ext2 根镜像 → 注入第二个 ext2 分区
-供 fstab 测试 + `verify.service` → 写 DLUB 到电脑 FS 的引导入口 → RCON 重启电脑 #3 → 用 `debugfs`
-从镜像取回 `/var/log/*`）；`scripts/realmachine_verify.sh` 是它在真机上跑的验证脚本。
+真机流程：`tools/realmachine.py`（**先关机** → 打包 → `tools/deploy.py` 重建 ext2 根镜像 → 注入第二个 ext2 分区
+供 fstab 测试 + `verify.service` → `e2fsck -fn` 门禁 → 装盘并按 md5 校验 → 开机 → 用 `debugfs`
+从镜像取回 `/var/log/*` → 再停机 fsck 一次）；`scripts/realmachine_verify.sh` 是它在真机上跑的验证脚本。
+
+**部署的两条硬约束**（踩过的事故，别改回去）：
+
+- **机器必须先停**。读基镜像（live `/parts/root.img`）和写盘都在停机状态下进行：曾经先覆盖 `root.img`
+  再关机，机器还在跑 ext2 测试并写同一张盘，两边写入交错，盘上的镜像变成"新镜像数据块 + 旧镜像
+  inode 表"的混合体，`/lib`、`/home` 整个目录读不出来。装盘后还会逐文件按 md5 回读校验。
+- **属主以基镜像为准**。`rdump` 以非 root 运行时无法恢复 uid/gid，`debugfs mkdir/write` 一律建成
+  root:root，所以 `deploy.py` 会先用 `debugfs ls -l -p` 把基镜像的 `path -> (uid,gid)` 读出来，
+  逐条 `set_inode_field uid/gid` 写回；基镜像里没有的路径默认 root:root。因此**基镜像的属主就是
+  权威来源**，现在用 `/mnt/bak/root.base.img`（干净的 rootfs，`/home/alice` 已是 1000:1000）。
+  基镜像损坏时 deploy 直接失败（debugfs 遇到坏目录只打印错误、退出码仍是 0，会静默漏掉整个目录，
+  历史上就是这样丢掉 `/lib` 的）。
 
 ### 设计要点
 
@@ -374,9 +386,13 @@ lua5.1 tools/bundle.lua dlub     # 生成 dist/dlub.lua（DLUB 引导装载器�
 ```bash
 lua5.1 tools/hosttest.lua        # 宿主测试: init 引擎/fstab/syslogd/logrotate/systemctl/sysfs/ccprinter/tty-ANSI (264 项)
 lua5.1 tools/harness.lua /bin/sh # 宿主上跑真实工具源码(sh/作业控制/管道; /sys 走真实 sysfs 后端)
-python3 tools/realmachine.py     # 真机: 打包->部署->重启电脑 #3->取回 /var/log/*
+lua5.1 tools/ext2test.lua        # ext2 驱动宿主回归: 真实镜像上跑目录增删, 再用宿主 e2fsck -fn 判定
+python3 tools/realmachine.py --base /mnt/bak/root.base.img   # 真机: 先关机->打包->部署->重启 #3->取回 /var/log/*
 python3 tools/realmachine.py --printer   # 真机 + 打印机(会实际打印页面): 探测 printer API + 验证 /dev/lp0
 ```
+
+`realmachine.py` 最后会停机再对安装到磁盘的 `root.img` 跑一次 `e2fsck -fn`：**跑一轮后 fsck 必须干净**，
+不干净就整体失败（这是"Delin 自己把文件系统写坏了"的判据）。
 
 ## 约定
 
@@ -464,8 +480,11 @@ tools/harness.lua          host 测试台: 用真实 Delin 工具源码在宿主
                            含信号/进程组语义: kill/killpg/SIGCONT/stopped, 供 sh 作业控制验证;
                            /sys 走真实 kernel.sysfs 后端 + 桩显示设备 + 桩 printer(/dev/lp0))
 tools/hosttest.lua         宿主测试: init 单元引擎/fstab 生成/syslogd 规则/logrotate 轮转/systemctl/sysfs/ccprinter/tty-ANSI(264 项)
-tools/deploy.py            重建干净 ext2 根镜像(基镜像+内核/bin/单元/配置/标记)并部署到 disk
-tools/realmachine.py       真机流程: 打包->部署->注入第二分区与 verify.service->重启 #3->debugfs 取回日志
+tools/ext2test.lua         宿主 ext2 回归: 真实镜像上跑目录增删(空洞/links/回收), 宿主 e2fsck -fn 判定
+tools/deploy.py            重建干净 ext2 根镜像(基镜像+内核/bin/单元/配置/标记), 属主按基镜像逐条写回;
+                           基镜像损坏/rdump 漏文件/构建后 fsck 不过一律 fail-fast
+tools/realmachine.py       真机流程: 先关机->打包->部署->注入第二分区与 verify.service->fsck 门禁->
+                           装盘并 md5 校验->开机->debugfs 取回日志->停机后再 fsck
                            (--printer 额外注入打印机探测/验证服务)
 dist/                      生成物(不提交)
 ```

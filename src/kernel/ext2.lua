@@ -148,7 +148,7 @@ end
 -- 块/inode 分配(多块组), 空闲计数, 保留块
 -- ---------------------------------------------------------------
 local function sbFreeBlocks(fs) return u32(fs.bd.read(1024, 1024), 12) end
-local function updateFreeCounters(fs, group, dBlocks, dInodes)
+local function updateFreeCounters(fs, group, dBlocks, dInodes, dDirs)
     local sb = fs.bd.read(1024, fs.blockSize)
     sb = setU32(sb, 12, (u32(sb, 12) or 0) + dBlocks)
     sb = setU32(sb, 16, (u32(sb, 16) or 0) + dInodes)
@@ -156,6 +156,10 @@ local function updateFreeCounters(fs, group, dBlocks, dInodes)
     local gdt = fs.bd.read(fs.gdtOffset + group * 32, 32)
     gdt = setU16(gdt, 12, (u16(gdt, 12) or 0) + dBlocks)
     gdt = setU16(gdt, 14, (u16(gdt, 14) or 0) + dInodes)
+    -- bg_used_dirs_count(偏移 16): 不维护它, fsck 会报 "Directories count wrong for group #N"。
+    if dDirs and dDirs ~= 0 then
+        gdt = setU16(gdt, 16, (u16(gdt, 16) or 0) + dDirs)
+    end
     fs.bd.write(fs.gdtOffset + group * 32, gdt)
 end
 
@@ -223,7 +227,7 @@ function ext2.allocInode(fs, mode, uid, gid)
                     local inode = { ino = ino, mode = mode, uid = uid or 0, gid = gid or 0, links = 1, size = 0, blocks = 0, atime = now, ctime = now, mtime = now, ptrs = {} }
                     for n = 1, 15 do inode.ptrs[n] = 0 end
                     ext2.writeInode(fs, inode)
-                    updateFreeCounters(fs, group, 0, -1)
+                    updateFreeCounters(fs, group, 0, -1, itype(mode) == T_DIR and 1 or 0)
                     return ino
                 end
             end
@@ -240,10 +244,12 @@ function ext2.freeInode(fs, ino)
     local pos = math.floor(bit / 8) + 1
     local v = bitmap:byte(pos) or 0
     if math.floor(v / 2 ^ (bit % 8)) % 2 == 1 then
+        local inode = ext2.readInode(fs, ino)
+        local wasDir = inode and inode.type == T_DIR
         v = v - 2 ^ (bit % 8)
         bitmap = bitmap:sub(1, pos - 1) .. string.char(v) .. bitmap:sub(pos + 1)
         writeBlockStr(fs, gd.inodeBitmap, bitmap)
-        updateFreeCounters(fs, group, 0, 1)
+        updateFreeCounters(fs, group, 0, 1, wasDir and -1 or 0)
         fs.bd.write(inodeDiskOffset(fs, ino), string.rep("\0", fs.inodeSize))
     end
 end
@@ -446,21 +452,33 @@ function ext2.addDirEntry(fs, dirIno, name, childIno, fileType)
             while off < #data do
                 local entRecLen = u16(data, off + 4)
                 if entRecLen == 0 then break end
-                local entNameLen = data:byte(off + 7)
-                local actual = alignedSize(8 + entNameLen)
-                local slack = entRecLen - actual
-                if slack >= rec then
-                    data = setU16(data, off + 4, actual)
-                    local newOff = off + actual
-                    -- 新条目必须占满被拆出来的整个 slack 区域(rec_len = slack),
-                    -- 否则会在块内留下无 rec_len 的间隙, readDir 视其为坏目录项。
-                    local entry = w32(childIno) .. w16(slack) .. string.char(nameLen, fileType) .. name .. string.rep("\0", slack - (8 + nameLen))
-                    -- 拆分: 新条目占满整个 slack 区(长度为 slack), 其后才是块内本该跟上的内容。
-                    -- 若用 data:sub(newOff+1) 会把旧项的 slack 区再叠加一次, 使 data 长度膨胀
-                    -- (1024 -> 2000), 一次写入越界到相邻数据块(如 /lib), 把它清零。
-                    data = data:sub(1, newOff) .. entry .. data:sub(newOff + slack + 1)
-                    writeBlockStr(fs, blockNum, data)
-                    return true
+                if u32(data, off) == 0 then
+                    -- 已删除条目(ino=0): 整条 rec_len 都是空闲空间, 直接复用它。
+                    -- 若按 name_len=0 算出 actual=8、把 rec_len 缩到 8 再往后塞新条目,
+                    -- 块中间就会留下 inode=0 的 8 字节空洞, e2fsck 判 "directory corrupted"。
+                    if entRecLen >= rec then
+                        local entry = w32(childIno) .. w16(entRecLen) .. string.char(nameLen, fileType) .. name .. string.rep("\0", entRecLen - (8 + nameLen))
+                        data = data:sub(1, off) .. entry .. data:sub(off + entRecLen + 1)
+                        writeBlockStr(fs, blockNum, data)
+                        return true
+                    end
+                else
+                    local entNameLen = data:byte(off + 7) -- name_len 在 6(file_type 在 7), Lua 索引从 1 起
+                    local actual = alignedSize(8 + entNameLen)
+                    local slack = entRecLen - actual
+                    if slack >= rec then
+                        data = setU16(data, off + 4, actual)
+                        local newOff = off + actual
+                        -- 新条目必须占满被拆出来的整个 slack 区域(rec_len = slack),
+                        -- 否则会在块内留下无 rec_len 的间隙, readDir 视其为坏目录项。
+                        local entry = w32(childIno) .. w16(slack) .. string.char(nameLen, fileType) .. name .. string.rep("\0", slack - (8 + nameLen))
+                        -- 拆分: 新条目占满整个 slack 区(长度为 slack), 其后才是块内本该跟上的内容。
+                        -- 若用 data:sub(newOff+1) 会把旧项的 slack 区再叠加一次, 使 data 长度膨胀
+                        -- (1024 -> 2000), 一次写入越界到相邻数据块(如 /lib), 把它清零。
+                        data = data:sub(1, newOff) .. entry .. data:sub(newOff + slack + 1)
+                        writeBlockStr(fs, blockNum, data)
+                        return true
+                    end
                 end
                 off = off + entRecLen
             end
@@ -504,8 +522,13 @@ function ext2.create(fs, dirPath, name, mode, uid, gid)
     end
     ext2.writeInode(fs, inode)
     ext2.addDirEntry(fs, parent, name, ino, typeToFileType(itype(mode)))
-    local pp = ext2.readInode(fs, parent.ino)
-    pp.links = pp.links + 1; ext2.writeInode(fs, pp)
+    if itype(mode) == T_DIR then
+        -- 只有新建子目录才增加父目录的 links(它多了一个 ".." 指向)。
+        -- 给普通文件也加会把这个计数越加越大(真机跑一轮 fsck: "ref count is 55, should be 3")。
+        local pp = ext2.readInode(fs, parent.ino)
+        pp.links = pp.links + 1
+        ext2.writeInode(fs, pp)
+    end
     return ino
 end
 
@@ -586,18 +609,21 @@ function ext2.removeDirEntry(fs, dirIno, name)
         local blockNum = ext2.getBlock(fs, dirIno, idx)
         if blockNum then
             local data = readBlockStr(fs, blockNum)
-            local off = 0
+            local off, prevOff, prevRec = 0, nil, 0
             while off < #data do
                 local entRecLen = u16(data, off + 4)
                 if entRecLen == 0 then break end
                 local entNameLen = data:byte(off + 7)
                 if entNameLen == #name and data:sub(off + 9, off + 8 + entNameLen) == name then
-                    data = setU32(data, off, 0)
-                    data = setU16(data, off + 6, 0)
-                    data = setU16(data, off + 8, 0)
+                    -- ext2 的标准删除: 把被删条目的 rec_len 并入前一条(条目直接从块里消失)。
+                    -- 也可以只清 inode 留个 ino=0 的条目, 但那样要靠 addDirEntry 记得复用整条
+                    -- 空间才不留空洞; 合并更简单, 目录块也不会越用越碎。
+                    if not prevOff then return nil, "cannot remove first dir entry" end
+                    data = setU16(data, prevOff + 4, prevRec + entRecLen)
                     writeBlockStr(fs, blockNum, data)
                     return true
                 end
+                prevOff, prevRec = off, entRecLen
                 off = off + entRecLen
             end
         end
@@ -610,15 +636,23 @@ function ext2.delete(fs, dirPath, name)
     if not parent or parent.type ~= T_DIR then return nil, "parent not a dir" end
     local entry = findDirEntry(fs, parent, name)
     if not entry then return nil, "no such entry" end
-    ext2.removeDirEntry(fs, parent, name)
+    local ok, err = ext2.removeDirEntry(fs, parent, name)
+    if not ok then return nil, err end
     local child = ext2.readInode(fs, entry.ino)
     if child then
         child.links = math.max(0, child.links - 1)
-        if child.links <= 0 then
+        -- 目录的 links 含 "." 与 "..": 删空目录后剩 1 即应回收, 否则会漏一个未连接 inode。
+        local free = (child.type == T_DIR) and (child.links <= 1) or (child.links <= 0)
+        if free then
             ext2.freeBlocksOfInode(fs, child)
             ext2.freeInode(fs, child.ino)
         else
             ext2.writeInode(fs, child)
+        end
+        if child.type == T_DIR then
+            -- 只有子目录才占父目录的 links(与 create 对称)。
+            parent.links = math.max(2, parent.links - 1)
+            ext2.writeInode(fs, parent)
         end
     end
     return true

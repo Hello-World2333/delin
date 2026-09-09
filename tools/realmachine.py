@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """Delin 真机验证(电脑 3 + 磁盘 0)。
 
-做四件事:
+做五件事:
+  0. **先关机** —— 读基镜像(/parts/root.img)与写盘都必须在电脑停机后进行。原来先覆盖
+     root.img、之后才 shutdown: 机器还在跑 ext2 测试并写这张盘, 两边对同一文件的写入交错,
+     盘上的 root.img 会变成"新镜像数据块 + 旧镜像 inode 表"的混合体(历史事故: /lib、/home
+     整个目录读不出来)。
   1. 重新打包内核 bundle(dist/kernel.lua)
-  2. 用 tools/deploy.py 重建干净的 ext2 根镜像(基础镜像 -> 新镜像)
+  2. 用 tools/deploy.py 重建干净的 ext2 根镜像(基础镜像 -> 新镜像; 属主以基镜像为准)
   3. 往镜像/磁盘里注入验证负载: 第二个 ext2 分区(/parts/data.img, 供 fstab 测试)、
-     /etc/fstab 测试条目、verify.service + /root/verify.sh(systemd-like init 的自检服务)
-  4. 重启电脑 #3, 等待启动, 用 debugfs 从 root.img 里取回 /var/log/*.log 打印出来
+     /etc/fstab 测试条目、verify.service + /root/verify.sh(systemd-like init 的自检服务);
+     注入后跑 e2fsck -fn 门禁, 安装到磁盘后逐文件按 md5 校验
+  4. 开机、等待启动, 用 debugfs 从 root.img 里取回 /var/log/*.log 打印出来; 再次停机后
+     对安装到磁盘的 root.img 跑一次只读 fsck, 报告是否被跑坏
 
 用法: python3 tools/realmachine.py [--base /mnt/disk/0/parts/root.img] [--no-reboot] [--reboot-only]
 
@@ -15,11 +21,12 @@
 只对全新电脑有意义; CC-fs 引导路径无法在此环境用真机验证(由 tools/hosttest.lua 的 init 端到端
 用例覆盖)。
 """
-import os, shutil, subprocess, sys, time
+import hashlib, os, shutil, subprocess, sys, time
 
 REPO = "/home/worker/delin"
 DBG = "/usr/sbin/debugfs"
 MKFS = "/usr/sbin/mkfs.ext2"
+FSCK = "/usr/sbin/e2fsck"
 DISK = "/mnt/disk/0"
 COMPUTER = "/mnt/computer/3"
 RCON = "/home/worker/docs/tools/rcon.py"
@@ -40,11 +47,48 @@ def df_write(img, host_path, img_path):
     # 所以先删目标再写; 写完检查输出, 别把"没写进去"当成成功。
     df(img, "rm %s" % img_path)
     out = df(img, "write %s %s" % (host_path, img_path), check=True)
-    if "already exists" in out or "error" in out.lower():
+    low = out.lower()
+    if "already exists" in low or "corrupted" in low or "not found" in low or "error" in low:
         raise RuntimeError("debugfs write failed: %s -> %s\n%s" % (host_path, img_path, out))
 
 def df_mkdir(img, path):
-    df(img, "mkdir %s" % path)
+    # debugfs 对**已存在**的目录 mkdir 会先分配 inode 再失败, 留下 "Unconnected directory
+    # inode", 而它占的块在位图里又被标回空闲(会和后续文件重复分配) —— 所以先探测再建。
+    out = df(img, "stat %s" % path)
+    if "Inode:" in out:
+        return
+    df(img, "mkdir %s" % path, check=True)
+
+def computer_on():
+    out = run("python3", RCON, "computercraft dump #3", check=False)
+    for line in out.splitlines():
+        if line.strip().startswith("On"):
+            parts = line.split("|")
+            if len(parts) >= 2:
+                return parts[1].strip().upper().startswith("Y")
+    return None
+
+def shutdown_computer(timeout=90):
+    """读基镜像 / 写磁盘镜像之前必须让电脑停下来(见模块开头的历史事故)。"""
+    print("== shutdown computer #3 (读写磁盘镜像必须在停机状态下进行) ==")
+    run("python3", RCON, "computercraft shutdown #3", check=False)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(2)
+        if computer_on() is False:
+            time.sleep(3)   # 再等一拍, 让游戏侧把磁盘缓存落盘
+            print("   computer #3 is off")
+            return
+    raise RuntimeError("computer #3 在 %ds 内没有关机; 拒绝在机器运行时读写磁盘镜像" % timeout)
+
+def install_verified(src, dst):
+    """复制到游戏侧路径后按内容校验: 不一致说明还有别的写入者在动这个文件。"""
+    shutil.copy(src, dst)
+    with open(src, "rb") as f: a = hashlib.md5(f.read()).hexdigest()
+    with open(dst, "rb") as f: b = hashlib.md5(f.read()).hexdigest()
+    if a != b:
+        raise RuntimeError("安装校验失败: %s 与 %s 内容不一致(%s != %s); 有别的写入者在改它" % (dst, src, b, a))
+    print("   installed %-30s md5=%s" % (os.path.basename(dst), a))
 
 def main():
     base = os.path.join(DISK, "parts/root.img")
@@ -73,10 +117,17 @@ def main():
         reboot_and_collect(printer)
         return
 
+    # 0) 先关机: 下面读基镜像(live /parts/root.img)和写盘都必须在一台停机的机器上进行
+    shutdown_computer()
+
     # 1) 打包
     print("== build kernel bundle ==")
     print(run("lua5.1", os.path.join(REPO, "tools/bundle.lua"), "kernel", cwd=REPO))
     print(run("lua5.1", os.path.join(REPO, "tools/bundle.lua"), "dlub", cwd=REPO))
+
+    # 1b) 宿主 ext2 回归(秒级): 驱动层的目录/links 问题先在这里挡住, 别拿真机试
+    print("== host ext2 regression ==")
+    print(run("lua5.1", os.path.join(REPO, "tools/ext2test.lua"), cwd=REPO))
 
     # 2) 部署根镜像到 /tmp, 成功后原子替换
     work = WORK
@@ -172,24 +223,36 @@ def main():
             df_write(out, unit_pv, "/lib/systemd/system/printer-verify.service")
             df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/printer-verify.service")
 
-    # 3d) 安装到磁盘
-    shutil.copy(out, os.path.join(DISK, "parts/root.img"))
-    shutil.copy(data_img, os.path.join(DISK, "parts/data.img"))
-    with open(os.path.join(DISK, "parts/manifest"), "w") as f:
-        f.write("root /parts/root.img ext2\n"
-                "data /parts/data.img ext2\n"
-                "boot /boot/delin.lua\n")
-    shutil.copy(os.path.join(REPO, "dist/kernel.lua"), os.path.join(DISK, "boot/delin.lua"))
-    shutil.copy(os.path.join(REPO, "dist/dlub.lua"), os.path.join(DISK, "boot/dlub.lua"))
+    # 3g) 门禁: 注入后镜像仍必须干净, 不把坏镜像带上真机
+    p = subprocess.run([FSCK, "-fn", out], capture_output=True, text=True)
+    if p.returncode != 0:
+        raise RuntimeError("注入后的镜像未通过 e2fsck -fn:\n" + p.stdout + p.stderr)
+
+    # 3d) 安装到磁盘(逐文件按内容校验; 机器此时已停机)
+    install_verified(out, os.path.join(DISK, "parts/root.img"))
+    install_verified(data_img, os.path.join(DISK, "parts/data.img"))
+    manifest = "root /parts/root.img ext2\ndata /parts/data.img ext2\nboot /boot/delin.lua\n"
+    mpath = os.path.join(DISK, "parts/manifest")
+    with open(mpath, "w") as f:
+        f.write(manifest)
+    with open(mpath, "r") as f:
+        if f.read() != manifest:
+            raise RuntimeError("manifest 写入校验失败: %s" % mpath)
+    install_verified(os.path.join(REPO, "dist/kernel.lua"), os.path.join(DISK, "boot/delin.lua"))
+    install_verified(os.path.join(REPO, "dist/dlub.lua"), os.path.join(DISK, "boot/dlub.lua"))
     # 电脑自身 FS 的引导入口(BIOS 按 /.boot -> /main.lua 引导): 放 DLUB 装载器。
     mainlua = os.path.join(COMPUTER, "main.lua")
     if os.path.exists(mainlua):
         shutil.copy(mainlua, mainlua + ".bak")
     shutil.copy(os.path.join(REPO, "dist/dlub.lua"), mainlua)
+    with open(mainlua, "rb") as f: got = hashlib.md5(f.read()).hexdigest()
+    with open(os.path.join(REPO, "dist/dlub.lua"), "rb") as f: want = hashlib.md5(f.read()).hexdigest()
+    if got != want:
+        print("   WARNING: %s 读回内容与 dist/dlub.lua 不一致(本环境电脑自身 FS 改写可能不生效)" % mainlua)
     print("installed root.img/data.img/manifest/kernel + DLUB -> %s/main.lua" % COMPUTER)
 
     if not reboot:
-        print("--no-reboot: stopping here")
+        print("--no-reboot: stopping here (computer #3 已关机)")
         return
     reboot_and_collect(printer)
 
@@ -228,6 +291,17 @@ def reboot_and_collect(printer=False):
             print(f.read()[-8000:])
     else:
         print("(missing)")
+
+    # 6) 停机后再对安装到磁盘的 root.img 做一次只读 fsck: 运行时读会得到撕裂的镜像。
+    #    这是"Delin 自己写坏的"唯一权威判据, 有错就整体失败(exit != 0)。
+    print("\n===== 停机后 fsck: /parts/root.img =====")
+    shutdown_computer()
+    p = subprocess.run([FSCK, "-fn", os.path.join(DISK, "parts/root.img")], capture_output=True, text=True)
+    out = (p.stdout + p.stderr).strip()
+    print(out[-3000:] if out else "(no output)")
+    print("e2fsck exit=%d" % p.returncode)
+    if p.returncode != 0:
+        raise RuntimeError("运行一轮后 root.img 不再 fsck 干净 —— Delin 把自己写坏了, 见上面输出")
 
 if __name__ == "__main__":
     main()
