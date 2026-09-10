@@ -307,16 +307,32 @@ end
 -- http
 -- ===============================================================
 
+--- 单次请求最多尝试几次 / 两次之间等多久(秒)。
+--- 真机实测: 从 GitHub 连拉 65 个 payload 时会**随机**断在某个文件上(http.get 返回 nil,
+--- 两次分别挂在 bin/mount 与 bin/chmod), 而同一批文件用 curl 在宿主机上全拉一遍 0 失败 ——
+--- 就是传输层偶发断连。一次失败就终止整个安装太脆, 所以网络层重试;
+--- **校验不算网络层**: 拉回来的 size/CRC32 不符仍然 fail-fast(见 writePayload)。
+local HTTP_TRIES = 3
+local HTTP_RETRY_DELAY = 0.5
+
 local function httpGet(url)
     if not http then return nil, "http API is disabled on this server" end
-    local res = http.get({ url = url, binary = true })
-    if not res then return nil, "request failed: " .. url end
-    local code = res.getResponseCode and res.getResponseCode() or 200
-    if code ~= 200 then
-        res.close()
-        return nil, string.format("http %d: %s", code, url)
+    local lastErr
+    for attempt = 1, HTTP_TRIES do
+        local res = http.get({ url = url, binary = true })
+        if res then
+            local code = res.getResponseCode and res.getResponseCode() or 200
+            if code == 200 then return res end
+            res.close()
+            lastErr = string.format("http %d: %s", code, url)
+            -- 4xx 是服务器明确的答复(路径不存在/没权限), 重试没意义
+            if code >= 400 and code < 500 then return nil, lastErr end
+        else
+            lastErr = "request failed: " .. url
+        end
+        if attempt < HTTP_TRIES then os.sleep(HTTP_RETRY_DELAY) end
     end
-    return res
+    return nil, string.format("%s (%d attempts)", lastErr, HTTP_TRIES)
 end
 
 local function fetchText(url)

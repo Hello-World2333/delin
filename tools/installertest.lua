@@ -46,8 +46,9 @@
         (最多消耗一个收尾键); 若实现要更多键, 会以"停在某一步"的形式暴露出来。
      6) term.write 在行末**截断**(不绕行): 这样每行内容与写入它的那一步一一对应, 断言能按行定位。
         真机会绕行, 但安装器自己控制每行长度, 不受影响。
-     7) fake os.reboot 只记录不结束进程(进程要留给后面的用例); os.sleep 故意不提供 —— 安装器真要用
-        定时器, 就应当以"调用 nil"的形式暴露出来。
+     7) fake os.reboot 只记录不结束进程(进程要留给后面的用例); fake os.sleep 只记账不真睡 ——
+        安装器只在 http 重试之间 sleep(真机上从 GitHub 连拉 65 个文件会偶发断连, 见 case 11/12),
+        于是"重试了几次"可以从 session.sleeps/sleptFor 上断言。
      8) fake pullEvent 在队列空时抛错 "installer blocked waiting for events; remaining queue empty"
         (任务书要求); 另外 debug hook 看门狗兜底死循环, 保证测试进程不会挂死。 ]]
 
@@ -648,7 +649,7 @@ local function newFsLayer(session)
 end
 
 -- ===============================================================
--- 假 http: 只读仓库发布树
+-- 假 http: 只读仓库发布树 + 可按 URL 注入"连接失败"(真机上偶发的断连)
 -- ===============================================================
 
 local function newHttpLayer(session)
@@ -660,6 +661,13 @@ local function newHttpLayer(session)
         url = tostring(url or "")
         session.httpCount = session.httpCount + 1
         session.httpUrls[#session.httpUrls + 1] = url
+        -- session.failUrls[url] = n: 这个 URL 的前 n 次请求直接返回 nil(等价于 CC 连不上)
+        local flaky = session.failUrls and session.failUrls[url]
+        if flaky and flaky > 0 then
+            session.failUrls[url] = flaky - 1
+            session.httpFailures = (session.httpFailures or 0) + 1
+            return nil
+        end
         local host, path = url:match("^https?://([^/]+)/(.*)$")
         if not host then return nil end -- 不是合法 http URL
         local root = served[host]
@@ -717,6 +725,9 @@ function fakeOS.newSession(opts)
         titlesSeen = {},
         httpCount = 0,
         httpUrls = {},
+        failUrls = opts.failUrls or {}, -- url -> 前 n 次请求返回 nil(注入偶发断连)
+        httpFailures = 0,
+        sleeps = 0,
         rebooted = false,
         printed = {},
         servedHosts = {
@@ -804,7 +815,12 @@ function fakeOS.newSession(opts)
     fakeos.time = function() return hostos.time() end
     fakeos.date = function(fmt, t) return hostos.date(fmt, t) end
     fakeos.day = function() return math.floor(hostos.time() / 86400) end
-    fakeos.sleep = nil -- 规范: 不需要定时器; 安装器真 sleep 就应当暴露成错误
+    -- 安装器**只在网络重试之间** sleep(见 installer.lua 的 HTTP_RETRY_DELAY): 桩只记账不真等,
+    -- 于是"重试了几次"可以从 session.sleeps 上断言, 而不是让整个测试真睡。
+    fakeos.sleep = function(sec)
+        session.sleeps = session.sleeps + 1
+        session.sleptFor = (session.sleptFor or 0) + (tonumber(sec) or 0)
+    end
     fakeos.getComputerID = function() return 0 end
     fakeos.getComputerLabel = function() return "installertest" end
     fakeos.setComputerLabel = function() end
@@ -2017,6 +2033,51 @@ runCase("10", "after install: Enter reboots", function()
 
     ok(logHas(w, "Install OK"), "日志含 Install OK", short(w:log() or "", 300))
     ok(w.rebooted, "回车触发了 os.reboot()")
+end)
+
+-- ===============================================================
+-- case 11 / 12: 网络层重试
+-- 真机实测: 从 GitHub 连拉 65 个 payload 会**随机**断在某个文件上(宿主机 curl 同一批 0 失败),
+-- 所以 httpGet 对"连不上"重试 HTTP_TRIES 次; 但校验(size/CRC32)不算网络层, 见 case 12 的后半。
+-- ===============================================================
+
+runCase("11", "transient http failures are retried (install still succeeds)", function()
+    local flaky = DEFAULT_URL .. "/payload/bin/sh"
+    local w = newSession({
+        name = "case11-http-retry", capacity = 4 * 1024 * 1024,
+        failUrls = { [flaky] = 2 }, -- 前两次断连, 第三次才通
+    })
+    out("  dir: " .. w.dir .. "\n")
+    playInstallSuccess(w)
+    w:runInstallScript()
+    reportRun(w)
+    okNoUnhandledError(w)
+
+    eq(w.httpFailures, 2, "注入了 2 次连接失败")
+    ok(w.sleeps >= 2, "重试之间有等待(不空转轰炸服务器)", "sleeps=" .. w.sleeps)
+    ok(logHas(w, "Install OK"), "重试后装完了", short(w:log() or "", 300))
+    ok(w:existsFile("/bin/sh"), "断连过的那个文件最终落地了")
+    eq(trim(w:file("/.boot")), "/boot/delin.lua", "引导配置照常写上")
+end)
+
+runCase("12", "persistent http failure still fails fast (no half-installed boot config)", function()
+    local dead = DEFAULT_URL .. "/payload/bin/ls"
+    local w = newSession({
+        name = "case12-http-dead", capacity = 4 * 1024 * 1024,
+        failUrls = { [dead] = 99 }, -- 一直连不上: 重试到头也必须放弃
+    })
+    out("  dir: " .. w.dir .. "\n")
+    playInstallSuccess(w)
+    w:runInstallScript()
+    reportRun(w)
+    okNoUnhandledError(w)
+
+    ok(logHas(w, "FAIL"), "日志含 FAIL", short(w:log() or "", 400))
+    ok(not w:existsFile("/.boot"), "没写 /.boot")
+    ok(not w:existsFile("/boot/delin.lua"), "没写引导入口")
+    ok(not logHas(w, "Install OK"), "日志里没有 Install OK")
+    -- 重试次数有上限: 不能一直重试下去
+    eq(w.httpFailures, 3, "同一个 URL 最多试 3 次")
 end)
 
 -- ===============================================================

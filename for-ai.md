@@ -578,6 +578,10 @@ sh tools/serve.sh                 # dist/release 挂在 10568 端口
 
 1. 从安装源拉 `manifest`（`version` / `files` / 每文件 `size crc32`），再逐个下载 `payload/`
    并**校验大小与 CRC32**，任何一处不符即 fail-fast（不留半成品配置）；
+   - **网络层重试**：`http.get` 返回 nil（连不上）或 5xx 时最多试 3 次、每次间隔 0.5 s；4xx 不重试。
+     真机实测：从 GitHub 默认源连拉 65 个 payload 会**随机**断在某个文件上（两次分别挂在
+     `bin/mount` 与 `bin/chmod`，而宿主机 curl 同一批文件 0 失败）—— 一次失败就终止整个安装太脆。
+     重试只包住**传输**：拉回来的 size/CRC32 不符仍然当场 FAIL，不做第二次。
 2. 把 payload 铺到目标：**CCFS**（直接铺文件）或 **EXT2**（现场 `mkfs` 出镜像再写进去）；
 3. 写引导配置：`/startup.lua`（Delin BIOS，旧的备份成 `/startup.lua.craftos`）、
    `/boot/delin.lua`、`/boot/dlub.lua`、`/.boot`、`/dlub.cfg`；
@@ -663,10 +667,10 @@ lua5.4 tools/hosttest.lua        # 同上用 5.4 跑一遍(CC 是 5.2 语义, �
                                  # 测试台的 fs 门面曾用 os.execute(...)==0 判目录 —— 5.1 独有语义)
 lua5.1 tools/harness.lua /bin/sh # 宿主上跑真实工具源码(sh/作业控制/管道; /sys 走真实 sysfs 后端, /proc 走真实 procfs 后端)
 lua5.1 tools/installertest.lua    # 安装器宿主回归: 假 CraftOS 环境(假终端格子+脚本化事件队列)跑构建产物
-                                  # dist/install.lua, 按键序列驱动整套向导(14 用例/194 断言: 两种落盘形态、
-                                  # 自定义容量、坏源/空间不足 fail-fast、退格回退、无人值守、双驱动器、
-                                  # 装完只有回车重启; 默认源用软链假装 GitHub 可访问; 失败时 dump 每一屏
-                                  # + 日志 + 目标文件树)
+                                  # dist/install.lua, 按键序列驱动整套向导(16 用例/206 断言: 两种落盘形态、
+                                  # 自定义容量、坏源/空间不足/网络断连 fail-fast、http 重试、退格回退、
+                                  # 无人值守、双驱动器、装完只有回车重启; 默认源用软链假装 GitHub 可访问;
+                                  # 失败时 dump 每一屏 + 日志 + 目标文件树)
 lua5.1 tools/harness.lua /bin/sh < scripts/proc_test.sh   # /proc + ps/pgrep/pkill/killall 自检(与真机比对)
 lua5.1 tools/harness.lua /bin/sh < scripts/redstone_test.sh   # /sys/class/redstone 读写/校验自检(与真机比对)
 lua5.1 tools/harness.lua /bin/sh < scripts/lua_test.sh   # /bin/lua 脚本/stdin/arg/dofile/退出码 + 进程环境白名单(与真机比对)
@@ -816,7 +820,10 @@ tools/serve.sh             开发期(本地)把 dist/release 挂在 10568 端口
 .github/workflows/release.yml  打 v* tag -> 门禁(build --check --release + installertest)
                            -> 把 dist/release/<版本>/ 推成 release 分支的 <版本>/ 目录
                            (发布树要能被 CraftOS 按目录结构 http 取, 所以用分支而不是 Release assets:
-                            Release 的附件是平铺的, 放不下 payload/ 子路径)
+                            Release 的附件是平铺的, 放不下 payload/ 子路径)。
+                           切到 release 分支**要 `git clean -fdx`**: `.gitignore` 只在 main 上被跟踪,
+                           切过去它随源文件一起消失, dist/ 这类"本来被忽略的未跟踪文件"就失去保护,
+                           会被 `git add -A` 整棵收进发布分支(v0.0.2 第一次跑真中过, 混进 213 个文件)。
 tools/minify.lua           Lua 压缩器: 词法分析 + 递归下降解析做作用域分析 + 局部变量改名,
                            只从 token 流输出(输出与输入的 token 序列逐项相同)。三重门禁:
                            lua5.1 解析 / 重词法逐 token 比对 / 改名不遮蔽任何全局名。
