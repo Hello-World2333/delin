@@ -572,13 +572,25 @@ TUI 里可选安装类型（CCFS / EXT2）、目标设备（电脑自身存储 /
 | EXT2 | 电脑自身存储 | BIOS、`/.boot` = `/boot/dlub.lua`、`/boot/dlub.lua`、`/dlub.cfg`(=`rootfs /parts/root.img`) | `/parts/root.img`(现场 mkfs) |
 | EXT2 | 磁盘 | 同上一行(`bootdisk <盘名>`) | `/parts/root.img` + `/parts/manifest` |
 
-真机实测（电脑1，无外设）：
-- **CCFS**：装完重启 → BIOS → `/.boot` → 内核 → `users loaded: root:0,alice:1000`、
-  `init up (pid 1) default.target active`、0 次 getty 重启（登录提示符就位）。
-- **EXT2**：装完重启 → `[DLUB] root=/parts/root.img fs=ext2 kernel=/boot/delin.lua (142715 bytes)`
-  → `root boot: fstype=ext2` → 同样进到 `init up`；游戏内造出来的镜像拿到宿主机上
-  `e2fsck -fn` **干净**（97 文件 / 444 块 of 512）。整轮 ext2 安装（mkfs + 铺 65 个文件）
-  在真机上约 1 分钟，512 KB 装得下 346 KB payload。
+真机实测（电脑1 = 一台电脑 + 一个磁盘驱动器，四种形态都验过；判定标准都是
+`users loaded`、`modules loaded`、`init up (pid 1) default.target active`、0 次 getty 重启）：
+
+| 形态 | 装法 | 引导日志 |
+|---|---|---|
+| CCFS → 电脑自身存储 | 安装器（`wget run`） | `/.boot` → `/boot/delin.lua` → 内核，直接进 `init up` |
+| EXT2 → 电脑自身存储 | 安装器（游戏内 mkfs） | `[DLUB] root=/parts/root.img fs=ext2 kernel=/boot/delin.lua (142715 bytes)` → `root boot: fstype=ext2` |
+| CCFS → 磁盘（`ccdisk`） | 同安装器产出（见下方配额限制） | `[DLUB] config /dlub.cfg ccdisk=right -> disk` → `root boot: fstype=ccdisk root=disk`，且盘同时以 `/dev/sda`(+`sda1`) 可见 |
+| EXT2 → 磁盘（`bootdisk`） | 同上 | `[DLUB] root=disk/parts/root.img fs=ext2` → `root boot: fstype=ext2` |
+
+其它实测数据：
+- 游戏内 mkfs + 铺 65 个文件造出的镜像，拿到宿主机上 `e2fsck -fn` **干净**
+  （97 文件 / 444 块 of 512）；512 KB 装得下 346 KB payload，真机整轮约 1 分钟。
+- **注意 CC 的软盘配额**：本环境 `fs.getCapacity("/disk")` 只有 **125,000 字节**（磁盘上还有个
+  宿主放进去的 2 MB `data.img`），所以 `fs.getFreeSpace` 为 0 —— 安装器会**正确拒绝**并给出
+  `FAIL: target has 0 B free, need 346.5 KB`（fail-fast，不留半成品配置）。
+  要在磁盘上真装，需要把 `floppy_space_limit` 调大（≥ 1 MB），或把 Delin 压得更小。
+  上面两种磁盘形态因此是用宿主铺盘（项目一贯做法）验证的**内核引导路径**，
+  安装器的落盘代码路径由前两行（电脑自身存储）覆盖。
 
 验证：
 
