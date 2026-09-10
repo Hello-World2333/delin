@@ -686,10 +686,10 @@ function F.open(p, mode)
 end
 
 -- ---------------------------------------------------------------
--- 桩 CC redstone API + 真实的 redstone.ko 模块源码: /sys/class/redstone/<side>/{...}。
--- 宿主上没有红石, 输入恒 0; 输出状态由桩保存, 使写-读回路径与真机一致,
--- 于是 scripts/redstone_test.sh 在宿主与真机上输出相同(真机与真实 API 的核对见
--- scripts/redstone_verify.lua)。
+-- 桩 CC redstone API + 真实的 redstone.ko 模块源码: /sys/class/redstone/<side>/{digital,analog,bundled}。
+-- 宿主上没有红石, 输入恒 0; 输出状态由桩保存, 于是"写文件 -> API 读回"的路径与真机一致
+-- (scripts/redstone_test.sh 用 /bin/lua 走 API 读回, 故宿主与真机输出相同;
+-- 真机与真实 API 的逐项核对见 scripts/redstone_verify.lua)。
 -- ---------------------------------------------------------------
 local rs = { input = {}, analogIn = {}, bundledIn = {}, output = {}, analogOut = {}, bundledOut = {} }
 local RS_SIDES = { "top", "bottom", "left", "right", "front", "back" }

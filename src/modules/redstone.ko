@@ -1,33 +1,38 @@
 --@name redstone
---@version 0.1.0
---@description CC 红石驱动: /sys/class/redstone/<side>/{input,output,analog_input,analog_output,
---             bundled_input,bundled_output}; 读 = 当前信号, 写 output/analog_output/bundled_output = 设输出。
+--@version 0.2.0
+--@description CC 红石驱动: /sys/class/redstone/<side>/{digital,analog,bundled}; 三个属性一律
+--             读 = 该面输入, 写 = 该面输出。
 --@deps
 
 --[[ 抽象(对齐 Linux gpio 的 sysfs 接口 /sys/class/gpio/gpioN/{direction,value}):
-     CC 的红石 API 是函数式的(redstone.getInput(side) / redstone.setAnalogOutput(side, v)),
-     本驱动把它摊成文件 —— 每个面一个目录, 属性文件是单行值, 读一次即 EOF(sysfs 语义):
+      CC 的红石 API 是函数式的(redstone.getInput(side) / redstone.setAnalogOutput(side, v)),
+      本驱动把它摊成文件 —— 每个面一个目录, 属性文件是单行值, 读一次即 EOF(sysfs 语义)。
+      每个面**只有三个**属性, 一个红石量一个文件, 读和写都落在同一个文件上:
 
-       /sys/class/redstone/<side>/input          读 0|1        (getInput)
-       /sys/class/redstone/<side>/analog_input   读 0..15      (getAnalogInput)
-       /sys/class/redstone/<side>/bundled_input  读 0..65535   (getBundledInput, 16 色位掩码)
-       /sys/class/redstone/<side>/output         读写 0|1      (getOutput / setOutput)
-       /sys/class/redstone/<side>/analog_output  读写 0..15    (getAnalogOutput / setAnalogOutput)
-       /sys/class/redstone/<side>/bundled_output 读写 0..65535 (getBundledOutput / setBundledOutput)
+        /sys/class/redstone/<side>/digital   读 0|1      (getInput)  写 0|1      (setOutput)
+        /sys/class/redstone/<side>/analog    读 0..15    (getAnalogInput) 写 0..15 (setAnalogOutput)
+        /sys/class/redstone/<side>/bundled   读 0..65535 (getBundledInput) 写 0..65535 (setBundledOutput)
 
-     于是 shell 里就是 `cat /sys/class/redstone/left/analog_input` 与
-     `echo 15 > /sys/class/redstone/left/analog_output`, 不需要 Lua 也不需要任何工具。
+      不设 input/output 变体: 一个面的一种红石量就是一个文件, 读是"线上的值"(输入),
+      写是"我驱动的值"(输出) —— 与真实红石口一样, 口本身没有第二个文件。
 
-     语义与 CC 一致: output 与 analog_output 是同一份输出状态 —— 写 output=1 后读
-     analog_output 得 15, 写 analog_output=0 后读 output 得 0。bundled 用十进制位掩码
-     (colors.white=1 .. colors.black=32768), 读也输出掩码, 与 colors.combine/subtract 对齐。
+      于是 shell 里就是 `cat /sys/class/redstone/left/analog` 与
+      `echo 15 > /sys/class/redstone/left/analog`, 不需要 Lua 也不需要任何工具。
 
-     写校验 fail-fast: 值必须是十进制整数且在范围内, 否则返回错误且**不改动**输出状态
-     (属性文件是内核接口, 不做 "0x10"/"1e2"/负数/小数的模糊解析)。六个面恒定存在
-     (CC 电脑六面都能收发红石), 因此没有 Linux gpio 的 export/unexport。 ]]
+      语义与 CC 一致: digital 与 analog 的**输出**侧是同一份状态 —— 写 digital=1 后
+      setAnalogOutput 得 15(CC 的 setOutput(true) 等价于 setAnalogOutput(15)), 写 analog=0
+      后 getOutput 为 false。bundled 用十进制位掩码(colors.white=1 .. colors.black=32768),
+      与 colors.combine/subtract 对齐。
 
-local ATTRS = { "input", "output", "analog_input", "analog_output", "bundled_input", "bundled_output" }
-local WRITABLE = { output = true, analog_output = true, bundled_output = true }
+      读的是**输入**(getInput/getAnalogInput/getBundledInput): 线对面接的是什么, 读到的就是什么;
+      CC 的 getOutput/getAnalogOutput/getBundledOutput(本机自己驱动了什么)没有对应文件,
+      要读它就写脚本用 CC 的 redstone API(用户态进程白名单里有 redstone)。
+
+      写校验 fail-fast: 值必须是十进制整数且在范围内, 否则返回错误且**不改动**输出状态
+      (属性文件是内核接口, 不做 "0x10"/"1e2"/负数/小数的模糊解析)。六个面恒定存在
+      (CC 电脑六面都能收发红石), 因此没有 Linux gpio 的 export/unexport, 也没有只读属性。 ]]
+
+local ATTRS = { "digital", "analog", "bundled" }
 
 local SIDES = nil
 
@@ -60,36 +65,35 @@ local function parseValue(value, max, what)
     return n
 end
 
+--- 读属性 = 该面的输入(getInput/getAnalogInput/getBundledInput)。
 local function get(entry, attr)
-    if attr == "input" then return redstone.getInput(entry) and "1" or "0" end
-    if attr == "output" then return redstone.getOutput(entry) and "1" or "0" end
-    if attr == "analog_input" then return tostring(redstone.getAnalogInput(entry)) end
-    if attr == "analog_output" then return tostring(redstone.getAnalogOutput(entry)) end
-    if attr == "bundled_input" then return tostring(redstone.getBundledInput(entry)) end
-    if attr == "bundled_output" then return tostring(redstone.getBundledOutput(entry)) end
+    if attr == "digital" then return redstone.getInput(entry) and "1" or "0" end
+    if attr == "analog" then return tostring(redstone.getAnalogInput(entry)) end
+    if attr == "bundled" then return tostring(redstone.getBundledInput(entry)) end
     return nil
 end
 
+--- 写属性 = 设该面的输出(setOutput/setAnalogOutput/setBundledOutput)。
 local function set(entry, attr, value)
-    if attr == "output" then
-        local n, err = parseValue(value, 1, "output")
+    if attr == "digital" then
+        local n, err = parseValue(value, 1, "digital")
         if not n then return nil, err end
         redstone.setOutput(entry, n == 1)
         return true
     end
-    if attr == "analog_output" then
-        local n, err = parseValue(value, 15, "analog_output")
+    if attr == "analog" then
+        local n, err = parseValue(value, 15, "analog")
         if not n then return nil, err end
         redstone.setAnalogOutput(entry, n)
         return true
     end
-    if attr == "bundled_output" then
-        local n, err = parseValue(value, 65535, "bundled_output")
+    if attr == "bundled" then
+        local n, err = parseValue(value, 65535, "bundled")
         if not n then return nil, err end
         redstone.setBundledOutput(entry, n)
         return true
     end
-    return nil, "read-only attribute: " .. tostring(attr)
+    return nil, "no such attribute: " .. tostring(attr)
 end
 
 local activeKapi = nil
@@ -102,9 +106,6 @@ return {
             attrs = function(entry)
                 if not isSide(entry) then return nil end
                 return ATTRS
-            end,
-            writable = function(entry, attr)
-                return isSide(entry) and WRITABLE[attr] == true
             end,
             get = get,
             set = set,

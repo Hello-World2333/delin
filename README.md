@@ -78,27 +78,31 @@ Linux `lp(4)` 风格的**字符设备**：写入的字节流 = 交给打印机�
 
 ### 红石（`redstone.ko`）
 
-CC 的红石 API 是函数式的（`redstone.getInput(side)` / `redstone.setAnalogOutput(side, v)`），
+CC 的红石 API 是函数式的（`redstone.getInput(side)` / `redstone.setAnalogOutput(side, v)` 成对），
 `redstone.ko` 把它摊成 Linux gpio 风格的 **sysfs 属性文件**（对应 `/sys/class/gpio/gpioN/{direction,value}`），
-于是 shell 里 `cat` / `echo` 就能直接和红石打交道，不需要写 Lua 也不需要任何工具：
+于是 shell 里 `cat` / `echo` 就能直接和红石打交道，不需要写 Lua 也不需要任何工具。
+**一个面的一种红石量就是一个文件**（不设 `input`/`output` 变体）：读 = 该面输入，写 = 该面输出 ——
+和真实红石口一样，口本身没有第二个文件。
 
-| 路径 | 含义 |
-|---|---|
-| `/sys/class/redstone/<side>/input` | 该面输入，读 `0`/`1`（`getInput`） |
-| `/sys/class/redstone/<side>/analog_input` | 该面模拟输入，读 `0..15`（`getAnalogInput`） |
-| `/sys/class/redstone/<side>/bundled_input` | 该面集束输入，读 `0..65535` 位掩码（`getBundledInput`） |
-| `/sys/class/redstone/<side>/output` | 该面输出，读写 `0`/`1`（`getOutput`/`setOutput`） |
-| `/sys/class/redstone/<side>/analog_output` | 该面模拟输出，读写 `0..15`（`getAnalogOutput`/`setAnalogOutput`） |
-| `/sys/class/redstone/<side>/bundled_output` | 该面集束输出，读写 `0..65535` 位掩码（`getBundledOutput`/`setBundledOutput`） |
+| 路径 | 读 | 写 |
+|---|---|---|
+| `/sys/class/redstone/<side>/digital` | `0`/`1`（`getInput`） | `0`/`1`（`setOutput`） |
+| `/sys/class/redstone/<side>/analog` | `0..15`（`getAnalogInput`） | `0..15`（`setAnalogOutput`） |
+| `/sys/class/redstone/<side>/bundled` | `0..65535` 位掩码（`getBundledInput`） | `0..65535` 位掩码（`setBundledOutput`） |
 
 `<side>` 是 CC 的六个面 `top bottom left right front back` —— 六个面恒定存在（CC 电脑六面都能收发红石），
-因此没有 Linux gpio 的 `export`/`unexport`。
+因此没有 Linux gpio 的 `export`/`unexport`，也没有只读属性（三个都能写）。
 
-- **用法**：`cat /sys/class/redstone/left/analog_input`、`echo 15 > /sys/class/redstone/left/analog_output`、
-  `echo 32768 > /sys/class/redstone/back/bundled_output`（`black` = 32768，与 `colors.black` 一致；
-  读也输出十进制掩码，与 `colors.combine`/`colors.subtract` 是同一套位掩码）。
-- **输出语义与 CC 一致**：`output` 与 `analog_output` 是同一份输出状态 —— 写 `output=1` 后读
-  `analog_output` 得 `15`，写 `analog_output=0` 后读 `output` 得 `0`。
+- **用法**：`cat /sys/class/redstone/left/analog`、`echo 15 > /sys/class/redstone/left/analog`、
+  `echo 32768 > /sys/class/redstone/back/bundled`（`black` = 32768，与 `colors.black` 一致；
+  读写都是十进制掩码，与 `colors.combine`/`colors.subtract` 是同一套位掩码）。
+- **读的是输入**：`getOutput`/`getAnalogOutput`/`getBundledOutput`（本机自己驱动了什么）没有对应文件 ——
+  口上是什么就读到什么，`echo 15 > analog` 之后 `cat analog` 读到的是**对面/线**的值，不是刚写的 15
+  （真机上若该面接着一段自己的红石线，CC 的 `getInput` 也会把这段线的 15 读回来，但这不是文件接口的保证）。
+  要在脚本里读回自己的输出状态就用 CC 的 `redstone` API（用户态进程白名单里有 `redstone`，
+  如 `lua` 里 `print(redstone.getAnalogOutput("left"))`）。
+- **输出语义与 CC 一致**：`digital` 与 `analog` 的**输出**侧是同一份状态 —— 写 `digital=1` 等价于
+  `setOutput(true)`，也等价于 `setAnalogOutput(15)`；写 `analog=0` 后 `getOutput` 为 `false`。
 - **写校验 fail-fast**：值必须是十进制整数且在范围内（`0x10`/`1e2`/负数/小数一律拒绝），
   非法写返回错误且**不改动**输出状态；`sh` 的 `echo` 把它报成 `echo: write error: invalid ...`
   并置退出码 1（见下文 `echo`），不会被静默吞掉。
@@ -205,7 +209,7 @@ CC 的红石 API 是函数式的（`redstone.getInput(side)` / `redstone.setAnal
 **`echo`**：POSIX + 扩展 `-n`（不换行）/ `-e`（解释转义 `\a \b \c \e \f \n \r \t \v \\ \0nnn \xHH`，
 `\c` 截断且不换行，未知转义原样保留），例如 `echo -e '\e[31mred\e[0m'`；写失败（设备/属性文件/管道
 句柄返回 `nil, err`）报 `echo: write error: ...` 并置退出码 1（POSIX），
-因此 `echo 15 > /sys/class/redstone/left/analog_output` 的失败不会被静默吞掉。
+因此 `echo 15 > /sys/class/redstone/left/analog` 的失败不会被静默吞掉。
 **`cd`**：无参进 `$HOME`，`cd -` 回 `$OLDPWD` 并打印新目录，`PWD`/`OLDPWD` 随 `cd` 更新。
 **`set`**（POSIX 特殊内建）：无参按名排序列出全部变量（`name='value'`，可重输入）；
 `set -- a b`（或 `set a b`）设位置参数，`set --` 清空；选项 `-e`（errexit）/`-u`（nounset）/
@@ -342,7 +346,7 @@ PID 1 现在是**用户态服务管理器**（`src/init/unit.lua` 单元解析 +
 用户态 `/dev/log`、`syslogd` 按 `/etc/syslog.conf` 写 `/var/log/*`（SIGHUP 重开、游标续读不重放）、
 `logrotate` + `logrotate.timer` 轮转、`logger`/`dmesg`。`/etc/fstab` 由 init 生成 mount 单元
 （`local-fs.target`），`mount -a` 复用同一解析器。init 里的自检代码已全部删除，验证改为
-宿主测试台 `tools/hosttest.lua`（361 项）与真机脚本 `tools/realmachine.py` +
+宿主测试台 `tools/hosttest.lua`（369 项）与真机脚本 `tools/realmachine.py` +
 `scripts/realmachine_verify.sh`。
 
 `src/bin/sh` 已升级为 POSIX 核心子集（变量/引号/if/for/while/case/函数/test/[ ]/&&/|| /文件重定向/管道
@@ -370,10 +374,11 @@ sysfs 也从 display 专用泛化成 class 注册表（模块用 `kapi.registerS
 `killall`（`-e`/`-q`/`-u`/`-l`）—— 全部是 `/proc` 的消费者，不额外开 syscall。
 `scripts/proc_test.sh`（41 项）在宿主 harness 与真机上各跑一次逐项比对。
 
-红石经 `redstone` 模块摊成 sysfs 属性文件 `/sys/class/redstone/<side>/{input,output,analog_input,
-analog_output,bundled_input,bundled_output}`（六个面恒定存在），`cat`/`echo` 即读写；
+红石经 `redstone` 模块摊成 sysfs 属性文件 `/sys/class/redstone/<side>/{digital,analog,bundled}`
+（六个面恒定存在），`cat`/`echo` 即读写；读 = 该面输入、写 = 该面输出，
 写值严格校验（十进制整数 + 范围），非法写 fail-fast 且不改动输出状态。
-`scripts/redstone_test.sh`（50 项）在宿主 harness 与真机上各跑一次逐项比对，
+`scripts/redstone_test.sh`（75 项）在宿主 harness 与真机上各跑一次逐项比对（写是否生效由 `/bin/lua`
+经 CC 原始 `redstone` API 读回确认 —— 文件读的是输入，读不回自己写的输出），
 `scripts/redstone_verify.lua` 在真机上以 CC 原始 `redstone` API 为真值逐项交叉核对。
 
 ### 引导
@@ -496,7 +501,7 @@ analog_output,bundled_input,bundled_output}`（六个面恒定存在），`cat`/
 
 ```bash
 lua5.1 tools/build.lua             # 构建 dist/: 压缩内核/DLUB/BIOS/工具/模块/配置 + manifest
-lua5.1 tools/build.lua --check     # 构建 + 压缩等价性门禁(hosttest 361 项 + 6 个自检脚本差分)
+lua5.1 tools/build.lua --check     # 构建 + 压缩等价性门禁(hosttest 369 项 + 6 个自检脚本差分)
 lua5.1 tools/build.lua --release   # 构建 + 生成 dist/release/<版本>/ 发布树(安装布局的 payload)
 sh tools/serve.sh                  # 把发布树挂在 10568 端口(游戏侧 wget 安装用)
 ```
@@ -595,7 +600,7 @@ TUI 里可选安装类型（CCFS / EXT2）、目标设备（电脑自身存储 /
 验证：
 
 ```bash
-lua5.1 tools/hosttest.lua        # 宿主测试: init 引擎/fstab/syslogd/logrotate/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone (361 项)
+lua5.1 tools/hosttest.lua        # 宿主测试: init 引擎/fstab/syslogd/logrotate/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone (369 项)
 DELIN_REPO=<压缩后的源码树> lua5.1 tools/hosttest.lua         # 压缩器等价性: 同一套测试跑在压缩产物上
 DELIN_SRCBIN=<压缩后的 bin> lua5.1 tools/harness.lua /bin/sh # 同上, 工具级差分比对
 lua5.4 tools/hosttest.lua        # 同上用 5.4 跑一遍(CC 是 5.2 语义, 不能只在 5.1 上验)
@@ -713,7 +718,7 @@ scripts/posix_test.sh      可移植 POSIX 自检(host 与 Delin 各跑一次比
 scripts/jobctl_test.sh     作业控制自检(& / $! / jobs / fg / bg / wait / kill %job, host 与真机各跑一次)
 scripts/sysinfo.sh         实用小工具: 系统信息(变量/函数/for/case/if/重定向/工具)
 scripts/proc_test.sh       /proc + ps/pgrep/pkill/killall 自检(host harness 与真机各跑一次比对, 41 项)
-scripts/redstone_test.sh   /sys/class/redstone 读写/校验自检(host harness 与真机各跑一次比对, 50 项)
+scripts/redstone_test.sh   /sys/class/redstone 读写/校验自检(host harness 与真机各跑一次比对, 75 项)
 scripts/lua_test.sh        /bin/lua 自检(host harness 与真机各跑一次比对, 107 项): 脚本/stdin/arg/变参/
                            dofile+loadfile/错误消息与退出码/shebang/进程环境白名单
 scripts/lua_repl_test.sh   /bin/lua 交互式 REPL 自检(宿主专用: 测试台把 stdin 伪装成终端,
@@ -741,7 +746,7 @@ tools/harness.lua          host 测试台: 用真实 Delin 工具源码在宿主
                            + 桩 printer(/dev/lp0) + 桩 redstone API(加载真实 redstone.ko)
                            + 桩进程表(ps/pgrep/pkill/killall);
                            进程环境用内核同一份白名单(src/kernel/procenv.lua), 不放宽)
-tools/hosttest.lua         宿主测试: init 单元引擎/fstab 生成/syslogd 规则/logrotate 轮转/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone(361 项)
+tools/hosttest.lua         宿主测试: init 单元引擎/fstab 生成/syslogd 规则/logrotate 轮转/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone(369 项)
 tools/ext2test.lua         宿主 ext2 回归: 真实镜像上跑目录增删(空洞/links/回收), 宿主 e2fsck -fn 判定
 tools/deploy.py            重建干净 ext2 根镜像(基镜像+内核/bin/单元/配置/标记), 属主按基镜像逐条写回;
                            基镜像损坏/rdump 漏文件/构建后 fsck 不过一律 fail-fast

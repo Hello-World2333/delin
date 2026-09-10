@@ -1397,7 +1397,8 @@ do
 end
 
 -- ===============================================================
--- L. redstone: /sys/class/redstone/<side>/{input,output,analog_*,bundled_*}
+-- L. redstone: /sys/class/redstone/<side>/{digital,analog,bundled}
+--    每面三个属性, 一个红石量一个文件: 读 = 该面输入, 写 = 该面输出。
 --    用桩 CC redstone API 验证驱动的读写/校验语义(真机与真实 API 的交叉核对见
 --    scripts/redstone_verify.lua, shell 接口见 scripts/redstone_test.sh)。
 -- ===============================================================
@@ -1405,7 +1406,7 @@ do
     local vfs = require("kernel.vfs")
     local sysfs = require("kernel.sysfs")
 
-    -- 桩 redstone API: 忠实模拟 CC 的语义(output 与 analog_output 是同一份状态)。
+    -- 桩 redstone API: 忠实模拟 CC 的语义(输出侧 digital 与 analog 是同一份状态)。
     local st = { input = {}, analogIn = {}, bundledIn = {}, output = {}, analogOut = {}, bundledOut = {} }
     local SIDE_LIST = { "top", "bottom", "left", "right", "front", "back" }
     local function num(t, s) return t[s] or 0 end
@@ -1448,8 +1449,8 @@ do
     local b, r = vfs.resolve("/sys/class/redstone")
     eq(table.concat(b.list(r), ","), "back,bottom,front,left,right,top",
        "redstone: 六个面按名排序(getSides 顺序无关)")
-    eq(table.concat(cls.attrs("left"), ","), "input,output,analog_input,analog_output,bundled_input,bundled_output",
-       "redstone: 属性清单")
+    eq(table.concat(cls.attrs("left"), ","), "digital,analog,bundled",
+       "redstone: 属性清单(每面三个, 读写同一个文件)")
     eq(cls.attrs("middle"), nil, "redstone: 不存在的面没有属性")
 
     local function openAttr(path, mode)
@@ -1459,42 +1460,52 @@ do
         return fh
     end
 
-    -- 读: 输入/输出/模拟量/集束量都取自 API 当前值
+    -- 读 = 输入: 三个属性都取 API 的 *Input 系列
     st.input.left, st.input.top = true, false
     st.analogIn.left, st.bundledIn.left = 9, 32769
-    eq(openAttr("/sys/class/redstone/left/input").readAll(), "1", "redstone: input=1")
-    eq(openAttr("/sys/class/redstone/top/input").readAll(), "0", "redstone: input=0")
-    eq(openAttr("/sys/class/redstone/left/analog_input").readAll(), "9", "redstone: analog_input")
-    eq(openAttr("/sys/class/redstone/left/bundled_input").readAll(), "32769", "redstone: bundled_input 位掩码")
+    eq(openAttr("/sys/class/redstone/left/digital").readAll(), "1", "redstone: digital 读输入 1")
+    eq(openAttr("/sys/class/redstone/top/digital").readAll(), "0", "redstone: digital 读输入 0")
+    eq(openAttr("/sys/class/redstone/left/analog").readAll(), "9", "redstone: analog 读输入 9")
+    eq(openAttr("/sys/class/redstone/left/bundled").readAll(), "32769", "redstone: bundled 读输入位掩码")
 
     -- 属性文件是单行值: 读一次即 EOF
-    local fh = openAttr("/sys/class/redstone/left/input")
+    local fh = openAttr("/sys/class/redstone/left/digital")
     eq(fh.readAll(), "1", "redstone: 首次读得值")
     eq(fh.readAll(), nil, "redstone: 读完即 EOF")
 
-    -- 写 output: 与 CC 一样落到 15, analog_output 读回 15
-    eq(cls.set("left", "output", "1"), true, "redstone: 写 output=1")
-    eq(st.output.left, true, "redstone: output 落到 API")
-    eq(openAttr("/sys/class/redstone/left/output").readAll(), "1", "redstone: 读回 output")
-    eq(openAttr("/sys/class/redstone/left/analog_output").readAll(), "15", "redstone: output=1 即 analog 15")
+    -- 写 digital: 落到 API 的输出; 读仍是输入(桩里输入与输出互相独立)
+    eq(cls.set("left", "digital", "1"), true, "redstone: 写 digital=1")
+    eq(st.output.left, true, "redstone: digital=1 落到 setOutput")
+    eq(st.analogOut.left, 15, "redstone: digital=1 即 CC 的 analog 15")
+    eq(openAttr("/sys/class/redstone/left/digital").readAll(), "1", "redstone: 写后读仍取输入")
+    eq(cls.set("left", "digital", "0"), true, "redstone: 写 digital=0")
+    eq(st.output.left, false, "redstone: digital=0 落到 setOutput")
+    eq(st.analogOut.left, 0, "redstone: digital=0 即 analog 0")
 
-    -- 写 analog_output: 0 关掉 output, 中间值保持 output=1
-    eq(cls.set("left", "analog_output", "7"), true, "redstone: 写 analog_output=7")
-    eq(openAttr("/sys/class/redstone/left/analog_output").readAll(), "7", "redstone: 读回 analog_output")
-    eq(openAttr("/sys/class/redstone/left/output").readAll(), "1", "redstone: analog 7 -> output 1")
-    cls.set("left", "analog_output", "0")
-    eq(openAttr("/sys/class/redstone/left/output").readAll(), "0", "redstone: analog 0 -> output 0")
+    -- 写 analog: 0 关掉 output, 中间值保持 output=1(CC 语义)
+    eq(cls.set("left", "analog", "7"), true, "redstone: 写 analog=7")
+    eq(st.analogOut.left, 7, "redstone: analog=7 落到 setAnalogOutput")
+    eq(st.output.left, true, "redstone: analog=7 -> output 1")
+    cls.set("left", "analog", "0")
+    eq(st.output.left, false, "redstone: analog=0 -> output 0")
 
-    -- 写 bundled_output: 十进制位掩码
-    eq(cls.set("left", "bundled_output", "32768"), true, "redstone: 写 bundled_output")
-    eq(openAttr("/sys/class/redstone/left/bundled_output").readAll(), "32768", "redstone: 读回 bundled_output")
-    cls.set("left", "bundled_output", "0")
+    -- 写 bundled: 十进制位掩码
+    eq(cls.set("left", "bundled", "32768"), true, "redstone: 写 bundled=32768(black)")
+    eq(st.bundledOut.left, 32768, "redstone: bundled 落到 setBundledOutput")
+    cls.set("left", "bundled", "0")
+
+    -- 三个属性都可写: 没有只读属性, 写打开一律成功
+    for _, a in ipairs({ "digital", "analog", "bundled" }) do
+        local bk, rl = vfs.resolve("/sys/class/redstone/left/" .. a)
+        local wfh, werr = bk.open(rl, "w")
+        ok(wfh ~= nil, "redstone: " .. a .. " 可写(写打开成功)", werr)
+    end
 
     -- 非法值 fail-fast, 且不改动输出状态
     st.analogOut.left = 3
-    local bad = { { "analog_output", "16" }, { "analog_output", "abc" }, { "analog_output", "1e2" },
-                  { "analog_output", "-1" }, { "analog_output", "0x10" },
-                  { "output", "2" }, { "bundled_output", "65536" } }
+    local bad = { { "analog", "16" }, { "analog", "abc" }, { "analog", "1e2" },
+                  { "analog", "-1" }, { "analog", "0x10" },
+                  { "digital", "2" }, { "bundled", "65536" } }
     for _, c in ipairs(bad) do
         local okw, werr = cls.set("left", c[1], c[2])
         ok(okw == nil and tostring(werr):find("invalid") ~= nil,
@@ -1502,15 +1513,13 @@ do
     end
     eq(st.analogOut.left, 3, "redstone: 非法值不改动输出状态")
 
-    -- 只读属性: 声明为不可写, 写打开被 sysfs 拒绝; class 的 set 也拒绝
-    local bk, rl = vfs.resolve("/sys/class/redstone/left/input")
-    local roh, roerr = bk.open(rl, "w")
-    ok(roh == nil and tostring(roerr):find("read%-only"), "redstone: input 只读(写打开失败)", roerr)
-    local sok, serr = cls.set("left", "input", "1")
-    ok(sok == nil and tostring(serr):find("read%-only"), "redstone: set 拒绝只读属性", serr)
+    -- class 的 set 只认这三个属性
+    local sok, serr = cls.set("left", "output", "1")
+    ok(sok == nil and tostring(serr):find("no such attribute") ~= nil,
+       "redstone: set 拒绝旧属性名 output", serr)
 
     -- 经 VFS 句柄写入(含末尾换行被剥掉), 非法值同样报错
-    local outH = openAttr("/sys/class/redstone/left/analog_output", "w")
+    local outH = openAttr("/sys/class/redstone/left/analog", "w")
     outH:writeLine("12")
     eq(st.analogOut.left, 12, "redstone: 句柄写入剥掉换行")
     local wok, wrerr = outH:write("99\n")
@@ -1520,7 +1529,7 @@ do
     -- 不存在的面: 不是目录, 属性也不存在
     b, r = vfs.resolve("/sys/class/redstone/middle")
     ok(not b.exists(r) and not b.isDir(r), "redstone: 不存在的面 exists/isDir=false")
-    b, r = vfs.resolve("/sys/class/redstone/middle/input")
+    b, r = vfs.resolve("/sys/class/redstone/middle/digital")
     ok(not b.exists(r), "redstone: 不存在面的属性 exists=false")
 
     -- 真机交叉核对脚本(scripts/redstone_verify.lua)的逻辑回归: 同一份源码在真机上以

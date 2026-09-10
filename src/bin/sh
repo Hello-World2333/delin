@@ -850,7 +850,7 @@ builtins.echo = function(args)
     if outH and outH.write then
         -- POSIX echo: 写失败必须报错并给非 0 退出码。设备/属性文件(sysfs、/dev/lpN、管道)
         -- 的句柄失败时返回 nil, err; 真实文件句柄成功时也返回 nil(无 err), 故按 err 判定 ——
-        -- 否则 `echo 15 > /sys/class/redstone/left/analog_output` 的失败会被静默吞掉。
+        -- 否则 `echo 15 > /sys/class/redstone/left/analog` 的失败会被静默吞掉。
         local okw, werr = outH:write(s .. (newline and "\n" or ""))
         if okw == nil and werr ~= nil then
             errln("echo: write error: " .. tostring(werr))
