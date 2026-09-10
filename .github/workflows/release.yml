@@ -1,0 +1,97 @@
+# 打 v* tag 时自动构建, 并把发布树推到 release 分支(raw.githubusercontent.com 直接可装)。
+#
+#   游戏内安装:
+#     wget run https://raw.githubusercontent.com/Hello-World2333/delin/release/<版本>/install.lua
+#
+# 发布树形状(release 分支):
+#     <版本>/install.lua        安装器本体
+#     <版本>/manifest           版本 + 每个 payload 文件的 size/crc32
+#     <版本>/payload/...        payload/ 下的相对路径 = 目标文件系统上的绝对路径
+# 每个版本一个目录, 推新版本不会动旧版本目录(老安装器里写死的源仍然能装)。
+# 版本号以 src/kernel/version.lua 为唯一真源: tag 必须是 v<版本号>, 不一致直接失败。
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# 同一时间只跑一个发布(两个 tag 同时推时, 后一个等着, 避免 release 分支互相覆盖)
+concurrency:
+  group: release-branch
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 要 fetch/push release 分支, 不用浅克隆
+
+      - name: Install lua5.1
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lua5.1 e2fsprogs
+
+      - name: Read version and check tag
+        id: version
+        run: |
+          set -euo pipefail
+          VERSION=$(sed -n 's/^return "\(.*\)"$/\1/p' src/kernel/version.lua)
+          if [ -z "$VERSION" ]; then
+            echo "cannot read version from src/kernel/version.lua" >&2
+            exit 1
+          fi
+          if [ "v$VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match v$VERSION (src/kernel/version.lua)" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "releasing Delin $VERSION"
+
+      # --check: 压缩等价性门禁(hosttest + harness 差分); --release: 生成发布树
+      - name: Build
+        run: lua5.1 tools/build.lua --check --release
+
+      # 安装器宿主回归: 在假 CraftOS 里按键驱动 dist/install.lua, 断言落盘结果
+      - name: Installer tests
+        run: lua5.1 tools/installertest.lua
+
+      - name: Publish release tree to the release branch
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          TREE="$RUNNER_TEMP/tree"
+          rm -rf "$TREE"
+          mkdir -p "$TREE"
+          cp -r "dist/release/$VERSION" "$TREE/$VERSION"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git ls-remote --exit-code --heads origin release > /dev/null 2>&1; then
+            git fetch --depth=1 origin release
+            git checkout -B release FETCH_HEAD
+          else
+            # 首次发布: 起一个干净的孤儿分支(源文件不进 release 分支)
+            git checkout --orphan release
+            git rm -rf .
+          fi
+
+          rm -rf "$VERSION"
+          cp -r "$TREE/$VERSION" "$VERSION"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "release branch already up to date for $VERSION"
+          else
+            git commit -m "release $VERSION"
+            git push origin release
+          fi
+
+          echo "published $VERSION to the release branch"
+          git ls-tree --name-only release

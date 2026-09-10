@@ -510,8 +510,23 @@ sysfs 也从 display 专用泛化成 class 注册表（模块用 `kapi.registerS
 lua5.1 tools/build.lua             # 构建 dist/: 压缩内核/DLUB/BIOS/工具/模块/配置 + manifest
 lua5.1 tools/build.lua --check     # 构建 + 压缩等价性门禁(hosttest 405 项 + 6 个自检脚本差分)
 lua5.1 tools/build.lua --release   # 构建 + 生成 dist/release/<版本>/ 发布树(安装布局的 payload)
-sh tools/serve.sh                  # 把发布树挂在 10568 端口(游戏侧 wget 安装用)
+sh tools/serve.sh                  # 开发期: 把发布树挂在 10568 端口(游戏侧 wget 安装用)
 ```
+
+**发布（CI）**：`.github/workflows/release.yml` 在**打 `v*` tag** 时跑
+`lua5.1 tools/build.lua --check --release` + `lua5.1 tools/installertest.lua`（门禁不过不发），
+然后把这棵发布树推成 **`release` 分支**的 `<版本>/` 目录（一个版本一个目录，推新版本不动旧版本）。
+tag 必须等于 `v<src/kernel/version.lua 里的版本号>`，不一致直接失败（免得版本号漂了）。
+安装器里写死的默认源就是它 —— `DEFAULT_URL` = `https://raw.githubusercontent.com/Hello-World2333/delin/release/<版本>`，
+版本号用 `require("kernel.version")` 取（升级版本不会漏改，也就不会静默装到旧版本）：
+
+```bash
+# 游戏内(目标电脑, CraftOS 下)直接从 GitHub 装:
+wget run https://raw.githubusercontent.com/Hello-World2333/delin/release/<版本>/install.lua
+```
+
+> **仓库必须保持 public**：raw.githubusercontent.com 对私有仓库一律 404（真机实测 CC 侧
+> `err=Not Found`，宿主机 curl 同样 404），私有期间这个默认源对所有玩家都不可用。
 
 `tools/build.lua` 是唯一入口：它会**自动建 `dist/`**（以前直接跑 `tools/bundle.lua` 时
 干净 checkout 上没有 `dist/`（`.gitignore` 里）就报错）。`dist/` 是"可发布树"：
@@ -550,12 +565,12 @@ Delin 的安装**完全发生在游戏内**：宿主机只负责用静态 http �
 一条命令起装。不需要任何外部工具、不需要改服务器文件、不需要重建镜像。
 
 ```bash
-# 宿主机(开发期): 先把发布树挂出来
-lua5.1 tools/build.lua --release
-sh tools/serve.sh                 # dist/release 挂在 10568 端口
+# 游戏内(目标电脑, CraftOS 下): 默认源就是 GitHub 上的 release 分支(见"构建"一节)
+wget run https://raw.githubusercontent.com/Hello-World2333/delin/release/<版本>/install.lua
 
-# 游戏内(目标电脑, CraftOS 下):
-wget run http://<宿主机>:10568/<版本>/install.lua
+# 开发期也可以改用自己的 http 服务: 先 `lua5.1 tools/build.lua --release`, 再
+sh tools/serve.sh                 # dist/release 挂在 10568 端口
+# 然后在安装器的 Install source 步骤选 `custom ...` 手输 http://<宿主机>:10568/<版本>
 ```
 
 安装器（`dist/install.lua`，由 `tools/installer.lua` + 内核同一份 `blockdev`/`ext2`/`crc32`
@@ -585,7 +600,9 @@ wget run http://<宿主机>:10568/<版本>/install.lua
 | 4. Image size（仅 EXT2） | `auto` / 256 / 512 / 768 / 1024 KB，或 `custom ...` 手输 64–8192 KB。auto 按 payload + 元数据 + 目录余量算，再上浮 15%、对齐 64 块（CCFS 时这一步整个跳过） |
 | 5. Summary | 列出最终配置（类型/目标/安装源/payload/镜像大小/将写入的引导配置）；`Start installation` 开装，`Cancel` 退回上一步改配置 |
 
-装完按 `R` 立即重启，其它键回到摘要页（可以改配置再来一次）。**向导每进一个步骤 / 每个文本输入
+装完**只有回车才重启**（`Press Enter to reboot now`），其它键一律不处理 —— 免得手滑按到别的键
+把向导带回摘要页又重装一遍；装失败则是"按任意键回摘要页"（可以改配置再来一次）。
+**向导每进一个步骤 / 每个文本输入
 都往 `/delin-install.log` 落一行**（`wizard step 2/5: target`、`wizard size: custom 512 KB` 这类）——
 CC 电脑读不了屏，宿主机只能靠日志判断它走到了哪一步、卡在了哪里。
 
@@ -622,7 +639,7 @@ key/char 事件**来驱动向导。喂按键的时机靠 `wait` 盯 `/delin-inst
 - 游戏内 mkfs + 铺 65 个文件造出的镜像，拿到宿主机上 `e2fsck -fn` **干净**
   （97 文件 / 444 块 of 512）；512 KB 装得下 346 KB payload，真机整轮约 1 分钟。
 - **交互式向导真机实测**（电脑3 + 磁盘0，注入按键走完整套向导，两种落盘路径各一轮，
-  判定标准同上，另加"装完按 `R` 真重启后 `init up`"）：
+  判定标准同上，另加"装完按**回车**真重启后 `init up`"）：
   - EXT2 → 电脑自身存储，`Image size` 手输 `512 KB`：向导 5 步全走到
     （`wizard step 1/4: type` … `wizard size: custom 512 KB` … `wizard confirm: start installation`），
     装完重启 → `[DLUB] root=/parts/root.img fs=ext2` → `root boot: fstype=ext2` → `init up`；
@@ -646,9 +663,10 @@ lua5.4 tools/hosttest.lua        # 同上用 5.4 跑一遍(CC 是 5.2 语义, �
                                  # 测试台的 fs 门面曾用 os.execute(...)==0 判目录 —— 5.1 独有语义)
 lua5.1 tools/harness.lua /bin/sh # 宿主上跑真实工具源码(sh/作业控制/管道; /sys 走真实 sysfs 后端, /proc 走真实 procfs 后端)
 lua5.1 tools/installertest.lua    # 安装器宿主回归: 假 CraftOS 环境(假终端格子+脚本化事件队列)跑构建产物
-                                  # dist/install.lua, 按键序列驱动整套向导(12 用例/185 断言: 两种落盘形态、
-                                  # 自定义容量、坏源/空间不足 fail-fast、退格回退、无人值守、双驱动器;
-                                  # 失败时 dump 每一屏 + 日志 + 目标文件树)
+                                  # dist/install.lua, 按键序列驱动整套向导(14 用例/194 断言: 两种落盘形态、
+                                  # 自定义容量、坏源/空间不足 fail-fast、退格回退、无人值守、双驱动器、
+                                  # 装完只有回车重启; 默认源用软链假装 GitHub 可访问; 失败时 dump 每一屏
+                                  # + 日志 + 目标文件树)
 lua5.1 tools/harness.lua /bin/sh < scripts/proc_test.sh   # /proc + ps/pgrep/pkill/killall 自检(与真机比对)
 lua5.1 tools/harness.lua /bin/sh < scripts/redstone_test.sh   # /sys/class/redstone 读写/校验自检(与真机比对)
 lua5.1 tools/harness.lua /bin/sh < scripts/lua_test.sh   # /bin/lua 脚本/stdin/arg/dofile/退出码 + 进程环境白名单(与真机比对)
@@ -791,8 +809,14 @@ tools/installer.lua        游戏内安装器(CraftOS 程序): 多步交互式�
 scripts/installer_interactive_test.lua  真机: 注入 key/char 事件驱动交互式向导(配合
                            /installer-test.plan 计划文件), 结果写 /installer-test.log
 scripts/installer_plan_ext2.plan / scripts/installer_plan_ccfs.plan  上面那份交互计划的现成例子
-                           (EXT2→电脑自身存储 手输 512 KB / CCFS→电脑自身存储)
-tools/serve.sh             开发期把 dist/release 挂在 10568 端口(游戏侧 wget 安装用)
+                           (EXT2→电脑自身存储 手输 512 KB / CCFS→电脑自身存储; 两轮都以
+                           `key enter` 收尾 = 装完回车重启进 Delin)
+tools/serve.sh             开发期(本地)把 dist/release 挂在 10568 端口; 正式安装源是 GitHub 上的
+                           release 分支(见"构建"一节)
+.github/workflows/release.yml  打 v* tag -> 门禁(build --check --release + installertest)
+                           -> 把 dist/release/<版本>/ 推成 release 分支的 <版本>/ 目录
+                           (发布树要能被 CraftOS 按目录结构 http 取, 所以用分支而不是 Release assets:
+                            Release 的附件是平铺的, 放不下 payload/ 子路径)
 tools/minify.lua           Lua 压缩器: 词法分析 + 递归下降解析做作用域分析 + 局部变量改名,
                            只从 token 流输出(输出与输入的 token 序列逐项相同)。三重门禁:
                            lua5.1 解析 / 重词法逐 token 比对 / 改名不遮蔽任何全局名。
