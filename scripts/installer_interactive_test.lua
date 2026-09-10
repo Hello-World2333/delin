@@ -150,7 +150,16 @@ local function main()
     end
     fs.delete(INSTALL_LOG) -- 旧日志里的标记会把"同步"骗过去, 必须从干净状态开始
 
-    local res = http.get({ url = plan.url, binary = true })
+    -- 驱动自己拉 install.lua 也重试几次: 游戏服务器到 raw.githubusercontent.com 的连接偶发断
+    -- (实测同一批文件重拉就好), 一次失败就让整轮真机验证白跑太亏。安装器自己的重试在
+    -- tools/installer.lua 的 httpGet 里(那才是给玩家用的)。
+    local res
+    for attempt = 1, 3 do
+        res = http.get({ url = plan.url, binary = true })
+        if res then break end
+        log("  retry fetch (" .. attempt .. "/3): " .. plan.url)
+        sleep(1)
+    end
     if not res then log("FAIL: cannot fetch " .. plan.url); return end
     local src = res.readAll()
     res.close()
