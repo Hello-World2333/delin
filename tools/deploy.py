@@ -25,14 +25,14 @@ BAD = ("corrupted", "short read", "i/o error", "not found", "invalid", "illegal"
 
 
 def _module_version():
-    # 从 src/kernel/modules.lua 读 modules.version = "x.y.z"
+    # 版本号唯一真源: src/kernel/version.lua (`return "x.y.z"`)。读不到就失败, 不回退。
     import re
-    with open(os.path.join(REPO, "src/kernel/modules.lua"), "r", encoding="utf-8") as f:
-        for line in f:
-            m = re.search(r'modules\.version\s*=\s*"([^"]+)"', line)
-            if m:
-                return m.group(1)
-    return "0.0.2"
+    path = os.path.join(REPO, "src/kernel/version.lua")
+    with open(path, "r", encoding="utf-8") as f:
+        m = re.search(r'^\s*return\s+"([^"]+)"', f.read(), re.M)
+    if not m:
+        raise RuntimeError(f"无法从 {path} 读出版本号")
+    return m.group(1)
 
 
 def dryrun(*a):

@@ -378,15 +378,23 @@ analog_output,bundled_input,bundled_output}`（六个面恒定存在），`cat`/
 
 ### 引导
 
-代码经 `tools/bundle.lua` 打包成自包含 Lua 文件部署。两条引导路径：
+代码经 `tools/bundle.lua` 打包成自包含 Lua 文件部署。**引导契约**：CraftOS 开机执行电脑自身 FS 的
+`/startup.lua`；Delin BIOS（`src/bios/startup.lua`，装到 `/startup.lua`）会扫描所有设备找 `/.boot`，
+读出里面的路径并 `loadfile` 执行——`/.boot` 的内容就是引导设备上那个"内核入口"文件的路径
+（如 `/boot/delin.lua`）。BIOS 启动前有 0.1s 窗口，按 `DELETE` 进 BIOS 设置（`C` 进 CraftOS shell），
+无 `/.boot` 的设备不会被选为引导设备。
+
+两条引导路径：
 
 - **CC-fs 引导**（默认）：`kernel.lua` 直接跑 `boot.boot()`——`setupVfs` 挂根 hdd 到 `/` +
   `mountDev` + `klog.register`（`/dev/kmsg`、`/dev/log`）+ `procfs.mount` 挂 `/proc` →
   `setupDevices` 扫描磁盘驱动器注册
   `/dev/sdX` 节点（不自动挂载）→ `registerConsole` 把电脑自身 `term` 注册为 `/dev/ttyN` 控制台
-  （并派生 `/dev/console`）→ `setupModules`
-  从 `/lib/modules/<version>/` 装模块（`loadAll` + `loadAliases` + 按外设 autoload 驱动，
-  modprobe 风格 `modules.use`）→ `sysfs.mount` 挂 `/sys` → `launch` 出 PID 1（用户态 init）。
+  （并派生 `/dev/console`）→ `setupUsers` 从**根的** `/etc/{passwd,shadow,group}` 建用户库并注册
+  `user.*` syscalls → `setupModules` 从**根的** `/lib/modules/<version>/` 装模块
+  （`loadAll` + `loadAliases` + 按外设 autoload 驱动，modprobe 风格 `modules.use`）→
+  `sysfs.mount` 挂 `/sys` → `launch` 出 PID 1（用户态 init）。
+  根是电脑自身 FS，因此用户库与模块都**只**来自电脑自身 FS，不扫描磁盘（fail-fast）。
 - **EXT2 根引导**（GRUB 风格，DLUB 独立文件）：先由 `dlub.lua` 读**电脑自身 FS** 的 `/dlub.cfg`
   配置文件，支持两种启动模式：
   1. **外部磁盘启动**（`bootdisk <外设名>`，如 `bootdisk left`）：锁定引导盘——多磁盘时
@@ -396,10 +404,14 @@ analog_output,bundled_input,bundled_output}`（六个面恒定存在），`cat`/
      ext2 镜像启动，适用于需要从本地存储启动的场景。
 
   两种模式都会读取 ext2 分区，挂载根文件系统，读内核镜像并设 `_G.__boot_info`；`boot.boot()`
-  检测到 `__boot_info` 即走 `bootExt2`——挂 ext2 根为 `/`，读 `/etc/passwd` 建用户库，
-  模块只从 ext2 根镜像自带的 `/lib/modules/<version>/` 装载（自包含，fail-fast，绝不回退到
-  引导盘/CC fs 的 `/lib`）。两条路径最后都 spawn 同一份 init 源码，随后由 init 启动
+  检测到 `__boot_info` 即走 `bootExt2`——挂 ext2 根为 `/`，`setupUsers` 从根的 `/etc/passwd`
+  建用户库，模块只从 ext2 根镜像自带的 `/lib/modules/<version>/` 装载（自包含，fail-fast，
+  绝不回退到引导盘/CC fs 的 `/lib`）。两条路径最后都 spawn 同一份 init 源码，随后由 init 启动
   `default.target`。
+
+  两条路径的**用户库与模块装载是同一段代码**（`setupUsers`）：少一处就会出现
+  "login 拿不到 `user.verify` → 立刻退出 → getty 重启风暴" 这种只在真机上看得见的故障。
+  根上没有 `/etc/passwd` 一律 fail-fast 报错（没有用户库等于登录不了，不静默降级）。
 
 真机流程：`tools/realmachine.py`（**先关机** → 打包 → `tools/deploy.py` 重建 ext2 根镜像 → 注入第二个 ext2 分区
 供 fstab 测试 + `verify.service` → `e2fsck -fn` 门禁 → 装盘并按 md5 校验 → 开机 → 用 `debugfs`
@@ -511,6 +523,9 @@ python3 tools/realmachine.py --printer   # 真机 + 打印机(会实际打印页
 ## 目录
 
 ```
+src/kernel/version.lua     版本号唯一真源(`return "x.y.z"`, 同时是 /lib/modules/<version>/ 的目录名)
+src/bios/startup.lua       Delin BIOS(装到电脑自身 FS 的 /startup.lua): 扫描设备的 /.boot -> loadfile
+                           引导入口; DELETE 进设置 TUI, C 进 CraftOS shell
 src/kernel/scheduler.lua   协程调度器(事件循环) + resume 前信号投递
 src/kernel/process.lua     进程表/进程树/spawn/隔离 env + cwd + argv + 会话/进程组/信号/作业控制
                             + 子进程退出钩子(init 服务监督) + opts.ppid
@@ -587,6 +602,8 @@ src/bin/sh                 交互/脚本 shell(POSIX 核心子集: 变量/IFS/�
 src/units/*                厂商单元文件 -> /lib/systemd/system/ (default/multi-user/local-fs/getty/timers
                            target, syslogd.service, getty@.service, logrotate.service/.timer)
 src/etc/{fstab,syslog.conf,logrotate.conf}  系统配置 -> /etc/
+src/etc/{passwd,shadow,group}  初始用户库 -> /etc/ (root + alice:1000)。全新安装必须自带,
+                           否则装完没有任何用户能登录 (boot 会 fail-fast 报 /etc/passwd not found)
 src/modules/*.ko           内核模块: ccdisk(ccdisk fstype) ccmonitor(CC 显示器驱动) ccprinter(CC 打印机 ->
                            /dev/lpN + sysfs printer 类) cc_hse(HSE 时钟拉模式 os.msleep) demo(演示)
                            ext2(ext2 fstype) redstone(CC 红石 -> sysfs redstone 类) tom(Tom GPU 驱动)

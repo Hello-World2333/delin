@@ -79,18 +79,29 @@ local function setupDevices()
     scheduler.setDiskHook(function() devdisk.refresh() end)
 end
 
---- 在磁盘上找模块目录: /lib/modules/<version>/ (真实 fs 路径)。
+--- CC-fs 引导的模块目录: 根**就是电脑自身 FS**, 因此模块固定来自 /lib/modules/<version>/。
+--- 不从磁盘找: 磁盘上的模块目录属于 EXT2/ccdisk 根引导(由 __boot_info 指定), 在这里扫描
+--- 只会让"根在电脑存储、模块在磁盘"这种半吊子状态混进来。
 local function findModuleDir()
-    local v = modules.version
-    for _, name in ipairs(peripheral.getNames()) do
-        if disk.hasData(name) then
-            local mp = disk.getMountPath(name)
-            if mp and fs.exists(mp .. "/lib/modules/" .. v .. "/manifest") then
-                return mp .. "/lib/modules/" .. v
-            end
-        end
-    end
+    local dir = "/lib/modules/" .. modules.version
+    if fs.exists(dir .. "/manifest") then return dir end
     return nil
+end
+
+--- 用户库: 从**当前根**的 /etc/{passwd,shadow,group} 装载并注册 user.* syscalls。
+--- 两条引导路径(CC-fs / __boot_info 根)都必须走这里: 少一处就没人能登录 ——
+--- login 拿不到 user.verify 会立刻退出, 表现为 getty 重启风暴。
+--- 缺 /etc/passwd 是致命的(没有用户库的系统等于登录不了), 直接报错不回退。
+local function setupUsers()
+    if not vfs_api.fs.exists("/etc/passwd") then
+        kprint("FATAL: /etc/passwd not found on root (no user can log in)")
+        return nil
+    end
+    local user = require("kernel.user")
+    local db = user.init(vfs_api.fs)
+    user.registerSyscalls(db)
+    kprint("users loaded: " .. table.concat(user.list(db), ","))
+    return db
 end
 
 local function launch(initSrc, label)
@@ -308,10 +319,7 @@ local function bootExt2(bi)
         { write = function(self, s) return write(s) end, writeLine = function(self, s) return write(s .. "\n") end, flush = function(self) return true end }
     )
     -- 用户库(从 EXT2 根 /etc/passwd 读) + 注册 user.* syscalls
-    local user = require("kernel.user")
-    local db = user.init(vfs_api.fs)
-    user.registerSyscalls(db)
-    kprint("users loaded: " .. table.concat(user.list(db), ","))
+    if not setupUsers() then return end
 
     -- 内核模块: 只从 ext2 根镜像自带的 /lib/modules/<version>/ 装载(自包含, fail-fast)。
     -- 绝不回退到引导盘/CC fs 的 /lib —— 那上面本就不该有模块。
@@ -358,6 +366,7 @@ function boot.boot()
     kprint("vfs ready")
     setupDevices()    -- /dev/sdX 设备节点(磁盘不自动挂载)
     registerConsole() -- 电脑自身 term 控制台(键盘输入焦点)
+    if not setupUsers() then return end -- 用户库来自根(电脑自身 FS)的 /etc/{passwd,shadow,group}
 
     local mdir = findModuleDir()
     if mdir then

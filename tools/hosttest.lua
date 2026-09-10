@@ -7,6 +7,7 @@ io.stdout:setvbuf("line")
 os.epoch = os.epoch or function() return os.time() * 1000 end -- 宿主桩: 内核 klog 载入时取引导标识
 package.path = "/home/worker/delin/src/?.lua;" .. package.path
 local procenv = require("kernel.procenv") -- 进程环境白名单(与内核同一份), 见 src/kernel/procenv.lua
+local VERSION = require("kernel.version") -- 模块目录名 /lib/modules/<version>
 
 local REPO = "/home/worker/delin"
 local ROOT = "/tmp/delinhost2"
@@ -1294,7 +1295,7 @@ do
             return 7
         end,
     }
-    require("kernel.procfs").mount(0, "0.0.2") -- bootMs=0
+    require("kernel.procfs").mount(0, VERSION) -- bootMs=0
 
     local function openAt(path)
         local b, r = vfs.resolve(path)

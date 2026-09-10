@@ -10,6 +10,7 @@ local ROOT = "/tmp/delinhost"
 -- 内核模块(与真机同一份源码): 进程环境白名单等要用真实实现, 不能在测试台上另写一套。
 package.path = "/home/worker/delin/src/?.lua;" .. package.path
 local procenv = require("kernel.procenv")
+local VERSION = require("kernel.version") -- 模块目录名 /lib/modules/<version>
 
 -- pipe 内核模块用 os.sleep 做协作式阻塞; 在宿主上把它改成 yield 给调度器
 -- (宿主 lua5.1 的 os 没有 sleep, 且这里必须能让出当前协程让调度器切走)。
@@ -515,7 +516,7 @@ local function setupRoot()
     -- /dev 占位
     os.execute("mkdir -p " .. ROOT .. "/dev " .. ROOT .. "/proc " .. ROOT .. "/sys/class/display")
     os.execute("touch " .. ROOT .. "/dev/null " .. ROOT .. "/dev/lp0") -- 占位(打开走设备桩, 使 ls /dev 一致)
-    os.execute("mkdir -p " .. ROOT .. "/lib/modules/0.0.2")
+    os.execute("mkdir -p " .. ROOT .. "/lib/modules/" .. VERSION)
 end
 
 -- ---------------------------------------------------------------
@@ -558,7 +559,7 @@ package.loaded["kernel.process"] = {
     ttyFor = function(pid) return procs[pid] and "/dev/tty0" or nil end,
     fgPgrpFor = function(pid) return procs[pid] and procs[pid].pgrp or nil end,
 }
-require("kernel.procfs").mount(os.epoch("utc"), "0.0.2")
+require("kernel.procfs").mount(os.epoch("utc"), VERSION)
 
 --- /sys 与 /proc 下的路径走虚拟后端, 其余仍走宿主文件。
 local function vfsFor(p)

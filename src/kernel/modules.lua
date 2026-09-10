@@ -10,10 +10,11 @@ local vfs     = require("kernel.vfs")
 local display = require("kernel.display")
 local devdisk = require("kernel.devdisk")
 local sysfs   = require("kernel.sysfs")
+local version = require("kernel.version")
 
 local modules = {}
 
-modules.version = "0.0.2"
+modules.version = version
 modules.log = print   -- boot 可替换为 kprint
 modules.fs = fs       -- 读模块文件的 fs 门面(默认 CC 真实 fs; EXT2 根引导时 boot 换成 vfs_api.fs)
 
