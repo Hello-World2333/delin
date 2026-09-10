@@ -1,0 +1,25 @@
+# 真机计划: EXT2 -> 电脑自身存储, 镜像大小手输 512 KB, 装完按 R 重启进 Delin
+# 用法见 README「安装」与 scripts/installer_interactive_test.lua 的注释。
+# 注意第 1 步的 step 计数是 1/4(此刻还是 CCFS, 没有 size 那一步), 选了 EXT2 之后变成 n/5。
+url http://127.0.0.1:10568/0.0.2/install.lua
+wait wizard step 1/4: type
+key down
+key enter
+wait wizard step 2/5: target
+key enter
+wait wizard step 3/5: source
+key enter
+wait wizard step 4/5: size
+key down
+key down
+key down
+key down
+key down
+key enter
+wait wizard input: Image size
+text 512
+key enter
+wait wizard step 5/5: summary
+key enter
+wait Install OK
+key r

@@ -2,7 +2,12 @@
      dist/install.lua)。
      用法(游戏内):
          wget run http://<host>:10568/<版本>/install.lua
-     然后在 TUI 里选安装类型/目标设备/安装源, 按 I 开始装。
+     然后跟着向导一步步走:
+         安装方式(CCFS / EXT2) -> 目标设备 -> 安装源 -> (仅 EXT2) 镜像大小
+         -> 摘要确认 -> 开始安装
+     上下箭头选择, 回车确认; Backspace 返回上一步(文本输入里行首再退格 = 返回), Q 退出。
+     注意: **CraftOS 不产生 Esc 键事件**(keys 表里没有 escape, keys.getName(256) 也是 nil),
+     所以"回退"只能绑 Backspace, 别写 keys.escape = 1 这种在其他版本上才有的东西。
 
      它做什么:
        - 从 http 安装源(发布树)拉 manifest, 再逐文件下载 payload/ 并校验 size + CRC32;
@@ -18,12 +23,16 @@
            CCFS(装到电脑存储)  /.boot = /boot/delin.lua   内核就在电脑存储上
            CCFS(装到磁盘)      /.boot = /boot/dlub.lua    /dlub.cfg = ccdisk <盘名>
            EXT2(电脑存储或磁盘) /.boot = /boot/dlub.lua    /dlub.cfg = rootfs <镜像> | bootdisk <盘名>
+         这份判断只有一处(bootPlan), 摘要页与安装过程共用, 不允许各写一遍。
 
      设计要点:
-       - **不需要外部工具**: ext2 格式化与写入用的是内核同一份 ext2 驱动(打包进本文件),
+       - **不需要外部工具**: ext2 格式化与写入用的是内核同一份 ext2 driver(打包进本文件),
          安装完全发生在游戏内; 宿主机只负责用静态 http 服务托管发布树(tools/serve.sh)。
        - **安装源只有 http**: 游戏侧碰不到服务器文件系统, 只能下载。
        - **fail-fast**: 校验不过 / 空间不够 / 目标非法一律报错返回, 不写半成品引导配置。
+         "安装源"这一步就会拉一次 manifest —— 源不通当场就能看见, 不用等到开始装。
+       - **向导只依赖事件队列**: 每一步都是"重画整屏 + os.pullEvent", 不做增量刷新;
+         真机自动化验证可以把按键事件预先 os.queueEvent 进队列来驱动它。
        - 输出全 ASCII(CC 终端打中文乱码)。 ]]
 
 local blockdev = require("kernel.blockdev")
@@ -39,6 +48,7 @@ local M = {}
 local CFG_PATH = "/delin-install.cfg"
 local LOG_PATH = "/delin-install.log" -- 安装日志: CC 电脑读不了屏, 装完/装挂了都要能被宿主机读回
 local DEFAULT_URL = "http://127.0.0.1:10568/0.0.2"
+local IMAGE_REL = "parts/root.img"    -- ext2 镜像在目标上的相对路径(摘要页与安装共用)
 
 -- 骨架目录: 全新安装必须自己建, 否则 login/日志/挂载点都不存在
 local SKELETON = {
@@ -50,85 +60,8 @@ local SKELETON = {
 -- payload 里需要可执行位的路径前缀
 local EXEC_PREFIXES = { "bin/", "lib/modules/" }
 
--- ===============================================================
--- 终端小工具
--- ===============================================================
-
-local W, H
-
-local function setColor(fg, bg)
-    if fg then term.setTextColor(fg) end
-    if bg then term.setBackgroundColor(bg) end
-end
-
-local function at(x, y, text, fg, bg)
-    term.setCursorPos(x, y)
-    setColor(fg, bg)
-    term.clearLine()
-    term.write(text or "")
-    setColor(colors.white, colors.black)
-end
-
-local function clear()
-    term.setBackgroundColor(colors.black)
-    term.clear()
-    term.setCursorPos(1, 1)
-    setColor(colors.white, colors.black)
-end
-
-local function waitKey()
-    local _, key = os.pullEvent("key")
-    return key
-end
-
-local function inputLine(prompt, default)
-    clear()
-    print(prompt)
-    if default and default ~= "" then print("[" .. default .. "]") end
-    write("> ")
-    local line = read(nil, nil, nil, default or "")
-    if line == nil then return default end
-    line = line:gsub("^%s+", ""):gsub("%s+$", "")
-    if line == "" then return default end
-    return line
-end
-
-local function human(bytes)
-    if bytes >= 1024 * 1024 then return string.format("%.1f MB", bytes / 1024 / 1024) end
-    if bytes >= 1024 then return string.format("%.1f KB", bytes / 1024) end
-    return tostring(bytes) .. " B"
-end
-
--- ===============================================================
--- 安装源配置
--- ===============================================================
-
---- 读安装配置。TUI 只写 url; 无人值守安装可以写齐
----   url <安装源>  type ccfs|ext2  target computer|<盘名>  size auto|<KB>  auto 1
-local function loadConfig()
-    local cfg = { url = DEFAULT_URL }
-    local f = fs.open(CFG_PATH, "r")
-    if f then
-        local text = f.readAll(); f.close()
-        for line in text:gmatch("[^\r\n]+") do
-            local k, v = line:match("^(%S+)%s+(%S+)$")
-            if k then cfg[k] = v end
-        end
-    end
-    return cfg
-end
-
-local function saveConfig(cfg)
-    local f = fs.open(CFG_PATH, "w")
-    if not f then return nil, "cannot write " .. CFG_PATH end
-    f.writeLine("url " .. cfg.url)
-    f.close()
-    return true
-end
-
-local function urlJoin(base, rel)
-    return (base:gsub("/+$", "")) .. "/" .. rel
-end
+-- 向导里能改的配置文件键(保存时按这个顺序写回, 别的键丢弃)
+local CFG_KEYS = { "url", "type", "target", "size", "auto" }
 
 -- ===============================================================
 -- 安装日志(屏幕 + 落盘)
@@ -145,6 +78,222 @@ local function report(s)
     print(s)
     local f = fs.open(LOG_PATH, "a")
     if f then f.writeLine(s); f.close() end
+end
+
+--- 只写日志不上屏。向导每一步/每个文本输入都留一行, 于是"卡在哪一步"从宿主机读日志
+--- 就知道(真机自动化验证也是靠这些行同步注入按键的时机)。
+local function logLine(s)
+    local f = fs.open(LOG_PATH, "a")
+    if f then f.writeLine(tostring(s or "")); f.close() end
+end
+
+-- ===============================================================
+-- 终端小工具
+-- ===============================================================
+
+local W, H     -- 屏幕尺寸(每步重读, 允许用户中途改分辨率)
+local progress -- 安装进度行(前向声明; M.run 里赋值)
+
+local HELP_SELECT = "Up/Down select   Enter confirm   Backspace back   Q quit"
+local HELP_INPUT  = "Type to edit   Enter confirm   Left/Right move   Backspace delete/back"
+
+--- 读一次屏幕尺寸。
+local function size()
+    W, H = term.getSize()
+end
+
+--- 在 y 行写一整行(先清行, 超宽截断)。返回 y + 1。
+--- bg 决定整行的背景色(clearLine 用当前背景色填充), 反显高亮就是这么来的。
+local function put(y, text, fg, bg)
+    text = tostring(text or "")
+    if #text > W then text = text:sub(1, W) end
+    term.setCursorPos(1, y)
+    term.setBackgroundColor(bg or colors.black)
+    term.setTextColor(fg or colors.white)
+    term.clearLine()
+    term.write(text)
+    term.setTextColor(colors.white)
+    term.setBackgroundColor(colors.black)
+    return y + 1
+end
+
+--- 黑底清屏 + 光标归位(向导每个步骤重画整屏, 不做增量刷新)。
+local function clear()
+    term.setBackgroundColor(colors.black)
+    term.clear()
+    term.setCursorPos(1, 1)
+    term.setTextColor(colors.white)
+    term.setCursorBlink(false)
+end
+
+--- 蓝色标题栏, 右上角带步骤号。
+local function banner(text, tag)
+    local line = " " .. tostring(text)
+    if tag then
+        local pad = W - #line - #tag - 2
+        if pad < 1 then pad = 1 end
+        line = line .. string.rep(" ", pad) .. tag .. " "
+    end
+    put(1, line, colors.white, colors.blue)
+end
+
+--- 底部帮助行(灰条)。
+local function helpLine(text)
+    put(H, text, colors.black, colors.gray)
+end
+
+--- 画一屏: 标题 -> 正文行 -> 选项(光标行反显) -> 错误提示 -> 帮助行。
+---@param items table { { value = any, label = string, desc = string|nil }, ... }
+---@param cursor number 光标所在项(1 起)
+---@param body table|nil 标题与选项之间的说明行(字符串数组, 灰色)
+---@param note string|nil 红色错误提示(单选列表上的"上一步失败了"这类信息)
+local function drawSelect(title, tag, items, cursor, body, note)
+    size()
+    clear()
+    banner("Delin Installer", tag)
+    local y = put(3, title, colors.white)
+    if body then
+        y = y + 1
+        for _, line in ipairs(body) do y = put(y, line, colors.lightGray) end
+    end
+    y = y + 1
+    for i, it in ipairs(items) do
+        local cur = (i == cursor)
+        local text = string.format("%s %s %s", cur and ">" or " ", cur and "[x]" or "[ ]", it.label)
+        if it.desc then text = text .. "   " .. it.desc end
+        y = put(y, text, cur and colors.black or colors.white, cur and colors.lightGray or nil)
+    end
+    if note then put(H - 1, "! " .. note, colors.red) end
+    helpLine(HELP_SELECT)
+end
+
+--- 单选: 上下移动光标, 回车确认。返回 items[cursor].value; 或 nil, "back"/"quit"。
+local function selectStep(title, tag, items, cursor, body, note)
+    while true do
+        drawSelect(title, tag, items, cursor, body, note)
+        local ev, p1 = os.pullEvent()
+        if ev == "key" then
+            if p1 == keys.up then
+                cursor = (cursor > 1) and (cursor - 1) or #items
+            elseif p1 == keys.down then
+                cursor = (cursor < #items) and (cursor + 1) or 1
+            elseif p1 == keys.enter then
+                return items[cursor].value
+            elseif p1 == keys.backspace then
+                return nil, "back"
+            elseif p1 == keys.q then
+                return nil, "quit"
+            end
+        end
+    end
+end
+
+--- 单行文本输入(插入/删除/左右移动, 用终端自己的光标当插入点)。
+--- 文本输入里 Q 是普通字符; 返回上一步靠"行首再按一次退格"。
+--- 返回 text; 或 nil, "back"。
+local function inputStep(title, tag, value, hint, note)
+    local pos = #value
+    logLine("wizard input: " .. title)
+    while true do
+        size()
+        clear()
+        banner("Delin Installer", tag)
+        local y = put(3, title, colors.white)
+        if hint then y = put(y, "  " .. hint, colors.lightGray) end
+        local inputRow = y + 1
+        y = put(inputRow, "> " .. value, colors.white)
+        y = put(y, string.rep("-", math.min(#value + 2, W)), colors.gray)
+        if note then put(y + 1, "! " .. note, colors.red) end
+        helpLine(HELP_INPUT)
+        term.setCursorPos(3 + pos, inputRow)
+        term.setCursorBlink(true)
+
+        local ev, p1 = os.pullEvent()
+        if ev == "char" then
+            local ch = tostring(p1)
+            value = value:sub(1, pos) .. ch .. value:sub(pos + 1)
+            pos = pos + #ch
+        elseif ev == "key" then
+            if p1 == keys.enter then
+                term.setCursorBlink(false)
+                return value
+            elseif p1 == keys.backspace then
+                if pos > 0 then
+                    value = value:sub(1, pos - 1) .. value:sub(pos + 1)
+                    pos = pos - 1
+                else
+                    term.setCursorBlink(false)
+                    return nil, "back" -- 行首再退格 = 回上一步(没有 Esc 可用, 见下)
+                end
+            elseif p1 == keys.left then
+                if pos > 0 then pos = pos - 1 end
+            elseif p1 == keys.right then
+                if pos < #value then pos = pos + 1 end
+            end
+        end
+    end
+end
+
+--- 画一屏"正在忙"的提示(网络请求期间给用户反馈, 否则屏幕静止看不出在动)。
+local function showBusy(title, tag, text)
+    size()
+    clear()
+    banner("Delin Installer", tag)
+    local y = put(3, title, colors.white)
+    put(y + 1, "  " .. text, colors.lightGray)
+    helpLine("please wait ...")
+end
+
+--- 等一个按键(不关心的其它事件丢掉)。返回 key 码。
+local function waitKey()
+    while true do
+        local ev, p1 = os.pullEvent()
+        if ev == "key" then return p1 end
+    end
+end
+
+local function human(bytes)
+    if bytes >= 1024 * 1024 then return string.format("%.1f MB", bytes / 1024 / 1024) end
+    if bytes >= 1024 then return string.format("%.1f KB", bytes / 1024) end
+    return tostring(bytes) .. " B"
+end
+
+local function trim(s)
+    return (tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+-- ===============================================================
+-- 安装源配置
+-- ===============================================================
+
+--- 读安装配置。向导只改 url; 无人值守安装可以写齐
+---   url <安装源>  type ccfs|ext2  target computer|<盘名>  size auto|<KB>  auto 1
+local function loadConfig()
+    local cfg = { url = DEFAULT_URL }
+    local f = fs.open(CFG_PATH, "r")
+    if f then
+        local text = f.readAll(); f.close()
+        for line in text:gmatch("[^\r\n]+") do
+            local k, v = line:match("^(%S+)%s+(%S+)$")
+            if k then cfg[k] = v end
+        end
+    end
+    return cfg
+end
+
+--- 写回配置(已知键按固定顺序, 其余丢弃 —— 免得旧文件里的垃圾键被一直带着走)。
+local function saveConfig(cfg)
+    local f = fs.open(CFG_PATH, "w")
+    if not f then return nil, "cannot write " .. CFG_PATH end
+    for _, k in ipairs(CFG_KEYS) do
+        if cfg[k] then f.writeLine(k .. " " .. tostring(cfg[k])) end
+    end
+    f.close()
+    return true
+end
+
+local function urlJoin(base, rel)
+    return (base:gsub("/+$", "")) .. "/" .. rel
 end
 
 -- ===============================================================
@@ -209,6 +358,15 @@ local function manifestBytes(mf)
     local n = 0
     for _, f in ipairs(mf.files) do n = n + f.size end
     return n
+end
+
+--- 拉并解析清单。返回 mf, 或 nil, err(错误消息是给人看的, 会直接显示在屏幕上)。
+local function fetchManifest(base)
+    local text, err = fetchText(urlJoin(base, "manifest"))
+    if not text then return nil, "cannot fetch manifest: " .. tostring(err) end
+    local mf, merr = parseManifest(text)
+    if not mf then return nil, "bad manifest: " .. tostring(merr) end
+    return mf
 end
 
 -- ===============================================================
@@ -313,11 +471,35 @@ local function listTargets()
     return out
 end
 
+--- 按配置里的 target 找到目标(名字或序号)。
+local function pickTarget(cfg, targets)
+    local want = cfg.target
+    if not want then return 1 end
+    local n = tonumber(want)
+    if n and targets[n] then return n end
+    for i, t in ipairs(targets) do
+        if t.name == want or t.name:sub(1, #want) == want then return i end
+    end
+    return nil
+end
+
+--- 引导配置方案: 返回 /.boot 的内容, 以及 /dlub.cfg 那一行(nil = 不用 DLUB)。
+--- 摘要页与安装过程共用这一份判断 —— 两处各写一遍迟早会不一致。
+local function bootPlan(state, tgt)
+    local useDlub = (state.type == "ext2") or (tgt.kind == "drive")
+    if not useDlub then return "/boot/delin.lua" end
+    local line
+    if state.type == "ext2" then
+        line = (tgt.kind == "computer") and ("rootfs /" .. IMAGE_REL) or ("bootdisk " .. tgt.name)
+    else
+        line = "ccdisk " .. tgt.name
+    end
+    return "/boot/dlub.lua", line
+end
+
 -- ===============================================================
 -- 安装
 -- ===============================================================
-
-local progress -- 前向声明
 
 --- 建骨架目录。
 local function makeSkeleton(t)
@@ -365,11 +547,11 @@ local function autoBlocks(payloadBytes)
     return blocks
 end
 
---- 在 hostT 上建 ext2 镜像并把 payload 铺进镜像。返回镜像相对 hostT 的路径。
+--- 在 hostT 上建 ext2 镜像并把 payload 铺进镜像。
 local function installExt2Image(hostT, blocks, mf, base)
     local ok, err = hostT.mkdirp("parts")
     if not ok then return nil, err end
-    local imgAbs = hostT.root .. "/parts/root.img"
+    local imgAbs = hostT.root .. "/" .. IMAGE_REL
 
     -- blockdev 用 "r+" 打开, 文件必须先存在
     local f, ferr = fs.open(imgAbs, "w")
@@ -387,65 +569,66 @@ local function installExt2Image(hostT, blocks, mf, base)
     local wok, werr = writePayload(et, mf, base)
     if not wok then bd.close(); return nil, werr end
     bd.close()
-    return "parts/root.img", blocks
+    return true
 end
 
---- 一次完整安装。
+--- 一次完整安装。要求 state.mf 已就绪(向导在"安装源"步骤就拉到了; 无人值守路径在调用前拉)。
+--- 返回 true; 或 false, err —— 失败原因由调用者 report 出来, 本函数只负责"别留半成品"。
 local function runInstall(state, targets)
     local tgt = targets[state.target]
+    local mf = assert(state.mf, "installer: manifest not fetched")
+    local need = manifestBytes(mf)
+    local entry, dlubLine = bootPlan(state, tgt)
+    local blocks = (state.type == "ext2") and (state.sizeAuto and autoBlocks(need) or state.sizeKb) or nil
+
+    size()
     clear()
-    logReset()
+    banner("Delin Installer", "installing")
+    term.setCursorPos(1, 2)
     report("Delin installer")
-    report("  source : " .. state.cfg.url)
+    report("  source : " .. state.url)
     report("  type   : " .. state.type)
     report("  target : " .. tgt.name .. "  (free " .. human(tgt.free or 0) .. ")")
+    report("  files  : " .. #mf.files .. " (" .. human(need) .. ")")
+    if blocks then
+        report(string.format("  image  : %d KB%s", blocks, state.sizeAuto and " (auto)" or ""))
+    end
+    report("  boot   : /.boot = " .. entry .. (dlubLine and ("   /dlub.cfg = " .. dlubLine) or ""))
     report("")
 
-    -- 1) 清单
-    local text, err = fetchText(urlJoin(state.cfg.url, "manifest"))
-    if not text then report("FAIL: " .. err); return false end
-    local mf, merr = parseManifest(text)
-    if not mf then report("FAIL: " .. tostring(merr)); return false end
-    local need = manifestBytes(mf)
-    report("manifest: version " .. mf.version .. ", " .. #mf.files .. " files, " .. human(need))
-
-    -- 2) 空间预检(CCFS 直接铺文件时能提前发现装不下)
+    -- 1) 空间预检(CCFS 直接铺文件时能提前发现装不下)
     if state.type == "ccfs" then
         if tgt.free and tgt.free < need + 4096 then
-            report(string.format("FAIL: target has %s free, need %s", human(tgt.free), human(need)))
-            return false
+            return false, string.format("target has %s free, need %s", human(tgt.free), human(need))
         end
     end
 
-    -- 3) 铺 payload
-    local imageRel, imageBlocks
+    -- 2) 铺 payload
     if state.type == "ccfs" then
         local pt = ccTarget(tgt.kind == "computer" and "" or tgt.mp)
         local ok, perr = makeSkeleton(pt)
-        if not ok then report("FAIL: " .. tostring(perr)); return false end
+        if not ok then return false, tostring(perr) end
         report("copying files ...")
-        local wok, werr = writePayload(pt, mf, state.cfg.url)
-        if not wok then report("FAIL: " .. tostring(werr)); return false end
+        local wok, werr = writePayload(pt, mf, state.url)
+        if not wok then return false, tostring(werr) end
     else
         local hostT = ccTarget(tgt.kind == "computer" and "" or tgt.mp)
-        local blocks = state.sizeAuto and autoBlocks(need) or state.sizeKb
         report("making ext2 image: " .. tostring(blocks) .. " KB ...")
-        local rel, berr = installExt2Image(hostT, blocks, mf, state.cfg.url)
-        if not rel then report("FAIL: " .. tostring(berr)); return false end
-        imageRel, imageBlocks = rel, blocks
-        report("image ready: " .. rel .. " (" .. tostring(blocks) .. " KB)")
+        local ok, berr = installExt2Image(hostT, blocks, mf, state.url)
+        if not ok then return false, tostring(berr) end
+        report("image ready: " .. IMAGE_REL .. " (" .. tostring(blocks) .. " KB)")
         -- bootdisk 模式需要分区清单
         if tgt.kind == "drive" then
             local mok, merman = hostT.write("parts/manifest", "root /parts/root.img ext2\nboot /boot/delin.lua\n")
-            if not mok then report("FAIL: manifest -> " .. tostring(merman)); return false end
+            if not mok then return false, "manifest -> " .. tostring(merman) end
         end
     end
 
-    -- 4) 引导配置(始终写在**电脑自身存储**上: BIOS 开机只跑 /startup.lua)
+    -- 3) 引导配置(始终写在**电脑自身存储**上: BIOS 开机只跑 /startup.lua)
     local boot = ccTarget("")
     report("writing boot config ...")
 
-    -- 4a) BIOS(旧的备份一次)
+    -- 3a) BIOS(旧的备份一次)
     if boot.exists("startup.lua") and not boot.exists("startup.lua.craftos") then
         local old = boot.read("startup.lua")
         if old then
@@ -453,16 +636,14 @@ local function runInstall(state, targets)
             report("  backup /startup.lua -> /startup.lua.craftos")
         end
     end
-    local bios, biosErr = fetchText(urlJoin(state.cfg.url, "payload/startup.lua"))
-    if not bios then report("FAIL: " .. tostring(biosErr)); return false end
+    local bios, biosErr = fetchText(urlJoin(state.url, "payload/startup.lua"))
+    if not bios then return false, tostring(biosErr) end
     local okBio, eBio = boot.write("startup.lua", bios)
-    if not okBio then report("FAIL: /startup.lua -> " .. tostring(eBio)); return false end
+    if not okBio then return false, "/startup.lua -> " .. tostring(eBio) end
 
-    -- 4b) 内核入口 + DLUB + /dlub.cfg
-    local useDlub = (state.type == "ext2") or (state.type == "ccfs" and tgt.kind == "drive")
-    local bootEntry
+    -- 3b) 内核入口 + DLUB + /dlub.cfg
     local function fetchTo(t, rel, urlRel, label)
-        local d, derr = fetchText(urlJoin(state.cfg.url, urlRel))
+        local d, derr = fetchText(urlJoin(state.url, urlRel))
         if not d then return nil, label .. ": " .. tostring(derr) end
         local dir = rel:match("^(.*)/[^/]+$")
         if dir then t.mkdirp(dir) end
@@ -471,84 +652,283 @@ local function runInstall(state, targets)
         return true
     end
 
-    if useDlub then
+    if dlubLine then
         local ok1, e1 = fetchTo(boot, "boot/dlub.lua", "payload/boot/dlub.lua", "DLUB")
-        if not ok1 then report("FAIL: " .. tostring(e1)); return false end
-        bootEntry = "/boot/dlub.lua"
-        local line
-        if state.type == "ext2" then
-            line = (tgt.kind == "computer") and ("rootfs /" .. imageRel) or ("bootdisk " .. tgt.name)
-        else
-            line = "ccdisk " .. tgt.name
-        end
-        local okC, eC = boot.write("dlub.cfg", line .. "\n")
-        if not okC then report("FAIL: /dlub.cfg -> " .. tostring(eC)); return false end
-        report("  /dlub.cfg = " .. line)
+        if not ok1 then return false, tostring(e1) end
+        local okC, eC = boot.write("dlub.cfg", dlubLine .. "\n")
+        if not okC then return false, "/dlub.cfg -> " .. tostring(eC) end
+        report("  /dlub.cfg = " .. dlubLine)
     else
         local ok1, e1 = fetchTo(boot, "boot/delin.lua", "payload/boot/delin.lua", "kernel")
-        if not ok1 then report("FAIL: " .. tostring(e1)); return false end
-        bootEntry = "/boot/delin.lua"
+        if not ok1 then return false, tostring(e1) end
     end
 
-    local okB, eB = boot.write(".boot", bootEntry)
-    if not okB then report("FAIL: /.boot -> " .. tostring(eB)); return false end
-    report("  /.boot = " .. bootEntry)
+    local okB, eB = boot.write(".boot", entry)
+    if not okB then return false, "/.boot -> " .. tostring(eB) end
+    report("  /.boot = " .. entry)
 
     report("")
-    report("Install OK.  Reboot to start Delin.")
-    report("Press R to reboot now, any other key to go back.")
-    if waitKey() == keys.r then os.reboot() end
+    report("Install OK.")
     return true
 end
 
 -- ===============================================================
--- TUI
+-- 向导
 -- ===============================================================
 
-local function drawMenu(state, targets)
-    W, H = term.getSize()
-    clear()
-    at(1, 1, " Delin Installer", colors.white, colors.blue)
-    at(1, 2, " Install type  (T to switch):", colors.lightGray)
-    at(3, 3, (state.type == "ccfs" and "(*)" or "( )") .. " CCFS - copy files onto the target")
-    at(3, 4, (state.type == "ext2" and "(*)" or "( )") .. " EXT2 - build an ext2 image on the target")
-    at(1, 6, " Target  (press the number):", colors.lightGray)
-    for i, tgt in ipairs(targets) do
-        local line = string.format("%d) %s   free %s", i, tgt.name, human(tgt.free or 0))
-        at(3, 6 + i, (state.target == i and "(*)" or "( )") .. " " .. line)
-    end
-    local y = 6 + #targets + 2
-    at(1, y, " Source : " .. state.cfg.url .. "   (U to edit)", colors.lightGray)
-    if state.type == "ext2" then
-        at(1, y + 1, " Size   : " .. (state.sizeAuto and "auto" or (tostring(state.sizeKb) .. " KB")) .. "   (S to change)", colors.lightGray)
-    end
-    at(1, H, " I=install  T=type  U=url  S=size  Q=quit", colors.black, colors.gray)
+--- 安装方式。
+local TYPE_ITEMS = {
+    { value = "ccfs", label = "CCFS", desc = "copy files onto the target" },
+    { value = "ext2", label = "EXT2", desc = "build an ext2 image on the target" },
+}
+
+local TYPE_DESC = { ccfs = "copy files onto the target", ext2 = "build an ext2 image on the target" }
+
+--- 步骤 1: 安装方式。
+local function stepType(tag, state)
+    local cursor = (state.type == "ext2") and 2 or 1
+    local v, reason = selectStep("Install type", tag, TYPE_ITEMS, cursor)
+    if not v then return reason end
+    state.type = v
+    logLine("wizard type: " .. v)
+    return "next"
 end
 
---- 按配置里的 target 找到目标(名字或序号)。
-local function pickTarget(cfg, targets)
-    local want = cfg.target
-    if not want then return 1 end
-    local n = tonumber(want)
-    if n and targets[n] then return n end
+--- 步骤 2: 目标设备。
+local function stepTarget(tag, state, targets)
+    local items = {}
     for i, t in ipairs(targets) do
-        if t.name == want or t.name:sub(1, #want) == want then return i end
+        items[i] = { value = i, label = t.name, desc = "free " .. human(t.free or 0) }
     end
-    return nil
+    local v, reason = selectStep("Install target", tag, items, state.target)
+    if not v then return reason end
+    state.target = v
+    logLine("wizard target: " .. targets[v].name)
+    return "next"
+end
+
+--- 步骤 3: 安装源。预置源(上次用过的 + 内置默认) + 手输。
+--- 选完就拉一次 manifest —— 源不通当场看得见, 不必等到开始装才失败。
+local function stepSource(tag, state, cfg)
+    local items = {}
+    local seen = {}
+    local function addPreset(u)
+        if u and u ~= "" and not seen[u] then
+            seen[u] = true
+            items[#items + 1] = { value = u, label = u }
+        end
+    end
+    addPreset(state.url)
+    addPreset(DEFAULT_URL)
+    items[#items + 1] = { value = "custom", label = "custom ...", desc = "type a URL" }
+
+    local cursor = 1
+    for i, it in ipairs(items) do if it.value == state.url then cursor = i end end
+
+    local note = nil
+    while true do
+        local chosen, reason = selectStep("Install source", tag, items, cursor, nil, note)
+        if not chosen then return reason end
+        local url = chosen
+        if chosen == "custom" then
+            cursor = #items
+            local text, r2 = inputStep("Install source - custom URL", tag, "",
+                "http://<host>:10568/<version>", note)
+            if not text then
+                if r2 == "back" then
+                    note = nil -- 回到预置列表
+                    url = nil
+                else
+                    return r2
+                end
+            else
+                url = trim(text)
+                if url == "" then url = nil end
+            end
+        end
+        if url then
+            if not url:match("^https?://") then
+                note = "URL must start with http:// or https://"
+            else
+                showBusy("Install source", tag, "fetching manifest from " .. url .. " ...")
+                local mf, merr = fetchManifest(url)
+                if not mf then
+                    note = merr
+                else
+                    state.url, state.mf = url, mf
+                    logLine(string.format("wizard source: %s (version %s, %d files)",
+                        url, tostring(mf.version), #mf.files))
+                    local ok, serr = saveConfig({ url = url })
+                    if not ok then note = "warning: " .. tostring(serr) end
+                    return "next"
+                end
+            end
+        end
+    end
+end
+
+--- 步骤 4(仅 EXT2): 镜像大小。预置值 + 自定义手输。
+local function stepSize(tag, state)
+    local items = {
+        { value = "auto", label = "auto", desc = "size the image from the payload" },
+        { value = 256,    label = "256 KB" },
+        { value = 512,    label = "512 KB" },
+        { value = 768,    label = "768 KB" },
+        { value = 1024,   label = "1024 KB" },
+        { value = "custom", label = "custom ...", desc = "type a size in KB" },
+    }
+    local cursor = 1
+    for i, it in ipairs(items) do
+        if (state.sizeAuto and it.value == "auto") or (not state.sizeAuto and it.value == state.sizeKb) then
+            cursor = i
+        end
+    end
+
+    while true do
+        local v, reason = selectStep("Image size", tag, items, cursor)
+        if not v then return reason end
+        if v == "custom" then
+            cursor = #items
+            local note = nil
+            while true do
+                -- 自定义容量从空串开始(不要预填当前值: 改数字得先擦掉, 手输一串更干脆)
+                local text, r2 = inputStep("Image size (KB)", tag, "", "64 - 8192", note)
+                if not text then
+                    if r2 == "back" then break end -- 回到预置列表
+                    return r2
+                end
+                local n = tonumber(trim(text))
+                if not n or n ~= math.floor(n) or n < 64 or n > 8192 then
+                    note = "enter a whole number between 64 and 8192"
+                else
+                    state.sizeAuto, state.sizeKb = false, n
+                    logLine("wizard size: custom " .. tostring(n) .. " KB")
+                    return "next"
+                end
+            end
+        else
+            if v == "auto" then
+                state.sizeAuto = true
+            else
+                state.sizeAuto, state.sizeKb = false, v
+            end
+            logLine("wizard size: " .. (state.sizeAuto and "auto" or (tostring(state.sizeKb) .. " KB")))
+            return "next"
+        end
+    end
+end
+
+--- 步骤 5: 摘要确认。Cancel = 退回上一步接着改。
+local function stepSummary(tag, state, targets)
+    local tgt = targets[state.target]
+    local entry, dlubLine = bootPlan(state, tgt)
+    local mf = assert(state.mf, "installer: manifest not fetched")
+    local need = manifestBytes(mf)
+
+    local body = {
+        string.format("  install type : %s   (%s)", string.upper(state.type), TYPE_DESC[state.type]),
+        string.format("  target       : %s   (free %s)", tgt.name, human(tgt.free or 0)),
+        string.format("  source       : %s", state.url),
+        string.format("  payload      : version %s, %d files, %s", tostring(mf.version), #mf.files, human(need)),
+    }
+    if state.type == "ext2" then
+        local blocks = state.sizeAuto and autoBlocks(need) or state.sizeKb
+        body[#body + 1] = string.format("  image size   : %s%d KB", state.sizeAuto and "auto -> " or "", blocks)
+    end
+    body[#body + 1] = "  boot config  : /.boot = " .. entry
+    if dlubLine then body[#body + 1] = "                 /dlub.cfg = " .. dlubLine end
+
+    local items = {
+        { value = "install", label = "Start installation" },
+        { value = "cancel",  label = "Cancel", desc = "go back and change the settings" },
+    }
+    local v, reason = selectStep("Summary", tag, items, 1, body)
+    if not v then return reason end
+    if v == "install" then
+        logLine("wizard confirm: start installation")
+        return "install"
+    end
+    logLine("wizard confirm: cancel")
+    return "back"
+end
+
+--- 跑安装并把结果告诉用户: 装完/装挂都落日志(CC 电脑读不了屏)。
+--- 装成功后按 R 重启; 否则回到摘要页(可以改配置再来一次)。
+local function installWithUi(state, targets)
+    -- pcall 三返回值: 协程里抛的错(ok=nil)与 fail-fast 的 (false, err) 都要报出来
+    local pok, ok, err = pcall(runInstall, state, targets)
+    if not pok then ok, err = false, tostring(ok) end
+    if ok then
+        report("")
+        report("Reboot to start Delin.")
+        report("Press R to reboot now, any other key to go back to the summary.")
+    else
+        report("FAIL: " .. tostring(err))
+        report("")
+        report("Install FAILED (details above and in " .. LOG_PATH .. ").")
+        report("Press any key to go back to the summary.")
+    end
+    local key = waitKey()
+    if ok and key == keys.r then os.reboot() end
+end
+
+--- 向导主循环。返回 true = 装过(或退出时已确认), false = 用户放弃。
+local function wizard(cfg, targets)
+    local state = {
+        type = "ccfs", target = 1, url = cfg.url or DEFAULT_URL,
+        sizeAuto = true, sizeKb = 512, mf = nil,
+    }
+    local step = 1
+    while true do
+        local steps = { "type", "target", "source" }
+        if state.type == "ext2" then steps[#steps + 1] = "size" end
+        steps[#steps + 1] = "summary"
+        if step > #steps then step = #steps end
+        local name = steps[step]
+        local tag = string.format("step %d/%d", step, #steps)
+        logLine("wizard " .. tag .. ": " .. name)
+
+        local action
+        if name == "type" then
+            action = stepType(tag, state)
+        elseif name == "target" then
+            action = stepTarget(tag, state, targets)
+        elseif name == "source" then
+            action = stepSource(tag, state, cfg)
+        elseif name == "size" then
+            action = stepSize(tag, state)
+        else
+            action = stepSummary(tag, state, targets)
+        end
+
+        if action == "quit" then return false end
+        if action == "back" then
+            if step == 1 then return false end -- 第一步再退 = 退出
+            step = step - 1
+        elseif action == "next" then
+            step = step + 1
+        elseif action == "install" then
+            installWithUi(state, targets) -- 装完停在摘要页
+        end
+    end
 end
 
 function M.run()
-    W, H = term.getSize()
+    size()
+    logReset() -- 一次运行一份日志: 向导走了什么、装了什么, 都在里面
     local cfg = loadConfig()
-    local state = { type = "ccfs", target = 1, cfg = cfg, sizeAuto = true, sizeKb = 512 }
     local targets = listTargets()
     progress = function(i, n, path)
-        at(1, H - 1, string.format("  [%d/%d] %s", i, n, path), colors.lightGray)
+        put(H, string.format("  [%d/%d] %s", i, n, path), colors.black, colors.gray)
     end
 
     -- 无人值守: /delin-install.cfg 里写 auto 1 (可选 type/target/size)。
     -- 用途: 真机自动化验证, 以及"用户碰不到机器"的批量安装。
     if cfg.auto == "1" then
+        local state = {
+            type = "ccfs", target = 1, url = cfg.url or DEFAULT_URL,
+            sizeAuto = true, sizeKb = 512, mf = nil,
+        }
         if cfg.type == "ext2" then state.type = "ext2" end
         if cfg.size and cfg.size ~= "auto" then
             local n = tonumber(cfg.size)
@@ -556,57 +936,31 @@ function M.run()
         end
         local idx = pickTarget(cfg, targets)
         if not idx then
-            logReset()
+            clear()
             report("FAIL: no such target: " .. tostring(cfg.target))
             return
         end
         state.target = idx
         -- 任何 Lua 级错误都要落盘: CC 电脑读不了屏, 静默卡住最难查。
-        local ok, err = pcall(runInstall, state, targets)
-        if not ok then report("FAIL: " .. tostring(err)) end
+        local mf, merr = fetchManifest(state.url)
+        if not mf then
+            clear()
+            report("FAIL: " .. tostring(merr))
+            return
+        end
+        state.mf = mf
+        local pok, ok, err = pcall(runInstall, state, targets)
+        if not pok then
+            report("FAIL: " .. tostring(ok))
+        elseif not ok then
+            report("FAIL: " .. tostring(err))
+        end
         return
     end
 
-    progress = function(i, n, path)
-        at(1, H - 1, string.format("  [%d/%d] %s", i, n, path), colors.lightGray)
-    end
-    while true do
-        drawMenu(state, targets)
-        local k = waitKey()
-        if k == keys.q then
-            clear()
-            return
-        elseif k == keys.t then
-            state.type = (state.type == "ccfs") and "ext2" or "ccfs"
-        elseif k == keys.u then
-            state.cfg.url = inputLine("Install source base URL", state.cfg.url)
-            local ok, err = saveConfig(state.cfg)
-            if not ok then print("warning: " .. tostring(err)) end
-        elseif k == keys.s then
-            local line = inputLine("Image size KB (auto / 256 / 512 / 768 / 1024)", state.sizeAuto and "auto" or tostring(state.sizeKb))
-            if line == "auto" then
-                state.sizeAuto = true
-            else
-                local n = tonumber(line)
-                if n and n >= 64 and n <= 8192 then
-                    state.sizeAuto = false
-                    state.sizeKb = math.floor(n)
-                end
-            end
-        elseif k == keys.i then
-            local okRun, res = pcall(runInstall, state, targets)
-            local ok = okRun and res
-            if not okRun then report("FAIL: " .. tostring(res)) end
-            if not ok then
-                print("")
-                print("Install FAILED (see above).")
-                print("Press any key to return.")
-                waitKey()
-            end
-        elseif k >= keys.one and k <= keys.nine then
-            local idx = k - keys.one + 1
-            if targets[idx] then state.target = idx end
-        end
+    if not wizard(cfg, targets) then
+        clear()
+        print("Install cancelled.")
     end
 end
 

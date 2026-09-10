@@ -561,12 +561,36 @@ wget run http://<宿主机>:10568/<版本>/install.lua
    `/boot/delin.lua`、`/boot/dlub.lua`、`/.boot`、`/dlub.cfg`；
 4. 全程写 `/delin-install.log`（CC 读不了屏，装完/装挂了都要能被宿主机读回）。
 
-TUI 里可选安装类型（CCFS / EXT2）、目标设备（电脑自身存储 / 每个有数据的磁盘驱动器）、
-安装源，EXT2 还能选镜像大小（auto 或 256/512/768/1024 KB）。auto 按 payload 大小 + 元数据
-+ 目录余量算，再上浮 15%。
+**交互式向导**（不是单屏热键 TUI）：一步一屏，上下箭头选、回车确认，**Backspace 退回上一步**
+（文本输入里 Backspace 删字符，**已经到行首再按一次就是退回**），`Q` 退出；
+光标所在的那一行整行反显高亮，`[x]` 标出回车会选中的那一项：
+
+> 没有用 Esc：**CraftOS 根本不产生 Esc 键事件** —— 真机实测 `keys.escape` 是 `nil`、
+> `keys.getName(256)` 也是 `nil`（这个版本里字母/数字键码是 ASCII、特殊键是 GLFW 码：
+> `enter=257 backspace=259 up=265`），所以"回退"只能绑 Backspace。
+
+
+| 步骤 | 内容 |
+|---|---|
+| 1. Install type | `CCFS`（直接把文件铺到目标）/ `EXT2`（现场 `mkfs` 出镜像再写进去） |
+| 2. Install target | 电脑自身存储 / 每个有数据的磁盘驱动器（各带剩余空间） |
+| 3. Install source | 上次用过的源 + 内置默认源，或 `custom ...` 手输 URL；**确认后立刻拉一次 `manifest`**，拉不到就留在这一步报错重输（不会等到"开始装"才发现源不通） |
+| 4. Image size（仅 EXT2） | `auto` / 256 / 512 / 768 / 1024 KB，或 `custom ...` 手输 64–8192 KB。auto 按 payload + 元数据 + 目录余量算，再上浮 15%、对齐 64 块（CCFS 时这一步整个跳过） |
+| 5. Summary | 列出最终配置（类型/目标/安装源/payload/镜像大小/将写入的引导配置）；`Start installation` 开装，`Cancel` 退回上一步改配置 |
+
+装完按 `R` 立即重启，其它键回到摘要页（可以改配置再来一次）。**向导每进一个步骤 / 每个文本输入
+都往 `/delin-install.log` 落一行**（`wizard step 2/5: target`、`wizard size: custom 512 KB` 这类）——
+CC 电脑读不了屏，宿主机只能靠日志判断它走到了哪一步、卡在了哪里。
 
 **无人值守安装**：`/delin-install.cfg` 写齐 `url` / `type` / `target` / `size` / `auto 1`
-即跳过 TUI 直接装（真机自动化验证就是这么跑的）。
+即跳过向导直接装（真机自动化验证就是这么跑的）。
+
+**真机自动跑完整向导**（验证交互路径本身）：`scripts/installer_interactive_test.lua`
+装成电脑自身 FS 的 `/startup.lua`，配一份计划 `/installer-test.plan`（`url <install.lua URL>` /
+`wait <日志标记>` / `key <键名>` / `text <字符串>`），它把安装器跑在一个协程里、另开一个协程**注入
+key/char 事件**来驱动向导。喂按键的时机靠 `wait` 盯 `/delin-install.log` 里的标记同步，**不能提前
+排队**：CC 里带过滤器的事件拉取（`http.get`/`sleep`）会把队列里不匹配的事件丢掉，一次性排好的按键
+会被中途一次 http 请求整批吃掉（实测）。
 
 四种落盘形态（引导入口**恒定**在电脑自身存储上：BIOS 开机只跑 `/startup.lua`）：
 
@@ -590,6 +614,14 @@ TUI 里可选安装类型（CCFS / EXT2）、目标设备（电脑自身存储 /
 其它实测数据：
 - 游戏内 mkfs + 铺 65 个文件造出的镜像，拿到宿主机上 `e2fsck -fn` **干净**
   （97 文件 / 444 块 of 512）；512 KB 装得下 346 KB payload，真机整轮约 1 分钟。
+- **交互式向导真机实测**（电脑3 + 磁盘0，注入按键走完整套向导，两种落盘路径各一轮，
+  判定标准同上，另加"装完按 `R` 真重启后 `init up`"）：
+  - EXT2 → 电脑自身存储，`Image size` 手输 `512 KB`：向导 5 步全走到
+    （`wizard step 1/4: type` … `wizard size: custom 512 KB` … `wizard confirm: start installation`），
+    装完重启 → `[DLUB] root=/parts/root.img fs=ext2` → `root boot: fstype=ext2` → `init up`；
+    停机后对盘上的镜像再跑 `e2fsck -fn` 干净（444/512 块）。
+  - CCFS → 电脑自身存储：向导 4 步（**没有 `Image size` 这一步**），装完重启 →
+    `vfs ready` → `modules loaded from /lib/modules/0.0.2`（电脑自身 FS）→ `init up`。
 - **注意 CC 的软盘配额**：本环境 `fs.getCapacity("/disk")` 只有 **125,000 字节**（磁盘上还有个
   宿主放进去的 2 MB `data.img`），所以 `fs.getFreeSpace` 为 0 —— 安装器会**正确拒绝**并给出
   `FAIL: target has 0 B free, need 346.5 KB`（fail-fast，不留半成品配置）。
@@ -605,6 +637,10 @@ DELIN_REPO=<压缩后的源码树> lua5.1 tools/hosttest.lua         # 压缩器
 DELIN_SRCBIN=<压缩后的 bin> lua5.1 tools/harness.lua /bin/sh # 同上, 工具级差分比对
 lua5.4 tools/hosttest.lua        # 同上用 5.4 跑一遍(CC 是 5.2 语义, 不能只在 5.1 上验)
 lua5.1 tools/harness.lua /bin/sh # 宿主上跑真实工具源码(sh/作业控制/管道; /sys 走真实 sysfs 后端, /proc 走真实 procfs 后端)
+lua5.1 tools/installertest.lua    # 安装器宿主回归: 假 CraftOS 环境(假终端格子+脚本化事件队列)跑构建产物
+                                  # dist/install.lua, 按键序列驱动整套向导(12 用例/185 断言: 两种落盘形态、
+                                  # 自定义容量、坏源/空间不足 fail-fast、退格回退、无人值守、双驱动器;
+                                  # 失败时 dump 每一屏 + 日志 + 目标文件树)
 lua5.1 tools/harness.lua /bin/sh < scripts/proc_test.sh   # /proc + ps/pgrep/pkill/killall 自检(与真机比对)
 lua5.1 tools/harness.lua /bin/sh < scripts/redstone_test.sh   # /sys/class/redstone 读写/校验自检(与真机比对)
 lua5.1 tools/harness.lua /bin/sh < scripts/lua_test.sh   # /bin/lua 脚本/stdin/arg/dofile/退出码 + 进程环境白名单(与真机比对)
@@ -612,6 +648,12 @@ sh scripts/lua_repl_test.sh        # /bin/lua 交互式 REPL(宿主专用: DELIN
 lua5.1 tools/ext2test.lua        # ext2 驱动宿主回归: 真实镜像上跑目录增删, 再用宿主 e2fsck -fn 判定
 python3 tools/realmachine.py --base /mnt/bak/root.base.img   # 真机: 先关机->打包->部署->重启 #3->取回 /var/log/*
 python3 tools/realmachine.py --printer   # 真机 + 打印机(会实际打印页面): 探测 printer API + 验证 /dev/lp0
+
+# 真机跑交互式安装向导(电脑3 + 磁盘0; 电脑先停机):
+cp scripts/installer_interactive_test.lua /mnt/computer/3/startup.lua
+cp scripts/installer_plan_ext2.plan       /mnt/computer/3/installer-test.plan
+python3 ~/docs/tools/rcon.py "computercraft turn-on #3"   # 注入按键走完向导并重启
+# 之后读回: /installer-test.log(同步与按键) /delin-install.log(向导配置+安装结果) /delin.log(引导)
 ```
 
 `realmachine.py` 最后会停机再对安装到磁盘的 `root.img` 跑一次 `e2fsck -fn`：**跑一轮后 fsck 必须干净**，
@@ -733,8 +775,14 @@ tools/bundle.lua           拼装 bundle: src/ -> 单文件内核/DLUB(init 多�
 tools/build.lua            构建入口: 自动建 dist/, 产出压缩后的内核/DLUB/BIOS/工具/模块/配置
                            + manifest(size/crc32); --check 跑压缩等价性门禁, --release 出发布树
 tools/crc32.lua            CRC32(纯 Lua, 不用位运算: 宿主 5.1 与 CC 5.2 必须算出同一个值)
-tools/installer.lua        游戏内安装器(CraftOS 程序): TUI + http 下载 + CRC32 校验 +
-                           现场 mkfs 写 ext2 镜像; 被 bundle 成单文件 dist/install.lua
+tools/installer.lua        游戏内安装器(CraftOS 程序): 多步交互式向导(箭头选/回车确认/
+                           Backspace 上一步, 文本输入里行首退格 = 上一步) + http 下载 + CRC32 校验
+                           + 现场 mkfs 写 ext2 镜像 + 向导全程写 /delin-install.log;
+                           被 bundle 成单文件 dist/install.lua
+scripts/installer_interactive_test.lua  真机: 注入 key/char 事件驱动交互式向导(配合
+                           /installer-test.plan 计划文件), 结果写 /installer-test.log
+scripts/installer_plan_ext2.plan / scripts/installer_plan_ccfs.plan  上面那份交互计划的现成例子
+                           (EXT2→电脑自身存储 手输 512 KB / CCFS→电脑自身存储)
 tools/serve.sh             开发期把 dist/release 挂在 10568 端口(游戏侧 wget 安装用)
 tools/minify.lua           Lua 压缩器: 词法分析 + 递归下降解析做作用域分析 + 局部变量改名,
                            只从 token 流输出(输出与输入的 token 序列逐项相同)。三重门禁:
@@ -747,6 +795,9 @@ tools/harness.lua          host 测试台: 用真实 Delin 工具源码在宿主
                            + 桩进程表(ps/pgrep/pkill/killall);
                            进程环境用内核同一份白名单(src/kernel/procenv.lua), 不放宽)
 tools/hosttest.lua         宿主测试: init 单元引擎/fstab 生成/syslogd 规则/logrotate 轮转/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone(369 项)
+tools/installertest.lua    安装器宿主回归: 假 CraftOS(fs/term/os/http/disk/peripheral + 脚本化事件队列)
+                           + 假终端格子(含 fg/bg), 用 loadfile 跑 dist/install.lua, 按键序列驱动向导
+                           并断言落盘文件/镜像/日志; 失败时 dump 每一屏(含反色行标记)
 tools/ext2test.lua         宿主 ext2 回归: 真实镜像上跑目录增删(空洞/links/回收), 宿主 e2fsck -fn 判定
 tools/deploy.py            重建干净 ext2 根镜像(基镜像+内核/bin/单元/配置/标记), 属主按基镜像逐条写回;
                            基镜像损坏/rdump 漏文件/构建后 fsck 不过一律 fail-fast
