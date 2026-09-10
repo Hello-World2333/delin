@@ -53,9 +53,24 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "releasing Delin $VERSION"
 
-      # --check: 压缩等价性门禁(hosttest + harness 差分); --release: 生成发布树
-      - name: Build
-        run: lua5.1 tools/build.lua --check --release
+      - name: Build (dist + release tree)
+        run: lua5.1 tools/build.lua --release
+
+      # 压缩等价性门禁: hosttest(压缩树) + 6 个自检脚本的 原始 vs 压缩 差分
+      - name: Check (compressed-tree equivalence)
+        run: lua5.1 tools/build.lua --check
+
+      # 门禁失败时把两边的差分输出打出来(否则只有一个非零退出码, 没法查)
+      - name: Dump check logs
+        if: failure()
+        run: |
+          for f in /tmp/delin-check-hosttest.log /tmp/delin-chk-a.log /tmp/delin-chk-b.log; do
+            if [ -f "$f" ]; then
+              echo "===== $f ====="
+              tail -n 120 "$f"
+            fi
+          done
+          ls -la /tmp | head -40
 
       # 安装器宿主回归: 在假 CraftOS 里按键驱动 dist/install.lua, 断言落盘结果
       - name: Installer tests
