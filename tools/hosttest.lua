@@ -5,11 +5,11 @@
 
 io.stdout:setvbuf("line")
 os.epoch = os.epoch or function() return os.time() * 1000 end -- 宿主桩: 内核 klog 载入时取引导标识
-package.path = "/home/worker/delin/src/?.lua;" .. package.path
+local REPO = os.getenv("DELIN_REPO") or "/home/worker/delin"
+package.path = REPO .. "/src/?.lua;" .. package.path
 local procenv = require("kernel.procenv") -- 进程环境白名单(与内核同一份), 见 src/kernel/procenv.lua
 local VERSION = require("kernel.version") -- 模块目录名 /lib/modules/<version>
 
-local REPO = "/home/worker/delin"
 local ROOT = "/tmp/delinhost2"
 
 local pass, fail = 0, 0
@@ -724,10 +724,30 @@ end
 -- G. 打包产物回归: 内核 bundle 里的 init 主程序必须在顶层执行
 --    (曾经的 bug: 主程序被包成未调用的 __initMods["init"], init 立刻退出)
 -- ===============================================================
+
+--- 从 bundle 里取出 kernel.init_src 的源码串。兼容未压缩与压缩两种产物:
+---   未压缩: `__chunks["kernel.init_src"] = function()\n    return [==[ ... ]==]\nend`
+---   压缩后: `__chunks["kernel.init_src"]=function()return[[...]]end`
+--- (压缩器不改长字符串内容, 也不改名 `__` 前缀的名字, 所以标记串本身是稳定的。)
+local function extractInitSrc(bundle)
+    local marker = '__chunks["kernel.init_src"]'
+    local pos = bundle:find(marker, 1, true)
+    if not pos then return nil end
+    local ob = bundle:find("[", pos + #marker, true) -- 标记之后的第一个 [ 即长括号开头
+    if not ob then return nil end
+    local level, i = 0, ob + 1
+    while bundle:sub(i, i) == "=" do level = level + 1; i = i + 1 end
+    if bundle:sub(i, i) ~= "[" then return nil end
+    local close = "]" .. string.rep("=", level) .. "]"
+    local e = bundle:find(close, i + 1, true)
+    if not e then return nil end
+    return bundle:sub(i + 1, e - 1)
+end
+
 do
     local bundle = readFile(REPO .. "/dist/kernel.lua")
     ok(bundle ~= nil, "bundle: dist/kernel.lua 存在")
-    local lvl, src = bundle:match('__chunks%["kernel%.init_src"%] = function%(%)\n%s+return %[(=*)%[(.*)%]%1%]%s*\nend')
+    local src = bundle and extractInitSrc(bundle)
     ok(src ~= nil, "bundle: 能取出 kernel.init_src")
     if src then
         ok(not src:find('__initMods%["init"%]', 1), "bundle: 主程序未被包成模块")

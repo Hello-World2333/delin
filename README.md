@@ -482,13 +482,30 @@ analog_output,bundled_input,bundled_output}`（六个面恒定存在），`cat`/
 - **设备与文件系统分层**：`devdisk` 只负责「有哪些设备」（枚举磁盘 → `/dev/sdX` + UUID 解析 + 挂载表），
   文件系统实现由模块用 `kapi.registerFstype(name, fn)` 注册（`ext2.ko` → `ext2`，`ccdisk.ko` → `ccdisk`）；
   `mount -t <type>` 找不到处理器即报错（fail-fast，无回退）。
+- **文件句柄的两种调用风格（踩过的大坑）**：CC 原生文件句柄的方法是 Java 方法，Lua 侧
+  **self 是隐式的** —— 只能 `h.write(s)`（点号）；写成 `h:write(s)` 会把**句柄自己**当数据传进去，
+  结果是文件里出现 `table: 0x...`，而且**不报错**，极难查。Delin 自己的句柄（ext2 后端、
+  `/dev` 设备）是普通 Lua 表，方法吃冒号，全部 `/bin` 工具都按冒号写。
+  两条路径必须给上层同一套语义，所以 `vfs.real()` 的 `open` 会把 CC 原生句柄包一层
+  `wrapCCHandle`（见 `src/kernel/vfs.lua`），**两种调用风格都接受** ——
+  于是内核里既有的点号调用（`f.readAll()`）与用户态工具的冒号调用都能用。
 
 ## 构建
 
 ```bash
 lua5.1 tools/bundle.lua kernel   # 生成 dist/kernel.lua（内核 bundle）
 lua5.1 tools/bundle.lua dlub     # 生成 dist/dlub.lua（DLUB 引导装载器，独立文件）
+lua5.1 tools/minify.lua src/bin/sh   # 压缩单个文件(产物体积见下)
 ```
+
+**压缩器**（`tools/minify.lua`）：去注释、去缩进、折叠空白，并把**局部变量/参数改名成短名**。
+它不是正则清洗 —— 源码里到处是 `local args = args or {}`（右值是内核注入的**全局** `args`），
+按 token 改名会压成 `local a = a or {}` 让工具全崩，所以必须先做真正的语法分析：
+递归下降解析 + 作用域分析，先解析初始化表达式再声明局部，只给局部符号分配短名，
+最后**从 token 流输出**（不重新打印语法树），保证输出与输入的 token 序列逐项相同（注释除外）。
+三条门禁，任何一条不过即 fail-fast：① 产物能被 `lua5.1` 解析；② 重新词法分析产物与原 token
+逐项比对；③ 新名不得遮蔽本 chunk 里出现的任何全局名，内层函数避开祖先已分配的新名。
+实测 `src/` 全量 634,040 → 296,863 字节（-53%），内核 bundle 266,208 → 138,776（-48%）。
 
 内核 bundle 复制到引导盘 `bootPath`（manifest 的 `boot` 行，默认 `/boot/delin.lua`）；DLUB 复制到
 **电脑自身 FS** 的引导脚本入口（`/.boot` 指向的 `/main.lua`）。DLUB 还需在**电脑自身 FS** 写
@@ -500,6 +517,9 @@ lua5.1 tools/bundle.lua dlub     # 生成 dist/dlub.lua（DLUB 引导装载器�
 
 ```bash
 lua5.1 tools/hosttest.lua        # 宿主测试: init 引擎/fstab/syslogd/logrotate/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone (361 项)
+DELIN_REPO=<压缩后的源码树> lua5.1 tools/hosttest.lua         # 压缩器等价性: 同一套测试跑在压缩产物上
+DELIN_SRCBIN=<压缩后的 bin> lua5.1 tools/harness.lua /bin/sh # 同上, 工具级差分比对
+lua5.4 tools/hosttest.lua        # 同上用 5.4 跑一遍(CC 是 5.2 语义, 不能只在 5.1 上验)
 lua5.1 tools/harness.lua /bin/sh # 宿主上跑真实工具源码(sh/作业控制/管道; /sys 走真实 sysfs 后端, /proc 走真实 procfs 后端)
 lua5.1 tools/harness.lua /bin/sh < scripts/proc_test.sh   # /proc + ps/pgrep/pkill/killall 自检(与真机比对)
 lua5.1 tools/harness.lua /bin/sh < scripts/redstone_test.sh   # /sys/class/redstone 读写/校验自检(与真机比对)
@@ -625,6 +645,10 @@ scripts/realmachine_verify.sh  真机验证脚本(由 verify.service 以 oneshot
 scripts/printer_probe.lua  真机探测 CC printer 原始 API 语义(页尺寸/写不折行/开页扣纸墨), 写 /var/log/printer_probe.log
 scripts/printer_verify.sh  真机验证 ccprinter 模块(/dev/lp0 + /sys/class/printer, 会实际打印), 写 /var/log/printer_verify.log
 tools/bundle.lua           打包 src/ -> dist/kernel.lua 或 dist/dlub.lua(init 多文件拼成一个 chunk)
+tools/minify.lua           Lua 压缩器: 词法分析 + 递归下降解析做作用域分析 + 局部变量改名,
+                           只从 token 流输出(输出与输入的 token 序列逐项相同)。三重门禁:
+                           lua5.1 解析 / 重词法逐 token 比对 / 改名不遮蔽任何全局名。
+                           实测 634,040 -> 296,863 字节(-53%)
 tools/harness.lua          host 测试台: 用真实 Delin 工具源码在宿主跑(fs/io/syscalls/spawn 桩,
                            含信号/进程组语义: kill/killpg/SIGCONT/stopped, 供 sh 作业控制验证;
                            /sys 与 /proc 走真实 kernel.sysfs/kernel.procfs 后端 + 桩显示设备

@@ -76,6 +76,33 @@ end
 --   basePath=""  → hdd(真实路径即 "/...")
 --   basePath="disk" → 磁盘驱动挂载到 "disk"(真实路径 "disk/...")
 -- ---------------------------------------------------------------
+
+--- 把 CC 原生文件句柄包成 Delin 句柄。
+--- **为什么必须包**: CC 的句柄方法是 Java 方法, Lua 侧 self 是**隐式**的 —— 只能
+--- `h.write(s)`(点号)。用 `h:write(s)` 会把句柄自身当数据传进去, 真机上的表现是
+--- 文件里出现 `table: 0x...`(而且不报错, 极难查)。Delin 自己的句柄(ext2 后端、/dev
+--- 设备)是普通 Lua 表, 方法吃冒号, 全部 /bin 工具都按冒号写。两条路径必须给上层
+--- 同一套语义: 这里包一层, **两种调用风格都接受**(与 klog 里 /dev/kmsg 的 seek 同一做法),
+--- 于是内核里既有的点号调用(f.readAll() 等)不受影响。
+--- 参数里没有表, 所以"第一个参数是句柄自身"这一个判据是可靠的。
+---@param h table CC 原生句柄
+---@return table
+local function wrapCCHandle(h)
+    local w = {}
+    local function isSelf(a) return a == w end
+    w.read     = function(a, b) if isSelf(a) then return h.read(b) end return h.read(a) end
+    w.readAll  = function() return h.readAll() end
+    w.readLine = function(a, b) if isSelf(a) then return h.readLine(b) end return h.readLine(a) end
+    w.write    = function(a, ...) if isSelf(a) then return h.write(...) end return h.write(a, ...) end
+    w.writeLine = function(a, ...) if isSelf(a) then return h.writeLine(...) end return h.writeLine(a, ...) end
+    w.seek     = function(a, ...) if isSelf(a) then return h.seek(...) end return h.seek(a, ...) end
+    w.flush    = function() return h.flush() end
+    w.close    = function() return h.close() end
+    w.isReadOnly = function() return h.isReadOnly() end
+    w.raw      = h -- 需要 CC 原生调用风格时(点号)的自留口
+    return w
+end
+
 ---@param basePath string
 ---@return table
 function vfs.real(basePath)
@@ -105,7 +132,11 @@ function vfs.real(basePath)
         copy     = function(a, b) return fs.copy(toReal(a), toReal(b)) end,
         delete   = function(rel) return fs.delete(toReal(rel)) end,
         isReadOnly = function(rel) return fs.isReadOnly(toReal(rel)) end,
-        open     = function(rel, mode) return fs.open(toReal(rel), mode) end,
+        open     = function(rel, mode)
+            local h, err = fs.open(toReal(rel), mode)
+            if not h then return nil, err end
+            return wrapCCHandle(h)
+        end,
     }
 end
 

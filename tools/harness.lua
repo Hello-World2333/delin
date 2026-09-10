@@ -7,8 +7,24 @@
 
 local ROOT = "/tmp/delinhost"
 
+-- Lua 5.2+ 没有 loadstring/setfenv; 用 load + 改 _ENV upvalue 顶上, 这样同一套测试
+-- 也能在 lua5.4 下跑 (CC 的 Lua 是 5.2 语义 —— 压缩器等改动必须在 5.2 语义下也验一遍)。
+loadstring = loadstring or function(s, n) return load(s, n) end
+setfenv = setfenv or function(f, env)
+    local i = 1
+    while true do
+        local n = debug.getupvalue(f, i)
+        if not n then break end
+        if n == "_ENV" then debug.setupvalue(f, i, env); return f end
+        i = i + 1
+    end
+    error("harness setfenv shim: chunk has no _ENV upvalue")
+end
+
 -- 内核模块(与真机同一份源码): 进程环境白名单等要用真实实现, 不能在测试台上另写一套。
-package.path = "/home/worker/delin/src/?.lua;" .. package.path
+-- REPO 可用 DELIN_REPO 覆盖: 压缩器等价性门禁会在一个"压缩后的镜像树"上跑同一套测试。
+local REPO = os.getenv("DELIN_REPO") or "/home/worker/delin"
+package.path = REPO .. "/src/?.lua;" .. package.path
 local procenv = require("kernel.procenv")
 local VERSION = require("kernel.version") -- 模块目录名 /lib/modules/<version>
 
@@ -217,7 +233,7 @@ local syscalls = {}
 local PIPE = nil -- 内核 pipe 模块(lazy require), 提供 pipe.create
 local function pipeCreate()
     if not PIPE then
-        package.path = "/home/worker/delin/src/?.lua;" .. package.path
+        package.path = REPO .. "/src/?.lua;" .. package.path
         PIPE = require("kernel.pipe")
     end
     return PIPE.create()
@@ -488,7 +504,7 @@ end
 -- ---------------------------------------------------------------
 -- 构建 ROOT
 -- ---------------------------------------------------------------
-local SRCBIN = "/home/worker/delin/src/bin"
+local SRCBIN = os.getenv("DELIN_SRCBIN") or (REPO .. "/src/bin")
 local function setupRoot()
     os.execute("rm -rf " .. ROOT .. " && mkdir -p " .. ROOT)
     os.execute("mkdir -p " .. ROOT .. "/bin " .. ROOT .. "/etc " .. ROOT .. "/home/alice " .. ROOT .. "/root " .. ROOT .. "/tmp " .. ROOT .. "/mnt/cc")
@@ -694,7 +710,7 @@ _G.redstone = {
     setBundledOutput = function(s, v) rs.bundledOut[s] = v end,
 }
 do
-    local f = assert(io.open("/home/worker/delin/src/modules/redstone.ko"))
+    local f = assert(io.open(REPO .. "/src/modules/redstone.ko"))
     local src = f:read("*a"); f:close()
     local env = setmetatable({ require = require }, { __index = _G })
     local chunk = assert(loadstring(src, "redstone")); setfenv(chunk, env)
