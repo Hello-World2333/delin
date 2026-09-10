@@ -1,0 +1,5 @@
+--@name ext2
+--@version 0.2.0
+--@description EXT2 filesystem driver: registers the ext2 fstype for `mount -t ext2 /dev/sdXN DIR` (a partition is a /parts/*.img image on the disk).
+--@deps
+local a=require("kernel.blockdev")local b=require("kernel.ext2")return{init=function(c)c.registerFstype("ext2",function(d,i)local e,h=a.file(d.img)if not e then return nil,tostring(h)end local f,g=b.mount(e)if not f then e.close()return nil,tostring(g)end return b.backend(f),{cleanup=function()e.close()end}end)c.log("ext2: fstype registered (mount -t ext2 /dev/sdXN DIR)")end,}

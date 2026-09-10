@@ -1,0 +1,5 @@
+--@name demo
+--@version 0.1.0
+--@description A demo module registering a syscall and a /dev device
+--@deps
+return{init=function(a)a.registerSyscall("demo.echo",function(...)local b={}for c=1,select("#",...)do b[c]=tostring(select(c,...))end return table.concat(b," ")end)a.registerDevice("demo",{open=function(e)local d={}local c=0 local function b()return table.concat(d)end return{read=function(i,h)local g=b()if c>=#g then return nil end if type(h)~="number"then c=#g;return g end local f=g:sub(c+1,c+h)c=c+#f return f end,readLine=function()if c>=#b()then return nil end c=#b()return b()end,readAll=function()if c>=#b()then return nil end c=#b()return b()end,write=function(f)d[#d+1]=f;return#f end,writeLine=function(f)d[#d+1]=f.."\n";return#f+1 end,close=function()end,}end,})end,}
