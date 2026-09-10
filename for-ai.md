@@ -678,7 +678,7 @@ lua5.4 tools/hosttest.lua        # 同上用 5.4 跑一遍(CC 是 5.2 语义, �
                                  # 测试台的 fs 门面曾用 os.execute(...)==0 判目录 —— 5.1 独有语义)
 lua5.1 tools/harness.lua /bin/sh # 宿主上跑真实工具源码(sh/作业控制/管道; /sys 走真实 sysfs 后端, /proc 走真实 procfs 后端)
 lua5.1 tools/installertest.lua    # 安装器宿主回归: 假 CraftOS 环境(假终端格子+脚本化事件队列)跑构建产物
-                                  # dist/install.lua, 按键序列驱动整套向导(16 用例/206 断言: 两种落盘形态、
+                                  # dist/install.lua, 按键序列驱动整套向导(16 用例/208 断言: 两种落盘形态、
                                   # 自定义容量、坏源/空间不足/网络断连 fail-fast、http 重试、退格回退、
                                   # 无人值守、双驱动器、装完只有回车重启; 默认源用软链假装 GitHub 可访问;
                                   # 失败时 dump 每一屏 + 日志 + 目标文件树)

@@ -1864,6 +1864,16 @@ runCase("5b", "bad source URL fails fast (via the custom URL entry)", function()
         if u:find(BAD, 1, true) and u:find("manifest", 1, true) then tried = true end
     end
     ok(tried, "对坏源尝试取过 <url>/manifest", "requests=" .. table.concat(w.httpUrls, " "))
+    -- 自定义 URL 输入屏的提示: 只讲格式, 不带任何具体端口(10568 是开发期 serve.sh 的端口)
+    local sawHint, sawPort = false, false
+    for _, f in ipairs(w.frames) do
+        for _, row in ipairs(f.rows) do
+            if row:find("http://<host>/<version>", 1, true) then sawHint = true end
+            if row:find("10568", 1, true) then sawPort = true end
+        end
+    end
+    ok(sawHint, "自定义 URL 屏的提示是 http://<host>/<version>")
+    ok(not sawPort, "这个提示里没有开发端口(10568)")
     ok(not w:existsFile("/.boot"), "没有写 /.boot")
     ok(not w:existsFile("/bin/sh"), "没有铺 payload")
     ok(not logHas(w, "Install OK"), "日志里没有 Install OK")
