@@ -98,6 +98,12 @@ jobs:
             git rm -rf .
           fi
 
+          # 工作区只留发布树。两条路径都必须清: 切到 release 分支会把 .gitignore 一起带走
+          # (它只在 main 上被跟踪), 于是 dist/ 这类"本来被忽略的未跟踪文件"失去保护,
+          # 被后面的 `git add -A` 整棵收进 release 分支 —— v0.0.2 第一次跑就中过(混进 213 个
+          # 构建产物), 第二次跑(已有 release 分支)同样会中。
+          git clean -fdx
+
           rm -rf "$VERSION"
           cp -r "$TREE/$VERSION" "$VERSION"
           git add -A
