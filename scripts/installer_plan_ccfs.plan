@@ -1,4 +1,4 @@
-# 真机计划: CCFS -> 电脑自身存储(没有 size 步骤), 装完按 R 重启进 Delin
+# 真机计划: CCFS -> 电脑自身存储(没有 size 步骤), 装完按回车重启进 Delin
 url http://127.0.0.1:10568/0.0.2/install.lua
 wait wizard step 1/4: type
 key enter
@@ -9,4 +9,4 @@ key enter
 wait wizard step 4/4: summary
 key enter
 wait Install OK
-key r
+key enter

@@ -1,7 +1,8 @@
---[[ Delin 安装器(CraftOS 程序; tools/bundle.lua 把它连同 blockdev/ext2/crc32 打成单文件
+--[[ Delin 安装器(CraftOS 程序; tools/bundle.lua 把它连同 blockdev/ext2/crc32/version 打成单文件
      dist/install.lua)。
      用法(游戏内):
-         wget run http://<host>:10568/<版本>/install.lua
+         wget run https://raw.githubusercontent.com/Hello-World2333/delin/release/<版本>/install.lua
+         (开发期也可以换成本地 http: wget run http://<host>:10568/<版本>/install.lua)
      然后跟着向导一步步走:
          安装方式(CCFS / EXT2) -> 目标设备 -> 安装源 -> (仅 EXT2) 镜像大小
          -> 摘要确认 -> 开始安装
@@ -14,7 +15,7 @@
        - 把 payload 铺到目标: CCFS(直接铺文件) 或 EXT2(现场 mkfs 出镜像再写进去);
        - 写引导配置: /startup.lua(Delin BIOS, 旧的备份成 /startup.lua.craftos)、
          /boot/{delin.lua,dlub.lua}、/.boot、/dlub.cfg;
-       - 装完提示重启。
+       - 装完提示回车重启(其它键不处理)。
 
      引导链(安装器产出的东西必须与它一致):
          CraftOS 开机跑 <电脑自身存储>/startup.lua = Delin BIOS
@@ -38,6 +39,7 @@
 local blockdev = require("kernel.blockdev")
 local ext2     = require("kernel.ext2")
 local crc32    = require("installer.crc32")
+local VERSION  = require("kernel.version")
 
 local M = {}
 
@@ -47,7 +49,12 @@ local M = {}
 
 local CFG_PATH = "/delin-install.cfg"
 local LOG_PATH = "/delin-install.log" -- 安装日志: CC 电脑读不了屏, 装完/装挂了都要能被宿主机读回
-local DEFAULT_URL = "http://127.0.0.1:10568/0.0.2"
+
+-- 默认安装源: 发布树由 CI(.github/workflows/release.yml)在打 v* tag 时推到 release 分支,
+-- 路径 <版本>/ 下就是 manifest + payload/ + install.lua。版本号取内核版本号唯一真源,
+-- 于是"升版本"不会留下指向旧版本的默认源(那会静默装上旧内核)。
+local DEFAULT_URL = string.format(
+    "https://raw.githubusercontent.com/Hello-World2333/delin/release/%s", VERSION)
 local IMAGE_REL = "parts/root.img"    -- ext2 镜像在目标上的相对路径(摘要页与安装共用)
 
 -- 骨架目录: 全新安装必须自己建, 否则 login/日志/挂载点都不存在
@@ -733,7 +740,7 @@ local function stepSource(tag, state, cfg)
         if chosen == "custom" then
             cursor = #items
             local text, r2 = inputStep("Install source - custom URL", tag, "",
-                "http://<host>:10568/<version>", note)
+                "http://<host>/<version>", note)
             if not text then
                 if r2 == "back" then
                     note = nil -- 回到预置列表
@@ -853,7 +860,8 @@ local function stepSummary(tag, state, targets)
 end
 
 --- 跑安装并把结果告诉用户: 装完/装挂都落日志(CC 电脑读不了屏)。
---- 装成功后按 R 重启; 否则回到摘要页(可以改配置再来一次)。
+--- 装成功后**只有回车**才重启(其它键一律不处理: 免得手滑把向导又带回摘要页重装一遍);
+--- 失败则按任意键回摘要页(可以改配置再来一次)。
 local function installWithUi(state, targets)
     -- pcall 三返回值: 协程里抛的错(ok=nil)与 fail-fast 的 (false, err) 都要报出来
     local pok, ok, err = pcall(runInstall, state, targets)
@@ -861,15 +869,16 @@ local function installWithUi(state, targets)
     if ok then
         report("")
         report("Reboot to start Delin.")
-        report("Press R to reboot now, any other key to go back to the summary.")
+        report("Press Enter to reboot now (other keys are ignored).")
+        while waitKey() ~= keys.enter do end -- 回车: 重启; 其它键: 什么都不做
+        os.reboot()
     else
         report("FAIL: " .. tostring(err))
         report("")
         report("Install FAILED (details above and in " .. LOG_PATH .. ").")
         report("Press any key to go back to the summary.")
+        waitKey()
     end
-    local key = waitKey()
-    if ok and key == keys.r then os.reboot() end
 end
 
 --- 向导主循环。返回 true = 装过(或退出时已确认), false = 用户放弃。

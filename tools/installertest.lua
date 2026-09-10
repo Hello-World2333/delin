@@ -24,6 +24,8 @@
      注意: **CraftOS 没有 Esc** —— 真机实测 keys.escape 为 nil、keys.getName(256) 也是 nil,
      所以回退手势只有 Backspace(别照抄其他 CC 版本的 keys.escape = 1)。
      光标所在选项行**反色**(非默认背景), 光标行是 [x], 其它行是 [ ]。
+     装完的收尾: **成功只有 Enter 重启**(其它键一律不处理, 也不回摘要页); 失败按任意键回摘要页。
+     默认安装源是 GitHub 上 release 分支的发布树(见 installer.lua 的 DEFAULT_URL)。
 
      ---- 与任务书/实现的差异, 都是有意为之, 不是漏改 ----
      1) Lua 5.1 下的模块 require: 打包器用 `local _ENV = setmetatable({require=__require}, {__index=_G})`
@@ -225,7 +227,23 @@ end
 --- 发布树上的一个文件(相对 payload/)
 local function payloadFile(rel) return readHostFile(RELEASE .. "/payload/" .. rel) end
 
-local BASE_URL = string.format("http://127.0.0.1:10568/%s", MF.version) -- 与安装器默认源一致
+local BASE_URL = string.format("http://127.0.0.1:10568/%s", MF.version) -- 本地开发期源(serve.sh)
+
+-- 安装器的**默认**安装源是 GitHub 上的 release 分支(见 installer.lua 的 DEFAULT_URL)。
+-- 宿主测试里没有网络, 所以让假 http 层把这个 host 也"能上网": 把 URL 里的
+-- <owner>/<repo>/<branch> 路径前缀做成软链指到本地发布树, 于是"选默认源"这条路
+-- 在宿主机上照样能真的拉 manifest/payload。
+-- 注意: 改了 installer.lua 里的 owner/repo/branch 必须同步这里(否则默认源用例当场失败)。
+local DEFAULT_URL = string.format(
+    "https://raw.githubusercontent.com/Hello-World2333/delin/release/%s", MF.version)
+local DEFAULT_URL_PREFIX = "Hello-World2333/delin/release"  -- URL 里去掉 host 的那一段
+local DEFAULT_URL_HOST = "raw.githubusercontent.com"
+local DEFAULT_URL_ROOT = string.format("/tmp/delin-installer-test-urlhost-%s", pidOfSelf())
+hostos.execute("rm -rf '" .. DEFAULT_URL_ROOT .. "'")
+hostos.execute("mkdir -p '" .. DEFAULT_URL_ROOT .. "/Hello-World2333/delin'")
+hostos.execute("ln -sfn '" .. RELEASE_ROOT .. "' '" .. DEFAULT_URL_ROOT .. "/" .. DEFAULT_URL_PREFIX .. "'")
+-- 51 列屏上这个 URL 会被截断, 断言只能按可见前缀来(真机上同样是截断显示)
+local DEFAULT_URL_SEEN = "https://" .. DEFAULT_URL_HOST .. "/"
 
 -- 可选: 用仓库自己的 ext2 驱动读回镜像内容(独立于安装器, 交叉验证)
 local ext2mod = select(2, pcall(require, "kernel.ext2"))
@@ -688,7 +706,11 @@ function fakeOS.newSession(opts)
         httpUrls = {},
         rebooted = false,
         printed = {},
-        servedHosts = { ["127.0.0.1:10568"] = RELEASE_ROOT, ["localhost:10568"] = RELEASE_ROOT },
+        servedHosts = {
+            ["127.0.0.1:10568"] = RELEASE_ROOT,
+            ["localhost:10568"] = RELEASE_ROOT,
+            [DEFAULT_URL_HOST] = DEFAULT_URL_ROOT, -- 默认源(GitHub)在宿主上的替身, 见上
+        },
         capacity = opts.capacity or (4 * 1024 * 1024),
         mounts = {},
         saved = {},
@@ -1751,22 +1773,23 @@ runCase("5a", "source step is a preset list (typing on the list changes nothing)
     local srcFrame = w:frameWith("Install source")
     ok(srcFrame ~= nil, "渲染过 Install source")
     ok(srcFrame ~= nil and frameHasOption(srcFrame, "custom"), "源列表里有 'custom ...' 手输项")
-    ok(srcFrame ~= nil and frameHasOption(srcFrame, "http://127.0.0.1:10568/0.0.2"),
-       "源列表里有默认源 URL 选项")
-    -- 敲进去的字符不该出现在任何一行(列表不接收字符输入)
+    ok(srcFrame ~= nil and frameHasOption(srcFrame, DEFAULT_URL_SEEN),
+       "源列表里有默认源 URL 选项(" .. DEFAULT_URL .. ")")
+    -- 敲进去的字符不该混进 URL: 装的时候真的去拉的就是那条默认源(一个字都不多)
     local dirty = nil
     if srcFrame then
         for _, row in ipairs(srcFrame.rows) do
-            if row:find("0.0.2X", 1, true) then dirty = row end
+            if row:find("X", 1, true) then dirty = row end
         end
     end
-    ok(dirty == nil, "列表上敲的字符没有混进 URL", tostring(dirty))
+    ok(dirty == nil, "列表上敲的字符没有混进任何一行", tostring(dirty))
+    eq(w.httpUrls[1], DEFAULT_URL .. "/manifest", "第一次 http 请求就是默认源的 manifest")
     local sum = w:frameWith("Summary")
     ok(sum ~= nil, "Enter 后进到 Summary", "steps=" .. table.concat(w.titlesSeen, " -> "))
     local sumOk = false
     if sum then
         for _, row in ipairs(sum.rows) do
-            if row:find("http://127.0.0.1:10568/0.0.2", 1, true) then sumOk = true end
+            if row:find(DEFAULT_URL_SEEN, 1, true) then sumOk = true end
         end
     end
     ok(sumOk, "Summary 里的 install source 就是那个预置 URL")
@@ -1937,6 +1960,50 @@ runCase("8", "target list with two drives; install onto the second drive", funct
     ok(w:existsFile("/boot/dlub.lua"), "计算机存储上有 /boot/dlub.lua")
     ok(logHas(w, "Install OK"), "日志含 Install OK",
        "log: " .. short(w:log() or "", 400))
+end)
+
+-- ===============================================================
+-- case 9 / 10: 装完的收尾 —— 只有 Enter 重启, 其它键一律不处理
+-- (旧行为: R 重启, 任意其它键回摘要页 = 手滑就把整个向导重来一遍)
+-- ===============================================================
+
+--- 走到"装完"那一步的按键序列(CCFS -> 计算机存储 -> 默认源 -> Start installation)。
+local function playInstallSuccess(w)
+    w:play({ key = keys.enter })  -- 1 类型 = CCFS
+    w:play({ key = keys.enter })  -- 2 目标 = 计算机存储
+    w:play({ key = keys.enter })  -- 3 源 = 默认(GitHub release 分支)
+    w:play({ key = keys.enter })  -- 4 摘要 = Start installation
+end
+
+runCase("9", "after install: R and other keys are ignored (no reboot, no back to summary)", function()
+    local w = newSession({ name = "case9-reboot-enter-only", capacity = 4 * 1024 * 1024 })
+    out("  dir: " .. w.dir .. "\n")
+    playInstallSuccess(w)
+    w:play({ key = keys.r })      -- 旧的重启键: 现在什么都不做
+    w:play({ key = keys.q })      -- 其它键也不处理(旧行为是回摘要页)
+    w:play({ key = keys.backspace })
+    w:runInstallScript()
+    reportRun(w)
+    okNoUnhandledError(w)
+
+    ok(logHas(w, "Install OK"), "日志含 Install OK", short(w:log() or "", 300))
+    ok(not w.rebooted, "R / Q / Backspace 都没触发 os.reboot()")
+    ok(w:hasOnScreen("Press Enter to reboot now"), "屏幕停在'按回车重启'的提示上",
+       short(w:screen(), 300))
+    ok(w:lastStep() ~= "Summary", "没有回到摘要页(旧行为: 任意键 -> 回摘要)", w:lastStep())
+end)
+
+runCase("10", "after install: Enter reboots", function()
+    local w = newSession({ name = "case10-reboot-enter", capacity = 4 * 1024 * 1024 })
+    out("  dir: " .. w.dir .. "\n")
+    playInstallSuccess(w)
+    w:play({ key = keys.enter })  -- 回车 = 重启
+    w:runInstallScript()
+    reportRun(w)
+    okNoUnhandledError(w)
+
+    ok(logHas(w, "Install OK"), "日志含 Install OK", short(w:log() or "", 300))
+    ok(w.rebooted, "回车触发了 os.reboot()")
 end)
 
 -- ===============================================================

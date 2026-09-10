@@ -86,6 +86,7 @@ local profiles = {
     -- 游戏内安装器(CraftOS 程序): 自带 ext2 驱动与 mkfs, 所以安装完全不需要外部工具。
     installer = {
         modules = {
+            ["kernel.version"]  = "src/kernel/version.lua", -- 默认安装源的版本路径 = 版本号唯一真源
             ["kernel.blockdev"] = "src/kernel/blockdev.lua",
             ["kernel.ext2"]     = "src/kernel/ext2.lua",
             ["installer.crc32"] = "tools/crc32.lua",

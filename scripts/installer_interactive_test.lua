@@ -24,8 +24,8 @@
          wait <子串>                   等 /delin-install.log 里出现这一行
          key <键名>                    up down left right enter backspace escape q r 或单个字符
          text <字符串>                 展开成逐字符的 char 事件(等价于手打)
-     计划里最后一个 key 若是 r, 安装成功后安装器会自己 os.reboot() —— 正好用来验证
-     "装完重启能进 Delin"。 ]]
+     计划里最后一个 key 若是 enter, 安装成功后安装器会自己 os.reboot() —— 正好用来验证
+     "装完回车重启能进 Delin"(收尾只有回车重启, 其它键一律不处理)。 ]]
 
 local LOG         = "/installer-test.log"
 local PLAN        = "/installer-test.plan"
@@ -123,7 +123,7 @@ local function runInstaller(src)
         return
     end
     local ok, err = pcall(fn)
-    -- 正常路径下最后一条 key r 会让安装器 os.reboot(), 走不到这里
+    -- 正常路径下最后一条 key enter 会让安装器 os.reboot(), 走不到这里
     log("installer returned: ok=" .. tostring(ok) .. " err=" .. tostring(err))
 end
 
