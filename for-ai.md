@@ -650,6 +650,17 @@ key/char 事件**来驱动向导。喂按键的时机靠 `wait` 盯 `/delin-inst
     停机后对盘上的镜像再跑 `e2fsck -fn` 干净（444/512 块）。
   - CCFS → 电脑自身存储：向导 4 步（**没有 `Image size` 这一步**），装完重启 →
     `vfs ready` → `modules loaded from /lib/modules/0.0.2`（电脑自身 FS）→ `init up`。
+- **默认源（GitHub release 分支）真机实测**（电脑3，2026-09-11）：驱动直接从
+  `https://raw.githubusercontent.com/Hello-World2333/delin/release/0.0.2/install.lua` 取安装器
+  （43504 字节），向导 `Install source` 那一步选**内置默认源**（就是上面那个 URL）：
+  `wizard source: https://raw.githubusercontent.com/.../0.0.2 (version 0.0.2, 65 files)` →
+  铺完 65 个文件 → `Install OK.` → 按**回车** → `os.reboot()` →
+  `spawned init as pid #1` / `[init] init up (pid 1), default.target active`（真机日志只有
+  `delin.log` 与驱动日志两份，前者出现即表示确实重启进了 Delin）。
+  同一套流程再跑一轮, 收尾只按 **R / Q**：驱动跑完（`feeder done`）机器仍停在
+  `Press Enter to reboot now (other keys are ignored).`，`/delin.log` 不存在（没有重启）——
+  "其它键不处理"这条是真机验过的，不是只在宿主假环境里过。
+  注：这条链路上 `http.get` 偶发断连（见"安装"一节的网络层重试），真机驱动脚本自己也重试 3 次。
 - **注意 CC 的软盘配额**：本环境 `fs.getCapacity("/disk")` 只有 **125,000 字节**（磁盘上还有个
   宿主放进去的 2 MB `data.img`），所以 `fs.getFreeSpace` 为 0 —— 安装器会**正确拒绝**并给出
   `FAIL: target has 0 B free, need 346.5 KB`（fail-fast，不留半成品配置）。
