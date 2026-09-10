@@ -57,8 +57,8 @@ def main():
 
     # 1. 构建
     print("== build kernel bundle ==")
-    print(run("lua5.1", os.path.join(REPO, "tools/bundle.lua"), "kernel", cwd=REPO))
-    print(run("lua5.1", os.path.join(REPO, "tools/bundle.lua"), "dlub", cwd=REPO))
+    # 构建 dist/: 压缩内核/DLUB/工具/模块, 并生成产物清单(压缩器门禁在 build.lua 内部)
+    print(run("lua5.1", os.path.join(REPO, "tools/build.lua"), cwd=REPO))
 
     # 2. 部署到磁盘0
     print("== deploy to disk 0 ==")

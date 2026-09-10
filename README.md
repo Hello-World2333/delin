@@ -493,10 +493,26 @@ analog_output,bundled_input,bundled_output}`（六个面恒定存在），`cat`/
 ## 构建
 
 ```bash
-lua5.1 tools/bundle.lua kernel   # 生成 dist/kernel.lua（内核 bundle）
-lua5.1 tools/bundle.lua dlub     # 生成 dist/dlub.lua（DLUB 引导装载器，独立文件）
-lua5.1 tools/minify.lua src/bin/sh   # 压缩单个文件(产物体积见下)
+lua5.1 tools/build.lua             # 构建 dist/: 压缩内核/DLUB/BIOS/工具/模块/配置 + manifest
+lua5.1 tools/build.lua --check     # 构建 + 压缩等价性门禁(hosttest 361 项 + 6 个自检脚本差分)
+lua5.1 tools/build.lua --release   # 构建 + 生成 dist/release/<版本>/ 发布树(安装布局的 payload)
+sh tools/serve.sh                  # 把发布树挂在 10568 端口(游戏侧 wget 安装用)
 ```
+
+`tools/build.lua` 是唯一入口：它会**自动建 `dist/`**（以前直接跑 `tools/bundle.lua` 时
+干净 checkout 上没有 `dist/`（`.gitignore` 里）就报错）。`dist/` 是"可发布树"：
+
+| 产物 | 去处 |
+|---|---|
+| `dist/kernel.lua` | 引导盘的 `<boot>` 行（默认 `/boot/delin.lua`） |
+| `dist/dlub.lua` | 电脑自身 FS 的 `/boot/dlub.lua`（EXT2 根引导用） |
+| `dist/bios/startup.lua` | 电脑自身 FS 的 `/startup.lua` |
+| `dist/bin/*`、`dist/modules/<版本>/*`、`dist/units/*`、`dist/etc/*` | 目标文件系统对应路径 |
+| `dist/manifest` | 版本 + 每个产物的 `size crc32`（安装器校验用，见 `tools/crc32.lua`） |
+| `dist/release/<版本>/` | 发布树：`manifest` + `payload/`（`payload/` 下的相对路径 = 目标上的绝对路径） |
+
+`tools/deploy.py` / `tools/realmachine.py` / `tools/deploy_to_computer4.py` 一律消费 `dist/`
+（`dist/bin` 缺失即 fail-fast），不再直接从 `src/` 取，避免内核与工具版本不同步。
 
 **压缩器**（`tools/minify.lua`）：去注释、去缩进、折叠空白，并把**局部变量/参数改名成短名**。
 它不是正则清洗 —— 源码里到处是 `local args = args or {}`（右值是内核注入的**全局** `args`），
@@ -644,7 +660,12 @@ scripts/redstone_verify.lua  真机交叉核对: /sys/class/redstone/* 与 CC �
 scripts/realmachine_verify.sh  真机验证脚本(由 verify.service 以 oneshot 运行, 结果写 /var/log/verify.log)
 scripts/printer_probe.lua  真机探测 CC printer 原始 API 语义(页尺寸/写不折行/开页扣纸墨), 写 /var/log/printer_probe.log
 scripts/printer_verify.sh  真机验证 ccprinter 模块(/dev/lp0 + /sys/class/printer, 会实际打印), 写 /var/log/printer_verify.log
-tools/bundle.lua           打包 src/ -> dist/kernel.lua 或 dist/dlub.lua(init 多文件拼成一个 chunk)
+tools/bundle.lua           拼装 bundle: src/ -> 单文件内核/DLUB(init 多文件拼成一个 chunk);
+                           压缩与门禁交给 tools/build.lua, 本文件只负责"拼"
+tools/build.lua            构建入口: 自动建 dist/, 产出压缩后的内核/DLUB/BIOS/工具/模块/配置
+                           + manifest(size/crc32); --check 跑压缩等价性门禁, --release 出发布树
+tools/crc32.lua            CRC32(纯 Lua, 不用位运算: 宿主 5.1 与 CC 5.2 必须算出同一个值)
+tools/serve.sh             开发期把 dist/release 挂在 10568 端口(游戏侧 wget 安装用)
 tools/minify.lua           Lua 压缩器: 词法分析 + 递归下降解析做作用域分析 + 局部变量改名,
                            只从 token 流输出(输出与输入的 token 序列逐项相同)。三重门禁:
                            lua5.1 解析 / 重词法逐 token 比对 / 改名不遮蔽任何全局名。

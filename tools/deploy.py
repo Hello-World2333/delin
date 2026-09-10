@@ -114,10 +114,14 @@ def main():
         # 1) 导出基础镜像全部文件
         rdump(base, rootfs)
         # 2) 更新文件
+        #    产物一律取 dist/(由 tools/build.lua 生成: 已压缩, 且过了压缩器门禁)。
+        #    dist 缺失即 fail-fast —— 曾经的坑: 直接从 src/ 拷, 版本与内核不同步。
+        distbin = os.path.join(REPO, "dist", "bin")
+        if not os.path.isdir(distbin):
+            raise RuntimeError("dist/bin 不存在; 先跑: lua5.1 tools/build.lua")
         shutil.copy(os.path.join(REPO, "dist/kernel.lua"), os.path.join(rootfs, "boot/delin.lua"))
-        # 部署全部 bin 工具, 保证真机与 src/bin 一致。
-        for f in sorted(os.listdir(os.path.join(REPO, "src/bin"))):
-            shutil.copy(os.path.join(REPO, "src/bin", f), os.path.join(rootfs, "bin", f))
+        for f in sorted(os.listdir(distbin)):
+            shutil.copy(os.path.join(distbin, f), os.path.join(rootfs, "bin", f))
             os.chmod(os.path.join(rootfs, "bin", f), 0o755)
         os.makedirs(os.path.join(rootfs, "root"), exist_ok=True)
         os.makedirs(os.path.join(rootfs, "tmp"),  exist_ok=True)
@@ -127,27 +131,27 @@ def main():
         shutil.copy(os.path.join(REPO, "scripts/posix_test.sh"), os.path.join(rootfs, "root/posix_test.sh"))
         shutil.copy(os.path.join(REPO, "scripts/jobctl_test.sh"), os.path.join(rootfs, "root/jobctl_test.sh"))
         shutil.copy(os.path.join(REPO, "scripts/sysinfo.sh"),    os.path.join(rootfs, "root/sysinfo.sh"))
-        # 单元文件: src/units/* -> /lib/systemd/system/ (厂商单元)
+        # 单元文件: dist/units/* -> /lib/systemd/system/ (厂商单元)
         unitdir = os.path.join(rootfs, "lib", "systemd", "system")
         os.makedirs(unitdir, exist_ok=True)
-        for f in sorted(os.listdir(os.path.join(REPO, "src/units"))):
-            shutil.copy(os.path.join(REPO, "src/units", f), os.path.join(unitdir, f))
-        # 系统配置: src/etc/* -> /etc/
-        for f in sorted(os.listdir(os.path.join(REPO, "src/etc"))):
-            shutil.copy(os.path.join(REPO, "src/etc", f), os.path.join(rootfs, "etc", f))
+        for f in sorted(os.listdir(os.path.join(REPO, "dist/units"))):
+            shutil.copy(os.path.join(REPO, "dist/units", f), os.path.join(unitdir, f))
+        # 系统配置: dist/etc/* -> /etc/ (含初始 passwd/shadow/group)
+        for f in sorted(os.listdir(os.path.join(REPO, "dist/etc"))):
+            shutil.copy(os.path.join(REPO, "dist/etc", f), os.path.join(rootfs, "etc", f))
         # 启用单元: /etc/systemd/system/<target>.wants/<unit> 空标记(systemd 的 enable)
         for target, unit in (("multi-user.target", "syslogd.service"),
                              ("timers.target", "logrotate.timer")):
             wantdir = os.path.join(rootfs, "etc", "systemd", "system", target + ".wants")
             os.makedirs(wantdir, exist_ok=True)
             open(os.path.join(wantdir, unit), "w").close()
-        # 安装内核模块(src/modules -> /lib/modules/<version>/):
-        # 基镜像的 /lib 可能因 debugfs 元数据损坏而无法 rdump, 且模块应始终取当前 src。
+        # 安装内核模块(dist/modules/<version> -> /lib/modules/<version>/):
+        # 基镜像的 /lib 可能因 debugfs 元数据损坏而无法 rdump, 且模块应始终取当前构建。
         ver = _module_version()
         moddir = os.path.join(rootfs, "lib", "modules", ver)
         os.makedirs(moddir, exist_ok=True)
-        for f in sorted(os.listdir(os.path.join(REPO, "src/modules"))):
-            p = os.path.join(REPO, "src/modules", f)
+        for f in sorted(os.listdir(os.path.join(REPO, "dist/modules", ver))):
+            p = os.path.join(REPO, "dist/modules", ver, f)
             if os.path.isfile(p):
                 shutil.copy(p, os.path.join(moddir, f))
                 os.chmod(os.path.join(moddir, f), 0o755)
