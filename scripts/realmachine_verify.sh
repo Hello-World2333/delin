@@ -89,6 +89,8 @@ echo "-- proc_test.sh (/proc + ps/pgrep/pkill/killall 自检) --" >> $LOG
 sh /root/proc_test.sh >> $LOG
 echo "-- redstone_test.sh (/sys/class/redstone 读写/校验自检) --" >> $LOG
 sh /root/redstone_test.sh >> $LOG
+echo "-- lua_test.sh (/bin/lua 脚本/stdin/arg/dofile/退出码 + 进程环境白名单自检) --" >> $LOG
+sh /root/lua_test.sh >> $LOG
 echo "-- redstone_verify.lua (sysfs 与 CC 原始 redstone API 交叉核对) --" >> $LOG
 /root/redstone_verify.lua
 cat /var/log/redstone_verify.log >> $LOG

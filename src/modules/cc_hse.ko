@@ -36,7 +36,8 @@ return {
             end
         end
 
-        -- 注入 os.msleep 到全局 os 表, 所有进程通过 __index = _G 继承。
+        -- 注入 os.msleep 到内核的全局 os 表。进程环境是白名单(kernel/procenv.lua), 每个进程
+        -- 创建时浅拷贝一份 os 表 —— 模块装载早于 launch init, 所以之后起来的进程都拿得到它。
         -- os.msleep(ms): 睡约 ms 毫秒, 亚 tick 精度(0.5ms)。
         --   ms <= 0    -> 让出: 拉模式等 4 tick(2ms)。调用者(工具/sh)只在 50ms 时间片
         --                 边界让出, 频率 ≤20 次/s, 不会淹没事件队列。

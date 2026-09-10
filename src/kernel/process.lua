@@ -1,6 +1,7 @@
 --[[ Delin process model.
      - 进程表 + 进程树 (pid/ppid/status/children)
      - 每个进程一个隔离 _ENV (load(src, name, "t", env))
+     - env 是白名单环境(kernel/procenv.lua): CC 原生 fs/模块/事件/电源渠道一律不给
      - spawn 只收源码字符串(不收闭包/路径); 读文件由程序自己做
      - 内核自供 print (CC 自带 print 不走 io.stdout)
      - 父死子并入 init (pid 1)
@@ -12,6 +13,7 @@ local scheduler = require("kernel.scheduler")
 local tty       = require("kernel.tty")
 local vfs_api   = require("kernel.vfs_api")
 local modules   = require("kernel.modules")
+local procenv   = require("kernel.procenv")
 
 local process = {}
 
@@ -76,7 +78,7 @@ local function buildEnv(pid, ppid, uid, gid, argv, opts)
         end
     end
     ---@type table
-    local env = setmetatable({
+    local env = {
         pid   = pid,
         ppid  = ppid,
         uid   = uid or 0,
@@ -93,7 +95,11 @@ local function buildEnv(pid, ppid, uid, gid, argv, opts)
         spawn = function(src, name, childUid, childGid, childArgv, childOpts)
             return process.spawn(src, name, pid, childUid, childGid, childArgv, childOpts)
         end,
-    }, { __index = _G })
+    }
+    -- 白名单: 只把 procenv 列出的 CC/Lua 全局给进程(没有 __index=_G 兜底), 于是
+    -- loadfile/dofile/os.run/require/settings/shell/disk/peripheral/os.pullEvent 等
+    -- 绕过 Delin 接口的渠道在内核层一次关干净(见 kernel/procenv.lua 的说明)。
+    procenv.apply(env)
     vfs_api.installForEnv(env) -- 替换 fs/io 为 VFS
     modules.applyToEnv(env)    -- 注入 syscalls 表
     env._G = env -- 子进程的 _G 是自己的环境(隔离)

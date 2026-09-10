@@ -181,7 +181,8 @@ def main():
                      ("scripts/sh_builtin_test.sh", "/root/sh_builtin_test.sh"),
                      ("scripts/proc_test.sh", "/root/proc_test.sh"),
                      ("scripts/redstone_test.sh", "/root/redstone_test.sh"),
-                     ("scripts/redstone_verify.lua", "/root/redstone_verify.lua")):
+                     ("scripts/redstone_verify.lua", "/root/redstone_verify.lua"),
+                     ("scripts/lua_test.sh", "/root/lua_test.sh")):
         df_write(out, os.path.join(REPO, src), dst)
         df(out, "set_inode_field %s mode 0100755" % dst)
     unit_sh = os.path.join(work, "verify-sh.service")

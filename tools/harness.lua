@@ -7,6 +7,10 @@
 
 local ROOT = "/tmp/delinhost"
 
+-- 内核模块(与真机同一份源码): 进程环境白名单等要用真实实现, 不能在测试台上另写一套。
+package.path = "/home/worker/delin/src/?.lua;" .. package.path
+local procenv = require("kernel.procenv")
+
 -- pipe 内核模块用 os.sleep 做协作式阻塞; 在宿主上把它改成 yield 给调度器
 -- (宿主 lua5.1 的 os 没有 sleep, 且这里必须能让出当前协程让调度器切走)。
 os.sleep = function() coroutine.yield() end
@@ -394,16 +398,22 @@ local function spawn(src, name, ppid, uid, gid, argv, opts)
             if v == nil then envvars[k] = nil else envvars[k] = tostring(v) end
         end
     end
-    local env = setmetatable({
+    local env = {
         pid = pid, ppid = ppid or 0, uid = uid or 0, gid = gid or 0,
         cwd = (opts and opts.cwd) or "/",
         argv = argv or {}, args = {}, argc = 0, arg0 = "",
         env = envvars, getenv = function(n) return envvars[n] end,
         fs = F, io = makeIo(stdio), syscalls = syscalls,
         print = function(...) end,
-        -- os.sleep 让出当前协程(调度器据此切换进程), 模拟内核按事件驱动恢复。
-        os = setmetatable({ sleep = function() coroutine.yield() end }, { __index = REAL_G.os or {} }),
-    }, { __index = REAL_G })
+    }
+    -- 与内核一致的白名单(见 src/kernel/procenv.lua): 测试台不放宽, 否则工具用到名单外的
+    -- 全局在宿主上照样能跑, 真机才炸。
+    procenv.apply(env)
+    -- os.sleep / os.msleep 都让出当前协程(调度器据此切换进程), 模拟内核按事件驱动恢复。
+    -- 真机的 os.msleep 来自 cc_hse.ko(逐 HSE 拍让出), 宿主没有那个模块, 这里给个等价桩,
+    -- 好让工具走的是真机上那条 msleep 分支。
+    env.os.sleep = function() coroutine.yield() end
+    env.os.msleep = function() coroutine.yield() end
     if argv then
         env.argv = argv
         env.arg0 = argv[0] or ""
@@ -481,7 +491,7 @@ local SRCBIN = "/home/worker/delin/src/bin"
 local function setupRoot()
     os.execute("rm -rf " .. ROOT .. " && mkdir -p " .. ROOT)
     os.execute("mkdir -p " .. ROOT .. "/bin " .. ROOT .. "/etc " .. ROOT .. "/home/alice " .. ROOT .. "/root " .. ROOT .. "/tmp " .. ROOT .. "/mnt/cc")
-    for _, f in ipairs({ "cat","clear","cp","ed","grep","head","kill","login","ls","mkdir","mv","rm","sed","sh","sleep","tail","touch","wc","chmod","chown","mount","umount","blkid","lsblk","lp","ps","pgrep","pkill","killall" }) do
+    for _, f in ipairs({ "cat","clear","cp","ed","grep","head","kill","login","ls","mkdir","mv","rm","sed","sh","sleep","tail","touch","wc","chmod","chown","mount","umount","blkid","lsblk","lp","ps","pgrep","pkill","killall","lua" }) do
         os.execute("cp -f " .. SRCBIN .. "/" .. f .. " " .. ROOT .. "/bin/" .. f)
         os.execute("chmod 755 " .. ROOT .. "/bin/" .. f)
     end
@@ -513,7 +523,6 @@ end
 -- 让 `cat /sys/class/display/top/name` 这类命令在宿主上得到与真机一致的行为。
 -- 显示设备用一个桩(kernel.display 只被 sysfs 用于 list/get/byName/resize)。
 -- ---------------------------------------------------------------
-package.path = "/home/worker/delin/src/?.lua;" .. package.path
 local sysfsDev = {
     id = "monitor:top", type = "monitor", mode = "term", name = "top",
     getSize = function() return 51, 19 end,

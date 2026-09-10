@@ -6,6 +6,7 @@
 io.stdout:setvbuf("line")
 os.epoch = os.epoch or function() return os.time() * 1000 end -- 宿主桩: 内核 klog 载入时取引导标识
 package.path = "/home/worker/delin/src/?.lua;" .. package.path
+local procenv = require("kernel.procenv") -- 进程环境白名单(与内核同一份), 见 src/kernel/procenv.lua
 
 local REPO = "/home/worker/delin"
 local ROOT = "/tmp/delinhost2"
@@ -165,7 +166,8 @@ end
 -- init 沙箱: 载入真实的 unit.lua / service.lua
 -- ---------------------------------------------------------------
 local function newInitEnv()
-    local env = setmetatable({}, { __index = _G }) -- 与内核注入的进程环境一致: __index = _G
+    local env = {} -- 与内核注入的进程环境一致(白名单, 无 __index=_G 兜底): 见 src/kernel/procenv.lua
+    procenv.apply(env)
     env.fs = F
     env.print = function(...)
         local parts = {}
@@ -564,17 +566,16 @@ do
             writeLine = function(self, s) return self:write(tostring(s or "") .. "\n") end,
             flush = function() return true end,
         }
-        local tenv = setmetatable({
+        local tenv = {
             fs = F, io = makeIo({ input = opts.input, output = outHandle }),
             syscalls = env.syscalls, args = argv or {}, argv = argv or {}, argc = #(argv or {}), arg0 = path,
             pid = 900, ppid = 1, uid = 0, gid = 0, cwd = "/",
             -- Delin 的 print 走内核控制台(klog), 不是 stdout; 宿主测试忽略它。
             print = function() end,
-            os = setmetatable({
-                sleep = function() coroutine.yield() end,
-                epoch = function() return env.now end,
-            }, { __index = _G.os }),
-        }, { __index = _G })
+        }
+        procenv.apply(tenv) -- 与内核一致的进程环境白名单
+        tenv.os.sleep = function() coroutine.yield() end
+        tenv.os.epoch = function() return env.now end
         tenv._G = tenv
         local src = assert(readFile(path), path)
         local chunk

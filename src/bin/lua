@@ -1,0 +1,334 @@
+-- Delin lua: Lua 解释器(运行脚本 / 交互式 REPL)。
+--   用法: lua [script [args...]]         script 为 - 时读 stdin
+--   无 script: stdin 是终端 -> 交互式 REPL;
+--              stdin 不是终端 -> 把整个 stdin 当一个 chunk 执行(官方 lua(1) 的行为)。
+--   REPL: 提示符 "> "/">> "(续行), =expr 简写, 裸表达式(如 1+1)按 return 求值并打印结果,
+--         未完成的语句自动续行(靠语法错误里的 <eof> 判定), ^D(EOF) 退出, ^C 取消当前输入行。
+--         提示符可用全局 _PROMPT/_PROMPT2 覆盖(与官方 lua 一致)。
+--   脚本: arg[0]=脚本路径, arg[1..]=参数, arg[-1]=解释器路径; 脚本体收到变参 ...
+--         dofile/loadfile 由本工具提供, 且**读文件走 Delin VFS**(不是 CC 原生 fs)。
+--         因此 `#!/bin/lua` 也成立(内核把脚本路径当第一个参数传进来)。
+--         print 在本环境里被覆盖成写 stdout(制表符分隔, 同 lua(1)), 不是内核的 kprint。
+--   本进程的全局环境就是 /bin/lua 自己的进程环境(内核白名单, 见 kernel/procenv.lua):
+--   fs/io/syscalls/os/argv 等都在; CC 原生的 loadfile/dofile/os.run/require/peripheral 等没有。
+--   与官方 lua(1) 的偏离:
+--     - 脚本/stdin 顶层 `return <数字>` 即退出码(CC 没有 os.exit; Delin 的工具/服务本来就是这个约定)。
+--     - 无参数且 stdin 非终端时执行完 stdin 后, 出错返回 1(官方 lua 这一路恒返回 0)。
+--     - ^C 只能取消输入行, 不能中断已经开跑的语句: 内核信号在让出点投递, 本工具没有指令级 hook。
+--   输出走 io.stdout(父进程把它指向控制台 tty 或文件), 错误走 io.stderr; 绝不 print(那是 klog)。
+--   交互用的字符串一律 ASCII(CC 终端打印中文会乱码)。
+
+local unpack = table.unpack or unpack
+local pack = table.pack or function(...) return { n = select("#", ...), ... } end
+local stdin  = io.stdin()
+local stdout = io.stdout()
+
+local function out(s)
+    if stdout and stdout.write then stdout:write(s) end
+end
+local function errout(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+-- 打印一串值: 制表符分隔 + 换行(官方 lua 的 printvalues)。REPL 的结果打印用它 ——
+-- 没有值就什么都不打(语句没有返回值时不输出空行); print 自己另外处理零参数(打一个空行)。
+local function writeValues(packed)
+    if packed.n == 0 then return end
+    local parts = {}
+    for i = 1, packed.n do parts[i] = tostring(packed[i]) end
+    out(table.concat(parts, "\t") .. "\n")
+end
+
+-- 进程环境(_G 指向它): 脚本/REPL 的全局都落在它上面, 于是 fs/io/syscalls/argv 直接可用。
+local G = _G
+local prog = arg0 or "/bin/lua"
+
+-- ---------------------------------------------------------------
+-- chunk 装载: 5.1(宿主测试台)用 loadstring+setfenv, 5.2(CC)用 load(..., env)。
+-- ---------------------------------------------------------------
+local loadChunk
+if _VERSION == "Lua 5.1" then
+    loadChunk = function(src, name, env)
+        local chunk, lerr = loadstring(src, name)
+        if not chunk then return nil, lerr end
+        setfenv(chunk, env)
+        return chunk
+    end
+else
+    loadChunk = function(src, name, env) return load(src, name, "t", env) end
+end
+
+-- ---------------------------------------------------------------
+-- 文件读取(dofile/loadfile 与脚本模式共用): 走 VFS
+-- ---------------------------------------------------------------
+-- 脚本首行的 #! 规则(与 lua(1)/luaL_loadfile 一致): 文件以 # 开头时首行整体当注释。
+-- 只把首行内容挖空、保留那个换行 —— 这样后续行号与文件行号对齐(与 Lua 补 '\n' 的做法同效)。
+local function stripShebang(src)
+    if src:sub(1, 1) ~= "#" then return src end
+    local nl = src:find("\n", 1, true)
+    if not nl then return "" end
+    return "\n" .. src:sub(nl + 1)
+end
+
+local function readFile(path)
+    local f, oerr = fs.open(path, "r")
+    if not f then return nil, oerr or "cannot open" end
+    local src = f.readAll()
+    f.close()
+    return stripShebang(src)
+end
+
+--- 标准 lua 的 loadfile, 但读文件走 Delin VFS(CC 原生 loadfile 在进程环境里不存在)。
+---@param path string
+---@param mode string|nil 只支持文本("b" 直接被拒)
+---@param env table|nil
+local function luaLoadfile(path, mode, env)
+    if mode and mode:find("b") then return nil, path .. ": binary chunks are not supported" end
+    local src, rerr = readFile(path)
+    if not src then return nil, rerr end
+    return loadChunk(src, "@" .. path, env or G)
+end
+
+--- 标准 lua 的 dofile: loadfile 后立即执行(出错抛给调用者)。
+local function luaDofile(path)
+    local chunk, lerr = luaLoadfile(path)
+    if not chunk then error(lerr, 0) end
+    return chunk()
+end
+
+G.loadfile = luaLoadfile
+G.dofile   = luaDofile
+
+-- print 覆盖: Lua 解释器里的 print 写 stdout(制表符分隔, 与 lua(1) 一致), 而不是内核的
+-- kprint(写 klog, 不随重定向) —— 否则 REPL 里敲 print 看不到结果, `lua x.lua > out` 也收不到。
+-- 零参数时输出一个空行(与 lua(1) 的 print() 一致)。
+G.print = function(...)
+    local n = select("#", ...)
+    if n == 0 then out("\n"); return end
+    writeValues(pack(...))
+end
+
+-- ---------------------------------------------------------------
+-- 出错报告(与官方 lua 的 msghandler 同形)
+-- ---------------------------------------------------------------
+-- 本解释器是 Lua userland 代码, 栈里会出现它自己的帧([string "/bin/lua"]:123 之类); 官方 lua
+-- 的解释器是 C, 用户看不到这些。这里把 traceback 切到本工具源名那一行为止, 只留用户代码的栈。
+-- 源名用一次 error 的定位信息量出来(进程白名单里没有 debug.getinfo, 也不为它开后门)。
+local SELF_SRC = (function()
+    local _, msg = pcall(function() error("\1", 1) end)
+    if type(msg) == "string" then return msg:match("^(.-):%d+: \1$") end
+    return nil
+end)()
+
+local traceback = debug.traceback
+
+--- 切掉 traceback 里属于解释器自己的帧(含其后的全部)。
+local function trimTrace(tb)
+    if not SELF_SRC then return tb end
+    local out = {}
+    for line in (tb .. "\n"):gmatch("(.-)\n") do
+        if line:find(SELF_SRC, 1, true) then break end
+        out[#out + 1] = line
+    end
+    return table.concat(out, "\n")
+end
+
+--- 错误对象 -> 字符串(表有 __tostring 就用它, 否则"某种值"占位, 与官方 lua 一致)。
+local function toMsg(e)
+    if type(e) == "string" then return e end
+    local mt = getmetatable(e)
+    local h = (type(mt) == "table") and mt.__tostring or nil
+    if type(h) == "function" then
+        local ok, s = pcall(h, e)
+        if ok and s ~= nil then return tostring(s) end
+    end
+    return "(error object is a " .. type(e) .. " value)"
+end
+
+--- 报错。运行期错误由 call() 的 handler 带上栈, 语法错误没有栈(两者都只报一次)。
+local function report(prefix, e)
+    errout(prefix .. toMsg(e) .. "\n")
+end
+
+--- 执行 chunk(args 为参数表)。成功返回 true, 结果表; 失败返回 false, 错误对象(带栈)。
+local function call(chunk, args)
+    local n = args and (args.n or #args) or 0
+    local packed = nil
+    local ok, e = xpcall(function()
+        packed = pack(chunk(unpack(args or {}, 1, n)))
+    end, function(err)
+        if traceback then return trimTrace(traceback(err, 2)) end
+        return err
+    end)
+    if not ok then return false, e end
+    return true, packed
+end
+
+-- 退出码: 顶层 chunk `return <数字>` 即退出码(Delin 风格, 与工具/服务一致)。官方 lua(1) 会
+-- 丢掉脚本的返回值, 但 CC 没有 os.exit, 不这样脚本就只能靠报错给出 1。
+local function topLevelExit(packed)
+    if type(packed[1]) == "number" then return packed[1] end
+    return 0
+end
+
+-- ---------------------------------------------------------------
+-- 参数解析: lua [script [args...]]
+-- ---------------------------------------------------------------
+local script, scriptArgs = nil, {}
+local pargs = args or {}
+if pargs[1] ~= nil then
+    local first = pargs[1]
+    if first:sub(1, 1) == "-" and first ~= "-" then
+        errout("lua: unrecognized option '" .. first .. "'\nusage: lua [script [args...]]\n")
+        return 1
+    end
+    script = first
+    for i = 2, #pargs do scriptArgs[#scriptArgs + 1] = pargs[i] end
+end
+
+-- arg 表(与 lua(1) 一致): arg[-1]=解释器, arg[0]=脚本(无脚本时是解释器), arg[1..]=脚本参数。
+local argTable = { [0] = prog }
+if script then
+    argTable[-1] = prog
+    argTable[0] = script
+    for i = 1, #scriptArgs do argTable[i] = scriptArgs[i] end
+end
+G.arg = argTable
+
+-- ---------------------------------------------------------------
+-- stdin 整体读成字符串(无脚本 + stdin 非终端, 以及 `lua -`)
+-- ---------------------------------------------------------------
+local function readStdin()
+    local parts = {}
+    while true do
+        local line = stdin:readLine()
+        if line == nil then break end
+        parts[#parts + 1] = line .. "\n"
+    end
+    return stripShebang(table.concat(parts)) -- stdin 也吃 #! 首行(与 lua(1) 一致)
+end
+
+-- 脚本模式(含 `lua -`): 返回退出码。
+local function runScript()
+    local src, rerr
+    if script == "-" then
+        src = readStdin()
+    else
+        src, rerr = readFile(script)
+    end
+    if not src then
+        errout("lua: cannot open " .. script .. ": " .. tostring(rerr) .. "\n")
+        return 1
+    end
+    local chunk, lerr = loadChunk(src, (script == "-") and "=stdin" or ("@" .. script), G)
+    if not chunk then
+        report("lua: ", lerr)
+        return 1
+    end
+    local ok, packed = call(chunk, scriptArgs)
+    if not ok then
+        report("lua: ", packed)
+        return 1
+    end
+    return topLevelExit(packed)
+end
+
+-- ---------------------------------------------------------------
+-- 交互式 REPL
+-- ---------------------------------------------------------------
+-- 未完成的语句: Lua 的语法错误消息以 <eof> 结尾(5.1/5.2 写成 '<eof>', 5.3+ 不带引号)。
+local function incomplete(lerr)
+    return type(lerr) == "string" and lerr:find("<eof>'?%s*$") ~= nil
+end
+
+-- 执行一个 chunk 并按 REPL 语义打印结果(出错只报告)。
+local function runInRepl(chunk)
+    local ok, packed = call(chunk)
+    if not ok then
+        report("", packed)
+        return
+    end
+    writeValues(packed)
+end
+
+-- 求值一行, 返回 "ok"(已执行) / "multi"(语句未完成, 需要续行) / "err"(已报错)。
+--   cont = 是否处于续行缓冲中。
+--   顺序: 1) 整行当语句; 2) 装不上就按 "return <行>" 当表达式再试一次(所以 1+1 打印 2,
+--   而 print(1) 只执行不打印返回值); 3) 仍不行且错误是"未完成"就续行, 否则报语法错误。
+--   `=expr` 是 "return expr" 的简写。
+--   注: 第 2 步排在"未完成"判定之前是有意的 —— Lua 5.1/5.2 的语法错误把裸名字(x)也
+--   报成 "…'=' expected near '<eof>'", 按官方那套先判未完成的话 REPL 会对 x 傻等续行;
+--   先试 return 就让 5.1/5.2 也有 5.3+ 的手感。
+local function evalInRepl(line, cont)
+    local src = line
+    if not cont and line:sub(1, 1) == "=" then src = "return " .. line:sub(2) end
+    local chunk, lerr = loadChunk(src, "=stdin", G)
+    if chunk then
+        runInRepl(chunk)
+        return "ok"
+    end
+    if not cont and src == line then
+        local chunk2 = loadChunk("return " .. line, "=stdin", G)
+        if chunk2 then
+            runInRepl(chunk2)
+            return "ok"
+        end
+    end
+    if incomplete(lerr) then return "multi" end
+    report("", lerr) -- 报最初的语法错误(与官方 lua 一致, 不报 return 那次的)
+    return "err"
+end
+
+local function repl()
+    out(_VERSION .. "  Delin lua\n")
+    -- ^C: 内核把 SIGINT 交给这里(默认动作会杀死进程), 只用来取消当前输入行, 不退出解释器。
+    -- 内核不给 signal.install 时(如宿主桩)不装, 那时 ^C 按默认动作终止本进程。
+    local interrupted = false
+    if syscalls and syscalls["signal.install"] then
+        syscalls["signal.install"](2, function() interrupted = true end)
+    end
+    local buffer = nil -- 未完成语句的续行缓冲(nil = 不在续行中)
+    while true do
+        interrupted = false -- 求值期间的 ^C 无法中断语句, 到这里作废
+        out(buffer and (G._PROMPT2 or ">> ") or (G._PROMPT or "> "))
+        local line = stdin:readLine()
+        if interrupted then
+            -- ^C: tty 已回显 "^C"; 丢弃当前行与续行缓冲, 回到 "> "
+            buffer = nil
+        elseif line == nil then
+            -- ^D(EOF): 续行缓冲里还有未完成的语句 -> 报语法错误(官方 lua 也报), 否则正常退出
+            if buffer then
+                local _, lerr = loadChunk(buffer, "=stdin", G)
+                report("", lerr)
+                return 1
+            end
+            return 0
+        else
+            local src = buffer and (buffer .. line) or line
+            local state = evalInRepl(src, buffer ~= nil)
+            buffer = (state == "multi") and (src .. "\n") or nil
+        end
+    end
+end
+
+-- ---------------------------------------------------------------
+-- 主流程
+-- ---------------------------------------------------------------
+if script then return runScript() end
+
+if stdin and stdin.isTTY then return repl() end
+
+-- stdin 非终端: 整个 stdin 当一个 chunk 执行(chunk 名 "=stdin", 与官方 lua 一致)
+local src = readStdin()
+local chunk, lerr = loadChunk(src, "=stdin", G)
+if not chunk then
+    report("lua: ", lerr)
+    return 1
+end
+local ok, packed = call(chunk)
+if not ok then
+    report("lua: ", packed)
+    return 1
+end
+return topLevelExit(packed)

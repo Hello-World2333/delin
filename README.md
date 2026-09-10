@@ -14,7 +14,7 @@
 
 | 路径 | 作用 |
 |---|---|
-| `/bin/` | 用户工具：`cat ls mkdir rm cp mv touch head tail wc grep sed kill ps pgrep pkill killall login sh clear sleep systemctl syslogd logrotate logger dmesg mount umount lp` |
+| `/bin/` | 用户工具：`cat ls mkdir rm cp mv touch head tail wc grep sed ed kill ps pgrep pkill killall login sh lua clear sleep systemctl syslogd logrotate logger dmesg mount umount lp` |
 | `/dev/` | 设备文件：`/dev/ttyN`（字符终端）、`/dev/fbN`（像素帧缓冲）、`/dev/sdX`（磁盘，见下）、`/dev/lpN`（打印机字符设备，只写，见下）、`/dev/null`（读 EOF/写丢弃）、`/dev/console`（系统控制台 = 控制台 tty）、`/dev/kmsg`（内核 ring buffer 只读流）、`/dev/log`（用户态 syslog 输入） |
 | `/etc/` | 系统配置：`passwd` `shadow` `group`、`fstab`、`syslog.conf`、`logrotate.conf`、`systemd/system/`（管理员单元与 enable 标记） |
 | `/proc/` | 虚拟进程/系统信息 fs（procfs，内核提供，见下）：`/proc/<pid>/{cmdline,comm,cwd,stat,status}`、`/proc/self`、`/proc/{mounts,uptime,version}` |
@@ -428,8 +428,19 @@ analog_output,bundled_input,bundled_output}`（六个面恒定存在），`cat`/
   输出期间的按键（字符/切 tty/`^C`）就是这样被丢掉的。`os.msleep(0)` 是一次按需 tick 让出
   （≥2ms，`ms>=50` 走 CC 定时器），工具与 `sh` 只在 ~50ms 时间片边界让出；内核另有 0.05s 调度
   心跳，保证裸让出（`filter=nil`，如 `tty.readLine`）的进程在空闲期也能推进。
-- **隔离环境**：每个进程有自己的 `_ENV`（`load(src, name, "t", env)`），注入内核上下文
-  `spawn`/`pid`/`ppid`/`uid`/`gid`/`syscalls`，`__index = _G` 兜底原始 API。
+- **隔离环境（白名单）**：每个进程有自己的 `_ENV`（`load(src, name, "t", env)`），注入内核上下文
+  `spawn`/`pid`/`ppid`/`uid`/`gid`/`syscalls`。环境**没有 `__index = _G` 兜底** —— 只给
+  `src/kernel/procenv.lua` 列出的名字：Lua 标准库（`string/table/math/coroutine/os` 子集，且都是
+  进程私有副本，进程改副本影响不到内核与其它进程）、`fs`/`io`（VFS 门面）、`syscalls`、`print`
+  与一批"不绕过 Delin 接口"的 CC API（`term`/`write`/`read` ≈ 直连控制台、`colors`/`keys`/
+  `vector`/`textutils`/`parallel`/`window`/`paintutils`、`redstone`、`rednet`/`gps`/`http`）。
+  需要**在内核层**一次关掉的逃逸渠道（它们绕过 VFS/设备文件/内核，只在用户层打补丁既漏又散）：
+  `loadfile`/`dofile`/`os.run`（读电脑自身 FS 执行）、`require`/`package`/`os.loadAPI`（原生模块）、
+  `settings`（原生 FS 配置）、`shell`/`commands`/`multishell`/`help`（CC ROM 程序，直接在电脑自身
+  FS 上增删文件）、`disk`（`getMountPath` 绕过 `/dev/sdX` 与 `mount`）、`peripheral`/`pocket`
+  （裸外设，绕过 `/dev` 与 `/sys`）、`os.pullEvent`/`pullEventRaw`/`queueEvent`（偷/伪造内核事件，
+  可窃取键盘事件或向别的 tty 注入按键）、`os.shutdown`/`os.reboot`（电源）、`debug`（只留
+  `debug.traceback`，整个 debug 可经 registry 逃出沙箱）。用到就是 `nil`（fail-fast，报错落在调用点）。
 - **环境块（`export` 的落点）**：进程环境里注入 `env`（`name -> string` 的表）与 `getenv(name)`；
   spawn 时从父进程**继承**，`opts.env` 覆盖/追加（值为 `nil` 即删除）。`sh` 的 `export` 变量、
   `login` 设置的 `USER`/`HOME`/`SHELL`/`PATH` 都走这里，外部程序用 `env.PATH` / `getenv("PATH")` 读。
@@ -478,6 +489,8 @@ lua5.1 tools/hosttest.lua        # 宿主测试: init 引擎/fstab/syslogd/logro
 lua5.1 tools/harness.lua /bin/sh # 宿主上跑真实工具源码(sh/作业控制/管道; /sys 走真实 sysfs 后端, /proc 走真实 procfs 后端)
 lua5.1 tools/harness.lua /bin/sh < scripts/proc_test.sh   # /proc + ps/pgrep/pkill/killall 自检(与真机比对)
 lua5.1 tools/harness.lua /bin/sh < scripts/redstone_test.sh   # /sys/class/redstone 读写/校验自检(与真机比对)
+lua5.1 tools/harness.lua /bin/sh < scripts/lua_test.sh   # /bin/lua 脚本/stdin/arg/dofile/退出码 + 进程环境白名单(与真机比对)
+sh scripts/lua_repl_test.sh        # /bin/lua 交互式 REPL(宿主专用: DELIN_HARNESS_TTY=1 伪装终端)
 lua5.1 tools/ext2test.lua        # ext2 驱动宿主回归: 真实镜像上跑目录增删, 再用宿主 e2fsck -fn 判定
 python3 tools/realmachine.py --base /mnt/bak/root.base.img   # 真机: 先关机->打包->部署->重启 #3->取回 /var/log/*
 python3 tools/realmachine.py --printer   # 真机 + 打印机(会实际打印页面): 探测 printer API + 验证 /dev/lp0
@@ -499,6 +512,9 @@ python3 tools/realmachine.py --printer   # 真机 + 打印机(会实际打印页
 src/kernel/scheduler.lua   协程调度器(事件循环) + resume 前信号投递
 src/kernel/process.lua     进程表/进程树/spawn/隔离 env + cwd + argv + 会话/进程组/信号/作业控制
                             + 子进程退出钩子(init 服务监督) + opts.ppid
+src/kernel/procenv.lua     进程环境白名单: 只把列出的 CC/Lua 全局给进程(无 __index=_G 兜底),
+                           在内核层封掉 loadfile/dofile/os.run/require/settings/shell/disk/peripheral
+                           /os.pullEvent/queueEvent/shutdown 等绕过 Delin 接口的渠道
 src/kernel/signal.lua      POSIX 信号编号/默认动作/可捕获表/名字表
 src/kernel/vfs.lua         虚拟文件系统: 挂载表 + resolve + real/virtual 后端
 src/kernel/vfs_api.lua     VFS 门面(fs/io) + /dev 设备注册表 + stdio
@@ -558,6 +574,11 @@ src/bin/logrotate          日志轮转 (logrotate(8) 子集: size/daily/rotate/
 src/bin/logger             写一条消息到 /dev/log (util-linux logger 子集)
 src/bin/dmesg              打印内核 ring buffer (/dev/kmsg)
 src/bin/lp                 打印文件 (POSIX lp(1) 子集: -d 设备 -t 标题, 无文件读 stdin)
+src/bin/lua                Lua 解释器: 无参进交互式 REPL(> / >> 提示符, =expr, 裸表达式按 return
+                           求值并打印, 未完成语句续行, ^D 退出, ^C 取消输入行), 否则运行脚本
+                           (lua [script [args...]], `-` 读 stdin; arg[-1]/arg[0]/arg[1..] 与变参 ...
+                           同 lua(1); 顶层 return 数字 = 退出码; dofile/loadfile 走 Delin VFS;
+                           print 在本环境里改写 stdout; stdin 非终端时整个 stdin 当一个 chunk)
 src/bin/sh                 交互/脚本 shell(POSIX 核心子集: 变量/IFS/引号/if/for/while/case/函数/test/[ ]/&&/||
                            /重定向/管道/作业控制(& jobs fg bg wait kill %job)/read, 支持 -c 与 shebang 脚本)
 src/units/*                厂商单元文件 -> /lib/systemd/system/ (default/multi-user/local-fs/getty/timers
@@ -574,6 +595,10 @@ scripts/jobctl_test.sh     作业控制自检(& / $! / jobs / fg / bg / wait / k
 scripts/sysinfo.sh         实用小工具: 系统信息(变量/函数/for/case/if/重定向/工具)
 scripts/proc_test.sh       /proc + ps/pgrep/pkill/killall 自检(host harness 与真机各跑一次比对, 41 项)
 scripts/redstone_test.sh   /sys/class/redstone 读写/校验自检(host harness 与真机各跑一次比对, 50 项)
+scripts/lua_test.sh        /bin/lua 自检(host harness 与真机各跑一次比对, 93 项): 脚本/stdin/arg/变参/
+                           dofile+loadfile/错误消息与退出码/shebang/进程环境白名单
+scripts/lua_repl_test.sh   /bin/lua 交互式 REPL 自检(宿主专用: 测试台把 stdin 伪装成终端,
+                           覆盖提示符/表达式自动打印/续行/报错/SIGINT/_PROMPT/EOF 退出码, 16 项)
 scripts/redstone_verify.lua  真机交叉核对: /sys/class/redstone/* 与 CC 原始 redstone API 逐项一致
                            (写 /var/log/redstone_verify.log; 由 realmachine_verify.sh 调用)
 scripts/realmachine_verify.sh  真机验证脚本(由 verify.service 以 oneshot 运行, 结果写 /var/log/verify.log)
@@ -584,7 +609,8 @@ tools/harness.lua          host 测试台: 用真实 Delin 工具源码在宿主
                            含信号/进程组语义: kill/killpg/SIGCONT/stopped, 供 sh 作业控制验证;
                            /sys 与 /proc 走真实 kernel.sysfs/kernel.procfs 后端 + 桩显示设备
                            + 桩 printer(/dev/lp0) + 桩 redstone API(加载真实 redstone.ko)
-                           + 桩进程表(ps/pgrep/pkill/killall))
+                           + 桩进程表(ps/pgrep/pkill/killall);
+                           进程环境用内核同一份白名单(src/kernel/procenv.lua), 不放宽)
 tools/hosttest.lua         宿主测试: init 单元引擎/fstab 生成/syslogd 规则/logrotate 轮转/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone(361 项)
 tools/ext2test.lua         宿主 ext2 回归: 真实镜像上跑目录增删(空洞/links/回收), 宿主 e2fsck -fn 判定
 tools/deploy.py            重建干净 ext2 根镜像(基镜像+内核/bin/单元/配置/标记), 属主按基镜像逐条写回;

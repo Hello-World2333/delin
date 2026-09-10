@@ -31,6 +31,7 @@ local profiles = {
         modules = {
             ["kernel.scheduler"] = "src/kernel/scheduler.lua",
             ["kernel.process"]   = "src/kernel/process.lua",
+            ["kernel.procenv"]   = "src/kernel/procenv.lua",
             ["kernel.signal"]    = "src/kernel/signal.lua",
             ["kernel.boot"]      = "src/kernel/boot.lua",
             ["kernel.vfs"]       = "src/kernel/vfs.lua",
