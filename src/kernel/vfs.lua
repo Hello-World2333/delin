@@ -8,20 +8,42 @@ local vfs = {}
 -- 挂载表: array of { root, backend } (root 是 VFS 绝对路径, 如 "/", "/dev", "/mnt/disk/left")
 local mounts = {}
 
+--- 路径规范化: 丢掉空段与 ".", 按 ".." 弹栈 —— **弹到根就停**(POSIX: "/.." 就是 "/")。
+---
+--- 为什么必须在 VFS 这一层做: CC 原生文件系统(CCFS)对"逃出根的 .."是直接**抛错**的
+--- (`/..: Invalid Path`), 不是返回 nil。而 ".." 会从很多地方自然冒出来 —— `ls -la /`
+--- 自己拼出 "/.."、`ls /../etc`、脚本里的 `$PWD/..` —— 于是"列出根目录"这种日常操作直接炸。
+--- 挂载点上的 ".." 按字典序回到父目录(Linux: "/mnt/disk/.." = "/mnt"), 与"不越出挂载点"
+--- 这个直觉不同但与 Linux 一致。
+--- 已知偏离: 经**符号链接目录**的 ".." 在 Linux 里按链接目标解析, 这里一律按字典序解析。
+---@param path string|nil
+---@return string
+local function normalize(path)
+    if path == nil or path == "" then return "/" end
+    if path:sub(1, 1) ~= "/" then path = "/" .. path end
+    local out = {}
+    for seg in path:gmatch("[^/]+") do
+        if seg == ".." then
+            if #out > 0 then out[#out] = nil end
+        elseif seg ~= "." then
+            out[#out + 1] = seg
+        end
+    end
+    if #out == 0 then return "/" end
+    return "/" .. table.concat(out, "/")
+end
+
 --- 挂载一个文件系统。
 ---@param root string  VFS 相对根, 例如 "/" / "/dev" / "/mnt/disk/left"
 ---@param backend table  后端(real 或 virtual), 实现 list/exists/isDir/attributes/getSize/open/getDrive/getFreeSpace/getCapacity/makeDir/move/copy/delete/isReadOnly
 ---@param meta table|nil  可选挂载元数据(device/fstype), 供 `mount` 列出
 function vfs.mount(root, backend, meta)
-    -- 规范化: 保证以 "/" 开头、去掉末尾斜杠(除非就是根)
-    if root == "" then root = "/" end
-    if root ~= "/" then root = root:gsub("/+$", "") end
+    root = normalize(root) -- 保证是绝对路径、无 "."/".."、无末尾斜杠
     mounts[#mounts + 1] = { root = root, backend = backend, meta = meta }
 end
 
 function vfs.unmount(root)
-    if root == "" then root = "/" end
-    if root ~= "/" then root = root:gsub("/+$", "") end
+    root = normalize(root)
     for i = #mounts, 1, -1 do
         if mounts[i].root == root then table.remove(mounts, i) end
     end
@@ -41,13 +63,11 @@ function vfs.list()
 end
 
 --- 解析路径到最长的挂载根。
----@param path string  VFS 绝对路径
+---@param path string  VFS 路径(绝对; 相对路径按根处理)
 ---@return table|nil backend, string rel, string|nil err
 function vfs.resolve(path)
-    -- 归一化: 绝对化、去掉末尾斜杠
-    if path == "" then path = "/" end
-    if path:sub(1, 1) ~= "/" then path = "/" .. path end
-    if path ~= "/" then path = path:gsub("/+$", "") end
+    -- 归一化: 去掉 "."/".."(见 normalize), 绝对化、去重复与末尾斜杠
+    path = normalize(path)
 
     local best = nil
     for _, m in ipairs(mounts) do

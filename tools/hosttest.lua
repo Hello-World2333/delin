@@ -106,8 +106,15 @@ local function devHandle(path, mode)
                  flush = function() return true end, close = function() return true end }
     end
 end
-function F.exists(p) return readFile(host(p)) ~= nil or os.execute("[ -d " .. host(p) .. " ]") == 0 end
-function F.isDir(p) return os.execute("[ -d " .. host(p) .. " ]") == 0 end
+--- os.execute 的返回值跨版本不同: 5.1 是退出码(数字), 5.2+ 是 true/nil + "exit" + code。
+--- 直接拿 `== 0` 判断会让 5.4 下所有目录都"不存在"(init 单元一个都装不进来)。
+local function execOk(cmd)
+    local a, _, code = os.execute(cmd)
+    if type(a) == "number" then return a == 0 end
+    return a == true and (code == nil or code == 0)
+end
+function F.exists(p) return readFile(host(p)) ~= nil or execOk("[ -d " .. host(p) .. " ]") end
+function F.isDir(p) return execOk("[ -d " .. host(p) .. " ]") end
 function F.list(p)
     local out = {}
     local fh = io.popen("ls -A -- " .. host(p) .. " 2>/dev/null")
@@ -1572,6 +1579,64 @@ do
     b, r = vfs.resolve("/sys/class/redstone")
     ok(not b.exists(r), "redstone: exit 注销 class")
     _G.redstone = nil
+end
+
+-- ===============================================================
+-- G2. VFS 路径规范化: "."/".." 必须在 resolve 里吃掉
+--     (真机 bug: CCFS 后端对"逃出根的 .."是**抛错** `/..: Invalid Path`, 而 `ls -la /`
+--      自己会拼出 "/.." —— 只有这一层归一化过, 日常命令才不会炸)
+-- ===============================================================
+do
+    local vfs = require("kernel.vfs")
+    local seen = {} -- 路径 -> "后端tag|rel", 用来断言"落到哪个后端"
+    local function backendOf(tag)
+        return {
+            tag = tag,
+            list = function() return {} end, exists = function() return true end,
+            isDir = function() return true end, attributes = function() return { isDir = true } end,
+        }
+    end
+    vfs.mount("/", backendOf("root"))
+    vfs.mount("/dev", backendOf("dev"))
+    vfs.mount("/mnt/disk", backendOf("disk"))
+
+    local function rel(p)
+        local b, r = vfs.resolve(p)
+        ok(b ~= nil, "vfs: resolve " .. p .. " 成功")
+        seen[p] = (b and b.tag or "?") .. "|" .. tostring(r)
+        return r
+    end
+
+    eq(rel("/"), "/", "vfs: / 的 rel")
+    eq(rel("/.."), "/", "vfs: /.. 夹到根(POSIX: /.. 就是 /)")
+    eq(rel("/../.."), "/", "vfs: /../.. 同样夹到根")
+    eq(rel("/../etc"), "/etc", "vfs: /../etc -> /etc")
+    eq(rel("/."), "/", "vfs: /. 去掉 . 段")
+    eq(rel("/etc/.."), "/", "vfs: /etc/.. -> /")
+    eq(rel("/etc/../etc/./fstab"), "/etc/fstab", "vfs: 混合 . / .. 归一")
+    eq(rel("/etc/"), "/etc", "vfs: 末尾斜杠去掉")
+    eq(rel("/etc//fstab"), "/etc/fstab", "vfs: 重复斜杠折叠")
+    eq(rel("etc/passwd"), "/etc/passwd", "vfs: 相对路径按根处理")
+    eq(seen["/etc/.."], "root|/", "vfs: /etc/.. 落到根挂载")
+    eq(rel("/dev/.."), "/", "vfs: 挂载点上的 .. 回到父目录(Linux 语义)")
+    eq(seen["/dev/.."], "root|/", "vfs: /dev/.. 落到根挂载而不是 /dev 内")
+    eq(rel("/mnt/disk/.."), "/mnt", "vfs: /mnt/disk/.. -> /mnt")
+    eq(seen["/mnt/disk/.."], "root|/mnt", "vfs: 磁盘挂载点上的 .. 落到父目录")
+    eq(rel("/mnt/disk/./boot/../delin.lua"), "/delin.lua", "vfs: 磁盘内的相对段(rel 相对挂载根)")
+    eq(seen["/mnt/disk/./boot/../delin.lua"], "disk|/delin.lua", "vfs: 归一后 rel 仍相对挂载根")
+    eq(rel("/dev/null"), "/null", "vfs: 挂载内的路径不受影响(rel 相对挂载根)")
+    eq(seen["/dev/null"], "dev|/null", "vfs: 挂载内的 rel 相对挂载根")
+
+    -- unmount/mount 的根路径同样要过规范化的那一关
+    vfs.unmount("/mnt/disk/")
+    local b = vfs.resolve("/mnt/disk/x")
+    ok(b ~= nil and b.tag == "root", "vfs: unmount 末尾斜杠也认(/mnt/disk/)")
+    vfs.mount("/mnt/disk/", backendOf("disk2"))
+    local b2, r2 = vfs.resolve("/mnt/disk/x")
+    eq(b2 ~= nil and b2.tag or "?", "disk2", "vfs: 带末尾斜杠 mount 认到同一个挂载点")
+    eq(r2, "/x", "vfs: 重挂后 rel")
+    vfs.unmount("/mnt/disk")
+    vfs.unmount("/dev")
 end
 
 -- ===============================================================

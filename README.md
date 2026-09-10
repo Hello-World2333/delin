@@ -155,6 +155,13 @@ CC 的红石 API 是函数式的（`redstone.getInput(side)` / `redstone.setAnal
 `kill [-SIG] pid|-pgid`、`kill -l`；终端 `^C`（`SIGINT`）/`^Z`（`SIGTSTP`）路由到前台进程组，
 后台进程组读控制终端按 POSIX 投 `SIGTTIN` 并停止（`jobs` 显示 `Stopped`，`fg`/`bg` 可恢复）。
 
+**路径语义**：`resolve` 统一做字典序规范化 —— `.` 丢掉、`..` 弹一层、**到根就停**
+（POSIX：`/..` 就是 `/`），挂载点上的 `..` 回到挂载点的父目录（Linux：`/mnt/disk/..` = `/mnt`）。
+这条不是洁癖：CC 原生 fs（CCFS）对"逃出根的 `..`"是**抛错**（`/..: Invalid Path`）而不是返回 nil，
+而 `ls -la /` 自己就会拼出 `/..` —— 不在这一层吃掉，`ls -a /`、`cat /../etc/passwd`、
+脚本里的 `$PWD/..` 全都会炸。已知偏离：经**符号链接目录**的 `..` 在 Linux 里按链接目标解析，
+Delin 一律按字典序解析。
+
 **文件系统**：进程所见 `fs/io` 走内核 VFS（真实磁盘 + 虚拟 `/dev` `/proc` `/sys` 同一命名空间）；
 权限用 `mode`（八进制）+ `uid/gid`，`chmod`/`chown`，启动外部程序强制检查执行（`x`）位 ——
 **root 也要文件至少有一个 `x` 位**（POSIX：root 绕过的是 `r`/`w` 检查，不绕过 `x`），否则 644 的
@@ -346,7 +353,7 @@ PID 1 现在是**用户态服务管理器**（`src/init/unit.lua` 单元解析 +
 用户态 `/dev/log`、`syslogd` 按 `/etc/syslog.conf` 写 `/var/log/*`（SIGHUP 重开、游标续读不重放）、
 `logrotate` + `logrotate.timer` 轮转、`logger`/`dmesg`。`/etc/fstab` 由 init 生成 mount 单元
 （`local-fs.target`），`mount -a` 复用同一解析器。init 里的自检代码已全部删除，验证改为
-宿主测试台 `tools/hosttest.lua`（369 项）与真机脚本 `tools/realmachine.py` +
+宿主测试台 `tools/hosttest.lua`（405 项）与真机脚本 `tools/realmachine.py` +
 `scripts/realmachine_verify.sh`。
 
 `src/bin/sh` 已升级为 POSIX 核心子集（变量/引号/if/for/while/case/函数/test/[ ]/&&/|| /文件重定向/管道
@@ -501,7 +508,7 @@ sysfs 也从 display 专用泛化成 class 注册表（模块用 `kapi.registerS
 
 ```bash
 lua5.1 tools/build.lua             # 构建 dist/: 压缩内核/DLUB/BIOS/工具/模块/配置 + manifest
-lua5.1 tools/build.lua --check     # 构建 + 压缩等价性门禁(hosttest 369 项 + 6 个自检脚本差分)
+lua5.1 tools/build.lua --check     # 构建 + 压缩等价性门禁(hosttest 405 项 + 6 个自检脚本差分)
 lua5.1 tools/build.lua --release   # 构建 + 生成 dist/release/<版本>/ 发布树(安装布局的 payload)
 sh tools/serve.sh                  # 把发布树挂在 10568 端口(游戏侧 wget 安装用)
 ```
@@ -632,10 +639,11 @@ key/char 事件**来驱动向导。喂按键的时机靠 `wait` 盯 `/delin-inst
 验证：
 
 ```bash
-lua5.1 tools/hosttest.lua        # 宿主测试: init 引擎/fstab/syslogd/logrotate/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone (369 项)
+lua5.1 tools/hosttest.lua        # 宿主测试: init 引擎/fstab/syslogd/logrotate/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone (405 项)
 DELIN_REPO=<压缩后的源码树> lua5.1 tools/hosttest.lua         # 压缩器等价性: 同一套测试跑在压缩产物上
 DELIN_SRCBIN=<压缩后的 bin> lua5.1 tools/harness.lua /bin/sh # 同上, 工具级差分比对
-lua5.4 tools/hosttest.lua        # 同上用 5.4 跑一遍(CC 是 5.2 语义, 不能只在 5.1 上验)
+lua5.4 tools/hosttest.lua        # 同上用 5.4 跑一遍(CC 是 5.2 语义, 不能只在 5.1 上验;
+                                 # 测试台的 fs 门面曾用 os.execute(...)==0 判目录 —— 5.1 独有语义)
 lua5.1 tools/harness.lua /bin/sh # 宿主上跑真实工具源码(sh/作业控制/管道; /sys 走真实 sysfs 后端, /proc 走真实 procfs 后端)
 lua5.1 tools/installertest.lua    # 安装器宿主回归: 假 CraftOS 环境(假终端格子+脚本化事件队列)跑构建产物
                                   # dist/install.lua, 按键序列驱动整套向导(12 用例/185 断言: 两种落盘形态、
@@ -679,7 +687,8 @@ src/kernel/procenv.lua     进程环境白名单: 只把列出的 CC/Lua 全局�
                            在内核层封掉 loadfile/dofile/os.run/require/settings/shell/disk/peripheral
                            /os.pullEvent/queueEvent/shutdown 等绕过 Delin 接口的渠道
 src/kernel/signal.lua      POSIX 信号编号/默认动作/可捕获表/名字表
-src/kernel/vfs.lua         虚拟文件系统: 挂载表 + resolve + real/virtual 后端
+src/kernel/vfs.lua         虚拟文件系统: 挂载表 + resolve(路径规范化: 吃掉 "."/".." 并夹在根上)
+                            + real/virtual 后端
 src/kernel/vfs_api.lua     VFS 门面(fs/io) + /dev 设备注册表 + stdio
 src/kernel/klog.lua        内核日志: ring buffer + /dev/kmsg(带 cursor/seek) + /dev/log + syslog 优先级名表
 src/kernel/fstab.lua       /etc/fstab 解析(fstab(5) 子集) + systemd 风格 mount 单元命名
@@ -794,7 +803,7 @@ tools/harness.lua          host 测试台: 用真实 Delin 工具源码在宿主
                            + 桩 printer(/dev/lp0) + 桩 redstone API(加载真实 redstone.ko)
                            + 桩进程表(ps/pgrep/pkill/killall);
                            进程环境用内核同一份白名单(src/kernel/procenv.lua), 不放宽)
-tools/hosttest.lua         宿主测试: init 单元引擎/fstab 生成/syslogd 规则/logrotate 轮转/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone(369 项)
+tools/hosttest.lua         宿主测试: init 单元引擎/fstab 生成/syslogd 规则/logrotate 轮转/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone(405 项)
 tools/installertest.lua    安装器宿主回归: 假 CraftOS(fs/term/os/http/disk/peripheral + 脚本化事件队列)
                            + 假终端格子(含 fg/bg), 用 loadfile 跑 dist/install.lua, 按键序列驱动向导
                            并断言落盘文件/镜像/日志; 失败时 dump 每一屏(含反色行标记)

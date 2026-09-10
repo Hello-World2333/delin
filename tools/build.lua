@@ -274,7 +274,7 @@ local CHECK_SCRIPTS = {
 local function check()
     local M = buildMirror()
 
-    -- 1) 内核/init/模块: hosttest 全绿(压缩树上跑同一套 361 项)
+    -- 1) 内核/init/模块: hosttest 全绿(压缩树上跑同一套 405 项)
     print("-- check: hosttest(压缩树) --")
     run("hosttest(压缩树)", "DELIN_REPO='" .. M .. "' lua5.1 tools/hosttest.lua > /tmp/delin-check-hosttest.log 2>&1")
     local log = readAll("/tmp/delin-check-hosttest.log")
