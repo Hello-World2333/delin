@@ -152,7 +152,9 @@ CC 的红石 API 是函数式的（`redstone.getInput(side)` / `redstone.setAnal
 后台进程组读控制终端按 POSIX 投 `SIGTTIN` 并停止（`jobs` 显示 `Stopped`，`fg`/`bg` 可恢复）。
 
 **文件系统**：进程所见 `fs/io` 走内核 VFS（真实磁盘 + 虚拟 `/dev` `/proc` `/sys` 同一命名空间）；
-权限用 `mode`（八进制）+ `uid/gid`，`chmod`/`chown`，启动外部程序强制检查执行（`x`）位。
+权限用 `mode`（八进制）+ `uid/gid`，`chmod`/`chown`，启动外部程序强制检查执行（`x`）位 ——
+**root 也要文件至少有一个 `x` 位**（POSIX：root 绕过的是 `r`/`w` 检查，不绕过 `x`），否则 644 的
+脚本 `./script` 也能跑起来。CC 原生文件系统（`ccdisk`）没有权限位，其文件一律视为可执行。
 
 **用户**：`/etc/passwd` `name:x:uid:gid:fullname:home:shell`、`/etc/shadow` `name:salt$hash`、
 `/etc/group`；`login` 提示用户名/密码（隐藏回显），验证通过后按该用户 `uid/gid` 起 `sh`。
@@ -355,7 +357,7 @@ UUID 用磁盘 ID 模拟，磁盘不随启动自动挂载（改由 `/etc/fstab` 
 终端侧：tty 层解释 ANSI 转义（SGR 16 色/ED-EL 清屏/CUP 定位/光标显隐与保存恢复，见上文
 「终端（ANSI / `$TERM=linux`）」），`$TERM=linux` 随环境导出，`echo` 支持 `-n`/`-e`，新增 `/bin/clear`，
 `login` 每次提示前清屏。
-`scripts/posix_test.sh`（111 项）与 `scripts/jobctl_test.sh` 在宿主与 Delin 上各跑一次逐项比对，
+`scripts/posix_test.sh`（122 项）与 `scripts/jobctl_test.sh` 在宿主与 Delin 上各跑一次逐项比对，
 `scripts/sysinfo.sh` 演示实用用法。
 
 打印机经 `ccprinter` 模块抽象成 `/dev/lpN` 字符设备（`cat f > /dev/lp0` / `lp f` 即打印，折行与
@@ -559,7 +561,8 @@ src/bin/ps                 报告进程状态, 数据源 /proc (POSIX ps + procp
 src/bin/pgrep              按进程名/命令行查找进程 (procps pgrep 子集: -f -x -v -l -a -n -o -u; Lua pattern)
 src/bin/pkill              按进程名/命令行发信号 (procps pkill 子集: -SIG/-s/--signal + pgrep 的选择项)
 src/bin/killall            按进程名给所有同名进程发信号 (psmisc killall 子集: -SIG/-s/-l/-e/-q/-u)
-src/bin/chmod              修改文件权限 (八进制+符号模式 [ugoa]*[+-=][rwx]*, -R 递归)
+src/bin/chmod              修改文件权限 (八进制+符号模式 [ugoa]*[+-=][rwx]*; 以 - 开头的符号模式
+                           也成立: chmod -x/-wx/-r 与 GNU 一致, 递归只有 -R)
 src/bin/chown              修改文件属主/属组 ([OWNER][:[GROUP]], -R 递归)
 src/bin/mount              挂载 /dev/sdX、UUID=<uuid> 或镜像路径 (-a 按 fstab; 无 -t 按设备类型; 无参列出)
 src/bin/umount             卸载文件系统 (umount <dir>|<-device>)
@@ -590,12 +593,12 @@ src/modules/*.ko           内核模块: ccdisk(ccdisk fstype) ccmonitor(CC 显�
                            void(Void 全息驱动)
 src/modules/modules.alias  驱动别名(modprobe 风格): tm_gpu->tom hologram->void monitor->ccmonitor printer->ccprinter
 src/modules/manifest       默认装载模块清单: demo ext2 ccdisk redstone
-scripts/posix_test.sh      可移植 POSIX 自检(host 与 Delin 各跑一次比对, 111 项全过)
+scripts/posix_test.sh      可移植 POSIX 自检(host 与 Delin 各跑一次比对, 122 项全过)
 scripts/jobctl_test.sh     作业控制自检(& / $! / jobs / fg / bg / wait / kill %job, host 与真机各跑一次)
 scripts/sysinfo.sh         实用小工具: 系统信息(变量/函数/for/case/if/重定向/工具)
 scripts/proc_test.sh       /proc + ps/pgrep/pkill/killall 自检(host harness 与真机各跑一次比对, 41 项)
 scripts/redstone_test.sh   /sys/class/redstone 读写/校验自检(host harness 与真机各跑一次比对, 50 项)
-scripts/lua_test.sh        /bin/lua 自检(host harness 与真机各跑一次比对, 93 项): 脚本/stdin/arg/变参/
+scripts/lua_test.sh        /bin/lua 自检(host harness 与真机各跑一次比对, 107 项): 脚本/stdin/arg/变参/
                            dofile+loadfile/错误消息与退出码/shebang/进程环境白名单
 scripts/lua_repl_test.sh   /bin/lua 交互式 REPL 自检(宿主专用: 测试台把 stdin 伪装成终端,
                            覆盖提示符/表达式自动打印/续行/报错/SIGINT/_PROMPT/EOF 退出码, 16 项)

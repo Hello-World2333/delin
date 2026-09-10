@@ -17,6 +17,12 @@ local function hasPerm(inode, uid, gid, perm) -- perm: 1=x,2=w,4=r
     local m = math.floor(inode.perms / (2 ^ c)) % 8
     return m % (perm * 2) >= perm
 end
+-- 低 9 位里是否有任何一个 x 位(u/g/o 其一)。root 执行文件时用得上: POSIX 下 root 绕过的是
+-- r/w 检查, **不**绕过 x —— 文件必须至少有一个 x 位才可执行。
+local function anyExecBit(perms)
+    local p = perms % 512
+    return (p % 2) == 1 or (math.floor(p / 8) % 2) == 1 or (math.floor(p / 64) % 2) == 1
+end
 
 -- 读小端
 local function u16(s, off) local a, b = s:byte(off + 1, off + 2); return a + b * 256 end
@@ -841,11 +847,14 @@ function ext2.backend(fs)
         chown = function(rel, uid, gid) return ext2.chown(fs, rel, uid, gid) end,
         -- 执行权限检查: 启动一个程序(普通文件/符号链接)必须对当前进程有 x 位。
         -- 目录/设备等不可执行。符号链接按其 i_block 内联目标判定(本 FS 不用它执行)。
+        -- root 也不能一路放行: POSIX 只要求文件至少有一个 x 位(root 绕过的是 r/w, 不绕过 x),
+        -- 否则 644 的脚本 `./script` 也能跑起来(历史 bug)。
         canExecute = function(rel)
             local inode = ext2.lookup(fs, rel)
             if not inode then return false end
             if inode.type ~= T_REG and inode.type ~= T_SYM then return false end
             local c = cred()
+            if c.uid == 0 then return anyExecBit(inode.perms) end
             return hasPerm(inode, c.uid, c.gid, 1)
         end,
     }

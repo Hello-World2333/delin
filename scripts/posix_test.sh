@@ -386,6 +386,65 @@ ls -l "$S/sub/f" > "$S/lsrec.txt"
 grep -F "rwx------" "$S/lsrec.txt" > "$S/p4.txt"
 chk chmod_recursive [ -s "$S/p4.txt" ]
 
+# chmod -x / +x: 以 - 开头的符号模式整体就是 MODE(与 GNU 一致; -r/-w/-x 是模式, -R 才是递归)
+chmod 755 "$S/perm.txt"
+chmod -x "$S/perm.txt"
+ls -l "$S/perm.txt" > "$S/lsx.txt"
+grep -F "rw-r--r--" "$S/lsx.txt" > "$S/p5.txt"
+chk chmod_dash_x [ -s "$S/p5.txt" ]
+
+chmod +x "$S/perm.txt"
+ls -l "$S/perm.txt" > "$S/lsx2.txt"
+grep -F "rwxr-xr-x" "$S/lsx2.txt" > "$S/p6.txt"
+chk chmod_plus_x [ -s "$S/p6.txt" ]
+
+chmod -w "$S/perm.txt"
+ls -l "$S/perm.txt" > "$S/lsw.txt"
+grep -F "r-xr-xr-x" "$S/lsw.txt" > "$S/p7.txt"
+chk chmod_dash_w [ -s "$S/p7.txt" ]
+
+chmod 755 "$S/perm.txt"
+chmod -- -x "$S/perm.txt"
+ls -l "$S/perm.txt" > "$S/lsdd.txt"
+grep -F "rw-r--r--" "$S/lsdd.txt" > "$S/p8.txt"
+chk chmod_dashdash_dash_x [ -s "$S/p8.txt" ]
+
+chmod 755 "$S/perm.txt"
+chmod -R -x "$S/perm.txt"
+ls -l "$S/perm.txt" > "$S/lsRx.txt"
+grep -F "rw-r--r--" "$S/lsRx.txt" > "$S/p9.txt"
+chk chmod_R_dash_x [ -s "$S/p9.txt" ]
+
+# 多个 - 模式: 755 去掉 x 与 w -> 444 (r--r--r--), 与 GNU 一致
+chmod 755 "$S/perm.txt"
+chmod -x -w "$S/perm.txt"
+ls -l "$S/perm.txt" > "$S/lsmulti.txt"
+grep -F "r--r--r--" "$S/lsmulti.txt" > "$S/p13.txt"
+chk chmod_dash_multi [ -s "$S/p13.txt" ]
+
+# 组合模式 -wx: 755 去掉 w 与 x -> 444 (r--r--r--)
+# 注: 这里不测 -rx(755 -> 200): 那样文件对属主也不可读, 宿主测试台的 exists 走 fopen 就看不到
+# 它了(真机 ext2 的 exists 是查目录项, 不受影响), 而本套自检要求两边输出一致。
+chmod 755 "$S/perm.txt"
+chmod -wx "$S/perm.txt"
+ls -l "$S/perm.txt" > "$S/lsrx.txt"
+grep -F "r--r--r--" "$S/lsrx.txt" > "$S/p10.txt"
+chk chmod_dash_wx [ -s "$S/p10.txt" ]
+chmod 755 "$S/perm.txt"
+
+# -r 是"去掉读位"的模式(不是递归): 目录自身的位变了(755 -> 311), 目录里的文件不能被动到
+mkdir -p "$S/norec"
+echo "inner" > "$S/norec/inner.txt"
+chmod 755 "$S/norec" "$S/norec/inner.txt"
+chmod -r "$S/norec"
+ls -ld "$S/norec" > "$S/lsnorec.txt"
+grep -F "wx--x--x" "$S/lsnorec.txt" > "$S/p11.txt"
+chk chmod_dash_r_not_recursive [ -s "$S/p11.txt" ]
+ls -l "$S/norec/inner.txt" > "$S/lsinner.txt"
+grep -F "rwxr-xr-x" "$S/lsinner.txt" > "$S/p12.txt"
+chk chmod_dash_r_keeps_inner [ -s "$S/p12.txt" ]
+chmod 755 "$S/norec"   # 还原本目录权限, 否则后面的清理删不掉它
+
 # chown: 数字/名字(宿主对改属主受限, 但命令应无错且解析正确)
 chown 1000:1000 "$S/perm.txt"
 chk chown_numeric [ -e "$S/perm.txt" ]
@@ -402,6 +461,18 @@ chk run_shebang_exec [ -s "$S/s1.txt" ]
 sh "$S/my.sh" world > "$S/out2.txt"
 grep -F "SHEBANG_OK arg1=world" "$S/out2.txt" > "$S/s2.txt"
 chk run_sh_script [ -s "$S/s2.txt" ]
+
+# 没有 x 位就不能直接执行(126 = permission denied)。root 也一样: POSIX 只要求文件至少有
+# 一个 x 位(root 绕过的是 r/w, 不绕过 x)—— 否则 644 的脚本 `./script` 也能跑。
+echo '#!/bin/sh' > "$S/noexec.sh"
+echo 'echo NOPE' >> "$S/noexec.sh"
+chmod 644 "$S/noexec.sh"
+"$S/noexec.sh" > "$S/noexec1.txt"   # stderr 与 stdout 同流(无需 2>&1, Delin sh 也不支持它)
+if [ "$?" = "126" ]; then echo "ok noexec_denied"; else echo "ng noexec_denied"; outcome=1; fi
+# 有读权限就能用解释器跑(不要求 x 位)
+sh "$S/noexec.sh" > "$S/noexec2.txt"
+grep -F "NOPE" "$S/noexec2.txt" > "$S/s4.txt"
+chk noexec_via_interpreter [ -s "$S/s4.txt" ]
 
 # 无 shebang 的 Lua 程序(./script 直接跑): 以 Lua 源码执行, 输出走 io.write(print 被内核接管)。
 echo 'io.write("LUAOK")' > "$S/prog.lua"

@@ -91,6 +91,30 @@ echo "-- redstone_test.sh (/sys/class/redstone 读写/校验自检) --" >> $LOG
 sh /root/redstone_test.sh >> $LOG
 echo "-- lua_test.sh (/bin/lua 脚本/stdin/arg/dofile/退出码 + 进程环境白名单自检) --" >> $LOG
 sh /root/lua_test.sh >> $LOG
+# chmod 的符号模式与执行位(根映像只有 256 个 inode, 这里只用 3 个文件, 不能整跑 posix_test.sh)
+echo "-- chmod 模式(-x/-R -x) 与执行位(root 也要 x 位) --" >> $LOG
+CD=/tmp/chmodchk
+rm -rf $CD
+mkdir -p $CD/d
+echo '#!/bin/sh' > $CD/x.sh
+echo 'echo SHOK' >> $CD/x.sh
+echo 'echo INNER' >> $CD/d/f.sh
+chmod 755 $CD/x.sh $CD/d/f.sh
+$CD/x.sh >> $LOG
+echo "chmod755_run_exit=$?" >> $LOG
+chmod -x $CD/x.sh
+ls -l $CD/x.sh >> $LOG
+$CD/x.sh > /dev/null
+if [ "$?" = "126" ]; then echo "ok chmod_noexec_126" >> $LOG; else echo "ng chmod_noexec_126" >> $LOG; fi
+chmod +x $CD/x.sh
+$CD/x.sh >> $LOG
+echo "chmod_plus_x_run_exit=$?" >> $LOG
+chmod 755 $CD/d/f.sh
+chmod -R -x $CD/d
+ls -l $CD/d/f.sh >> $LOG
+chmod -x -w $CD/x.sh
+ls -l $CD/x.sh >> $LOG
+rm -rf $CD
 echo "-- redstone_verify.lua (sysfs 与 CC 原始 redstone API 交叉核对) --" >> $LOG
 /root/redstone_verify.lua
 cat /var/log/redstone_verify.log >> $LOG

@@ -117,6 +117,19 @@ h:close()
 local r = assert(ext2.backend(fs).open("/d/f1", "r"))
 eq(r:readAll(), "hello ext2\n", "写文件后读回内容一致")
 
+-- canExecute: 执行位判定。POSIX 下 root 也要求文件**至少有一个 x 位**(root 绕过的是 r/w,
+-- 不绕过 x)—— 否则 644 的脚本 `./script` 也能跑起来(真机暴露过的 bug: 验伪服务以 root 跑,
+-- 于是所有文件都"可执行")。目录/不存在的文件一律 false。
+local be = ext2.backend(fs)
+assert(ext2.create(fs, "/d", "x644", T_REG + tonumber("644", 8)))
+assert(ext2.create(fs, "/d", "x755", T_REG + tonumber("755", 8)))
+assert(ext2.create(fs, "/d", "x111", T_REG + tonumber("111", 8)))
+eq(be.canExecute("/d/x644"), false, "canExecute: 644 不可执行(root 也不能)")
+eq(be.canExecute("/d/x755"), true,  "canExecute: 755 可执行")
+eq(be.canExecute("/d/x111"), true,  "canExecute: 111 可执行(有 x 位即可, 不要求可读)")
+eq(be.canExecute("/d"),      false, "canExecute: 目录不可执行")
+eq(be.canExecute("/d/nope"), false, "canExecute: 不存在的文件 -> false")
+
 bd.close()
 
 -- ---------------------------------------------------------------

@@ -6,6 +6,7 @@
 --         未完成的语句自动续行(靠语法错误里的 <eof> 判定), ^D(EOF) 退出, ^C 取消当前输入行。
 --         提示符可用全局 _PROMPT/_PROMPT2 覆盖(与官方 lua 一致)。
 --   脚本: arg[0]=脚本路径, arg[1..]=参数, arg[-1]=解释器路径; 脚本体收到变参 ...
+--         脚本路径与 dofile/loadfile 的相对路径按进程 cwd 展开(VFS 只认绝对路径)。
 --         dofile/loadfile 由本工具提供, 且**读文件走 Delin VFS**(不是 CC 原生 fs)。
 --         因此 `#!/bin/lua` 也成立(内核把脚本路径当第一个参数传进来)。
 --         print 在本环境里被覆盖成写 stdout(制表符分隔, 同 lua(1)), 不是内核的 kprint。
@@ -62,6 +63,22 @@ end
 -- ---------------------------------------------------------------
 -- 文件读取(dofile/loadfile 与脚本模式共用): 走 VFS
 -- ---------------------------------------------------------------
+-- VFS 的 fs.open 只认绝对路径: 相对路径按进程 cwd 展开(与 cat/ls/ed 等工具同一套 resolve)。
+local here = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return "/" end
+    local base = ""
+    if p:sub(1, 1) ~= "/" then base = (here == "/") and "" or here end
+    local stack = {}
+    for seg in (base .. "/" .. p):gmatch("[^/]+") do
+        if seg == "." then -- 跳过
+        elseif seg == ".." then stack[#stack] = nil
+        else stack[#stack + 1] = seg end
+    end
+    return "/" .. table.concat(stack, "/")
+end
+
 -- 脚本首行的 #! 规则(与 lua(1)/luaL_loadfile 一致): 文件以 # 开头时首行整体当注释。
 -- 只把首行内容挖空、保留那个换行 —— 这样后续行号与文件行号对齐(与 Lua 补 '\n' 的做法同效)。
 local function stripShebang(src)
@@ -71,8 +88,9 @@ local function stripShebang(src)
     return "\n" .. src:sub(nl + 1)
 end
 
+-- 读文件按 resolved 路径, 但 chunk 名用用户写的那份(报错里显示相对路径, 与 lua(1) 一致)。
 local function readFile(path)
-    local f, oerr = fs.open(path, "r")
+    local f, oerr = fs.open(resolve(path), "r")
     if not f then return nil, oerr or "cannot open" end
     local src = f.readAll()
     f.close()

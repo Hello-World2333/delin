@@ -142,8 +142,38 @@ chkcontain lua_shebang_tag  'shebang' $T/shebang.out
 chkcontain lua_shebang_path "$T/shebang.lua" $T/shebang.out
 chkcontain lua_shebang_arg  '%shi$' $T/shebang.out
 
+# 没有 x 位就只能用解释器跑(126 = permission denied; root 也要至少一个 x 位)
+chmod 644 $T/shebang.lua
+chkrun lua_shebang_noexec 126 $T/shebang.noexec.out $T/shebang.lua hi
+lua $T/shebang.lua hi > $T/shebang.read.out
+chkcontain lua_noexec_via_interpreter 'shebang' $T/shebang.read.out
+chmod 755 $T/shebang.lua
+
 # ---------------------------------------------------------------
-# 6. 内核进程环境白名单: 直接由 sh 执行的 Delin 程序(无 shebang)= 纯内核进程环境。
+# 6. 相对路径: VFS 只认绝对路径, 解释器按进程 cwd 展开(与 cat/ls 等工具一致)
+# ---------------------------------------------------------------
+mkdir -p $T/sub
+echo 'print("rel ok")' > $T/rel.lua
+echo 'print("sub ok")' > $T/sub/rel2.lua
+echo 'return 5' > $T/relinc.lua
+echo 'print(dofile("relinc.lua"))' > $T/reldofile.lua
+cd $T
+chkrun lua_rel_script 0 $T/rel.out lua rel.lua
+chkcontain lua_rel_script_out 'rel ok' $T/rel.out
+chkrun lua_rel_dotslash 0 $T/reldots.out lua ./rel.lua
+chkcontain lua_rel_dotslash_out 'rel ok' $T/reldots.out
+chkrun lua_rel_subdir 0 $T/relsub.out lua sub/rel2.lua
+chkcontain lua_rel_subdir_out 'sub ok' $T/relsub.out
+chkrun lua_rel_dofile 0 $T/reldf.out lua reldofile.lua
+chkcontain lua_rel_dofile_out '^5$' $T/reldf.out
+chkrun lua_rel_dotdot 0 $T/reldd.out lua sub/../rel.lua
+chkcontain lua_rel_dotdot_out 'rel ok' $T/reldd.out
+chkrun lua_rel_missing 1 $T/relmiss.out lua nosuch.lua
+chkcontain lua_rel_missing_msg 'cannot open' $T/relmiss.out
+cd /
+
+# ---------------------------------------------------------------
+# 7. 内核进程环境白名单: 直接由 sh 执行的 Delin 程序(无 shebang)= 纯内核进程环境。
 #    这里用 io.write 输出(print 在 Delin 程序里走 klog)。
 # ---------------------------------------------------------------
 echo 'local function chk(n, c) io.write(c and ("ok " .. n) or ("ng " .. n), "\n") end' > $T/envcheck.lua
@@ -182,5 +212,6 @@ chkrun lua_env_ok 0 $T/luaenv.out lua $T/luaenv.lua
 chkcontain lua_env_provides '^true%strue%strue%strue%strue$' $T/luaenv.out
 
 # ---------------------------------------------------------------
+rm -rf $T   # 根映像 inode 很紧(256 个), 用完即清(与 proc_test/redstone_test 一致)
 echo "lua_test: done (exit=$outcome)"
 exit $outcome

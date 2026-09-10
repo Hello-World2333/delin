@@ -1,8 +1,11 @@
 -- Delin chmod: 修改文件权限 (POSIX 子集 + GNU -R/-v/-c/-f)。
 -- 用法: chmod [OPTION]... MODE FILE...
---   MODE 可为八进制(如 755 / 0644 / 0o755) 或符号模式([ugoa]*[+-=][rwxX]*,...)
+--   MODE 可为八进制(如 755 / 0644 / 0o755) 或符号模式([ugoa]*[+-=][rwxX]*,...);
+--   以 - 开头的符号模式同样成立: `chmod -x FILE`(去掉 x 位), `chmod -rw FILE`
+--   —— 与 GNU 一致(含模式字符的 - 参数整体当 MODE, 不被当成选项); 注意 GNU 的 -r/-w/-x
+--   是**模式**(去读/去写/去执行), 递归只有 -R。
 --   --reference=RFILE  以 RFILE 的权限为准
---   -R/-r, --recursive 递归
+--   -R, --recursive 递归
 --   -v, --verbose      对每个改动打印
 --   -c, --changes      只打印实际改动的
 --   -f, --silent       忽略错误
@@ -118,23 +121,41 @@ end
 -- ---------------------------------------------------------------
 -- 选项解析
 -- ---------------------------------------------------------------
+-- GNU chmod 的规则: `-` 开头但含**符号模式字符**的参数整体就是 MODE, 不当选项看 ——
+-- 于是 `chmod -x file`(去掉 x 位)/ `chmod -rw file` 都成立(GNU 把 rwxXstugoa,+-= 这些
+-- 字符都登记进 getopt 串, 命中就把整个参数当模式)。纯选项组合(-R/-v/-c/-f/-Rv)照旧。
+local MODE_CHAR = {
+    r = true, w = true, x = true, X = true, s = true, t = true,
+    u = true, g = true, o = true, a = true,
+    [","] = true, ["+"] = true, ["-"] = true, ["="] = true,
+}
+local function isDashMode(a)
+    if a:sub(1, 1) ~= "-" or a == "-" or a:sub(1, 2) == "--" then return false end
+    for k = 2, #a do
+        if MODE_CHAR[a:sub(k, k)] then return true end
+    end
+    return false
+end
+
 local optRecursive, optVerbose, optChanges, optSilent = false, false, false, false
 local refFile = nil
+local dashModes = {} -- - 开头的模式条款(可多个: `chmod -x -w f` 两条都生效, 与 GNU 一致)
 local positional, noMoreOpts = {}, false
 for _, a in ipairs(args) do
     if noMoreOpts then
         positional[#positional + 1] = a
     elseif a == "--" then
         noMoreOpts = true
-    elseif a == "-R" or a == "-r" or a == "--recursive" then optRecursive = true
+    elseif a == "-R" or a == "--recursive" then optRecursive = true
     elseif a == "-v" or a == "--verbose" then optVerbose = true
     elseif a == "-c" or a == "--changes" then optChanges = true
     elseif a == "-f" or a == "--silent" or a == "--quiet" then optSilent = true
     elseif a:match("^%-%-reference=") then refFile = resolve(a:sub(#"--reference=" + 1))
-    elseif a:sub(1, 1) == "-" and a ~= "-" then
+    elseif isDashMode(a) then dashModes[#dashModes + 1] = a
+    elseif a:sub(1, 1) == "-" then
         for k = 2, #a do
             local ch = a:sub(k, k)
-            if ch == "R" or ch == "r" then optRecursive = true
+            if ch == "R" then optRecursive = true
             elseif ch == "v" then optVerbose = true
             elseif ch == "c" then optChanges = true
             elseif ch == "f" then optSilent = true
@@ -153,6 +174,10 @@ end
 local modeStr, fileList
 if refFile then
     modeStr = nil
+    fileList = positional
+elseif #dashModes > 0 then
+    -- `chmod -x FILE...`(MODE 由 - 开头的参数给出): 位置参数全是文件
+    modeStr = table.concat(dashModes, ",")
     fileList = positional
 else
     modeStr = positional[1]
