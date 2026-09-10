@@ -10,7 +10,19 @@
 
 io.stdout:setvbuf("line")
 os.epoch = os.epoch or function() return os.time() * 1000 end
-package.path = "/home/worker/delin/src/?.lua;" .. package.path
+--- 仓库根: 按本脚本位置推并补成绝对路径(别写死绝对路径, 否则换台机器/CI 上 require 不到 src/)。
+local function repoRoot()
+    local self = (arg and arg[0]) or "tools/ext2test.lua"
+    local dir = self:match("^(.*)/[^/]*$") or "."   -- 脚本所在目录
+    local root = dir:match("^(.*)/[^/]+$") or "."    -- 去掉 tools = 仓库根
+    if root:sub(1, 1) ~= "/" then
+        local p = io.popen("pwd")
+        local cwd = p:read("*l"); p:close()
+        root = (root == ".") and cwd or (cwd .. "/" .. root:gsub("^%./", ""))
+    end
+    return root
+end
+package.path = repoRoot() .. "/src/?.lua;" .. package.path
 
 local ext2 = require("kernel.ext2")
 

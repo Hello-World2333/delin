@@ -23,7 +23,20 @@ end
 
 -- 内核模块(与真机同一份源码): 进程环境白名单等要用真实实现, 不能在测试台上另写一套。
 -- REPO 可用 DELIN_REPO 覆盖: 压缩器等价性门禁会在一个"压缩后的镜像树"上跑同一套测试。
-local REPO = os.getenv("DELIN_REPO") or "/home/worker/delin"
+-- 没给 DELIN_REPO 时按**本脚本所在目录**推仓库根, 并补成绝对路径 —— 别写死绝对路径:
+-- 换台机器/CI 上跑就会变成 "module 'kernel.procenv' not found"(v0.0.2 tag 第一次跑 CI 就是这么炸的)。
+local function repoRoot()
+    local self = (arg and arg[0]) or "tools/harness.lua"
+    local dir = self:match("^(.*)/[^/]*$") or "."   -- 脚本所在目录
+    local root = dir:match("^(.*)/[^/]+$") or "."    -- 去掉 tools = 仓库根
+    if root:sub(1, 1) ~= "/" then
+        local p = io.popen("pwd")
+        local cwd = p:read("*l"); p:close()
+        root = (root == ".") and cwd or (cwd .. "/" .. root:gsub("^%./", ""))
+    end
+    return root
+end
+local REPO = os.getenv("DELIN_REPO") or repoRoot()
 package.path = REPO .. "/src/?.lua;" .. package.path
 local procenv = require("kernel.procenv")
 local VERSION = require("kernel.version") -- 模块目录名 /lib/modules/<version>

@@ -58,7 +58,20 @@ local hostos = os
 local hostio = io
 local unpack = table.unpack or unpack
 
-local REPO = hostos.getenv("DELIN_REPO") or "/home/worker/delin"
+--- 仓库根: 按本脚本位置推, 并补成**绝对路径**(别写死 /home/worker/delin: 换台机器/CI 上跑就会
+--- require 不到 src/; 而默认源的软链替身也必须用绝对目标, 否则相对软链是断的)。
+local function repoRoot()
+    local self = (arg and arg[0]) or "tools/installertest.lua"
+    local dir = self:match("^(.*)/[^/]*$") or "."   -- 脚本所在目录
+    local root = dir:match("^(.*)/[^/]+$") or "."    -- 去掉 tools = 仓库根
+    if root:sub(1, 1) ~= "/" then
+        local p = hostio.popen("pwd")
+        local cwd = p:read("*l"); p:close()
+        root = (root == ".") and cwd or (cwd .. "/" .. root:gsub("^%./", ""))
+    end
+    return root
+end
+local REPO = hostos.getenv("DELIN_REPO") or repoRoot()
 local RELEASE_ROOT = REPO .. "/dist/release"
 local INSTALL_BUNDLE = REPO .. "/dist/install.lua"
 local E2FSCK = "/usr/sbin/e2fsck"
