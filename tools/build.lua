@@ -116,6 +116,8 @@ local function build()
     end
     local kin, kout = bundleMinified("kernel", DIST .. "/kernel.lua")
     local din, dout = bundleMinified("dlub", DIST .. "/dlub.lua")
+    local iin, iout = bundleMinified("installer", DIST .. "/install.lua")
+    print(string.format("install.lua  %d -> %d", iin, iout))
 
     -- 2) BIOS
     acc(minifyTo("src/bios/startup.lua", DIST .. "/bios/startup.lua", {}))
@@ -196,6 +198,9 @@ local function buildRelease()
         { DIST .. "/kernel.lua",       "boot/delin.lua" },
         { DIST .. "/dlub.lua",         "boot/dlub.lua" },
     }
+    -- 安装器本体放在发布树根: 用户 `wget run <base>/install.lua`
+    writeAll(RELEASE_ROOT .. "/install.lua", readAll(DIST .. "/install.lua"))
+
     local function copyTo(src, rel)
         local dst = RELEASE_ROOT .. "/payload/" .. rel
         bundle.mkdirp(dst:match("^(.*)/[^/]+$") or ".")

@@ -912,7 +912,9 @@ function ext2.mkfs(bd, opts)
     while off < blocks * blockSize do
         local n = math.min(#zero, blocks * blockSize - off)
         local ok, werr = bd.write(off, n == #zero and zero or zero:sub(1, n))
-        if not ok then return nil, "mkfs: 清零失败: " .. tostring(werr) end
+        if not ok then
+            return nil, string.format("mkfs: 清零失败于偏移 %d: %s", off, tostring(werr))
+        end
         off = off + n
     end
 

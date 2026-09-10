@@ -83,6 +83,17 @@ local profiles = {
         assets = {},
         entry = "__require('kernel.dlub').master()",
     },
+    -- 游戏内安装器(CraftOS 程序): 自带 ext2 驱动与 mkfs, 所以安装完全不需要外部工具。
+    installer = {
+        modules = {
+            ["kernel.blockdev"] = "src/kernel/blockdev.lua",
+            ["kernel.ext2"]     = "src/kernel/ext2.lua",
+            ["installer.crc32"] = "tools/crc32.lua",
+            ["installer.main"]  = "tools/installer.lua",
+        },
+        assets = {},
+        entry = "__require('installer.main').run()",
+    },
 }
 
 --- 把 src/init/*.lua 拼成一个自包含的用户态 init chunk。

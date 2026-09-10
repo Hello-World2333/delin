@@ -531,6 +531,55 @@ sh tools/serve.sh                  # 把发布树挂在 10568 端口(游戏侧 w
 产物均以 Lua 5.2+ `_ENV` 技巧打包，每个模块包一层 `__require` 到内部 shim；init 的多个源文件
 （`unit.lua` + `service.lua` + `init.lua`）拼成**一个** chunk（前两者为内部模块，最后一个是顶层主程序）。
 
+
+## 安装
+
+Delin 的安装**完全发生在游戏内**：宿主机只负责用静态 http 服务托管发布树，用户在目标电脑上
+一条命令起装。不需要任何外部工具、不需要改服务器文件、不需要重建镜像。
+
+```bash
+# 宿主机(开发期): 先把发布树挂出来
+lua5.1 tools/build.lua --release
+sh tools/serve.sh                 # dist/release 挂在 10568 端口
+
+# 游戏内(目标电脑, CraftOS 下):
+wget run http://<宿主机>:10568/<版本>/install.lua
+```
+
+安装器（`dist/install.lua`，由 `tools/installer.lua` + 内核同一份 `blockdev`/`ext2`/`crc32`
+打包成单文件）做的事：
+
+1. 从安装源拉 `manifest`（`version` / `files` / 每文件 `size crc32`），再逐个下载 `payload/`
+   并**校验大小与 CRC32**，任何一处不符即 fail-fast（不留半成品配置）；
+2. 把 payload 铺到目标：**CCFS**（直接铺文件）或 **EXT2**（现场 `mkfs` 出镜像再写进去）；
+3. 写引导配置：`/startup.lua`（Delin BIOS，旧的备份成 `/startup.lua.craftos`）、
+   `/boot/delin.lua`、`/boot/dlub.lua`、`/.boot`、`/dlub.cfg`；
+4. 全程写 `/delin-install.log`（CC 读不了屏，装完/装挂了都要能被宿主机读回）。
+
+TUI 里可选安装类型（CCFS / EXT2）、目标设备（电脑自身存储 / 每个有数据的磁盘驱动器）、
+安装源，EXT2 还能选镜像大小（auto 或 256/512/768/1024 KB）。auto 按 payload 大小 + 元数据
++ 目录余量算，再上浮 15%。
+
+**无人值守安装**：`/delin-install.cfg` 写齐 `url` / `type` / `target` / `size` / `auto 1`
+即跳过 TUI 直接装（真机自动化验证就是这么跑的）。
+
+四种落盘形态（引导入口**恒定**在电脑自身存储上：BIOS 开机只跑 `/startup.lua`）：
+
+| 安装类型 | 目标 | 电脑自身存储 | 目标设备 |
+|---|---|---|---|
+| CCFS | 电脑自身存储 | BIOS、`/.boot` = `/boot/delin.lua`、`/boot/delin.lua`、`/bin`、`/lib`、`/etc` | — |
+| CCFS | 磁盘 | BIOS、`/.boot` = `/boot/dlub.lua`、`/boot/dlub.lua`、`/dlub.cfg`(=`ccdisk <盘名>`) | `/boot/delin.lua`、`/bin`、`/lib`、`/etc` |
+| EXT2 | 电脑自身存储 | BIOS、`/.boot` = `/boot/dlub.lua`、`/boot/dlub.lua`、`/dlub.cfg`(=`rootfs /parts/root.img`) | `/parts/root.img`(现场 mkfs) |
+| EXT2 | 磁盘 | 同上一行(`bootdisk <盘名>`) | `/parts/root.img` + `/parts/manifest` |
+
+真机实测（电脑1，无外设）：
+- **CCFS**：装完重启 → BIOS → `/.boot` → 内核 → `users loaded: root:0,alice:1000`、
+  `init up (pid 1) default.target active`、0 次 getty 重启（登录提示符就位）。
+- **EXT2**：装完重启 → `[DLUB] root=/parts/root.img fs=ext2 kernel=/boot/delin.lua (142715 bytes)`
+  → `root boot: fstype=ext2` → 同样进到 `init up`；游戏内造出来的镜像拿到宿主机上
+  `e2fsck -fn` **干净**（97 文件 / 444 块 of 512）。整轮 ext2 安装（mkfs + 铺 65 个文件）
+  在真机上约 1 分钟，512 KB 装得下 346 KB payload。
+
 验证：
 
 ```bash
@@ -667,6 +716,8 @@ tools/bundle.lua           拼装 bundle: src/ -> 单文件内核/DLUB(init 多�
 tools/build.lua            构建入口: 自动建 dist/, 产出压缩后的内核/DLUB/BIOS/工具/模块/配置
                            + manifest(size/crc32); --check 跑压缩等价性门禁, --release 出发布树
 tools/crc32.lua            CRC32(纯 Lua, 不用位运算: 宿主 5.1 与 CC 5.2 必须算出同一个值)
+tools/installer.lua        游戏内安装器(CraftOS 程序): TUI + http 下载 + CRC32 校验 +
+                           现场 mkfs 写 ext2 镜像; 被 bundle 成单文件 dist/install.lua
 tools/serve.sh             开发期把 dist/release 挂在 10568 端口(游戏侧 wget 安装用)
 tools/minify.lua           Lua 压缩器: 词法分析 + 递归下降解析做作用域分析 + 局部变量改名,
                            只从 token 流输出(输出与输入的 token 序列逐项相同)。三重门禁:
