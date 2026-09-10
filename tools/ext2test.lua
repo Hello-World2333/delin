@@ -133,6 +133,42 @@ eq(be.canExecute("/d/nope"), false, "canExecute: 不存在的文件 -> false")
 bd.close()
 
 -- ---------------------------------------------------------------
+-- 1b) mkfs(安装器现场格式化): 自建镜像必须能被驱动读、被 e2fsck 判干净
+--     位图映射是这里最容易错的地方: 块位图是 **bit k <-> block (k+1)**
+--     (blockSize==1024 时 block0 是引导块, 不进位图), inode 位图是 bit k <-> inode (k+1),
+--     两个位图的尾部填充位都要置 1。写错任何一处 e2fsck 都会报出来。
+-- ---------------------------------------------------------------
+for _, blocks in ipairs({ 64, 512, 1024 }) do
+    local p = "/tmp/delin-mkfs-" .. blocks .. ".img"
+    os.remove(p)
+    local f0 = assert(io.open(p, "wb")); f0:close()
+    local b = filebd(p)
+    local mfs, merr = ext2.mkfs(b, { blocks = blocks, label = "delintest" })
+    ok(mfs ~= nil, string.format("mkfs(%d): 格式化成功", blocks), tostring(merr))
+    if mfs then
+        eq(ext2.lookup(mfs, "/") ~= nil, true, string.format("mkfs(%d): 能查到根目录", blocks))
+        eq(ext2.lookup(mfs, "/lost+found") ~= nil, true, string.format("mkfs(%d): 有 /lost+found", blocks))
+        eq(ext2.lookup(mfs, "/").links, 3, string.format("mkfs(%d): 根目录 links=3", blocks))
+        -- 用驱动自己的写路径灌文件, 再交 e2fsck 判
+        assert(ext2.create(mfs, "/", "bin", T_DIR + 493), "mkfs: mkdir /bin")
+        assert(ext2.create(mfs, "/", "etc", T_DIR + 493), "mkfs: mkdir /etc")
+        for i = 1, 5 do
+            local ino = ext2.create(mfs, "/bin", "tool" .. i, T_REG + 493)
+            assert(ext2.writeFile(mfs, ino, string.rep("x", 100 * i) .. "\n"), "mkfs: 写文件 " .. i)
+        end
+        local hh = assert(ext2.backend(mfs).open("/bin/tool3", "r"))
+        eq(hh:readAll(), string.rep("x", 300) .. "\n", string.format("mkfs(%d): 写进去的文件读回来一致", blocks))
+        hh:close()
+        b.close()
+        local rc2 = os.execute(string.format("%s -fn %s > %s 2>&1", FSCK, p, p .. ".fsck.txt"))
+        local lf = io.open(p .. ".fsck.txt")
+        local lout = lf and lf:read("*a") or ""
+        if lf then lf:close() end
+        ok(rc2 == 0, string.format("mkfs(%d): e2fsck -fn 干净", blocks), "\n" .. lout)
+    end
+end
+
+-- ---------------------------------------------------------------
 -- 2) 宿主 e2fsck 判定
 -- ---------------------------------------------------------------
 -- 注意: Lua 5.1 的 io.popen():close() 不返回退出码, 用 os.execute 取

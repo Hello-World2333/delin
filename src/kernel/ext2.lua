@@ -860,4 +860,168 @@ function ext2.backend(fs)
     }
 end
 
+-- ---------------------------------------------------------------
+-- mkfs: 建一个空白 ext2(安装器现场格式化用)
+-- ---------------------------------------------------------------
+
+--- 在块设备上建一个空白 ext2 文件系统(mkfs.ext2 子集)。
+--- 布局(块大小固定 1024, **单块组**):
+---   block 0      引导扇区(全零)
+---   block 1      超级块(1024 字节, 位于字节偏移 1024)
+---   block 2      块组描述符表
+---   block 3      块位图
+---   block 4      inode 位图
+---   block 5..36  inode 表(256 个 inode x 128 字节)
+---   block 37..   数据块(根目录 / lost+found 依次分配)
+--- 只做单块组(<= 8192 块 = 8MB): 安装场景只要几百 KB, 少一块组就少一处出错的地方;
+--- 超了直接报错, 不静默截断。
+--- 根目录与 lost+found 用驱动自己的 create/allocBlock 建(而不是另写一份编码),
+--- 这样"mkfs 写出来的东西"与"驱动读得懂的东西"天生一致; 建完再 mount 回来自检。
+---@param bd table 块设备
+---@param opts table|nil { blocks = number 必需, label = string, time = number 秒 }
+---@return table|nil fs, string|nil err
+function ext2.mkfs(bd, opts)
+    opts = opts or {}
+    local blockSize = 1024
+    local blocks = tonumber(opts.blocks)
+    if not blocks then return nil, "mkfs: 必须给 blocks" end
+    blocks = math.floor(blocks)
+    if blocks < 64 then return nil, "mkfs: 块数至少 64(64KB)" end
+    if blocks > 8192 then return nil, "mkfs: 只支持单块组(最多 8192 块 = 8MB)" end
+
+    local inodeSize, inodesPerGroup, blocksPerGroup = 128, 256, 8192
+    local firstDataBlock = 1 -- blockSize==1024 时 block0 是引导扇区
+    local firstIno = 11      -- 1..10 保留, 11 起给普通文件(与 mkfs.ext2 一致)
+    local blockBitmap, inodeBitmap, inodeTable = 3, 4, 5
+    local inodeTableBlocks = math.ceil(inodesPerGroup * inodeSize / blockSize) -- 32
+    local dataStart = inodeTable + inodeTableBlocks                            -- 37
+    if blocks < dataStart + 2 then
+        return nil, string.format("mkfs: 块数至少 %d(元数据 %d 块 + 根目录 + lost+found)", dataStart + 2, dataStart)
+    end
+    local size = bd.getSize and bd.getSize() or nil
+    if size and size > 0 and size < blocks * blockSize then
+        return nil, string.format("mkfs: 设备只有 %d 字节, 放不下 %d 块(%d 字节)", size, blocks, blocks * blockSize)
+    end
+
+    local now = math.floor(opts.time or (os.epoch and (os.epoch("utc") / 1000)) or os.time())
+
+    -- 1) 整盘清零。CC 的 fs 不支持预分配, 写入即扩展文件, 这里顺带把镜像撑到目标大小。
+    local CHUNK = 64 * 1024
+    local zero = string.rep("\0", math.min(CHUNK, blocks * blockSize))
+    local off = 0
+    while off < blocks * blockSize do
+        local n = math.min(#zero, blocks * blockSize - off)
+        local ok, werr = bd.write(off, n == #zero and zero or zero:sub(1, n))
+        if not ok then return nil, "mkfs: 清零失败: " .. tostring(werr) end
+        off = off + n
+    end
+
+    -- 2) 超级块
+    local sb = string.rep("\0", 1024)
+    sb = setU32(sb, 0, inodesPerGroup)          -- s_inodes_count
+    sb = setU32(sb, 4, blocks)                  -- s_blocks_count
+    sb = setU32(sb, 8, 0)                       -- s_r_blocks_count(单用户, 不留 root 保留块)
+    sb = setU32(sb, 12, blocks - dataStart - 1) -- s_free_blocks_count(根目录占 1 块)
+    sb = setU32(sb, 16, inodesPerGroup - 10)    -- s_free_inodes_count(1..10 保留; 根目录是 2, 在保留段内)
+    sb = setU32(sb, 20, firstDataBlock)
+    sb = setU32(sb, 24, 0)                      -- s_log_block_size: 0 -> 1024
+    sb = setU32(sb, 28, 0)                      -- s_log_frag_size
+    sb = setU32(sb, 32, blocksPerGroup)
+    sb = setU32(sb, 36, blocksPerGroup)
+    sb = setU32(sb, 40, inodesPerGroup)
+    sb = setU32(sb, 44, now)                    -- s_mtime
+    sb = setU32(sb, 48, now)                    -- s_wtime
+    sb = setU16(sb, 52, 0)                      -- s_mnt_count
+    sb = setU16(sb, 54, 0xFFFF)                 -- s_max_mnt_count
+    sb = setU16(sb, 56, 0xEF53)                 -- s_magic
+    sb = setU16(sb, 58, 1)                      -- s_state: clean
+    sb = setU16(sb, 60, 1)                      -- s_errors: continue
+    sb = setU16(sb, 62, 0)                      -- s_minor_rev_level
+    sb = setU32(sb, 64, now)                    -- s_lastcheck
+    sb = setU32(sb, 68, 0)                      -- s_checkinterval
+    sb = setU32(sb, 72, 0)                      -- s_creator_os: Linux
+    sb = setU32(sb, 76, 1)                      -- s_rev_level: dynamic
+    sb = setU16(sb, 80, 0)                      -- s_def_resuid
+    sb = setU16(sb, 82, 0)                      -- s_def_resgid
+    sb = setU32(sb, 84, firstIno)
+    sb = setU16(sb, 88, inodeSize)
+    sb = setU16(sb, 90, 0)                      -- s_block_group_nr
+    sb = setU32(sb, 92, 0)                      -- s_feature_compat
+    -- 目录项的 file_type 字段要有 INCOMPAT_FILETYPE 才合法(驱动一直写它)。
+    sb = setU32(sb, 96, 0x2)                    -- s_feature_incompat: FILETYPE
+    sb = setU32(sb, 100, 0)                     -- s_feature_ro_compat
+    -- s_uuid(104..119): 时间派生的 16 字节, 够区分不同镜像(Delin 不用 ext2 uuid 挂载)
+    local seed = now % 2147483647
+    local uuid = {}
+    for i = 1, 16 do
+        seed = (seed * 1103515245 + 12345) % 2147483648
+        uuid[i] = string.char(math.floor(seed / 8388608) % 256)
+    end
+    sb = sb:sub(1, 104) .. table.concat(uuid) .. sb:sub(121)
+    local label = tostring(opts.label or "delin"):sub(1, 15)
+    sb = sb:sub(1, 120) .. label .. string.rep("\0", 16 - #label) .. sb:sub(137)
+    if not bd.write(1024, sb) then return nil, "mkfs: 写超级块失败" end
+
+    -- 3) 块组描述符(单块组)
+    --    位图映射(与宿主 mkfs.ext2 的产物逐字节核对过):
+    --      块位图: bit k <-> block (k+1)  —— blockSize==1024 时 block0 是引导块, **不进位图**
+    --      inode 位图: bit k <-> inode (k+1)
+    --    尾部填充位必须置 1, 否则 e2fsck 报 "Padding at end of ... bitmap is not set"。
+    local usedBlocks = dataStart -- 从 block 1 数起的已用块数: 块 1..36 元数据 + 块 37 根目录
+    local freeBlocks = blocks - usedBlocks - 1 -- 再减掉不进位图的 block 0
+    local gdt = w32(blockBitmap) .. w32(inodeBitmap) .. w32(inodeTable)
+        .. w16(freeBlocks) .. w16(inodesPerGroup - 10) .. w16(1) .. w16(0) .. string.rep("\0", 12)
+    if not bd.write(2 * blockSize, gdt) then return nil, "mkfs: 写块组描述符失败" end
+
+    local function setBit(s, bit)
+        local pos = math.floor(bit / 8) + 1
+        local v = s:byte(pos) or 0
+        return s:sub(1, pos - 1) .. string.char(v + 2 ^ (bit % 8)) .. s:sub(pos + 1)
+    end
+    local bitsPerBitmap = blockSize * 8
+    local bmap = string.rep("\0", blockSize)
+    for bit = 0, usedBlocks - 1 do bmap = setBit(bmap, bit) end            -- 块 1..37
+    for bit = blocks - 1, bitsPerBitmap - 1 do bmap = setBit(bmap, bit) end -- 尾部填充
+    if not bd.write(blockBitmap * blockSize, bmap) then return nil, "mkfs: 写块位图失败" end
+
+    local imap = string.rep("\0", blockSize)
+    for bit = 0, 9 do imap = setBit(imap, bit) end -- inode 1..10(保留段; 2 是根目录)
+    for bit = inodesPerGroup, bitsPerBitmap - 1 do imap = setBit(imap, bit) end -- 尾部填充(inode 256 是合法空闲 inode)
+    if not bd.write(inodeBitmap * blockSize, imap) then return nil, "mkfs: 写 inode 位图失败" end
+
+    -- 5) 根目录(固定 inode 2)+ 它的目录块
+    local fs = {
+        bd = bd, blockSize = blockSize, inodes = inodesPerGroup, blocks = blocks,
+        rBlocks = 0, firstDataBlock = firstDataBlock, inodesPerGroup = inodesPerGroup,
+        blocksPerGroup = blocksPerGroup, inodeSize = inodeSize, firstIno = firstIno,
+        gdtOffset = 2 * blockSize, numGroups = 1,
+    }
+    local rootBlock = dataStart
+    local e1 = w32(2) .. w16(12) .. string.char(1, FT_DIR) .. "." .. string.rep("\0", 3)
+    local e2 = w32(2) .. w16(blockSize - 12) .. string.char(2, FT_DIR) .. ".." .. string.rep("\0", 2)
+    if not writeBlockStr(fs, rootBlock, e1 .. e2) then return nil, "mkfs: 写根目录失败" end
+    local rootInode = {
+        ino = 2, mode = T_DIR + 493, uid = 0, gid = 0, links = 2, size = blockSize, -- 0755
+        blocks = math.floor(blockSize / 512), atime = now, ctime = now, mtime = now,
+        ptrs = { rootBlock },
+    }
+    for n = 2, 15 do rootInode.ptrs[n] = 0 end
+    if not ext2.writeInode(fs, rootInode) then return nil, "mkfs: 写根 inode 失败" end
+
+    -- 6) lost+found: 用驱动自己的 create(取 firstIno=11 的 inode、分配目录块、写 "."/".."、
+    --    在根目录项里登记, 并把根的 links 加到 3)
+    local lf, lerr = ext2.create(fs, "/", "lost+found", T_DIR + 448) -- 0700
+    if not lf then return nil, "mkfs: 建 lost+found 失败: " .. tostring(lerr) end
+
+    -- 7) 自检: 按 mount() 的路径重新挂回来, 根与 lost+found 必须都在
+    local rfs, rerr = ext2.mount(bd)
+    if not rfs then return nil, "mkfs: 自检挂载失败: " .. tostring(rerr) end
+    local root = ext2.lookup(rfs, "/")
+    if not root or root.type ~= T_DIR then return nil, "mkfs: 自检读不到根目录" end
+    local lfi = ext2.lookup(rfs, "/lost+found")
+    if not lfi or lfi.type ~= T_DIR then return nil, "mkfs: 自检读不到 /lost+found" end
+    if root.links ~= 3 then return nil, "mkfs: 根目录 links 应为 3, 实得 " .. tostring(root.links) end
+    return rfs
+end
+
 return ext2

@@ -26,7 +26,7 @@
 | `/mnt/` | 挂载点（`/etc/fstab` 中的条目由 init 生成 mount 单元自动挂载；其余用 `mount` 显式挂载） |
 | `/parts/` | 引导盘分区清单 `manifest`（`<role> <path> <fstype>`，`#` 为注释） |
 | `/boot/` | 内核镜像 |
-| `/dlub.cfg` | DLUB 引导配置（电脑自身 FS）：`bootdisk <外设名>` 显式指定引导盘 |
+| `/dlub.cfg` | DLUB 引导配置（电脑自身 FS）：三种根来源**互斥**，必须指定一个 —— `rootfs <路径>`（电脑自带存储上的 ext2 镜像）、`bootdisk <外设名>`（磁盘上 manifest 的 root 分区）、`ccdisk <外设名>`（该磁盘的 CC 原生文件系统本身） |
 
 ### 磁盘设备（`/dev/sdX`）
 
@@ -402,6 +402,8 @@ analog_output,bundled_input,bundled_output}`（六个面恒定存在），`cat`/
      配置缺失/语法错误/该外设不是磁盘驱动/盘上无 `/parts/manifest` 一律 fail-fast 报错。
   2. **电脑自带存储启动**（`rootfs <路径>`，如 `rootfs /parts/root.img`）：从电脑自带存储的
      ext2 镜像启动，适用于需要从本地存储启动的场景。
+  3. **磁盘 CCFS 启动**（`ccdisk <外设名>`）：根 = 该磁盘的 CC 原生文件系统本身，
+     内核从该盘 `/boot/delin.lua` 读。装 Delin 到磁盘时不必建 ext2 镜像，直接铺文件即可。
 
   两种模式都会读取 ext2 分区，挂载根文件系统，读内核镜像并设 `_G.__boot_info`；`boot.boot()`
   检测到 `__boot_info` 即走 `bootExt2`——挂 ext2 根为 `/`，`setupUsers` 从根的 `/etc/passwd`

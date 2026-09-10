@@ -1565,5 +1565,36 @@ do
     _G.redstone = nil
 end
 
+-- ===============================================================
+-- H. /dlub.cfg 解析: 三种根来源互斥(rootfs / bootdisk / ccdisk)
+-- ===============================================================
+do
+    local dlubcfg = require("kernel.dlubcfg")
+
+    local c = dlubcfg.parse("bootdisk left\n")
+    ok(c ~= nil and c.bootdisk == "left", "dlubcfg: bootdisk 单键")
+
+    c = dlubcfg.parse("# comment\n\nrootfs /parts/root.img\n")
+    ok(c ~= nil and c.rootfs == "/parts/root.img", "dlubcfg: rootfs 单键(含注释/空行)")
+
+    c = dlubcfg.parse("ccdisk left\n")
+    ok(c ~= nil and c.ccdisk == "left", "dlubcfg: ccdisk 单键")
+
+    local _, e = dlubcfg.parse("")
+    ok(e ~= nil, "dlubcfg: 空配置 -> 报错")
+
+    _, e = dlubcfg.parse("frobnicate left\n")
+    ok(e ~= nil and e:find("unknown key"), "dlubcfg: 未知键 -> 报错")
+
+    _, e = dlubcfg.parse("bootdisk left\nbootdisk right\n")
+    ok(e ~= nil and e:find("duplicate"), "dlubcfg: 重复键 -> 报错")
+
+    _, e = dlubcfg.parse("rootfs /a.img\nccdisk left\n")
+    ok(e ~= nil and e:find("conflicting"), "dlubcfg: 两个根来源 -> 报错")
+
+    _, e = dlubcfg.parse("bootdisk\n")
+    ok(e ~= nil, "dlubcfg: 缺值 -> 报错")
+end
+
 io.write(string.format("\n%d passed, %d failed\n", pass, fail))
 os.exit(fail == 0 and 0 or 1)

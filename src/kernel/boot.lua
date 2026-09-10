@@ -289,46 +289,61 @@ local function setupModules(reader, dir)
     return true
 end
 
---- EXT2 根引导: 挂根分区为 "/", 再跑 init。
-local function bootExt2(bi)
-    kprint("EXT2 boot: root=" .. (bi.rootFstype or "?") .. " " .. (bi.rootPath or "?"))
-    local rfs, ferr = ext2.mount(bi.blockDevice)
-    if not rfs then kprint("FATAL: root ext2 mount: " .. tostring(ferr)); return end
+--- __boot_info 根引导(DLUB 指定根来源): 按 rootFstype 挂根为 "/", 再跑 init。
+---   ext2   —— 根是块设备上的 ext2 文件系统(电脑自带存储的镜像文件, 或磁盘上的分区镜像)
+---   ccdisk —— 根是某个磁盘的 CC 原生文件系统本身(CCFS 装在磁盘上)
+--- 未知 rootFstype 一律 fail-fast, 不回退。
+local function bootFromInfo(bi)
+    local fstype = bi.rootFstype
+    kprint("root boot: fstype=" .. tostring(fstype) .. " root=" .. tostring(bi.rootPath))
+
+    local rootBackend, mountInfo
+    if fstype == "ext2" then
+        local rfs, ferr = ext2.mount(bi.blockDevice)
+        if not rfs then kprint("FATAL: root ext2 mount: " .. tostring(ferr)); return end
+        rootBackend = ext2.backend(rfs)
+        -- 根分区对上设备节点, 使 mount/lsblk 里根挂载显示为 /dev/sdXN 而不是 "rootfs"。
+        local rootDev
+        for _, e in ipairs(devdisk.list()) do
+            if e.type == "part" and e.img == bi.blockDevice.path then rootDev = e; break end
+        end
+        if rootDev then
+            mountInfo = { device = rootDev.node, fstype = rootDev.fstype, uuid = rootDev.uuid }
+        else
+            -- 从电脑自带存储启动时, 根分区可能没有对应的 /dev 节点
+            kprint("root boot: no /dev node for root partition, using virtual device")
+            mountInfo = { device = bi.rootPath or "rootfs", fstype = "ext2" }
+        end
+    elseif fstype == "ccdisk" then
+        -- 根 = 磁盘的 CC 原生文件系统: 直接以该盘的 CC 挂载路径作为真实根路径前缀。
+        rootBackend = vfs.real(bi.rootPath)
+        mountInfo = { device = bi.rootPath, fstype = "ccdisk" }
+    else
+        kprint("FATAL: unknown root fstype " .. tostring(fstype))
+        return
+    end
+
     vfs_api.mountDev()
     klog.register()
     procfs.mount(bootMs, modules.version) -- /proc: 进程/系统信息
     registerConsole() -- 电脑自身 term 控制台(键盘输入焦点)
     setupDevices()    -- /dev/sdX 设备节点(磁盘不自动挂载)
-    -- 根分区对上设备节点, 使 mount/lsblk 里根挂载显示为 /dev/sdXN 而不是 "rootfs"。
-    local rootDev
-    for _, e in ipairs(devdisk.list()) do
-        if e.type == "part" and e.img == bi.blockDevice.path then rootDev = e; break end
-    end
-    if not rootDev then
-        -- 从电脑自带存储启动时, 根分区可能没有对应的 /dev 节点
-        -- 使用虚拟设备节点
-        kprint("ext2 boot: no /dev node for root partition, using virtual device")
-        local device = bi.rootPath or "rootfs"
-        local uuid = nil
-        vfs.mount("/", ext2.backend(rfs), { device = device, fstype = "ext2", uuid = uuid })
-    else
-        vfs.mount("/", ext2.backend(rfs), { device = rootDev.node, fstype = rootDev.fstype, uuid = rootDev.uuid })
-    end
+    vfs.mount("/", rootBackend, mountInfo)
     vfs_api.setStdio(
         { read = function(self, ...) return read(...) end },
         { write = function(self, s) return write(s) end, writeLine = function(self, s) return write(s .. "\n") end, flush = function(self) return true end }
     )
-    -- 用户库(从 EXT2 根 /etc/passwd 读) + 注册 user.* syscalls
+    -- 用户库(从根的 /etc/passwd 读) + 注册 user.* syscalls
     if not setupUsers() then return end
 
-    -- 内核模块: 只从 ext2 根镜像自带的 /lib/modules/<version>/ 装载(自包含, fail-fast)。
+    -- 内核模块: 只从根自带的 /lib/modules/<version>/ 装载(自包含, fail-fast)。
     -- 绝不回退到引导盘/CC fs 的 /lib —— 那上面本就不该有模块。
     local mdir = "/lib/modules/" .. modules.version
     if not vfs_api.fs.exists(mdir .. "/manifest") then
-        kprint("FATAL: ext2 root has no module dir " .. mdir)
+        kprint("FATAL: root has no module dir " .. mdir)
         return
     end
-    -- 关闭任意别处回退: 显式以 vfs(fs) 作为读模块文件的门面, 只读 ext2 根。
+    -- 关闭任意别处回退: 显式以 vfs(fs) 作为读模块文件的门面, 只读根。
     local okMod, errMod = setupModules(vfs_api.fs, mdir)
     if not okMod then
         kprint("FATAL: module load failed: " .. tostring(errMod))
@@ -338,7 +353,7 @@ local function bootExt2(bi)
     registerDisplaySyscalls()
     registerRuntimeSyscalls()
     sysfs.mount() -- /sys/class/display 虚拟配置 fs(display 已注册)
-    launch(INIT_SOURCE, "ext2")
+    launch(INIT_SOURCE, fstype)
 end
 
 local boot = {}
@@ -352,9 +367,9 @@ function boot.boot()
     kprint("Delin OS " .. modules.version .. " boot")
     kprint("craftos=" .. os.version())
 
-    -- 1) 已被 DLUB 设置了 bootInfo -> EXT2 根引导
+    -- 1) 已被 DLUB 设置了 bootInfo -> 按 rootFstype 引导(ext2 / ccdisk)
     if __boot_info then
-        return bootExt2(__boot_info)
+        return bootFromInfo(__boot_info)
     end
 
     -- 2) 默认 CC-fs 引导
