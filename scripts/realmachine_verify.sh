@@ -25,8 +25,17 @@ systemctl is-active syslogd.service >> $LOG
 systemctl is-active getty@tty0.service >> $LOG
 echo "-- mount --" >> $LOG
 mount >> $LOG
-echo "-- lsblk --" >> $LOG
+echo "-- lsblk (sda 必须是电脑自带存储, 磁盘驱动器从 sdb 起) --" >> $LOG
 lsblk >> $LOG
+echo "-- blkid --" >> $LOG
+blkid >> $LOG
+echo "-- 电脑自带存储是块设备: mount -t ccdisk /dev/sda /mnt/hdd 要能看到电脑自身 FS --" >> $LOG
+mkdir -p /mnt/hdd
+mount -t ccdisk /dev/sda /mnt/hdd >> $LOG
+ls /mnt/hdd >> $LOG
+if ls /mnt/hdd | grep -q '^main.lua$'; then echo "ok own_storage_is_block_device" >> $LOG; else echo "ng own_storage_is_block_device" >> $LOG; fi
+grep /mnt/hdd /proc/mounts >> $LOG
+umount /mnt/hdd >> $LOG
 echo "-- /etc/fstab --" >> $LOG
 cat /etc/fstab >> $LOG
 echo "-- /mnt/data (fstab 自动挂载) --" >> $LOG
@@ -36,9 +45,16 @@ echo "-- mount -a (noauto 不应挂载 /mnt/rootcopy) --" >> $LOG
 mount -a >> $LOG
 mount >> $LOG
 echo "-- 手动挂载 noauto 条目 --" >> $LOG
-mount /dev/sda1 /mnt/rootcopy >> $LOG
+mount /dev/sdb1 /mnt/rootcopy >> $LOG
 ls /mnt/rootcopy >> $LOG
 umount /mnt/rootcopy >> $LOG
+echo "-- 按 UUID 挂载(命名空间前缀: 磁盘 d<磁盘ID>, 自带存储 c<电脑ID>) --" >> $LOG
+mount UUID=d0-1 /mnt/rootcopy >> $LOG
+grep /mnt/rootcopy /proc/mounts >> $LOG
+umount /mnt/rootcopy >> $LOG
+echo "-- 裸数字 UUID 必须被拒(磁盘 ID 与电脑 ID 会撞号) --" >> $LOG
+mount UUID=0 /mnt/rootcopy >> $LOG
+if [ "$?" != "0" ]; then echo "ok bare_number_uuid_rejected" >> $LOG; else echo "ng bare_number_uuid_rejected" >> $LOG; fi
 echo "-- logger -> /dev/log -> syslogd --" >> $LOG
 logger -t verify -p daemon.notice "verify daemon message"
 logger -t verify -p authpriv.warning "verify authpriv message"

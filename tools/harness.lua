@@ -508,13 +508,16 @@ syscalls["fs.mounts"] = function()
     return out
 end
 
--- 块设备桩: 两个磁盘(整盘 ccdisk + 各自 manifest 分区 ext2), 与真机 devdisk 的字段一致。
+-- 块设备桩: 电脑自带存储(恒为 sda) + 两个磁盘驱动器, 与真机 devdisk 的字段一致
+-- (自带存储 c<电脑ID>, 磁盘 d<磁盘ID>, 且磁盘一律接在自带存储之后按磁盘 ID 升序)。
 -- mounted 由当前挂载表算出, 使 lsblk 的 MOUNTPOINT 列可验证。
 local blkDevices = {
-    { name = "sda",  node = "/dev/sda",  type = "disk", fstype = "ccdisk", uuid = "0",   size = 128000,  label = "BOOT" },
-    { name = "sda1", node = "/dev/sda1", type = "part", fstype = "ext2",   uuid = "0-1", size = 2097152, role = "root" },
-    { name = "sdb",  node = "/dev/sdb",  type = "disk", fstype = "ccdisk", uuid = "1",   size = 128000 },
-    { name = "sdb1", node = "/dev/sdb1", type = "part", fstype = "ext2",   uuid = "1-1", size = 2097152, role = "data" },
+    { name = "sda",  node = "/dev/sda",  type = "disk", fstype = "ccdisk", uuid = "c1",   size = 1000000, label = "DELIN" },
+    { name = "sda1", node = "/dev/sda1", type = "part", fstype = "ext2",   uuid = "c1-1", size = 2097152, role = "root" },
+    { name = "sdb",  node = "/dev/sdb",  type = "disk", fstype = "ccdisk", uuid = "d0",   size = 128000,  label = "BOOT" },
+    { name = "sdb1", node = "/dev/sdb1", type = "part", fstype = "ext2",   uuid = "d0-1", size = 2097152, role = "root" },
+    { name = "sdc",  node = "/dev/sdc",  type = "disk", fstype = "ccdisk", uuid = "d1",   size = 128000 },
+    { name = "sdc1", node = "/dev/sdc1", type = "part", fstype = "ext2",   uuid = "d1-1", size = 2097152, role = "data" },
 }
 syscalls["blkdev.list"] = function()
     local out = {}

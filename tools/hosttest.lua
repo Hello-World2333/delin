@@ -1946,5 +1946,126 @@ do
     eq(fw["/etc/passwd"]:find("mallory"), nil, "user: 被拒的调用没有落盘")
 end
 
+-- ===============================================================
+-- J. 块设备枚举(kernel/devdisk.lua): 电脑自带存储必须成为 /dev/sda
+--    曾经的 bug: 只枚举 peripheral.getNames()(磁盘驱动器), 电脑自带存储不是外设, 于是它
+--    (以及其中 /parts/*.img 分区)**永远不是块设备** —— 真机上表现为 rootfs 模式
+--    `block devices: (none)` + 根分区没有设备节点, 磁盘接在自带存储之后。
+--    另一半是 UUID 命名空间: 磁盘 ID 与电脑 ID 各自递增会撞号, 所以 d<磁盘ID> / c<电脑ID>。
+-- ===============================================================
+do
+    local COMPUTER_ID, COMPUTER_LABEL = 7, "DELIN-PC"
+
+    -- driveData: 槽位 -> 驱动器里的介质。顺序刻意与磁盘 ID 反着排, 顺带锁住"按 ID 升序编号"。
+    --   top = 放了一台电脑(没有磁盘 ID, CC 对这类介质不给 ID) —— 必须排最后且没有 UUID。
+    local driveData = {
+        bottom = { diskId = 1, mountPath = "disk2" },                    -- 无分区
+        left   = { diskId = 0, mountPath = "disk", label = "BOOT" },     -- data 分区
+        top    = { mountPath = "disk3" },                                 -- 无 ID 介质
+    }
+    local manifests = {
+        [""]    = "root /parts/root.img ext2\ndata /parts/data.img ext2\n", -- 电脑自带存储
+        ["disk"] = "data /parts/data.img ext2\n",
+    }
+    local sizes = {
+        ["/parts/root.img"] = 2097152, ["/parts/data.img"] = 2097152,
+        ["disk/parts/data.img"] = 524288,
+    }
+    local capacity = { ["/"] = 1000000, ["disk"] = 128000, ["disk2"] = 128000, ["disk3"] = 128000 }
+
+    local fsStub = {
+        open = function(path)
+            local mp = path:match("^(.*)/parts/manifest$") or ""
+            if not manifests[mp] then return nil end
+            return { readAll = function() return manifests[mp] end, close = function() end }
+        end,
+        exists = function(path) return sizes[path] ~= nil end,
+        getSize = function(path) return sizes[path] end,
+        getCapacity = function(path) return capacity[path] end,
+    }
+    local diskStub = {
+        hasData = function(side) return driveData[side] ~= nil end,
+        getMountPath = function(side) return driveData[side] and driveData[side].mountPath end,
+        getID = function(side) return driveData[side] and driveData[side].diskId end,
+        getLabel = function(side) return driveData[side] and driveData[side].label end,
+    }
+    local peripheralStub = { getNames = function() return { "bottom", "left", "top" } end }
+    local osStub = {
+        getComputerID = function() return COMPUTER_ID end,
+        getComputerLabel = function() return COMPUTER_LABEL end,
+    }
+
+    -- 用真实源码 + 桩全局装载(devdisk.lua 的依赖 vfs/vfs_api/manifest 都是纯 Lua, 走真 require)。
+    local env = {
+        require = require, fs = fsStub, disk = diskStub, peripheral = peripheralStub, os = osStub,
+        string = string, table = table, math = math, tostring = tostring, type = type,
+        ipairs = ipairs, pairs = pairs, error = error, pcall = pcall, select = select,
+    }
+    local src = assert(readFile(REPO .. "/src/kernel/devdisk.lua"), "读不到 src/kernel/devdisk.lua")
+    local chunk = assert(loadstring(src, "devdisk.lua"))
+    setfenv(chunk, env)
+    local devdisk = chunk()
+    local vfs_api = require("kernel.vfs_api")
+
+    local list = devdisk.scan()
+    local names, byName = {}, {}
+    for _, e in ipairs(list) do names[#names + 1] = e.name; byName[e.name] = e end
+    eq(table.concat(names, ","), "sda,sda1,sda2,sdb,sdb1,sdc,sdd",
+       "devdisk: 自带存储=sda(含分区), 磁盘接在其后按磁盘 ID 升序, 无 ID 介质排最后")
+
+    -- 电脑自带存储: 整盘 ccdisk + /parts/manifest 的两个分区
+    ok(byName.sda.internal == true, "devdisk: sda 是电脑自带存储(internal)")
+    eq(byName.sda.mountPath, "", "devdisk: sda 的 CC 挂载路径是根 \"\"")
+    eq(byName.sda.uuid, "c7", "devdisk: 自带存储 UUID = c<电脑ID>")
+    eq(byName.sda.label, COMPUTER_LABEL, "devdisk: 自带存储 LABEL = 电脑标签")
+    eq(byName.sda.size, 1000000, "devdisk: 自带存储容量走 fs.getCapacity(\"/\")")
+    eq(byName.sda1.uuid, "c7-1", "devdisk: 自带存储分区 UUID = c<电脑ID>-<分区号>")
+    eq(byName.sda1.role, "root", "devdisk: 自带存储 /parts/manifest 分区角色")
+    eq(byName.sda1.img, "/parts/root.img", "devdisk: 自带存储分区的镜像路径")
+    eq(byName.sda1.size, 2097152, "devdisk: 自带存储分区大小")
+    eq(byName.sda2.img, "/parts/data.img", "devdisk: 自带存储第二个分区")
+
+    -- 磁盘驱动器: 按 disk.getID() 升序(与 peripheral.getNames() 顺序无关)
+    eq(byName.sdb.uuid, "d0", "devdisk: 磁盘 ID 0 -> sdb, UUID d0")
+    eq(byName.sdb.label, "BOOT", "devdisk: 磁盘 LABEL 来自 disk.getLabel")
+    eq(byName.sdb.mountPath, "disk", "devdisk: 磁盘 sdb 的 CC 挂载路径")
+    eq(byName.sdb1.uuid, "d0-1", "devdisk: 磁盘分区 UUID = d<磁盘ID>-<分区号>")
+    eq(byName.sdb1.img, "disk/parts/data.img", "devdisk: 磁盘分区的镜像路径")
+    eq(byName.sdc.uuid, "d1", "devdisk: 磁盘 ID 1 -> sdc")
+    ok(byName.sdc1 == nil, "devdisk: 没有 manifest 的磁盘只有整盘节点")
+
+    -- 无磁盘 ID 的介质(放进驱动器的电脑): 有节点但没有 UUID
+    eq(byName.sdd.uuid, nil, "devdisk: 无 ID 介质没有 UUID")
+    eq(byName.sdd.type, "disk", "devdisk: 无 ID 介质仍是整盘节点")
+
+    -- 设备节点注册 + 别名 ccdiskN(自带存储 = ccdisk0)
+    devdisk.refresh()
+    local devs = {}
+    for _, n in ipairs(vfs_api.devices()) do devs[n] = true end
+    ok(devs.sda and devs.sdb and devs.sdd, "devdisk: refresh 注册 /dev/sda.. 节点")
+    ok(devs.ccdisk0 and devs.ccdisk1 and devs.ccdisk2, "devdisk: refresh 注册 /dev/ccdiskN 别名")
+    eq(devdisk.find("ccdisk0").name, "sda", "devdisk: /dev/ccdisk0 = 电脑自带存储")
+    eq(devdisk.find("/dev/ccdisk2").name, "sdc", "devdisk: /dev/ccdiskN 按整盘序号")
+    local en, eerr = devdisk.find("ccdiskN")
+    ok(en == nil and eerr ~= nil, "devdisk: 未知别名报错")
+
+    -- 按节点名 / UUID 解析
+    eq(devdisk.find("sda1").node, "/dev/sda1", "devdisk: find 裸节点名")
+    eq(devdisk.find("/dev/sdb1").img, "disk/parts/data.img", "devdisk: find /dev/ 前缀")
+    eq(devdisk.find("UUID=c7-2").node, "/dev/sda2", "devdisk: UUID=c<电脑ID>-<n> 解析")
+    eq(devdisk.find("UUID=d0-1").node, "/dev/sdb1", "devdisk: UUID=d<磁盘ID>-<n> 解析")
+    eq(devdisk.find("UUID=c7").node, "/dev/sda", "devdisk: 整盘 UUID = c<电脑ID>")
+    -- 纯数字不再是任何设备的 UUID: 磁盘 ID 与电脑 ID 会撞号, 所以两边都带前缀
+    local e0, err0 = devdisk.find("UUID=0")
+    ok(e0 == nil and err0:find("no such device") ~= nil, "devdisk: 裸数字 UUID 不再匹配(命名空间必需)")
+    local e1, err1 = devdisk.find("UUID=7")
+    ok(e1 == nil and err1:find("no such device") ~= nil, "devdisk: 电脑 ID 裸数字同样不匹配")
+
+    -- byMountPath: 根挂载对上设备节点用
+    eq(devdisk.byMountPath("").name, "sda", "devdisk: byMountPath(\"\") = 自带存储")
+    eq(devdisk.byMountPath("disk2").name, "sdc", "devdisk: byMountPath 找驱动器里的盘")
+    eq(devdisk.byMountPath("missing"), nil, "devdisk: byMountPath 找不到即 nil")
+end
+
 io.write(string.format("\n%d passed, %d failed\n", pass, fail))
 os.exit(fail == 0 and 0 or 1)

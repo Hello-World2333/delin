@@ -4,10 +4,10 @@
 --   mount -a                       挂载 /etc/fstab 中除 noauto 外的全部条目
 --   mount [-t fstype] device dir   挂载
 -- device 可为:
---   /dev/sda      整盘: 盘上的 CC 原生文件系统 (fstype ccdisk)
---   /dev/sda1     分区: 盘上 /parts/manifest 列出的镜像 (fstype ext2)
+--   /dev/sda      整盘: 该存储上的 CC 原生文件系统 (fstype ccdisk); sda = 电脑自带存储
+--   /dev/sda1     分区: 该存储 /parts/manifest 列出的镜像 (fstype ext2)
 --   /dev/ccdisk0  整盘 CC 原生 fs 的别名节点
---   UUID=<uuid>   按 UUID 挂载 (UUID 由磁盘 ID 模拟: 整盘 <id>, 分区 <id>-<n>)
+--   UUID=<uuid>   按 UUID 挂载 (UUID 由 ID 模拟: 磁盘 d<ID>/d<ID>-<n>, 自带存储 c<电脑ID>/c<电脑ID>-<n>)
 --   其他路径      真实后端上的块设备镜像/CC fs 路径 (兼容旧式)
 -- 省略 -t 时按设备条目自带的 fstype; 显式 -t 与设备类型不符即报错。
 local args = args or {}

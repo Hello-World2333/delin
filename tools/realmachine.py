@@ -154,9 +154,11 @@ def main():
     # 3b) 测试用 /etc/fstab(defaults + noauto 两条)
     fstab = os.path.join(work, "fstab")
     with open(fstab, "w") as f:
+        # /dev/sda 恒为电脑自带存储, 引导盘是磁盘驱动器里的第一块盘(sdb, UUID d0)。
+        # data 分区走 UUID(顺带验证 UUID 命名空间), rootcopy 走设备节点(验证 sdbN 命名)。
         f.write("# real-machine verify fstab\n"
-                "/dev/sda2   /mnt/data     ext2   defaults   0 2\n"
-                "/dev/sda1   /mnt/rootcopy ext2   noauto     0 2\n")
+                "UUID=d0-2   /mnt/data     ext2   defaults   0 2\n"
+                "/dev/sdb1   /mnt/rootcopy ext2   noauto     0 2\n")
     df(out, "rm /etc/fstab")
     df_write(out, fstab, "/etc/fstab")
 
@@ -352,7 +354,10 @@ def reboot_and_collect(printer=False):
     # 三段各有出处: 磁盘 CC-fs 上的 /delin.log 是 DLUB 写的; 根镜像里的 /delin.log 是内核写的
     # (ext2 根); 电脑自身 FS 的 /delin.log 只在这台机器**回退**去引导自带存储时才有意义。
     for label, path in (("disk ccfs", os.path.join(DISK, "delin.log")),
-                        ("computer ccfs", os.path.join(COMPUTER, "delin.log"))):
+                        ("computer3 ccfs", os.path.join(COMPUTER, "delin.log")),
+                        # 电脑 4 跑 rootfs 模式(根 = 电脑自带存储上的 /parts/root.img):
+                        # 它的 /delin.log 是"自带存储被识别成 /dev/sda 与根分区对上节点"的直接证据。
+                        ("computer4 ccfs (rootfs)", os.path.join(COMPUTER4, "delin.log"))):
         print("----- %s: %s -----" % (label, path))
         if os.path.exists(path):
             with open(path, "r", errors="replace") as f:

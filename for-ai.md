@@ -28,28 +28,39 @@
 | `/boot/` | 内核镜像 |
 | `/dlub.cfg` | DLUB 引导配置（电脑自身 FS）：三种根来源**互斥**，必须指定一个 —— `rootfs <路径>`（电脑自带存储上的 ext2 镜像）、`bootdisk <外设名>`（磁盘上 manifest 的 root 分区）、`ccdisk <外设名>`（该磁盘的 CC 原生文件系统本身） |
 
-### 磁盘设备（`/dev/sdX`）
+### 存储设备（`/dev/sdX`）
 
-CC 没有裸块 API：磁盘驱动器只提供「盘上的 CC 原生文件系统」和「盘上的 `/parts/*.img` 文件」两样东西。
-内核把它们抽象成 Linux 风格的设备节点，**磁盘不自动挂载**，一律由 `mount` 显式挂载：
+CC 没有裸块 API：一块存储（**电脑自带存储**，或磁盘驱动器里的盘）只提供「它上面的 CC 原生文件系统」和
+「它上面的 `/parts/*.img` 文件」两样东西。内核把它们抽象成 Linux 风格的设备节点，**不自动挂载**，
+一律由 `mount` 显式挂载：
 
 | 节点 | 含义 | fstype |
 |---|---|---|
-| `/dev/sda`、`/dev/sdb` … | 整盘：该驱动器的 CC 原生文件系统 | `ccdisk` |
-| `/dev/sda1` … `/dev/sdaN` | 分区：该盘 `/parts/manifest` 第 N 个分区行指向的镜像 | `ext2` |
+| `/dev/sda`、`/dev/sdb` … | 整盘：该存储的 CC 原生文件系统（`sda` 恒为电脑自带存储） | `ccdisk` |
+| `/dev/sda1` … `/dev/sdaN` | 分区：该存储 `/parts/manifest` 第 N 个分区行指向的镜像 | `ext2` |
 | `/dev/ccdisk0`、`/dev/ccdisk1` … | 整盘 CC 原生 fs 的别名节点（N 从 0 起，同 `sda`、`sdb`） | `ccdisk` |
 
-- **命名**：磁盘按 `disk.getID()` 升序编成 `sda`、`sdb`、…（与 `peripheral.getNames()` 顺序、槽位无关，
-  重启后同一块盘仍是同一个字母）；分区号取该盘 `/parts/manifest` 分区行的序号（1 起，`root` 行在前）。
-- **UUID**：CC 没有文件系统 UUID，用**磁盘 ID 模拟**——整盘为 `<磁盘ID>`，分区为 `<磁盘ID>-<分区号>`
-  （如磁盘 ID 1 的第一个分区是 `1-1`）；无 ID 的介质（电脑盘/海龟盘）没有 UUID，不能用 `UUID=` 挂载。
+- **命名**：**电脑自带存储恒为 `sda`**（它不是外设，`peripheral.getNames()` 里根本没有它，
+  曾经的 bug 就是只枚举磁盘驱动器，于是自带存储与其上的分区永远不是设备）；磁盘驱动器接在其后按
+  `disk.getID()` 升序编成 `sdb`、`sdc`、…（与 `peripheral.getNames()` 顺序、槽位无关，重启后同一块盘
+  仍是同一个字母）；无 ID 的介质（放进驱动器里的电脑/海龟）排最后。分区号取该存储 `/parts/manifest`
+  分区行的序号（1 起，`root` 行在前）。
+- **UUID**：CC 没有文件系统 UUID，用 ID 模拟，**并且必须带前缀**——磁盘 ID 与电脑 ID 是两套各自递增的
+  数字，会撞号（磁盘 0 与电脑 0 无法区分）：磁盘 `d<磁盘ID>`／`d<磁盘ID>-<分区号>`，
+  电脑自带存储 `c<电脑ID>`／`c<电脑ID>-<分区号>`（如 `UUID=d0-1`、`UUID=c3-1`）。
+  **裸数字不再匹配任何设备**。CC 对自带存储、以及放进驱动器的电脑/海龟**根本不给 ID**
+  （`disk.getID` 只认软盘），这类无 ID 介质没有 UUID，不能用 `UUID=` 挂载。
 - **挂载**：`mount /dev/sda1 /mnt`（无 `-t` 时按节点自带类型）、`mount -t ccdisk /dev/sda /mnt`、
-  `mount UUID=1-1 /mnt`；`umount` 接受挂载点或设备节点。`mount` 无参列出挂载
+  `mount UUID=d0-1 /mnt`；`umount` 接受挂载点或设备节点。`mount` 无参列出挂载
   （设备节点/挂载点/类型/`ro|rw`/uuid，与 `/proc/mounts` 同一来源），
   `blkid` 列出设备的 UUID/TYPE/LABEL，`lsblk` 以树状列出设备与挂载点。
+  **根挂载也对上设备节点**：根 = 自带存储本身（CC-fs 引导）时是 `/dev/sda`，根 = 镜像文件
+  （`rootfs`/`bootdisk`）时是其所在存储的 `/dev/sdXN`——只有镜像没写进该存储的 `/parts/manifest`
+  时才退回虚拟设备名 `rootfs`（并打日志）。
 - **原始字节**：分区节点可当字节设备打开（`fs.open("/dev/sda1","r")` 读镜像原始字节）；整盘是 CC 原生
   文件系统（目录树，不是字节流），打开会被拒绝，只能挂载。
 - 磁盘插入/弹出（CC `disk` / `disk_eject` 事件）时内核重新扫描并刷新 `/dev` 节点。
+  自带存储的 LABEL 取 `os.getComputerLabel()`。
 
 ### 打印机设备（`/dev/lpN`）
 
@@ -303,7 +314,8 @@ CC 原生文件系统没有这些概念、`ext2` 驱动里有 inode 类型却没
 `!` 取反、`-n -s -e -f -i`）、`ed`（POSIX 子集：`a/i/c/d/p/n/l/s/t/m/r/w/q/u/g/v/=`、地址 `.` `$` n `/re/` `+n` `-n`、输入模式以 `.` 结束）、`kill`、
 `ps`/`pgrep`/`pkill`/`killall`（进程管理，见上文「procfs 与进程管理」）、`login`、
 `chmod`（八进制 + 符号模式 `[ugoa]*[+-=][rwx]*` + `-R` 递归）、`chown`（`[OWNER][:[GROUP]]` + `-R`）、
-`mount`（挂载 `/dev/sdX`、`UUID=<uuid>` 或镜像路径；无 `-t` 时按设备类型；无参列出挂载含 `ro|rw`）、`umount`、
+`mount`（挂载 `/dev/sdX`、`UUID=d<磁盘ID>[-N]`/`c<电脑ID>[-N]` 或镜像路径；无 `-t` 时按设备类型；
+无参列出挂载含 `ro|rw`）、`umount`、
 `blkid`（列出设备 UUID/TYPE/LABEL）、`lsblk`（树状列出设备/大小/类型/挂载点）、
 `systemctl`（init 控制）、`syslogd`/`logger`/`dmesg`/`logrotate`（日志）、
 `passwd`/`useradd`/`userdel`/`usermod`/`groupadd`/`groupdel`/`id`/`whoami`/`groups`（用户管理，见下文）、
@@ -498,15 +510,16 @@ PID 1 现在是**用户态服务管理器**（`src/init/unit.lua` 单元解析 +
 用户态 `/dev/log`、`syslogd` 按 `/etc/syslog.conf` 写 `/var/log/*`（SIGHUP 重开、游标续读不重放）、
 `logrotate` + `logrotate.timer` 轮转、`logger`/`dmesg`。`/etc/fstab` 由 init 生成 mount 单元
 （`local-fs.target`），`mount -a` 复用同一解析器。init 里的自检代码已全部删除，验证改为
-宿主测试台 `tools/hosttest.lua`（512 项）与真机脚本 `tools/realmachine.py` +
+宿主测试台 `tools/hosttest.lua`（547 项）与真机脚本 `tools/realmachine.py` +
 `scripts/realmachine_verify.sh`。
 
 `src/bin/sh` 已升级为 POSIX 核心子集（变量/引号/if/for/while/case/函数/test/[ ]/&&/|| /文件重定向/管道
 `|`，无命令替换 `$()`、算术 `$(( ))`），支持脚本执行（`sh script.sh` / `./script.sh`，`#!` shebang）、
 `rm`/`mkdir` 补了 GNU `-r/-f`/`-p`；新增 `chmod`（八进制 + 符号模式 + `-R`）、`chown`（`owner:group` + `-R`）、
 `mount`（挂载 `/dev/sdX`、`UUID=` 或镜像路径 / `-a` 按 fstab 挂载 / 无参列出）/ `umount` / `blkid` / `lsblk`；
-磁盘驱动器经 `devdisk` 抽象为 `/dev/sda`（整盘 ccdisk）与 `/dev/sdaN`（manifest 分区 ext2）设备节点，
-UUID 用磁盘 ID 模拟，磁盘不随启动自动挂载（改由 `/etc/fstab` 声明）。作业控制落地：
+存储经 `devdisk` 抽象为整盘（ccdisk）与分区（manifest 里的 ext2 镜像）设备节点 —— **电脑自带存储恒为
+`/dev/sda`**（曾经的 bug：只枚举磁盘驱动器，自带存储与其上的分区永远不是设备），磁盘驱动器接在其后，
+UUID 用 ID 加前缀模拟（`d<磁盘ID>`/`c<电脑ID>`），存储不随启动自动挂载（改由 `/etc/fstab` 声明）。作业控制落地：
 `&` 后台作业 + `jobs`/`fg`/`bg`/`wait`/`kill %job`/`$!`、
 前台作业进程组与 `^C`/`^Z` 路由、后台进程组读 tty 的 `SIGTTIN`、`/dev/null`、`sh -c`；
 新增 `read` 内建（POSIX，跟随 `IFS` 变量）与 `/bin/sleep`（GNU 风格，分片睡眠便于信号打断）。
@@ -557,7 +570,7 @@ sysfs 也从 display 专用泛化成 class 注册表（模块用 `kapi.registerS
 
 - **CC-fs 引导**（默认）：`kernel.lua` 直接跑 `boot.boot()`——`setupVfs` 挂根 hdd 到 `/` +
   `mountDev` + `klog.register`（`/dev/kmsg`、`/dev/log`）+ `procfs.mount` 挂 `/proc` →
-  `setupDevices` 扫描磁盘驱动器注册
+  `setupDevices` 扫描存储（电脑自带存储 + 磁盘驱动器）注册
   `/dev/sdX` 节点（不自动挂载）→ `registerConsole` 把电脑自身 `term` 注册为 `/dev/ttyN` 控制台
   （并派生 `/dev/console`）→ `setupUsers` 从**根的** `/etc/{passwd,shadow,group}` 建用户库并注册
   `user.*` syscalls → `setupModules` 从**根的** `/lib/modules/<version>/` 装模块
@@ -677,7 +690,8 @@ sysfs 也从 display 专用泛化成 class 注册表（模块用 `kapi.registerS
   getty 退出由 init 按 `Restart=always` 重新拉起。
 - **服务是 init 的孩子**：`proc.spawnFile` 支持 `opts.ppid`，服务统一挂在 PID 1 名下（与 systemd 一致）；
   子进程退出经内核 `proc.onExit` 钩子同步通知 init（不轮询）。
-- **设备与文件系统分层**：`devdisk` 只负责「有哪些设备」（枚举磁盘 → `/dev/sdX` + UUID 解析 + 挂载表），
+- **设备与文件系统分层**：`devdisk` 只负责「有哪些设备」（枚举存储：电脑自带存储恒为 `sda`、磁盘驱动器
+  接在其后 → `/dev/sdX` + UUID 解析 + 挂载表），
   文件系统实现由模块用 `kapi.registerFstype(name, fn)` 注册（`ext2.ko` → `ext2`，`ccdisk.ko` → `ccdisk`）；
   `mount -t <type>` 找不到处理器即报错（fail-fast，无回退）。
 - **文件句柄的两种调用风格（踩过的大坑）**：CC 原生文件句柄的方法是 Java 方法，Lua 侧
@@ -705,7 +719,7 @@ sysfs 也从 display 专用泛化成 class 注册表（模块用 `kapi.registerS
 
 ```bash
 lua5.1 tools/build.lua             # 构建 dist/: 压缩内核/DLUB/BIOS/工具/模块/配置 + manifest
-lua5.1 tools/build.lua --check     # 构建 + 压缩等价性门禁(hosttest 512 项 + 7 个自检脚本差分)
+lua5.1 tools/build.lua --check     # 构建 + 压缩等价性门禁(hosttest 547 项 + 7 个自检脚本差分)
 lua5.1 tools/build.lua --release   # 构建 + 生成 dist/release/<版本>/ 发布树(安装布局的 payload)
 sh tools/serve.sh                  # 开发期: 把发布树挂在 10568 端口(游戏侧 wget 安装用)
 ```
@@ -833,10 +847,20 @@ key/char 事件**来驱动向导。喂按键的时机靠 `wait` 盯 `/delin-inst
 |---|---|---|
 | CCFS → 电脑自身存储 | 安装器（`wget run`） | `/.boot` → `/boot/delin.lua` → 内核，直接进 `init up` |
 | EXT2 → 电脑自身存储 | 安装器（游戏内 mkfs） | `[DLUB] root=/parts/root.img fs=ext2 kernel=/boot/delin.lua (142715 bytes)` → `root boot: fstype=ext2` |
-| CCFS → 磁盘（`ccdisk`） | 同安装器产出（见下方配额限制） | `[DLUB] config /dlub.cfg ccdisk=right -> disk` → `root boot: fstype=ccdisk root=disk`，且盘同时以 `/dev/sda`(+`sda1`) 可见 |
+| CCFS → 磁盘（`ccdisk`） | 同安装器产出（见下方配额限制） | `[DLUB] config /dlub.cfg ccdisk=right -> disk` → `root boot: fstype=ccdisk`，且盘同时以整盘/分区设备节点可见（该次实测在“自带存储还不是设备”之前，日志里盘是 `sda`；现在自带存储恒为 `sda`，盘顺延到 `sdb`） |
 | EXT2 → 磁盘（`bootdisk`） | 同上 | `[DLUB] root=disk/parts/root.img fs=ext2` → `root boot: fstype=ext2` |
 
 其它实测数据：
+- **电脑自带存储成为块设备 + UUID 命名空间真机实测**（电脑3 bootdisk + 电脑4 rootfs, 2026-09-11）：
+  修 bug 前电脑4（Delin 装在自带存储里）的 `delin.log` 是 `block devices: (none)` +
+  `root boot: no /dev node for root partition`；修完同一台机器变成
+  `block devices: sda(ccdisk,uuid=c4) sda1(ext2,uuid=c4-1) sda2(ext2,uuid=c4-2)`（`/parts/manifest` 的两个分区）。
+  电脑3（根在磁盘上）：`block devices: sda(ccdisk,uuid=c3) sdb(ccdisk,uuid=d0) sdb1(ext2,uuid=d0-1) sdb2(ext2,uuid=d0-2)`，
+  `mount` 里根显示为 **`/dev/sdb1 on / type ext2 (rw) uuid=d0-1`**（不再是虚拟设备名 `rootfs`），
+  fstab 的 `UUID=d0-2` 自动挂载 `/mnt/data` 成功；`mount -t ccdisk /dev/sda /mnt/hdd` 列出的是
+  **电脑自身 FS**（`main.lua`/`startup.lua`/`delin.log`…）→ `ok own_storage_is_block_device`；
+  `mount UUID=d0-1` 可挂、裸数字 `mount UUID=0` 被拒（`no such device`，命名空间必需）。
+  停机后 `e2fsck -fn` 干净。
 - 游戏内 mkfs + 铺 65 个文件造出的镜像，拿到宿主机上 `e2fsck -fn` **干净**
   （97 文件 / 444 块 of 512）；512 KB 装得下 346 KB payload，真机整轮约 1 分钟。
 - **交互式向导真机实测**（电脑3 + 磁盘0，注入按键走完整套向导，两种落盘路径各一轮，
@@ -868,7 +892,7 @@ key/char 事件**来驱动向导。喂按键的时机靠 `wait` 盯 `/delin-inst
 验证：
 
 ```bash
-lua5.1 tools/hosttest.lua        # 宿主测试: init 引擎/fstab/syslogd/logrotate/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone (512 项)
+lua5.1 tools/hosttest.lua        # 宿主测试: init 引擎/fstab/syslogd/logrotate/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone/devdisk (547 项)
 DELIN_REPO=<压缩后的源码树> lua5.1 tools/hosttest.lua         # 压缩器等价性: 同一套测试跑在压缩产物上
 DELIN_SRCBIN=<压缩后的 bin> lua5.1 tools/harness.lua /bin/sh # 同上, 工具级差分比对
 lua5.4 tools/hosttest.lua        # 同上用 5.4 跑一遍(CC 是 5.2 语义, 不能只在 5.1 上验;
@@ -926,7 +950,7 @@ src/kernel/klog.lua        内核日志: ring buffer + /dev/kmsg(带 cursor/seek
 src/kernel/fstab.lua       /etc/fstab 解析(fstab(5) 子集) + systemd 风格 mount 单元命名
 src/kernel/modules.lua     内核模块系统: .ko 解析(注释头)/依赖拓扑/装载/alias(use) + fstype 注册
 src/kernel/blockdev.lua    块设备层: 文件块设备(/parts/*.img, seek+read/write)
-src/kernel/devdisk.lua     磁盘设备抽象: CC 磁盘 -> /dev/sdX 节点 + UUID(磁盘 ID 模拟) + fstype 挂载/卸载
+src/kernel/devdisk.lua     存储设备抽象: 电脑自带存储/CC 磁盘 -> /dev/sdX 节点 + UUID(d<磁盘ID>/c<电脑ID>) + fstype 挂载/卸载
 src/kernel/ext2.lua        EXT2 读写: 超级块/inode(uid/gid/mode/硬链接/符号链接)/间接块/多块组
                             + 追加写增量落盘(appendFile/flush)
 src/kernel/user.lua        用户库: /etc/passwd|shadow|group, salt+hash, chmod/chown 权限
@@ -1054,7 +1078,7 @@ tools/harness.lua          host 测试台: 用真实 Delin 工具源码在宿主
                            + 桩 printer(/dev/lp0) + 桩 redstone API(加载真实 redstone.ko)
                            + 桩进程表(ps/pgrep/pkill/killall);
                            进程环境用内核同一份白名单(src/kernel/procenv.lua), 不放宽)
-tools/hosttest.lua         宿主测试: init 单元引擎/fstab 生成/syslogd 规则/logrotate 轮转/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone(512 项)
+tools/hosttest.lua         宿主测试: init 单元引擎/fstab 生成/syslogd 规则/logrotate 轮转/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone/devdisk(547 项)
 tools/installertest.lua    安装器宿主回归: 假 CraftOS(fs/term/os/http/disk/peripheral + 脚本化事件队列)
                            + 假终端格子(含 fg/bg), 用 loadfile 跑 dist/install.lua, 按键序列驱动向导
                            并断言落盘文件/镜像/日志; 失败时 dump 每一屏(含反色行标记)

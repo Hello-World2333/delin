@@ -35,7 +35,7 @@
 --    mount 表里有 root 不存在的条目时向 stderr 报一行并跳过, 退出码置 1(与 GNU 对陈旧挂载的处理一致)。
 -- 6) 百分比用向上取整(GNU df 也是向上取整: 1052/3033520 会显示 1% 而不是 0%)。
 -- 7) 操作数路径存在但不在任何挂载点之下时报 `not a mounted filesystem` 并 return 1:
---    真机上 "/" 一定在 mount 表里(rootfs, 见 src/kernel/boot.lua 的 vfs.mount("/", ...)),
+--    真机上 "/" 一定在 mount 表里(设备节点见 src/kernel/boot.lua 的 vfs.mount("/", ...)),
 --    所以正常路径一定匹配得到; 宿主测试台 mount 表初始为空, 需要先 mount 或直接给挂载点。
 -- 8) 单独 "-" 按普通操作数处理(SPEC 约定), 会解析成不存在的路径并报 No such file or directory。
 local args = args or {}

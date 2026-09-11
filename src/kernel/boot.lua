@@ -55,8 +55,10 @@ local function userprint(...) return emit(PRI_USER, ...) end
 --- 挂载: 根 hdd + /dev + /proc(procfs)。磁盘驱动器不自动挂载 —— 只作为 /dev/sdX 设备节点
 --- 暴露(见 setupDevices), 由 fstab/mount 显式挂载。
 local function setupVfs()
-    -- 根 = 电脑 hdd(真实路径即 "/...")
-    vfs.mount("/", vfs.real(""), { device = "rootfs", fstype = "ccdisk" })
+    -- 根 = 电脑自带存储(真实路径即 "/..."): 对上它的整盘设备节点(恒为 /dev/sda, 见 devdisk)。
+    local rootDev = devdisk.byMountPath("")
+    if not rootDev then error("boot: no /dev node for the computer's own storage", 0) end
+    vfs.mount("/", vfs.real(""), { device = rootDev.node, fstype = "ccdisk", uuid = rootDev.uuid })
     vfs_api.mountDev()
     klog.register() -- /dev/kmsg + /dev/log
     procfs.mount(bootMs, modules.version) -- /proc: 进程/系统信息
@@ -188,7 +190,8 @@ local function registerRuntimeSyscalls()
     sc["tty.setFocus"] = function(name) return tty.setFocus(name) end
     sc["tty.console"] = function() return tty.getFocus() end
     -- 挂载/卸载: device 可为 /dev/sdX(整盘 ccdisk / manifest 分区 ext2)、/dev/ccdiskN、
-    --   UUID=<uuid>(UUID 由磁盘 ID 模拟: 整盘 <id>, 分区 <id>-<n>), 或真实后端上的镜像路径(旧式)。
+    --   UUID=<uuid>(UUID 由 ID 模拟并带前缀: 磁盘 d<磁盘ID>/d<磁盘ID>-<n>, 自带存储 c<电脑ID>/c<电脑ID>-<n>),
+    --   或真实后端上的镜像路径(旧式)。
     --   fs.umount(dir): 卸载并关闭块设备; fs.mounts(): 列出当前挂载(含 uuid)。
     sc["fs.mount"] = function(device, dir, fstype) return devdisk.mount(device, dir, fstype) end
     sc["fs.umount"] = function(dir) return devdisk.umount(dir) end
@@ -312,14 +315,18 @@ local function bootFromInfo(bi)
         if rootDev then
             mountInfo = { device = rootDev.node, fstype = rootDev.fstype, uuid = rootDev.uuid }
         else
-            -- 从电脑自带存储启动时, 根分区可能没有对应的 /dev 节点
-            kprint("root boot: no /dev node for root partition, using virtual device")
+            -- 根镜像不在其所在存储的 /parts/manifest 里(如 /dlub.cfg 直接指向一个没登记的 .img)
+            -- 就没有对应的设备节点: 报出来, 挂载表里记 rootfs 这个虚拟设备名。
+            kprint("root boot: " .. bi.rootPath .. " is not in the storage's /parts/manifest, using virtual device")
             mountInfo = { device = bi.rootPath or "rootfs", fstype = "ext2" }
         end
     elseif fstype == "ccdisk" then
-        -- 根 = 磁盘的 CC 原生文件系统: 直接以该盘的 CC 挂载路径作为真实根路径前缀。
+        -- 根 = 某个存储(电脑自带存储或磁盘)的 CC 原生文件系统: 直接以该存储的 CC 挂载路径
+        -- 作为真实根路径前缀, 并对上它的整盘设备节点。
+        local e = devdisk.byMountPath(bi.rootPath)
+        if not e then kprint("FATAL: no device node for root storage " .. tostring(bi.rootPath)); return end
         rootBackend = vfs.real(bi.rootPath)
-        mountInfo = { device = bi.rootPath, fstype = "ccdisk" }
+        mountInfo = { device = e.node, fstype = "ccdisk", uuid = e.uuid }
     else
         kprint("FATAL: unknown root fstype " .. tostring(fstype))
         return

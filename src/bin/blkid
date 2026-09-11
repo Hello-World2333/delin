@@ -1,8 +1,10 @@
 -- Delin blkid: 列出块设备的 UUID 与文件系统类型 (util-linux blkid 子集)。
 -- 用法: blkid [device...]
--- 输出: /dev/sda: UUID="0" TYPE="ccdisk" LABEL="MYDISK"
---       /dev/sda1: UUID="0-1" TYPE="ext2"
--- UUID 由磁盘 ID 模拟(CC 无文件系统 UUID): 整盘 <磁盘ID>, 分区 <磁盘ID>-<分区号>。
+-- 输出: /dev/sda: UUID="c3" TYPE="ccdisk" LABEL="MYDISK"     (电脑自带存储)
+--       /dev/sdb1: UUID="d0-1" TYPE="ext2"                    (磁盘驱动器里的盘)
+-- UUID 由 ID 模拟(CC 无文件系统 UUID), 前缀区分介质(磁盘 ID 与电脑 ID 会撞号):
+--   磁盘 d<磁盘ID>/d<磁盘ID>-<分区号>; 电脑自带存储 c<电脑ID>/c<电脑ID>-<分区号>。
+-- 无 ID 的介质(放进驱动器的电脑/海龟)没有 UUID。
 local args = args or {}
 
 local function stderr(s)
