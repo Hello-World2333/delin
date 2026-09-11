@@ -67,7 +67,7 @@ while i <= #args do
         sig = parseSig(a)
         if not sig then
             stderr("kill: unknown signal " .. a .. "\n")
-            return
+            return 1
         end
     else
         targets[#targets + 1] = a
@@ -85,7 +85,7 @@ end
 
 if #targets == 0 then
     stderr("usage: kill [-SIG] pid...\n")
-    return
+    return 1
 end
 
 for _, tgt in ipairs(targets) do

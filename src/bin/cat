@@ -80,7 +80,7 @@ for _, a in ipairs(args) do
     elseif a == "--show-all" then optShowAll, optNonprint, optEnds, optTabs = true, true, true, true
     elseif a == "--show-nonprinting" then optNonprint = true
     elseif a:sub(1, 1) == "-" and a ~= "-" then
-        for k = 2, #a do if not setShort(a:sub(k, k)) then return end end
+        for k = 2, #a do if not setShort(a:sub(k, k)) then return 1 end end
     else
         files[#files + 1] = a
     end
@@ -152,6 +152,9 @@ local function catFile(p)
     if not f then
         local msg = "No such file or directory"
         if err and (err:find("permission") or err:find("denied")) then msg = "Permission denied"
+        -- 先判 ENOENT: "No such file or directory" 里含 "directory",
+        -- 先匹 "directory" 会把"文件不存在"误报成"Is a directory"(老模板的 bug)。
+        elseif err and err:lower():find("no such file") then msg = "No such file or directory"
         elseif err and err:find("directory") then msg = "Is a directory" end
         stderr("cat: " .. p .. ": " .. msg .. "\n")
         return false
@@ -161,6 +164,11 @@ local function catFile(p)
     return true
 end
 
+-- POSIX cat: 某个文件出错时**继续处理其余操作数**, 但最终退出码必须非 0
+-- (老实现是出错就裸 return, 于是 `cat /nope` 报完错却返回 0)。
+local rc = 0
 for _, a in ipairs(files) do
-    if _interrupted or not catFile(a) then return end
+    if _interrupted then return 130 end
+    if not catFile(a) then rc = 1 end
 end
+return rc

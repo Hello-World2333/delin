@@ -61,7 +61,7 @@ for _, a in ipairs(args) do
 end
 if #srcs < 2 then
     stderr("cp: missing destination file operand\n")
-    return
+    return 1
 end
 local destRaw = srcs[#srcs]
 local destHintIsDir = destRaw:sub(-1) == "/"
@@ -148,7 +148,7 @@ end
 for _, src in ipairs(sources) do
     if not fs.exists(src) then
         stderr("cp: " .. src .. ": No such file or directory\n")
-        return
+        return 1
     end
     local target
     if fs.isDir(dest) or destHintIsDir then
@@ -156,14 +156,14 @@ for _, src in ipairs(sources) do
     else
         if #sources > 1 then
             stderr("cp: target '" .. destRaw .. "' is not a directory\n")
-            return
+            return 1
         end
         target = dest
     end
     if fs.isDir(src) then
         if not recursive then
             stderr("cp: " .. src .. ": is a directory (use -r)\n")
-            return
+            return 1
         end
         local ok, err = copyTree(src, target)
         if not ok then stderr("cp: " .. src .. ": " .. tostring(err) .. "\n"); return end

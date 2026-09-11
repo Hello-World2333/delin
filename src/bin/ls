@@ -47,10 +47,13 @@ local function ioeMsg(err)
     return "No such file or directory"
 end
 
--- 读 fs.attributes, 兼容 ext2(mode/uid/gid/mtime/links)与 CC 原生(modificationTime)。
+-- 读 fs.lstat(不跟随符号链接, 等价 Linux ls -l 的 lstat), 兼容 ext2(mode/uid/gid/mtime/links)
+-- 与 CC 原生(modificationTime)。用 fs.lstat 而不是 fs.attributes 才看得到链接本身:
+-- 否则 `ls -l link` 显示的是目标, 类型字符也不是 "l"。
 local function attrs(p)
-    if fs.attributes then
-        local a = fs.attributes(p)
+    if fs.lstat or fs.attributes then
+        local fn = fs.lstat or fs.attributes
+        local a = fn(p)
         if a then
             if not a.mtime and a.modificationTime then a.mtime = a.modificationTime end
             return a
@@ -112,7 +115,13 @@ local function rwx(b)
     return r .. w .. x
 end
 local function modeStr(a)
-    local tchar = (a.kind == "symlink") and "l" or (a.isDir and "d" or "-")
+    -- 类型字符与 Linux ls 一致: l 符号链接 / p 命名管道 / c,b 字符与块设备 / d 目录 / - 普通文件。
+    local k = a.kind
+    local tchar = (k == "symlink" and "l")
+        or (k == "fifo" and "p")
+        or (a.isDir and "d")
+        or (k == "device" and "c")
+        or "-"
     local perm
     if a.mode then
         local bits = a.mode % 512

@@ -1,9 +1,15 @@
--- Delin chown: 修改文件属主/属组 (POSIX 子集 + GNU -R/-v/-c/-f)。
+-- Delin chown: 修改文件属主/属组 (POSIX 子集 + GNU -R/-h/-v/-c/-f)。
 -- 用法: chown [OPTION]... [OWNER][:[GROUP]] FILE...
 --   OWNER/GROUP 可为名字(经 /etc/passwd,/etc/group syscalls 解析)或数字 uid/gid;
 --   省略则不变(如 :staff 仅改组, alice: 仅改主, alice:staff 两项都改)。
 --   --reference=RFILE  以 RFILE 的 uid/gid 为准
---   -R/-r, --recursive 递归; -v/-c/-f 同 chmod; -- 结束选项。
+--   -h, --no-dereference 只作用于符号链接本身, 不跟随链接(GNU 的 lchown 语义)
+--   -R/-r, --recursive 递归; -f 静默文件错误; -- 结束选项。
+-- -v/-c 的提示走 **stdout**(GNU 语义: 诊断/错误才走 stderr), 文案与 GNU 一致:
+--   变了 -> changed ownership of 'X' from OWNER:GROUP to OWNER:GROUP
+--   没变(-v 也打印) -> ownership of 'X' retained as OWNER:GROUP
+-- 符号链接语义(与 GNU 一致): 命令行操作数不给 -h 就跟随链接改**目标**; 给 -h 只改**链接本身**;
+--   -R 遍历中遇到的链接一律改链接本身、不下钻(GNU 递归的默认 -P)。判链接用 fs.lstat。
 local args = args or {}
 
 local cwd = (type(cwd) == "string" and cwd) or "/"
@@ -52,7 +58,7 @@ end
 -- ---------------------------------------------------------------
 -- 选项解析
 -- ---------------------------------------------------------------
-local optRecursive, optVerbose, optChanges, optSilent = false, false, false, false
+local optRecursive, optVerbose, optChanges, optSilent, optNoDeref = false, false, false, false, false
 local refFile = nil
 local positional, noMoreOpts = {}, false
 for _, a in ipairs(args) do
@@ -64,6 +70,7 @@ for _, a in ipairs(args) do
     elseif a == "-v" or a == "--verbose" then optVerbose = true
     elseif a == "-c" or a == "--changes" then optChanges = true
     elseif a == "-f" or a == "--silent" or a == "--quiet" then optSilent = true
+    elseif a == "-h" or a == "--no-dereference" then optNoDeref = true
     elseif a:match("^%-%-reference=") then refFile = resolve(a:sub(#"--reference=" + 1))
     elseif a:sub(1, 1) == "-" and a ~= "-" then
         for k = 2, #a do
@@ -72,7 +79,8 @@ for _, a in ipairs(args) do
             elseif ch == "v" then optVerbose = true
             elseif ch == "c" then optChanges = true
             elseif ch == "f" then optSilent = true
-            else if not optSilent then stderr("chown: invalid option -- '" .. ch .. "'\n") end return end
+            elseif ch == "h" then optNoDeref = true
+            else if not optSilent then stderr("chown: invalid option -- '" .. ch .. "'\n") end return 1 end
         end
     else
         positional[#positional + 1] = a
@@ -81,7 +89,7 @@ end
 
 if refFile and not fs.exists(refFile) then
     if not optSilent then stderr("chown: " .. refFile .. ": No such file or directory\n") end
-    return
+    return 1
 end
 
 local spec, fileList
@@ -95,7 +103,7 @@ else
 end
 if (not refFile and not spec) or #fileList == 0 then
     if not optSilent then stderr("usage: chown [OPTION]... [OWNER][:[GROUP]] FILE...\n") end
-    return
+    return 1
 end
 
 local uidKeep, gidKeep
@@ -110,54 +118,139 @@ else
         -- 有冒号: owner(可空), group(可空)
         if owner ~= "" then
             local u = parseId(owner, syscalls and syscalls["user.get"] and function(n) local r = syscalls["user.get"](n); if r then return { uid = r.uid } end end)
-            if not u then if not optSilent then stderr("chown: invalid owner: '" .. owner .. "'\n") end return end
+            if not u then if not optSilent then stderr("chown: invalid owner: '" .. owner .. "'\n") end return 1 end
             uidKeep = u
         end
         if group ~= "" then
             local g = parseId(group, syscalls and syscalls["user.groupByName"] and function(n) local r = syscalls["user.groupByName"](n); if r then return { gid = r.gid } end end)
-            if not g then if not optSilent then stderr("chown: invalid group: '" .. group .. "'\n") end return end
+            if not g then if not optSilent then stderr("chown: invalid group: '" .. group .. "'\n") end return 1 end
             gidKeep = g
         end
     else
         local u = parseId(spec, syscalls and syscalls["user.get"] and function(n) local r = syscalls["user.get"](n); if r then return { uid = r.uid } end end)
-        if not u then if not optSilent then stderr("chown: invalid owner: '" .. spec .. "'\n") end return end
+        if not u then if not optSilent then stderr("chown: invalid owner: '" .. spec .. "'\n") end return 1 end
         uidKeep = u
     end
 end
 
-local function applyOne(path)
-    local before = fs.attributes(path)
-    local ok, err = fs.chown(path, uidKeep, gidKeep)
-    if not ok then
-        if not optSilent then stderr("chown: " .. path .. ": " .. tostring(err) .. "\n") end
-        return
+-- uid/gid -> "owner:group"(查不到名字就打印数字, 与 GNU 的提示格式一致)。
+local function ownerLabel(uidv, gidv)
+    local uname = tostring(uidv)
+    if syscalls and syscalls["user.byUid"] then
+        local r = syscalls["user.byUid"](uidv)
+        if r and r.name then uname = r.name end
     end
-    if not optSilent and (optVerbose or (optChanges and before and ((before.uid or 0) ~= (uidKeep or 0) or (before.gid or 0) ~= (gidKeep or 0)))) then
-        stderr("ownership of '" .. path .. "' changed\n")
+    local gname = tostring(gidv)
+    if syscalls and syscalls["user.groupByGid"] then
+        local r = syscalls["user.groupByGid"](gidv)
+        if r and r.name then gname = r.name end
+    end
+    return uname .. ":" .. gname
+end
+
+-- -v 每条都打印; -c 只在真的变了时打印。文案与 GNU 一致(见文件头)。
+local function report(raw, oldUid, oldGid, newUid, newGid, changed)
+    if changed then
+        if optVerbose or optChanges then
+            io.write("changed ownership of '" .. raw .. "' from " .. ownerLabel(oldUid, oldGid) ..
+                     " to " .. ownerLabel(newUid, newGid) .. "\n")
+        end
+    elseif optVerbose then
+        io.write("ownership of '" .. raw .. "' retained as " .. ownerLabel(newUid, newGid) .. "\n")
     end
 end
 
-local function walk(top)
+-- 跟随链接改目标(chown(2) 语义 = 命令行操作数不给 -h 时的 GNU 行为)。
+local function applyOne(path, raw)
+    local before = fs.attributes(path)
+    local ok, err = fs.chown(path, uidKeep, gidKeep)
+    if not ok then
+        if not optSilent then stderr("chown: " .. raw .. ": " .. tostring(err) .. "\n") end
+        status = 1
+        return
+    end
+    local oldUid = before and (before.uid or 0) or 0
+    local oldGid = before and (before.gid or 0) or 0
+    local newUid = uidKeep or oldUid
+    local newGid = gidKeep or oldGid
+    if not optSilent then
+        report(raw, oldUid, oldGid, newUid, newGid,
+               before == nil or oldUid ~= newUid or oldGid ~= newGid)
+    end
+end
+
+-- 只改符号链接本身(Linux lchown); 内核没给 fs.lchown 就明确报错, 绝不退化成跟随链接
+-- (跟随会把目标文件的属主改掉, 递归时常常是树外文件)。
+local function applyLink(path, raw)
+    local before = fs.lstat(path)
+    local lchown = fs.lchown
+    if not lchown then
+        stderr("chown: " .. raw .. ": cannot change the ownership of a symbolic link: " ..
+               "fs.lchown is not supported by this kernel\n")
+        status = 1
+        return
+    end
+    local ok, err = lchown(path, uidKeep, gidKeep)
+    if not ok then
+        if not optSilent then stderr("chown: " .. raw .. ": " .. tostring(err) .. "\n") end
+        status = 1
+        return
+    end
+    local oldUid = before and (before.uid or 0) or 0
+    local oldGid = before and (before.gid or 0) or 0
+    local newUid = uidKeep or oldUid
+    local newGid = gidKeep or oldGid
+    if not optSilent then
+        report(raw, oldUid, oldGid, newUid, newGid,
+               before == nil or oldUid ~= newUid or oldGid ~= newGid)
+    end
+end
+
+-- 判符号链接: 必须用 lstat(fs.attributes 会跟随链接, 拿到的 kind 是目标的)。
+local function isSymlink(path)
+    local a = fs.lstat(path)
+    return a ~= nil and a.kind == "symlink"
+end
+
+local function childRaw(raw, n)
+    return (raw:sub(-1) == "/") and (raw .. n) or (raw .. "/" .. n)
+end
+
+local function walk(raw, top)
     if fs.isDir(top) then
-        applyOne(top)
+        applyOne(top, raw)
         local names = fs.list(top) or {}
         table.sort(names)
         for _, n in ipairs(names) do
             local full = (top == "/") and ("/" .. n) or (top .. "/" .. n)
-            if fs.isDir(full) then walk(full) else applyOne(full) end
+            local fullRaw = childRaw(raw, n)
+            if isSymlink(full) then
+                applyLink(full, fullRaw) -- GNU 递归默认(-P): 改链接本身, 不下钻
+            elseif fs.isDir(full) then
+                walk(fullRaw, full)
+            else
+                applyOne(full, fullRaw)
+            end
         end
     else
-        applyOne(top)
+        applyOne(top, raw)
     end
 end
 
+local status = 0
 for _, raw in ipairs(fileList) do
     local path = resolve(raw)
-    if not fs.exists(path) then
+    if not fs.exists(path) and not isSymlink(path) then
+        -- 悬空链接也算存在(lstat 成功), 所以再查一次 lstat。
         if not optSilent then stderr("chown: " .. raw .. ": No such file or directory\n") end
+        status = 1
+    elseif isSymlink(path) and optNoDeref then
+        applyLink(path, raw)
     elseif optRecursive then
-        walk(path)
+        walk(raw, path)
     else
-        applyOne(path)
+        applyOne(path, raw)
     end
 end
+
+return status

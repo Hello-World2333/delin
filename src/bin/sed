@@ -37,6 +37,9 @@ local function stderr(s)
 end
 local function ioeMsg(err)
     if err and (err:find("permission") or err:find("denied")) then return "Permission denied" end
+    -- 必须先判 ENOENT: "No such file or directory" 里本来就含 "directory" 这个词,
+    -- 先匹 "directory" 会把"文件不存在"误报成 "Is a directory"(老模板的 bug)。
+    if err and err:lower():find("no such file") then return "No such file or directory" end
     if err and err:find("directory") then return "Is a directory" end
     return "No such file or directory"
 end
@@ -91,7 +94,7 @@ while i <= #args do
         break
     elseif a:sub(1, 1) == "-" and a ~= "-" then
         stderr("sed: invalid option -- " .. a .. "\n")
-        return
+        return 1
     else
         -- 第一个非选项参数是脚本; 若已用 -e/-f, 则都当文件。
         if not seenScriptOpt and #scripts == 0 and #files == 0 then
@@ -106,11 +109,11 @@ end
 
 if #scripts == 0 then
     stderr("sed: no script specified\n")
-    return
+    return 1
 end
 if inplace and #files == 0 then
     stderr("sed: can't read stdin (in-place needs files)\n")
-    return
+    return 1
 end
 
 -- ---------------------------------------------------------------
@@ -416,7 +419,7 @@ for _, s in ipairs(scripts) do
 end
 if #cmds == 0 then
     stderr("sed: no usable commands\n")
-    return
+    return 1
 end
 
 -- ---------------------------------------------------------------

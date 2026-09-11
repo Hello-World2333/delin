@@ -23,6 +23,9 @@ local function stderr(s)
 end
 local function ioeMsg(err)
     if err and (err:find("permission") or err:find("denied")) then return "Permission denied" end
+    -- 必须先判 ENOENT: "No such file or directory" 里本来就含 "directory" 这个词,
+    -- 先匹 "directory" 会把"文件不存在"误报成 "Is a directory"(老模板的 bug)。
+    if err and err:lower():find("no such file") then return "No such file or directory" end
     if err and err:find("directory") then return "Is a directory" end
     return "No such file or directory"
 end
@@ -77,7 +80,7 @@ while i <= #args do
             setCount(optglued, "lines")
         else
             stderr("head: invalid option -- '" .. a .. "'\n")
-            return
+            return 1
         end
     else
         files[#files + 1] = a
@@ -143,7 +146,7 @@ for idx, raw in ipairs(files) do
         local f, err = fs.open(p, "r")
         if not f then
             stderr("head: " .. p .. ": " .. ioeMsg(err) .. "\n")
-            return
+            return 1
         end
         header(raw)
         emit(f)

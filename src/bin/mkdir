@@ -64,7 +64,7 @@ while i <= #args do
 end
 if #rest == 0 then
     stderr("mkdir: missing operand\n")
-    return
+    return 1
 end
 
 local function applyMode(p)

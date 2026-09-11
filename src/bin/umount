@@ -24,10 +24,10 @@ end
 
 if #operands == 0 then
     stderr("umount: missing operand\n")
-    return
+    return 1
 elseif #operands > 1 then
     stderr("umount: too many arguments\n")
-    return
+    return 1
 end
 
 local what = operands[1]
@@ -43,11 +43,11 @@ if not target then
 end
 if not target then
     stderr("umount: " .. what .. ": not mounted\n")
-    return
+    return 1
 end
 local ok, err = syscalls["fs.umount"](target)
 if not ok then
     stderr("umount: " .. tostring(err) .. "\n")
-    return
+    return 1
 end
 io.write("unmounted " .. target .. "\n")

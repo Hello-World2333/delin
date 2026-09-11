@@ -68,7 +68,7 @@ end
 
 if #rest == 0 then
     stderr("touch: missing file operand\n")
-    return
+    return 1
 end
 
 for _, fp in ipairs(rest) do

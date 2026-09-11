@@ -64,16 +64,16 @@ end
 local function doMount(device, dir)
     if not fs.isDir(dir) then
         stderr("mount: " .. dir .. ": No such file or directory\n")
-        return
+        return 1
     end
     if not (syscalls and syscalls["fs.mount"]) then
         stderr("mount: fs.mount syscall not available\n")
-        return
+        return 1
     end
     local ok, info = syscalls["fs.mount"](device, dir, fstype)
     if not ok then
         stderr("mount: " .. tostring(info) .. "\n")
-        return
+        return 1
     end
     info = info or {}
     io.write("mounted " .. (info.device or device) .. " on " .. dir
@@ -123,8 +123,12 @@ elseif #operands == 0 then
     listMounts()
 elseif #operands == 1 then
     stderr("mount: " .. operands[1] .. ": missing mount point\n")
+    return 1
 elseif #operands == 2 then
-    doMount(operands[1], operands[2])
+    -- 把 doMount 的失败透出来: 直接在 doMount 里 return 1 是没用的, 它的返回值没人看,
+    -- 于是 `mount /dev/没有这个设备 /mnt` 会报错却返回 0。
+    return doMount(operands[1], operands[2])
 else
     stderr("mount: too many arguments\n")
+    return 1
 end

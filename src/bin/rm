@@ -52,7 +52,7 @@ for _, a in ipairs(args) do
 end
 if #rest == 0 then
     stderr("rm: missing operand\n")
-    return
+    return 1
 end
 
 -- 删除前询问(仅在 -i 且非 -f 时)。

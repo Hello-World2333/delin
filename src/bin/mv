@@ -53,7 +53,7 @@ for _, a in ipairs(args) do
 end
 if #srcs < 2 then
     stderr("mv: missing destination file operand\n")
-    return
+    return 1
 end
 local destRaw = srcs[#srcs]
 local destHintIsDir = destRaw:sub(-1) == "/"
@@ -145,7 +145,7 @@ for si = 1, #srcs - 1 do
     local src = resolve(srcs[si])
     if not fs.exists(src) then
         stderr("mv: " .. src .. ": No such file or directory\n")
-        return
+        return 1
     end
     local target
     if fs.isDir(dest) or destHintIsDir then
@@ -153,17 +153,17 @@ for si = 1, #srcs - 1 do
     else
         if #srcs - 1 > 1 then
             stderr("mv: target '" .. destRaw .. "' is not a directory\n")
-            return
+            return 1
         end
         target = dest
     end
     if src == target then
         stderr("mv: " .. srcs[si] .. " and " .. destRaw .. " are the same file\n")
-        return
+        return 1
     end
     local ok, why = doMove(src, target)
     if not ok then
         stderr("mv: " .. src .. ": " .. tostring(why) .. "\n")
-        return
+        return 1
     end
 end

@@ -20,7 +20,7 @@ for _, a in ipairs(args) do
         noheadings = true
     elseif a:sub(1, 1) == "-" and a ~= "-" then
         stderr("lsblk: invalid option -- '" .. a:sub(2, 2) .. "'\n")
-        return
+        return 1
     else
         operands[#operands + 1] = a
     end
@@ -29,7 +29,7 @@ end
 local list = syscalls and syscalls["blkdev.list"] and syscalls["blkdev.list"]()
 if not list then
     stderr("lsblk: blkdev.list syscall not available\n")
-    return
+    return 1
 end
 
 --- 字节数 -> lsblk 风格的人类可读值 (2M / 125K / 1.5M)。
