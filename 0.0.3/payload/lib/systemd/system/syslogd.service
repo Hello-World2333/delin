@@ -1,0 +1,13 @@
+[Unit]
+Description=System Logging Service
+After=local-fs.target
+Documentation=man:syslogd(8) man:syslog.conf(5)
+
+[Service]
+Type=simple
+ExecStart=/bin/syslogd -f /etc/syslog.conf -p /run/syslogd.pid
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

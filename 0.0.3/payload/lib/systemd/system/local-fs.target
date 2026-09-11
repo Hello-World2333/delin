@@ -1,0 +1,5 @@
+[Unit]
+Description=Local File Systems
+Wants=local-fs-pre.target
+After=local-fs-pre.target
+# init 由 /etc/fstab 生成 <mountpoint>.mount 单元, 并把它们作为 Requires=/After= 注入本 target。

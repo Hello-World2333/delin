@@ -1,0 +1,3 @@
+[Unit]
+Description=Login Prompts
+# init 为每个 /dev/ttyN 实例化 getty@ttyN.service 并挂到本 target。

@@ -1,0 +1,7 @@
+[Unit]
+Description=Rotate Log Files
+After=syslogd.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/logrotate /etc/logrotate.conf

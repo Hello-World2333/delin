@@ -1,0 +1,5 @@
+--@name ccmonitor
+--@version 0.1.0
+--@description CC:Tweaked 原生 monitor 显示器驱动 (term 型: /dev/ttyN, 无 /dev/fbN)。
+--@deps
+return{init=function(e,d)local b=d local a=peripheral.wrap(b)pcall(a.setCursorBlink,false)local function c(i)return string.format("%x",i)end local h,g=a.getSize()local f={id="monitor:"..b,type="monitor",mode="term",name=b,device=a,width=h,height=g,getSize=function()return a.getSize()end,text=function(m,n,k,j,i)a.setCursorPos(m+1,n+1)if j and i then local l=#k a.blit(k,string.rep(c(j),l),string.rep(c(i),l))else a.write(k)end end,blit=function(m,n,i,k,j)a.setCursorPos(m+1,n+1)local l=#i a.blit(i,string.rep(c(k or 0),l),string.rep(c(j or 0),l))end,fill=function(i)a.setBackgroundColour(i or 0)a.clear()end,rect=function(n,l,o,m,i)local j=a.getTextColour and a.getTextColour()a.setBackgroundColour(i or 0)for k=l,l+m-1 do a.setCursorPos(n+1,k+1)a.write("")end if j then a.setTextColour(j)end end,flush=function()end,release=function()end,}e.registerDisplay(f)e.log("ccmonitor: display '"..f.id.."' registered (term)")end,}
