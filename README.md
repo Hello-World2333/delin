@@ -22,7 +22,7 @@ while true; do
     read CMD
     if [ "$CMD" = "q" ]; then break; fi
     echo "$CMD" > /sys/class/redstone/top/analog
-    echo ok
+    if [ "$?" -eq 0 ]; then echo ok; fi
 done
 ```
 要运行这个脚本，请把它保存为redstone.sh，然后`chmod +x redstone.sh && ./redstone.sh`。进入交互环境后，输入0-15的整数改变电脑top面的红石输出，输入q退出。
