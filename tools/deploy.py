@@ -16,6 +16,7 @@ import os, sys, subprocess, tempfile, shutil, stat
 DBG = "/usr/sbin/debugfs"
 MKFS = "/usr/sbin/mkfs.ext2"
 FSCK = "/usr/sbin/e2fsck"
+DUMPE2FS = "/usr/sbin/dumpe2fs"
 REPO = "/home/worker/delin"
 
 # debugfs 以非 root 运行必然出现的告警(无法 chown 导出文件), 不算失败。
@@ -162,7 +163,12 @@ def main():
                 shutil.copy(p, os.path.join(moddir, f))
                 os.chmod(os.path.join(moddir, f), 0o755)
         # 3) 建全新 ext2 镜像
-        run(MKFS, "-q", "-t", "ext2", "-b", "1024", out, "2048")
+        #    **inode 必须显式给足**: 2048 块(2MB)按 mkfs 缺省的 bytes-per-inode 只会有 ~256 个
+        #    inode, 而 /bin 现在有 85 个工具 + 模块 + 单元 + 配置 + /var/log + 验证负载 —— 早就
+        #    超了。症状极具迷惑性: 镜像照样 fsck 干净、机器照样启动, 但**运行时一建文件就失败**
+        #    (`alloc inode failed` / 重定向建不出文件 / service 退 1), 看起来像内核 bug。
+        #    实测那一轮 255/256 个 inode 已用满。这里给 1024 个(约 128KB inode 表), 块数不变。
+        run(MKFS, "-q", "-t", "ext2", "-b", "1024", "-N", "1024", out, "2048")
         # 4) 写回目录 + 文件 + 属主/属组
         def walk(d, rel):
             entries = sorted(os.listdir(d))
@@ -191,6 +197,27 @@ def main():
             raise RuntimeError("新镜像未通过 e2fsck -fn:\n" + p.stdout + p.stderr)
         nonroot = sum(1 for v in owner.values() if v != (0, 0))
         print("deployed ->", out, os.path.getsize(out), "bytes; 保留非 root 属主条目:", nonroot)
+        # 6) 余量门禁: 镜像"能 fsck 干净"不等于"运行时还建得出文件"。剩余 inode/块太少就直接
+        #    构建失败 —— 否则会在真机上表现为一堆看不出原因的运行期失败(建文件失败 / 服务退 1)。
+        stats = subprocess.run([DUMPE2FS, "-h", out], capture_output=True, text=True).stdout
+        free_inodes = free_blocks = total_inodes = None
+        for line in stats.splitlines():
+            key, _, val = line.partition(":")
+            val = val.strip()
+            if val.isdigit():
+                if key.startswith("Free inodes"): free_inodes = int(val)
+                elif key.startswith("Free blocks"): free_blocks = int(val)
+                elif key.startswith("Inode count"): total_inodes = int(val)
+        if free_inodes is None or free_blocks is None:
+            raise RuntimeError("拿不到镜像余量(dumpe2fs 输出异常):\n" + stats)
+        print("   inode 余量: %d/%d 空闲, 块余量: %d 空闲" % (free_inodes, total_inodes, free_blocks))
+        if free_inodes < 64:
+            raise RuntimeError(
+                "镜像 inode 余量不足(%d 空闲) —— 真机上会表现为'运行时建文件失败', "
+                "请调大 mkfs 的 -N" % free_inodes)
+        if free_blocks < 128:
+            raise RuntimeError(
+                "镜像块余量不足(%d 空闲) —— 请调大 mkfs 的块数" % free_blocks)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

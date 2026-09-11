@@ -161,6 +161,20 @@ eq(be.canExecute("/d/x111"), true,  "canExecute: 111 可执行(有 x 位即可, 
 eq(be.canExecute("/d"),      false, "canExecute: 目录不可执行")
 eq(be.canExecute("/d/nope"), false, "canExecute: 不存在的文件 -> false")
 
+-- read(n) 的 EOF 契约: 必须返回 **nil**(不是空串)。返回空串会让"读到 nil 为止"的循环
+-- 在真机上无限打转(tee/dd/cp 全中招), 而宿主测试台的句柄是标准的, 所以这里必须锁住。
+do
+    local eofh = assert(be.open("/d/f1", "r"))
+    eq(eofh.read(4096), "hello ext2\n", "ext2 read(n): 读到内容")
+    eq(eofh.read(4096), nil, "ext2 read(n): EOF 返回 nil(不是空串)")
+    eq(eofh.read(4096), nil, "ext2 read(n): EOF 之后再读仍是 nil")
+    local eofh2 = assert(be.open("/d/f1", "r"))
+    eq(eofh2.read(), "hello ext2\n", "ext2 read(): 无参读到末尾")
+    eq(eofh2.read(), nil, "ext2 read(): 末尾之后再读返回 nil")
+    eofh.close(); eofh2.close()
+end
+
+
 -- ---------------------------------------------------------------
 -- 1a2) 符号链接 / 硬链接(与 POSIX ln / ln -s / readlink 配套)
 --      ext2 的"快速符号链接"把 <=60 字节的目标内联在 i_block 里, 更长才占数据块 ——

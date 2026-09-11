@@ -5,19 +5,45 @@
 # 只用 Delin sh 支持的子集: **没有命令替换($() 与反引号)、没有算术展开、没有 here-doc**,
 # 所以"取命令输出再比较"一律走"重定向到文件 + cmp -s"这条路。
 LOG=/var/log/posix_verify.log
-T=/var/tmp/posixt
 mkdir -p /var/log   # 真机上 syslogd 已经建好; 这条只为能在宿主测试台里跑同一份脚本
-rm -rf "$T"
-mkdir -p "$T"
 
 echo "=== Delin POSIX tools verify ===" > $LOG
+
+# 挑一个真的能建的临时目录。上一次真机跑的时候 /var/tmp/posixt 怎么也建不出来, 而同一进程里
+# 的 /bin/lua 用 fs.makeDir 建 /var/tmp/posixk 却成功了 —— 所以这里逐个候选地建、并把每一步的
+# 退出码与 ls 结果写进日志, 让下一轮直接看出到底是"建不出来"还是"建了又没了"。
+T=
+for cand in /var/tmp/posixt /tmp/posixt /run/posixt /posixt; do
+    echo "try: mkdir -p $cand" >> $LOG
+    rm -rf "$cand" >> $LOG
+    echo "     rm rc=$?" >> $LOG
+    mkdir -p "$cand" >> $LOG
+    echo "     mkdir rc=$?" >> $LOG
+    ls -ld "$cand" >> $LOG
+    if [ -d "$cand" ]; then
+        T="$cand"
+        echo "     -> 采用 $T" >> $LOG
+        break
+    fi
+    echo "     -> 不可用" >> $LOG
+done
+if [ -z "$T" ]; then
+    echo "FATAL: 没有任何候选临时目录能建出来" >> $LOG
+    ls -ld / /var /var/tmp /tmp /run >> $LOG
+    exit 1
+fi
+echo "env: cwd=/$T" >> $LOG
+ls -ld / /var /var/tmp /tmp >> $LOG
+
 ng=0
 
 # ---- 辅助 ----
 # cmd_chk <名字> <命令...>: 退出码 0 记 ok
 cmd_chk() {
     _n="$1"; shift
-    "$@" > "$T/got"
+    # stdin 一律接 /dev/null: 服务里的 stdin 是**控制台**, 而 tr/tee 这类"缺省读 stdin"的命令
+    # 会一直等输入 —— 上一轮真机就是这么挂死的(systemd 60s 超时后把服务杀掉, 日志戛然而止)。
+    "$@" > "$T/got" < /dev/null
     _rc="$?"
     if [ "$_rc" = "0" ]; then
         echo "ok   $_n" >> $LOG
@@ -28,7 +54,7 @@ cmd_chk() {
 # out_chk <名字> <期望(单行)> <命令...>: 命令 stdout 必须与期望逐字节相同
 out_chk() {
     _n="$1"; _want="$2"; shift; shift
-    "$@" > "$T/got"
+    "$@" > "$T/got" < /dev/null
     echo "$_want" > "$T/want"
     if cmp -s "$T/got" "$T/want"; then
         echo "ok   $_n" >> $LOG
@@ -49,6 +75,19 @@ file_eq() {
         echo "ng   $_n" >> $LOG; ng=1
     fi
 }
+# stdin_chk <名字> <输入文件> <命令...>: 从文件喂 stdin, 命令必须退 0
+stdin_chk() {
+    _n="$1"; _in="$2"; shift; shift
+    "$@" < "$_in" > "$T/got2"
+    _rc="$?"
+    if [ "$_rc" = "0" ]; then
+        echo "ok   $_n" >> $LOG
+    else
+        echo "ng   $_n (rc=$_rc)" >> $LOG
+        cat "$T/got2" >> $LOG
+        ng=1
+    fi
+}
 have() { command -v "$1" > /dev/null; }
 
 # ---------------------------------------------------------------
@@ -61,6 +100,7 @@ else
 fi
 
 # ---------------------------------------------------------------
+echo "step: 路径/文本工具" >> $LOG
 echo "-- 路径/文本工具 --" >> $LOG
 if have basename; then out_chk basename c basename /a/b/c; fi
 if have dirname;  then out_chk dirname /a/b dirname /a/b/c; fi
@@ -73,7 +113,7 @@ if have pathchk;  then cmd_chk pathchk_ok pathchk -p foo/bar; fi
 if have sort;     then cmd_chk sort cut -f1 -d: /etc/passwd; fi
 if have uniq;     then cmd_chk uniq uniq /etc/passwd; fi
 if have cut;      then cmd_chk cut cut -d: -f1 /etc/passwd; fi
-if have tr;       then cmd_chk tr tr a-z A-Z; fi
+if have tr;       then stdin_chk tr /etc/passwd tr a-z A-Z; fi
 if have cmp;      then cmd_chk cmp_same cmp /etc/passwd /etc/passwd; fi
 if have comm;     then sort /etc/passwd > "$T/sorted"; cmd_chk comm comm "$T/sorted" "$T/sorted"; fi
 if have join;     then cmd_chk join join "$T/sorted" "$T/sorted"; fi
@@ -87,25 +127,33 @@ if have cksum;    then cmd_chk cksum cksum /etc/passwd; fi
 if have pr;       then cmd_chk pr pr -t /etc/passwd; fi
 if have split;    then cmd_chk split split -l 2 /etc/passwd "$T/sp_"; fi
 if have csplit;   then cmd_chk csplit csplit -s -f "$T/cs_" /etc/passwd 1; fi
-if have tee;      then cmd_chk tee tee "$T/tee.out"; fi
+if have tee; then
+    cp /etc/passwd "$T/tee.in"
+    tee "$T/tee.out" < "$T/tee.in" > "$T/tee.stdout"
+    echo "tee rc=$?" >> $LOG
+    file_eq tee_file "$T/tee.out" "$T/tee.in"
+    file_eq tee_stdout "$T/tee.stdout" "$T/tee.in"
+fi
 if have rmdir;    then mkdir "$T/nodir"; cmd_chk rmdir rmdir "$T/nodir"; fi
 if have du;       then cmd_chk du du -s "$T"; fi
 if have df;       then cmd_chk df df; fi
 if have file;     then cmd_chk file file /etc/passwd; fi
 if have diff;     then cmd_chk diff_same diff /etc/passwd /etc/passwd; fi
 
+echo "step: cksum 基准" >> $LOG
 # cksum 基准值: POSIX CRC, "abc" -> 1219131554 3 (空 -> 4294967295 0)
 if have cksum; then
     printf 'abc' > "$T/cksum.in"
     printf '1219131554 3 %s\n' "$T/cksum.in" > "$T/cksum.want"
-    cksum "$T/cksum.in" > "$T/cksum.got"
+    cksum "$T/cksum.in" > "$T/cksum.got" < /dev/null
     file_eq cksum_abc "$T/cksum.got" "$T/cksum.want"
     printf 'abc\n' > "$T/cksum2.in"
     printf '1112837078 4 %s\n' "$T/cksum2.in" > "$T/cksum2.want"
-    cksum "$T/cksum2.in" > "$T/cksum2.got"
+    cksum "$T/cksum2.in" > "$T/cksum2.got" < /dev/null
     file_eq cksum_abc_nl "$T/cksum2.got" "$T/cksum2.want"
 fi
 
+echo "step: patch 往返" >> $LOG
 # diff -u -> patch -> 逐字节相同(核心验收, 真机上跑一遍)
 if have diff && have patch; then
     echo one > "$T/p1"
@@ -115,17 +163,18 @@ if have diff && have patch; then
     echo TWO >> "$T/p2"
     echo three >> "$T/p2"
     cp "$T/p2" "$T/p2.want"
-    diff -u "$T/p1" "$T/p2" > "$T/p.patch"
-    patch -p0 "$T/p1" "$T/p.patch" > /dev/null
+    diff -u "$T/p1" "$T/p2" > "$T/p.patch" < /dev/null
+    patch -p0 "$T/p1" "$T/p.patch" > /dev/null < /dev/null
     echo "patch rc=$?" >> $LOG
     # p1 打完补丁后必须与 p2 逐字节相同
     file_eq patch_roundtrip "$T/p1" "$T/p2.want"
 fi
 
+echo "step: uu 往返" >> $LOG
 # uuencode -> uudecode 往返逐字节相同
 if have uuencode && have uudecode; then
-    uuencode "$T/p1" p1 > "$T/uu.enc"
-    uudecode -o "$T/uu.dec" "$T/uu.enc"
+    uuencode "$T/p1" p1 > "$T/uu.enc" < /dev/null
+    uudecode -o "$T/uu.dec" "$T/uu.enc" < /dev/null
     file_eq uu_roundtrip "$T/uu.dec" "$T/p1"
 fi
 
@@ -134,6 +183,7 @@ if have dd; then
     file_eq dd_copy "$T/dd.out" /etc/passwd
 fi
 
+echo "step: 链接/管道工具" >> $LOG
 echo "-- 链接/管道工具 --" >> $LOG
 if have ln;       then cmd_chk ln_hard ln /etc/passwd "$T/hl"; fi
 if have ln;       then cmd_chk ln_sym ln -s /etc/passwd "$T/sl"; fi
@@ -142,7 +192,13 @@ if have realpath; then out_chk realpath /etc/passwd realpath /etc/../etc/passwd;
 if have mkfifo;   then cmd_chk mkfifo_node mkfifo "$T/fifo0"; fi
 if have find;     then cmd_chk find find /etc -name passwd -type f; fi
 if have find;     then cmd_chk find_type find /etc -maxdepth 1 -type d; fi
-if have xargs;    then cmd_chk xargs_e echo a b c | xargs echo; fi
+if have xargs; then
+    echo "a b c" > "$T/xargs.in"
+    echo "a b c" > "$T/xargs.want"
+    xargs /bin/echo < "$T/xargs.in" > "$T/xargs.out"
+    echo "xargs rc=$?" >> $LOG
+    file_eq xargs_default "$T/xargs.out" "$T/xargs.want"
+fi
 if have nohup;    then cmd_chk nohup nohup /bin/cat /etc/passwd; fi
 # ln -s 之后必须能经链接读到内容(路径解析要穿过链接)
 cp /etc/passwd "$T/sl.copy"
@@ -154,24 +210,26 @@ ls -l "$T/hl" >> $LOG
 # 命名管道端到端: 后台读 + 前台写(POSIX 阻塞 open 的互相成全)
 # 两种顺序都测: 读端先起 / 写端先起。
 # ---------------------------------------------------------------
+echo "step: FIFO 端到端" >> $LOG
 echo "-- 命名管道端到端 --" >> $LOG
 mkfifo "$T/pipe1"
 cat "$T/pipe1" > "$T/pipe1.out" &
 echo "through fifo" > "$T/pipe1"
-wait
+sleep 2
 echo "through fifo" > "$T/pipe1.want"
 file_eq fifo_e2e "$T/pipe1.out" "$T/pipe1.want"
 
 mkfifo "$T/pipe2"
 echo "reverse fifo" > "$T/pipe2" &
 cat "$T/pipe2" > "$T/pipe2.out"
-wait
+sleep 2
 echo "reverse fifo" > "$T/pipe2.want"
 file_eq fifo_reverse "$T/pipe2.out" "$T/pipe2.want"
 
 # ---------------------------------------------------------------
 # sh 新内建
 # ---------------------------------------------------------------
+echo "step: sh 内建" >> $LOG
 echo "-- sh 内建 --" >> $LOG
 alias ll='echo alias-works'
 out_chk alias alias-works ll

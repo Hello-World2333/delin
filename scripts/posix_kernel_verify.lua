@@ -12,6 +12,15 @@ local function eq(got, want, label)
     ok(got == want, label, "got=" .. tostring(got) .. " want=" .. tostring(want))
 end
 
+-- 先记录环境事实: 一轮真机 4 分钟, 出问题时这几个数最省事。
+io.write("env: cwd=" .. tostring(cwd) .. " uid=" .. tostring(uid) .. " gid=" .. tostring(gid) .. "\n")
+for _, d in ipairs({ "/", "/var", "/var/tmp", "/tmp" }) do
+    local a = fs.attributes(d)
+    io.write(string.format("env: %-10s exists=%s isDir=%s mode=%s\n", d,
+        tostring(a ~= nil), tostring(a and a.isDir),
+        tostring(a and a.mode and string.format("%o", a.mode % 4096))))
+end
+
 local BASE = "/var/tmp/posixk"
 pcall(function() fs.delete(BASE) end)
 assert(fs.makeDir(BASE), "cannot create " .. BASE)
@@ -20,8 +29,14 @@ assert(fs.makeDir(BASE), "cannot create " .. BASE)
 local f = fs.open(BASE .. "/target", "w"); f:write("payload\n"); f:close()
 ok(fs.symlink("target", BASE .. "/rel_link") ~= nil, "symlink: 建相对目标的链接")
 eq(fs.readlink(BASE .. "/rel_link"), "target", "readlink: 相对目标原样保存")
-ok(fs.symlink(BASE .. "/target", BASE .. "/abs_link") ~= nil, "symlink: 建绝对目标的链接")
-eq(fs.readlink(BASE .. "/abs_link"), BASE .. "/target", "readlink: 绝对目标原样保存")
+-- 失败也要把**错误原文**打出来: 只报 FAIL 不报原因的话, 真机一轮 4 分钟就白跑了。
+local abs_ok, abs_err = fs.symlink(BASE .. "/target", BASE .. "/abs_link")
+ok(abs_ok ~= nil, "symlink: 建绝对目标的链接", tostring(abs_err))
+if abs_ok then
+    eq(fs.readlink(BASE .. "/abs_link"), BASE .. "/target", "readlink: 绝对目标原样保存")
+else
+    ok(false, "readlink: 绝对目标原样保存(跳过: 链接没建成)")
+end
 
 -- lstat 看链接本身, attributes 跟随到目标
 eq(fs.lstat(BASE .. "/abs_link").kind, "symlink", "fs.lstat: kind=symlink")
@@ -33,16 +48,25 @@ eq(fs.lstat(BASE .. "/abs_link").mode % 4096, tonumber("777", 8), "symlink: 权�
 
 -- 经链接读写(路径解析要穿过链接)
 local r = fs.open(BASE .. "/abs_link", "r")
-eq(r.readAll(), "payload\n", "经符号链接读到目标内容")
-r.close()
+if r then
+    eq(r.readAll(), "payload\n", "经符号链接读到目标内容")
+    r.close()
+else
+    ok(false, "经符号链接读到目标内容(跳过: 打不开)")
+end
 
 -- 目录链接: 中间段也要跟随
 assert(fs.makeDir(BASE .. "/sub"))
-local g = fs.open(BASE .. "/sub/inner", "w"); g:write("inner\n"); g:close()
+local g = fs.open(BASE .. "/sub/inner", "w")
+if g then g:write("inner\n"); g:close() end
 ok(fs.symlink(BASE .. "/sub", BASE .. "/dirlink") ~= nil, "symlink: 建目录链接")
 local h = fs.open(BASE .. "/dirlink/inner", "r")
-eq(h.readAll(), "inner\n", "经目录链接读到链接目录里的文件")
-h.close()
+if h then
+    eq(h.readAll(), "inner\n", "经目录链接读到链接目录里的文件")
+    h.close()
+else
+    ok(false, "经目录链接读到链接目录里的文件(跳过: 打不开)")
+end
 ok(fs.isDir(BASE .. "/dirlink"), "fs.isDir: 目录链接判定为目录")
 
 -- 悬空链接: readlink 有效, exists 为假
@@ -53,9 +77,11 @@ eq(fs.exists(BASE .. "/dangling"), false, "fs.exists: 悬空链接 -> false")
 -- 链接成环: 必须 ELOOP 而不是死循环(这里只验证不挂死)
 assert(fs.symlink(BASE .. "/loop2", BASE .. "/loop1"))
 assert(fs.symlink(BASE .. "/loop1", BASE .. "/loop2"))
-io.write("     (环检测: 下面这次 open 应当报错返回)\n")
-local lp, lperr = fs.open(BASE .. "/loop1", "r")
-ok(lp == nil, "ELOOP: 成环链接不返回句柄", tostring(lperr))
+io.write("     (环检测: 下面这次 open 应当失败 —— 内核在 dispatch 里直接 error, 所以用 pcall 接)\n")
+local ok_loop, lp_or_err = pcall(fs.open, BASE .. "/loop1", "r")
+ok(ok_loop == false, "ELOOP: 成环链接打不开(内核直接报错)", tostring(lp_or_err))
+ok(tostring(lp_or_err):find("too many levels") ~= nil, "ELOOP: 错误信息是 too many levels",
+   tostring(lp_or_err))
 
 -- 删除链接不删目标
 assert(fs.symlink(BASE .. "/target", BASE .. "/torm"))

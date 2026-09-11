@@ -1001,6 +1001,11 @@ function ext2.backend(fs)
                     local n
                     if type(a) == "number" then n = a
                     elseif type(a) == "table" and type(b) == "number" then n = b end
+                    -- **EOF 必须返回 nil, 不能返回空串**: 与 CC 原生句柄和 Lua 文件语义一致。
+                    -- 返回空串会让所有"读到 nil 为止"的循环(tee/dd/cp/od ...)在 EOF 上无限打转 ——
+                    -- 症状是命令在真机上挂死(服务被 60s 超时杀掉), 而宿主测试台的句柄是标准的,
+                    -- 所以这个 bug 一直只在真机上露头。真机定位: posix-verify.service 卡在 tee。
+                    if pos >= #content then return nil end
                     if n == nil then
                         local r = content:sub(pos + 1); pos = #content; return r
                     end
