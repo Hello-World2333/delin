@@ -1,0 +1,182 @@
+-- Delin fold: 按指定宽度折行 (POSIX + GNU 子集)。用法: fold [-bs] [-w WIDTH] [FILE]...
+-- 选项:
+--   -b, --bytes           按字节计数(缺省按"列"计数)
+--   -s, --spaces          在空格处断开(尽量不把词拆开)
+--   -w WIDTH, --width=WIDTH  每行宽度(缺省 80); 亦支持粘连形式 -w80 / -80
+-- FILE 缺省或为 "-" 时读 stdin。
+-- 列计数规则(POSIX, 缺省即 -b 之外的模式): TAB 前进到下一个 8 的倍数, BS 退一列(不小于 0),
+-- CR 归零, 其它字节各占一列。
+-- 已知偏离:
+--   - 宽度 0 报错信息简化为 "fold: invalid number of columns: '0'"(GNU 还有其他修饰)。
+--   - 字符按字节处理, 不做多字节字符宽度计算(C locale 语义)。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+local function ioeMsg(err)
+    if err and (err:find("permission") or err:find("denied")) then return "Permission denied" end
+    -- 必须先判 ENOENT: "No such file or directory" 里本来就含 "directory" 这个词,
+    -- 先匹 "directory" 会把"文件不存在"误报成 "Is a directory"(老模板的 bug)。
+    if err and err:lower():find("no such file") then return "No such file or directory" end
+    if err and err:find("directory") then return "Is a directory" end
+    return "No such file or directory"
+end
+
+local bytesMode, breakSpaces = false, false
+local width = 80
+local files = {}
+local noMoreOpts = false
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if noMoreOpts then
+        files[#files + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "-b" or a == "--bytes" then bytesMode = true
+    elseif a == "-s" or a == "--spaces" then breakSpaces = true
+    elseif a:match("^%-%-width=") then
+        local n = tonumber(a:sub(9))
+        if not n or n < 1 then stderr("fold: invalid number of columns: '" .. a:sub(9) .. "'\n"); return 1 end
+        width = n
+    elseif a:match("^%-%-") then
+        stderr("fold: unrecognized option '" .. a .. "'\n")
+        return 1
+    elseif a:match("^%-%d+$") then
+        local n = tonumber(a:sub(2))
+        if not n or n < 1 then stderr("fold: invalid number of columns: '" .. a:sub(2) .. "'\n"); return 1 end
+        width = n
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        local k = 2
+        while k <= #a do
+            local ch = a:sub(k, k)
+            if ch == "b" then bytesMode = true; k = k + 1
+            elseif ch == "s" then breakSpaces = true; k = k + 1
+            elseif ch == "w" then
+                local val = a:sub(k + 1)
+                if val == "" then
+                    i = i + 1
+                    if not args[i] then stderr("fold: option requires an argument -- 'w'\n"); return 1 end
+                    val = args[i]
+                end
+                local n = tonumber(val)
+                if not n or n < 1 then stderr("fold: invalid number of columns: '" .. val .. "'\n"); return 1 end
+                width = n
+                k = #a + 1
+            else
+                stderr("fold: invalid option -- '" .. ch .. "'\n")
+                return 1
+            end
+        end
+    else
+        files[#files + 1] = a
+    end
+    i = i + 1
+end
+if #files == 0 then files = { "-" } end
+
+-- 单字节对列的推进量(列模式)。
+local function colAdvance(c, column)
+    if bytesMode then return column + 1 end
+    if c == "\t" then return column + (8 - column % 8) end
+    if c == "\b" then return column > 0 and column - 1 or 0 end
+    if c == "\r" then return 0 end
+    return column + 1
+end
+
+-- 折行的核心: 逐字节处理一个输入流。
+local function foldStream(h)
+    local parts, n = {}, 0          -- 当前行已缓冲的字节
+    local lastBlank = 0             -- parts 中最后一个空格/TAB 之后的位置(0 = 无)
+    local column = 0
+    local out = {}
+    local function flushOut()
+        if #out > 0 then io.write(table.concat(out)); out = {} end
+    end
+    local function emit(s)
+        out[#out + 1] = s
+        if #out >= 512 then flushOut() end
+    end
+    -- 重新计算一段文本的列宽。
+    local function recount(s)
+        local c = 0
+        for idx = 1, #s do c = colAdvance(s:sub(idx, idx), c) end
+        return c
+    end
+    local function newline()
+        emit("\n")
+        parts, n, lastBlank, column = {}, 0, 0, 0
+    end
+    while true do
+        local chunk = h.read and h.read(4096)
+        if type(chunk) ~= "string" or chunk == "" then chunk = nil end
+        if not chunk then
+            -- 无 read 的句柄(宿主测试台的 stdin): 退化为逐行读取, 每行补回换行。
+            local l = h.readLine()
+            if l == nil then break end
+            chunk = l .. "\n"
+        end
+        for idx = 1, #chunk do
+            local c = chunk:sub(idx, idx)
+            if c == "\n" then
+                emit(table.concat(parts, "", 1, n))
+                parts, n, lastBlank = {}, 0, 0
+                newline()
+                column = 0
+            else
+                local newcol = colAdvance(c, column)
+                if newcol > width and column > 0 then
+                    if breakSpaces and lastBlank > 0 and lastBlank < n then
+                        -- 在上一个空白处断开: 空白留在上一行末尾。
+                        local head = table.concat(parts, "", 1, lastBlank)
+                        local tail = table.concat(parts, "", lastBlank + 1, n)
+                        emit(head)
+                        emit("\n")
+                        parts, n = {}, 0
+                        if tail ~= "" then parts[1] = tail; n = 1 end
+                        lastBlank = 0
+                        column = recount(tail)
+                    else
+                        emit(table.concat(parts, "", 1, n))
+                        emit("\n")
+                        parts, n, lastBlank = {}, 0, 0
+                        column = 0
+                    end
+                end
+                n = n + 1
+                parts[n] = c
+                if c == " " or c == "\t" then lastBlank = n end
+                column = colAdvance(c, column)
+            end
+        end
+    end
+    if n > 0 then emit(table.concat(parts, "", 1, n)) end
+    flushOut()
+end
+
+for _, f in ipairs(files) do
+    if f == "-" then
+        local h = io.stdin()
+        if h then foldStream(h) end
+    else
+        local h, err = fs.open(resolve(f), "r")
+        if not h then
+            stderr("fold: " .. f .. ": " .. ioeMsg(err) .. "\n")
+            return 1
+        end
+        foldStream(h)
+        h:close()
+    end
+end

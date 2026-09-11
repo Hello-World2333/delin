@@ -1,0 +1,174 @@
+-- Delin strings: 从文件里抽取可打印字符串 (POSIX + GNU 子集)。用法:
+--   strings [-a] [-n N] [-t {d|o|x}] [-f] [FILE]...
+-- 选项:
+--   -a, -all, --all                扫描整个文件(POSIX 缺省只扫已初始化数据段)
+--   -n N, --bytes=N                最短字符串长度(缺省 4)
+--   -t {d|o|x}, --radix={d|o|x}    每条前加 0 起的字节偏移(十进制/八进制/十六进制, 宽度 7)
+--   -f, --print-file-name          每条前加 "文件名: "
+-- FILE 缺省或为 "-" 时读 stdin。
+-- "可打印" 定义为字节 0x20..0x7E 与 TAB(0x09), 与 C locale 的 strings 一致。
+-- 已知偏离:
+--   - Delin 一律扫描整个文件(POSIX 的"已初始化数据段"概念在 Delin 上不存在), 故 -a 是默认行为。
+--   - 只识别单字节可打印字符, 不做 locale 多字节处理。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+local function ioeMsg(err)
+    if err and (err:find("permission") or err:find("denied")) then return "Permission denied" end
+    -- 必须先判 ENOENT: "No such file or directory" 里本来就含 "directory" 这个词,
+    -- 先匹 "directory" 会把"文件不存在"误报成 "Is a directory"(老模板的 bug)。
+    if err and err:lower():find("no such file") then return "No such file or directory" end
+    if err and err:find("directory") then return "Is a directory" end
+    return "No such file or directory"
+end
+
+local minLen = 4
+local radix = nil            -- nil | "d" | "o" | "x"
+local showName = false
+local files = {}
+local noMoreOpts = false
+
+local function setRadix(v)
+    if v == "d" or v == "o" or v == "x" then radix = v; return true end
+    stderr("strings: invalid radix: '" .. v .. "'\n")
+    return false
+end
+
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if noMoreOpts then
+        files[#files + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "-a" or a == "-all" or a == "--all" then -- Delin 一律全文件扫描
+    elseif a == "-f" or a == "--print-file-name" then showName = true
+    elseif a:match("^%-%-bytes=") then
+        local n = tonumber(a:sub(9))
+        if not n or n < 1 then stderr("strings: invalid integer argument '" .. a:sub(9) .. "'\n"); return 1 end
+        minLen = n
+    elseif a:match("^%-%-radix=") then
+        if not setRadix(a:sub(9)) then return 1 end
+    elseif a == "-n" or a == "--bytes" then
+        i = i + 1
+        if not args[i] then stderr("strings: option requires an argument -- 'n'\n"); return 1 end
+        local n = tonumber(args[i])
+        if not n or n < 1 then stderr("strings: invalid integer argument '" .. args[i] .. "'\n"); return 1 end
+        minLen = n
+    elseif a == "-t" or a == "--radix" then
+        i = i + 1
+        if not args[i] then stderr("strings: option requires an argument -- 't'\n"); return 1 end
+        if not setRadix(args[i]) then return 1 end
+    elseif a:sub(1, 1) == "-" and a ~= "-" and a:sub(1, 2) ~= "--" then
+        local k = 2
+        while k <= #a do
+            local ch = a:sub(k, k)
+            if ch == "a" then k = k + 1
+            elseif ch == "f" then showName = true; k = k + 1
+            elseif ch == "n" or ch == "t" then
+                local val = a:sub(k + 1)
+                if val == "" then
+                    i = i + 1
+                    if not args[i] then stderr("strings: option requires an argument -- '" .. ch .. "'\n"); return 1 end
+                    val = args[i]
+                end
+                if ch == "n" then
+                    local n = tonumber(val)
+                    if not n or n < 1 then stderr("strings: invalid integer argument '" .. val .. "'\n"); return 1 end
+                    minLen = n
+                else
+                    if not setRadix(val) then return 1 end
+                end
+                k = #a + 1
+            else
+                stderr("strings: invalid option -- '" .. ch .. "'\n")
+                return 1
+            end
+        end
+    elseif a:sub(1, 2) == "--" then
+        stderr("strings: unrecognized option '" .. a .. "'\n")
+        return 1
+    else
+        files[#files + 1] = a
+    end
+    i = i + 1
+end
+if #files == 0 then files = { "-" } end
+
+local function printable(b)
+    return (b >= 0x20 and b <= 0x7E) or b == 0x09
+end
+
+-- 扫描一个输入流: 分块读取, 处理跨界字符串。
+local function scan(h, name)
+    local out = {}
+    local function flush()
+        if #out > 0 then io.write(table.concat(out)); out = {} end
+    end
+    local offset = 0
+    local runStart = nil
+    local run = {}
+    local function flushRun()
+        if runStart and #run >= minLen then
+            if showName then out[#out + 1] = name .. ": " end
+            if radix then
+                local fmt = (radix == "d" and "%7d") or (radix == "o" and "%7o") or "%7x"
+                out[#out + 1] = string.format(fmt, runStart) .. " "
+            end
+            out[#out + 1] = table.concat(run) .. "\n"
+            if #out >= 256 then flush() end
+        end
+        runStart = nil
+        run = {}
+    end
+    while true do
+        local chunk
+        if h.read then chunk = h.read(65536) end
+        if type(chunk) ~= "string" or chunk == "" then
+            local l = h.readLine()
+            if l == nil then break end
+            chunk = l .. "\n"
+        end
+        for idx = 1, #chunk do
+            local b = chunk:byte(idx)
+            if printable(b) then
+                if not runStart then runStart = offset end
+                run[#run + 1] = chunk:sub(idx, idx)
+            else
+                flushRun()
+            end
+            offset = offset + 1
+        end
+    end
+    flushRun()
+    flush()
+end
+
+for _, f in ipairs(files) do
+    if f == "-" then
+        local h = io.stdin()
+        if not h then stderr("strings: 无法读取 stdin\n"); return 1 end
+        scan(h, "-")
+    else
+        local h, err = fs.open(resolve(f), "r")
+        if not h then
+            stderr("strings: " .. f .. ": " .. ioeMsg(err) .. "\n")
+            return 1
+        end
+        scan(h, f)
+        h:close()
+    end
+end

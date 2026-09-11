@@ -1,0 +1,261 @@
+-- Delin split: 把文件切成多个片段 (POSIX + GNU 子集)。用法:
+--   split [-a N] [-b N[K|M|G]] [-l N] [-d] [--numeric-suffixes[=FROM]] [--additional-suffix=S]
+--         [FILE [PREFIX]]
+-- 选项:
+--   -a N, --suffix-length=N      后缀长度(缺省 2)
+--   -b N[K|M|G], --bytes=N       每片字节数(大写后缀 = 1024 进制, 小写 = 1000 进制)
+--   -l N, --lines=N              每片行数(缺省 1000)
+--   -d, --numeric-suffixes[=FROM]  用数字后缀(缺省从 0 开始, 位数由 -a 决定)
+--   --additional-suffix=S        在后缀后再加固定字符串
+-- FILE 缺省或 "-" 读 stdin; PREFIX 缺省为 "x"。字母后缀为 aa ab ... az ba ...。
+-- 已知偏离:
+--   - 只实现上述选项; GNU 的 -n/--filter/--verbose 未实现。
+--   - 按行切分时保留原始字节(不做行尾换行符的增删); 宿主测试台的 stdin 无字节读取能力,
+--     此时退化为逐行 + 补换行。
+--   - 输入为空时不产生任何分片(与 GNU 一致)。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+local function ioeMsg(err)
+    if err and (err:find("permission") or err:find("denied")) then return "Permission denied" end
+    -- 必须先判 ENOENT: "No such file or directory" 里本来就含 "directory" 这个词,
+    -- 先匹 "directory" 会把"文件不存在"误报成 "Is a directory"(老模板的 bug)。
+    if err and err:lower():find("no such file") then return "No such file or directory" end
+    if err and err:find("directory") then return "Is a directory" end
+    return "No such file or directory"
+end
+
+local suffixLen = 2
+local linesPer = 1000
+local bytesPer = nil
+local numeric = false
+local numericFrom = 0
+local addSuffix = ""
+local operands = {}
+local noMoreOpts = false
+
+-- 解析 N[K|M|G]: 大写 1024 进制, 小写 1000 进制(GNU 语义)。
+local function parseSize(val)
+    local num, suf = val:match("^(%d+)([KkMmGg]?)$")
+    if not num then return nil end
+    local n = tonumber(num)
+    if suf == "K" then n = n * 1024
+    elseif suf == "M" then n = n * 1024 * 1024
+    elseif suf == "G" then n = n * 1024 * 1024 * 1024
+    elseif suf == "k" then n = n * 1000
+    elseif suf == "m" then n = n * 1000 * 1000
+    elseif suf == "g" then n = n * 1000 * 1000 * 1000 end
+    return n
+end
+
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if noMoreOpts then
+        operands[#operands + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a:match("^%-%-suffix%-length=") then
+        suffixLen = tonumber(a:sub(17))
+        if not suffixLen or suffixLen < 1 then stderr("split: invalid suffix length: '" .. a:sub(17) .. "'\n"); return 1 end
+    elseif a == "--numeric-suffixes" then numeric = true
+    elseif a:match("^%-%-numeric%-suffixes=") then
+        numeric = true
+        numericFrom = tonumber(a:sub(20))
+        if not numericFrom or numericFrom < 0 then stderr("split: invalid number: '" .. a:sub(20) .. "'\n"); return 1 end
+    elseif a:match("^%-%-additional%-suffix=") then addSuffix = a:sub(21)
+    elseif a:match("^%-%-bytes=") then
+        bytesPer = parseSize(a:sub(9))
+        if not bytesPer then stderr("split: invalid number of bytes: '" .. a:sub(9) .. "'\n"); return 1 end
+    elseif a:match("^%-%-lines=") then
+        linesPer = tonumber(a:sub(9))
+        if not linesPer or linesPer < 1 then stderr("split: invalid number of lines: '" .. a:sub(9) .. "'\n"); return 1 end
+    elseif a:match("^%-%-") then
+        stderr("split: unrecognized option '" .. a .. "'\n")
+        return 1
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        local k = 2
+        while k <= #a do
+            local ch = a:sub(k, k)
+            if ch == "d" then numeric = true; k = k + 1
+            elseif ch == "a" or ch == "b" or ch == "l" then
+                local val = a:sub(k + 1)
+                if val == "" then
+                    i = i + 1
+                    if not args[i] then stderr("split: option requires an argument -- '" .. ch .. "'\n"); return 1 end
+                    val = args[i]
+                end
+                if ch == "a" then
+                    suffixLen = tonumber(val)
+                    if not suffixLen or suffixLen < 1 then stderr("split: invalid suffix length: '" .. val .. "'\n"); return 1 end
+                elseif ch == "l" then
+                    linesPer = tonumber(val)
+                    if not linesPer or linesPer < 1 then stderr("split: invalid number of lines: '" .. val .. "'\n"); return 1 end
+                else
+                    bytesPer = parseSize(val)
+                    if not bytesPer then stderr("split: invalid number of bytes: '" .. val .. "'\n"); return 1 end
+                end
+                k = #a + 1
+            else
+                stderr("split: invalid option -- '" .. ch .. "'\n")
+                return 1
+            end
+        end
+    elseif a:match("^%-%-") then
+        stderr("split: unrecognized option '" .. a .. "'\n")
+        return 1
+    else
+        operands[#operands + 1] = a
+    end
+    i = i + 1
+end
+if #operands > 2 then
+    stderr("split: extra operand '" .. operands[3] .. "'\n")
+    return 1
+end
+local inName = operands[1] or "-"
+local prefix = operands[2] or "x"
+
+-- 后缀生成: 第 n 个分片(从 0 起)。
+local function makeSuffix(n)
+    if numeric then
+        local s = string.format("%0" .. suffixLen .. "d", numericFrom + n)
+        if #s > suffixLen then return nil end
+        return s
+    end
+    local s = ""
+    local v = n
+    for _ = 1, suffixLen do
+        s = string.char(97 + v % 26) .. s
+        v = math.floor(v / 26)
+    end
+    if v > 0 then return nil end
+    return s
+end
+
+-- 打开输入。
+local h
+if inName == "-" then
+    h = io.stdin()
+    if not h then stderr("split: 无法读取 stdin\n"); return 1 end
+else
+    local err
+    h, err = fs.open(resolve(inName), "r")
+    if not h then
+        stderr("split: " .. inName .. ": " .. ioeMsg(err) .. "\n")
+        return 1
+    end
+end
+
+local outCount = 0
+local curH = nil
+local function openNext()
+    local suf = makeSuffix(outCount)
+    if not suf then
+        stderr("split: output file suffixes exhausted\n")
+        return nil, true
+    end
+    outCount = outCount + 1
+    local path = prefix .. suf .. addSuffix
+    local fh, err = fs.open(resolve(path), "w")
+    if not fh then
+        stderr("split: " .. path .. ": " .. ioeMsg(err) .. "\n")
+        return nil
+    end
+    return fh
+end
+
+-- 精确逐行读取(保留行尾换行符)。
+local function makeExactReader(fh)
+    local buf = ""
+    local eof = false
+    return function()
+        while true do
+            local p = buf:find("\n", 1, true)
+            if p then
+                local r = buf:sub(1, p)
+                buf = buf:sub(p + 1)
+                return r
+            end
+            if eof then
+                if buf == "" then return nil end
+                local r = buf; buf = ""; return r
+            end
+            local c
+            if fh.read then c = fh.read(65536) end
+            if type(c) ~= "string" or c == "" then
+                if buf == "" then
+                    local l = fh.readLine()
+                    if l == nil then eof = true; return nil end
+                    return l .. "\n"
+                end
+                eof = true
+            else
+                buf = buf .. c
+            end
+        end
+    end
+end
+
+if bytesPer then
+    local remaining = bytesPer
+    while true do
+        local chunk
+        if h.read then chunk = h.read(remaining) end
+        if type(chunk) ~= "string" or chunk == "" then
+            -- 无字节读取能力: 退化为逐行。
+            local l = h.readLine()
+            if l == nil then break end
+            chunk = l .. "\n"
+        end
+        while #chunk > 0 do
+            if not curH then
+                local err
+                curH, err = openNext()
+                if not curH then return 1 end
+            end
+            local take = (#chunk < remaining) and #chunk or remaining
+            curH:write(chunk:sub(1, take))
+            chunk = chunk:sub(take + 1)
+            remaining = remaining - take
+            if remaining == 0 then
+                curH:close()
+                curH = nil
+                remaining = bytesPer
+            end
+        end
+    end
+else
+    local nextLine = makeExactReader(h)
+    local count = 0
+    while true do
+        local line = nextLine()
+        if line == nil then break end
+        if not curH then
+            curH = openNext()
+            if not curH then return 1 end
+            count = 0
+        end
+        curH:write(line)
+        count = count + 1
+        if count >= linesPer then
+            curH:close()
+            curH = nil
+        end
+    end
+end
+if curH then curH:close() end
+if inName ~= "-" then h:close() end

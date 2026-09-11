@@ -1,0 +1,161 @@
+-- Delin cksum: 计算文件的 POSIX CRC 校验和 (POSIX + GNU 子集)。用法: cksum [FILE]...
+-- 输出: "<十进制 CRC> <字节数> [文件名]" (每个文件一行)。
+-- 算法 = POSIX cksum 的 CRC, **不是**常见的 CRC-32/IEEE:
+--   初值 crc = 0; 对每个字节做 crc = ((crc << 8) & 0xFFFFFFFF) XOR T[((crc >> 24) XOR byte) & 0xFF];
+--   再把文件的**字节长度**按小端逐字节做同样处理; 最后 crc = (~crc) & 0xFFFFFFFF。
+--   表 T 由多项式 0x04C11DB7 生成(非反射/大端形式)。
+-- FILE 缺省或为 "-" 时读 stdin。已知基准: "hello\n" -> 3015617425 6; "abc" -> 1219131554 3; 空 -> 4294967295 0。
+-- 已知偏离:
+--   - 无 locale 处理(与 C locale 的 GNU 一致); 不做 -a 之外的任何 GNU 扩展(cksum 本身没有别的选项)。
+--   - Lua 5.1 没有位运算, 移位/异或全部用算术实现(与 tools/crc32.lua 同一手法, 但表不同)。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+local function ioeMsg(err)
+    if err and (err:find("permission") or err:find("denied")) then return "Permission denied" end
+    -- 必须先判 ENOENT: "No such file or directory" 里本来就含 "directory" 这个词,
+    -- 先匹 "directory" 会把"文件不存在"误报成 "Is a directory"(老模板的 bug)。
+    if err and err:lower():find("no such file") then return "No such file or directory" end
+    if err and err:find("directory") then return "Is a directory" end
+    return "No such file or directory"
+end
+
+local MOD = 4294967296
+
+-- 16x16 半字节异或表(纯算术, Lua 5.1/5.2 通用)。
+local NX = {}
+for a = 0, 15 do
+    NX[a] = {}
+    for b = 0, 15 do
+        local r, bit, x, y = 0, 1, a, b
+        while x > 0 or y > 0 do
+            if x % 2 ~= y % 2 then r = r + bit end
+            x = math.floor(x / 2); y = math.floor(y / 2); bit = bit * 2
+        end
+        NX[a][b] = r
+    end
+end
+local function xor32(a, b)
+    local r, mul = 0, 1
+    for _ = 1, 8 do
+        r = r + NX[a % 16][b % 16] * mul
+        a = math.floor(a / 16); b = math.floor(b / 16); mul = mul * 16
+    end
+    return r
+end
+
+-- 多项式 0x04C11DB7 的字节表(非反射)。
+local TAB
+do
+    TAB = {}
+    for i = 0, 255 do
+        local c = i * 16777216 % MOD
+        for _ = 1, 8 do
+            if c >= 2147483648 then
+                c = ((c * 2) % MOD)
+                c = xor32(c, 0x04C11DB7)
+            else
+                c = (c * 2) % MOD
+            end
+        end
+        TAB[i] = c
+    end
+end
+
+local function update(crc, byte)
+    local idx = xor32(math.floor(crc / 16777216), byte) % 256
+    return xor32((crc * 256) % MOD, TAB[idx])
+end
+
+-- 32 位无符号十进制输出: 分两半格式化, 避开 Lua 5.1 大整数 %d 的不确定性。
+local function dec32(n)
+    local hi = math.floor(n / 1000000)
+    local lo = n % 1000000
+    if hi == 0 then return string.format("%d", lo) end
+    return string.format("%d%06d", hi, lo)
+end
+
+-- 对一个输入流计算 (crc, 字节数)。
+local function cksumStream(h)
+    local crc = 0
+    local size = 0
+    local pending = nil
+    while true do
+        local chunk
+        if h.read then chunk = h.read(65536) end
+        if type(chunk) ~= "string" or chunk == "" then
+            local l = h.readLine()
+            if l == nil then break end
+            chunk = l .. "\n"
+        end
+        for i = 1, #chunk do
+            crc = update(crc, chunk:byte(i))
+            size = size + 1
+        end
+    end
+    -- 长度按小端逐字节处理。
+    local n = size
+    while n > 0 do
+        crc = update(crc, n % 256)
+        n = math.floor(n / 256)
+    end
+    crc = MOD - 1 - crc
+    return crc, size
+end
+
+local files = {}
+local noMoreOpts = false
+for _, a in ipairs(args) do
+    if noMoreOpts then
+        files[#files + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        stderr("cksum: invalid option -- '" .. a:sub(2, 2) .. "'\n")
+        return 1
+    else
+        files[#files + 1] = a
+    end
+end
+
+local out = {}
+if #files == 0 then
+    local h = io.stdin()
+    if not h then stderr("cksum: 无法读取 stdin\n"); return 1 end
+    local crc, size = cksumStream(h)
+    io.write(dec32(crc) .. " " .. size .. "\n")
+    return
+end
+
+for _, f in ipairs(files) do
+    local h
+    if f == "-" then
+        h = io.stdin()
+        if not h then stderr("cksum: 无法读取 stdin\n"); return 1 end
+    else
+        local err
+        h, err = fs.open(resolve(f), "r")
+        if not h then
+            stderr("cksum: " .. f .. ": " .. ioeMsg(err) .. "\n")
+            return 1
+        end
+    end
+    local crc, size = cksumStream(h)
+    if f ~= "-" then h:close() end
+    out[#out + 1] = dec32(crc) .. " " .. size .. " " .. f .. "\n"
+    if #out >= 128 then io.write(table.concat(out)); out = {} end
+end
+if #out > 0 then io.write(table.concat(out)) end

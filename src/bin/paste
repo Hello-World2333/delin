@@ -1,0 +1,189 @@
+-- Delin paste: 按行横向合并文件 (POSIX)。用法: paste [-s] [-d LIST] [FILE]...
+-- 选项:
+--   -d LIST, --delimiters=LIST  列间分隔符列表, 循环使用; 支持 \n \t \\ \0(空分隔)
+--   -s, --serial                每个文件各自串成一行(而不是横向合并多个文件)
+--   -z, --zero-terminated       行以 NUL 分隔(GNU 扩展)
+-- FILE 缺省或为 "-" 时读 stdin。支持 -- 与短选项粘连(-d: / -sd:)。
+-- 已知偏离:
+--   - LIST 里出现未知转义 \X 时按 GNU 处理: 取 X 本身。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+local function ioeMsg(err)
+    if err and (err:find("permission") or err:find("denied")) then return "Permission denied" end
+    -- 必须先判 ENOENT: "No such file or directory" 里本来就含 "directory" 这个词,
+    -- 先匹 "directory" 会把"文件不存在"误报成 "Is a directory"(老模板的 bug)。
+    if err and err:lower():find("no such file") then return "No such file or directory" end
+    if err and err:find("directory") then return "Is a directory" end
+    return "No such file or directory"
+end
+
+-- 解析分隔符列表: \n \t \\ \0(长度为 0 的分隔符, 即不插入任何字符)。
+local function parseDelims(list)
+    local out, i = {}, 1
+    while i <= #list do
+        local c = list:sub(i, i)
+        if c == "\\" then
+            local n = list:sub(i + 1, i + 1)
+            if n == "" then
+                stderr("paste: delimiter list ends with an unescaped backslash: " .. list .. "\n")
+                return nil
+            end
+            if n == "n" then out[#out + 1] = "\n"
+            elseif n == "t" then out[#out + 1] = "\t"
+            elseif n == "\\" then out[#out + 1] = "\\"
+            elseif n == "0" then out[#out + 1] = ""
+            elseif n == "r" then out[#out + 1] = "\r"
+            else out[#out + 1] = n end
+            i = i + 2
+        else
+            out[#out + 1] = c
+            i = i + 1
+        end
+    end
+    if #out == 0 then
+        stderr("paste: empty delimiter list\n")
+        return nil
+    end
+    return out
+end
+
+local delims = { "\t" }
+local serial, zeroTerm = false, false
+local files = {}
+local noMoreOpts = false
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if noMoreOpts then
+        files[#files + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "-s" or a == "--serial" then serial = true
+    elseif a == "-z" or a == "--zero-terminated" then zeroTerm = true
+    elseif a == "-d" or a == "--delimiters" then
+        i = i + 1
+        if not args[i] then stderr("paste: option requires an argument -- 'd'\n"); return 1 end
+        delims = parseDelims(args[i])
+        if not delims then return 1 end
+    elseif a:match("^%-%-delimiters=") then
+        delims = parseDelims(a:sub(14))
+        if not delims then return 1 end
+    elseif a:sub(1, 1) == "-" and a ~= "-" and a:sub(1, 2) ~= "--" then
+        local k = 2
+        while k <= #a do
+            local ch = a:sub(k, k)
+            if ch == "s" then serial = true; k = k + 1
+            elseif ch == "z" then zeroTerm = true; k = k + 1
+            elseif ch == "d" then
+                local val = a:sub(k + 1)
+                if val == "" then
+                    i = i + 1
+                    if not args[i] then stderr("paste: option requires an argument -- 'd'\n"); return 1 end
+                    val = args[i]
+                end
+                delims = parseDelims(val)
+                if not delims then return 1 end
+                k = #a + 1
+            else
+                stderr("paste: invalid option -- '" .. ch .. "'\n")
+                return 1
+            end
+        end
+    elseif a:sub(1, 2) == "--" then
+        stderr("paste: unrecognized option '" .. a .. "'\n")
+        return 1
+    else
+        files[#files + 1] = a
+    end
+    i = i + 1
+end
+if #files == 0 then files = { "-" } end
+
+local sep = zeroTerm and "\0" or "\n"
+local outH = io.stdout()
+local dIdx = 0
+local function nextDelim()
+    dIdx = dIdx + 1
+    return delims[(dIdx - 1) % #delims + 1]
+end
+
+local function openInput(name)
+    if name == "-" then
+        local h = io.stdin()
+        if not h then stderr("paste: 无法读取 stdin\n"); return nil end
+        return h
+    end
+    local h, err = fs.open(resolve(name), "r")
+    if not h then
+        stderr("paste: " .. name .. ": " .. ioeMsg(err) .. "\n")
+        return nil
+    end
+    return h
+end
+
+-- -s: 每个文件串成一行。
+local function serialFile(name)
+    local h = openInput(name)
+    if not h then return false end
+    local first = true
+    local buf = {}
+    while true do
+        local l = h.readLine()
+        if l == nil then break end
+        if first then buf[#buf + 1] = l; first = false
+        else buf[#buf + 1] = nextDelim(); buf[#buf + 1] = l end
+    end
+    if name ~= "-" then h:close() end
+    buf[#buf + 1] = sep
+    outH:write(table.concat(buf))
+    return true
+end
+
+if serial then
+    for _, f in ipairs(files) do
+        if not serialFile(f) then return 1 end
+    end
+    return
+end
+
+-- 横向合并: 所有文件同步前进。
+local handles = {}
+for idx, f in ipairs(files) do
+    local h = openInput(f)
+    if not h then return 1 end
+    handles[idx] = h
+end
+local done = false
+while not done do
+    local cells, any = {}, false
+    for idx = 1, #handles do
+        local l = handles[idx].readLine()
+        if l == nil then cells[idx] = nil else cells[idx] = l; any = true end
+    end
+    if not any then done = true else
+        local buf = {}
+        for idx = 1, #handles do
+            if idx > 1 then buf[#buf + 1] = nextDelim() end
+            buf[#buf + 1] = cells[idx] or ""
+        end
+        buf[#buf + 1] = sep
+        outH:write(table.concat(buf))
+    end
+end
+for idx, f in ipairs(files) do
+    if f ~= "-" then handles[idx]:close() end
+end

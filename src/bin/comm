@@ -1,0 +1,166 @@
+-- Delin comm: 逐行比较两个已排序文件, 输出三列 (POSIX)。用法: comm [OPTION]... FILE1 FILE2
+-- 选项:
+--   -1                     不输出"只在 FILE1 中"的列
+--   -2                     不输出"只在 FILE2 中"的列
+--   -3                     不输出"两文件共有"的列
+--   --check-order          发现输入未排序时立即报错退出(GNU)
+--   --nocheck-order        不检查输入是否已排序(GNU)
+-- FILE 为 "-" 时读 stdin。短选项可合并(-123)。
+-- 已知偏离:
+--   - 比较按**字节序**(C locale)进行, 不做 locale 折叠。
+--   - 默认与 GNU 一致地检查顺序: 发现乱序时向 stderr 报
+--     "comm: file N is not in sorted order" 与 "comm: input is not in sorted order" 并退出 1,
+--     但不像 GNU 那样继续打印可比较的部分(报错后直接停止)。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+local function ioeMsg(err)
+    if err and (err:find("permission") or err:find("denied")) then return "Permission denied" end
+    -- 必须先判 ENOENT: "No such file or directory" 里本来就含 "directory" 这个词,
+    -- 先匹 "directory" 会把"文件不存在"误报成 "Is a directory"(老模板的 bug)。
+    if err and err:lower():find("no such file") then return "No such file or directory" end
+    if err and err:find("directory") then return "Is a directory" end
+    return "No such file or directory"
+end
+
+local hide1, hide2, hide3 = false, false, false
+local checkOrder = true
+local files = {}
+local noMoreOpts = false
+
+for _, a in ipairs(args) do
+    if noMoreOpts then
+        files[#files + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "--check-order" then checkOrder = true
+    elseif a == "--nocheck-order" then checkOrder = false
+    elseif a:sub(1, 1) == "-" and a ~= "-" and a:sub(1, 2) ~= "--" then
+        for k = 2, #a do
+            local ch = a:sub(k, k)
+            if ch == "1" then hide1 = true
+            elseif ch == "2" then hide2 = true
+            elseif ch == "3" then hide3 = true
+            else stderr("comm: invalid option -- '" .. ch .. "'\n"); return 1 end
+        end
+    elseif a:sub(1, 2) == "--" then
+        stderr("comm: unrecognized option '" .. a .. "'\n")
+        return 1
+    else
+        files[#files + 1] = a
+    end
+end
+if #files < 2 then
+    stderr("comm: missing operand\n")
+    return 1
+end
+if #files > 2 then
+    stderr("comm: extra operand '" .. files[3] .. "'\n")
+    return 1
+end
+
+-- 打开一个操作数: "-" 为 stdin。
+local function openInput(name)
+    if name == "-" then
+        local h = io.stdin()
+        if not h then stderr("comm: 无法读取 stdin\n"); return nil end
+        return h
+    end
+    local h, err = fs.open(resolve(name), "r")
+    if not h then
+        stderr("comm: " .. name .. ": " .. ioeMsg(err) .. "\n")
+        return nil
+    end
+    return h
+end
+
+-- 逐行迭代器, 附带"上一行"以检查排序。
+local function makeSource(name)
+    local h = openInput(name)
+    if not h then return nil end
+    local prev, done = nil, false
+    local disorder = false
+    return {
+        name = name,
+        read = function()
+            if done then return nil end
+            local l = h.readLine()
+            if l == nil then done = true; return nil end
+            if prev and l < prev then disorder = true end
+            prev = l
+            return l
+        end,
+        close = function() if name ~= "-" then h:close() end end,
+        disorder = function() return disorder end,
+    }
+end
+
+local s1 = makeSource(files[1])
+if not s1 then return 1 end
+local s2 = makeSource(files[2])
+if not s2 then return 1 end
+
+local prefix2 = hide1 and "" or "\t"                  -- 第二列的前置分隔符
+local prefix3 = prefix2 .. (hide2 and "" or "\t")     -- 第三列的前置分隔符
+local out = {}
+local function flush()
+    if #out > 0 then io.write(table.concat(out)); out = {} end
+end
+
+local disorderFile = nil
+local function disordered(n)
+    if checkOrder then
+        stderr("comm: file " .. n .. " is not in sorted order\n")
+        return 1
+    end
+    disorderFile = disorderFile or n
+    return nil
+end
+
+local a, b = s1.read(), s2.read()
+while a ~= nil and b ~= nil do
+    if a < b then
+        if not hide1 then out[#out + 1] = a .. "\n" end
+        a = s1.read()
+    elseif a > b then
+        if not hide2 then out[#out + 1] = prefix2 .. b .. "\n" end
+        b = s2.read()
+    else
+        if not hide3 then out[#out + 1] = prefix3 .. a .. "\n" end
+        a = s1.read()
+        b = s2.read()
+    end
+    if #out > 256 then flush() end
+    if s1.disorder() then local r = disordered(1); if r then flush(); return r end end
+    if s2.disorder() then local r = disordered(2); if r then flush(); return r end end
+end
+while a ~= nil do
+    if not hide1 then out[#out + 1] = a .. "\n" end
+    a = s1.read()
+    if #out > 256 then flush() end
+end
+while b ~= nil do
+    if not hide2 then out[#out + 1] = prefix2 .. b .. "\n" end
+    b = s2.read()
+    if #out > 256 then flush() end
+end
+flush()
+s1.close()
+s2.close()
+if disorderFile then
+    stderr("comm: input is not in sorted order\n")
+    return 1
+end

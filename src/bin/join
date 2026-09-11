@@ -1,0 +1,319 @@
+-- Delin join: 按连接字段合并两个已排序文件 (POSIX + GNU 子集)。用法:
+--   join [-1 F] [-2 F] [-j F] [-a N] [-v N] [-e S] [-o LIST] [-t CHAR] [-i] FILE1 FILE2
+-- 选项:
+--   -1 F              FILE1 的连接字段(缺省 1)
+--   -2 F              FILE2 的连接字段(缺省 1)
+--   -j F              -1 F 与 -2 F 同时设置
+--   -a N              除配对行外, 也输出第 N 个文件里不可配对的行
+--   -v N               只输出第 N 个文件里不可配对的行(等价 -a N 并抑制配对输出)
+--   -e S               用 S 替换缺失/空字段(与 -o 一起用)
+--   -o LIST            输出字段列表: 0 = 连接字段, F.F = 第 F 个文件的第 F 个字段
+--   -t CHAR            字段分隔符(单字符); 缺省为空白, 且前导空白被吃掉、连续空白算一个分隔
+--   -i, --ignore-case  比较连接字段时忽略大小写
+-- FILE 为 "-" 时读 stdin。多字符的 -t 取第一个字符。
+-- 已知偏离:
+--   - 比较与输出按**字节**(C locale); -i 只折叠 ASCII 字母。
+--   - 连接字段不在该行时视为空字段(与 GNU 相同)。
+--   - 发现输入未按连接字段排序时报
+--     "join: FILE:LINE: is not sorted: LINE" 与 "join: input is not in sorted order" 并退出 1。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+local function ioeMsg(err)
+    if err and (err:find("permission") or err:find("denied")) then return "Permission denied" end
+    -- 必须先判 ENOENT: "No such file or directory" 里本来就含 "directory" 这个词,
+    -- 先匹 "directory" 会把"文件不存在"误报成 "Is a directory"(老模板的 bug)。
+    if err and err:lower():find("no such file") then return "No such file or directory" end
+    if err and err:find("directory") then return "Is a directory" end
+    return "No such file or directory"
+end
+
+local f1Field, f2Field = 1, 1
+local allA, allV = {}, {}       -- 需要输出不可配对行的文件号
+local onlyV = {}
+local emptyStr = nil
+local outSpec = nil             -- { {file=0|1|2, field=n}, ... }
+local sep = nil
+local ignoreCase = false
+local files = {}
+local noMoreOpts = false
+
+local function parseSpec(list)
+    local out = {}
+    for item in list:gmatch("[^,%s]+") do
+        if item == "0" then
+            out[#out + 1] = { file = 0, field = 0 }
+        else
+            local f, n = item:match("^(%d+)%.(%d+)$")
+            if not f then
+                stderr("join: invalid field specifier: '" .. item .. "'\n")
+                return nil
+            end
+            if f ~= "1" and f ~= "2" then
+                stderr("join: invalid file number in field spec: '" .. item .. "'\n")
+                return nil
+            end
+            local fn = tonumber(n)
+            if fn < 1 then
+                stderr("join: invalid field number: '" .. item .. "'\n")
+                return nil
+            end
+            out[#out + 1] = { file = tonumber(f), field = fn }
+        end
+    end
+    if #out == 0 then
+        stderr("join: invalid field list\n")
+        return nil
+    end
+    return out
+end
+
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if noMoreOpts then
+        files[#files + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "--ignore-case" then ignoreCase = true
+    elseif a:match("^%-%-field%-separator=") then
+        local v = a:sub(19)
+        if #v ~= 1 then stderr("join: multi-character tab '" .. v .. "'\n"); return 1 end
+        sep = v
+    elseif a:sub(1, 1) == "-" and a ~= "-" and a:sub(1, 2) ~= "--" then
+        local k = 2
+        while k <= #a do
+            local ch = a:sub(k, k)
+            if ch == "i" then ignoreCase = true; k = k + 1
+            elseif ch == "1" or ch == "2" or ch == "j" or ch == "a" or ch == "v" or ch == "e" or ch == "o" or ch == "t" then
+                local val = a:sub(k + 1)
+                if val == "" then
+                    i = i + 1
+                    if not args[i] then stderr("join: option requires an argument -- '" .. ch .. "'\n"); return 1 end
+                    val = args[i]
+                end
+                if ch == "1" or ch == "2" or ch == "j" then
+                    local n = tonumber(val)
+                    if not n or n < 1 or n ~= math.floor(n) then
+                        stderr("join: invalid field number: '" .. val .. "'\n"); return 1
+                    end
+                    if ch == "1" then f1Field = n
+                    elseif ch == "2" then f2Field = n
+                    else f1Field, f2Field = n, n end
+                elseif ch == "a" or ch == "v" then
+                    if val ~= "1" and val ~= "2" then
+                        stderr("join: invalid file number: '" .. val .. "'\n"); return 1
+                    end
+                    local n = tonumber(val)
+                    allA[n] = true
+                    if ch == "v" then onlyV[n] = true end
+                elseif ch == "e" then emptyStr = val
+                elseif ch == "o" then
+                    outSpec = parseSpec(val)
+                    if not outSpec then return 1 end
+                else
+                    if #val ~= 1 then stderr("join: multi-character tab '" .. val .. "'\n"); return 1 end
+                    sep = val
+                end
+                k = #a + 1
+            else
+                stderr("join: invalid option -- '" .. ch .. "'\n")
+                return 1
+            end
+        end
+    elseif a:sub(1, 2) == "--" then
+        stderr("join: unrecognized option '" .. a .. "'\n")
+        return 1
+    else
+        files[#files + 1] = a
+    end
+    i = i + 1
+end
+if #files < 2 then
+    stderr("join: missing operand\n")
+    return 1
+end
+if #files > 2 then
+    stderr("join: extra operand '" .. files[3] .. "'\n")
+    return 1
+end
+
+local outSep = sep or " "
+
+-- 切字段: 给了 -t 按该字符; 否则按空白(前导空白被吃掉, 连续空白算一个)。
+local function splitFields(line)
+    local f = {}
+    if sep then
+        local pos = 1
+        while true do
+            local e = line:find(sep, pos, true)
+            if not e then f[#f + 1] = line:sub(pos); break end
+            f[#f + 1] = line:sub(pos, e - 1)
+            pos = e + 1
+        end
+    else
+        for w in line:gmatch("%S+") do f[#f + 1] = w end
+    end
+    return f
+end
+
+-- 打开输入。
+local function openInput(name)
+    if name == "-" then
+        local h = io.stdin()
+        if not h then stderr("join: 无法读取 stdin\n"); return nil end
+        return h
+    end
+    local h, err = fs.open(resolve(name), "r")
+    if not h then
+        stderr("join: " .. name .. ": " .. ioeMsg(err) .. "\n")
+        return nil
+    end
+    return h
+end
+
+-- 逐行读取器(带上一行密钥用于排序检查)。
+local function makeSource(name)
+    local h = openInput(name)
+    if not h then return nil end
+    local lineno, prevKey = 0, nil
+    local src = { name = name, h = h }
+    function src.next()
+        local l = h.readLine()
+        if l == nil then return nil end
+        lineno = lineno + 1
+        local fields = splitFields(l)
+        local key = fields[src.keyField]
+        if key == nil then key = "" end
+        local cmpKey = ignoreCase and key:lower() or key
+        if prevKey and cmpKey < prevKey then
+            stderr("join: " .. name .. ":" .. lineno .. ": is not sorted: " .. l .. "\n")
+            stderr("join: input is not in sorted order\n")
+            return nil, true
+        end
+        prevKey = cmpKey
+        return { line = l, fields = fields, key = cmpKey, rawKey = key }
+    end
+    function src.close() if name ~= "-" then h:close() end end
+    return src
+end
+
+local s1 = makeSource(files[1])
+if not s1 then return 1 end
+s1.keyField = f1Field
+local s2 = makeSource(files[2])
+if not s2 then return 1 end
+s2.keyField = f2Field
+
+local out = {}
+local function flush()
+    if #out > 0 then io.write(table.concat(out)); out = {} end
+end
+
+-- 取某行第 n 个字段, 不存在时用 -e 的替换串(没有 -e 时为空)。
+local function fieldOf(fields, n)
+    local v = fields[n]
+    if v == nil then return emptyStr or "" end
+    return v
+end
+
+-- 输出一行配对结果。
+local function emitPair(a, b)
+    local parts = {}
+    if outSpec then
+        for _, s in ipairs(outSpec) do
+            if s.file == 0 then
+                parts[#parts + 1] = a.rawKey
+            elseif s.file == 1 then
+                parts[#parts + 1] = fieldOf(a.fields, s.field)
+            else
+                parts[#parts + 1] = fieldOf(b.fields, s.field)
+            end
+        end
+    else
+        parts[#parts + 1] = a.rawKey
+        for k = 1, #a.fields do
+            if k ~= f1Field then parts[#parts + 1] = a.fields[k] end
+        end
+        for k = 1, #b.fields do
+            if k ~= f2Field then parts[#parts + 1] = b.fields[k] end
+        end
+    end
+    out[#out + 1] = table.concat(parts, outSep) .. "\n"
+    if #out >= 256 then flush() end
+end
+
+-- 输出不可配对的行(fileNo = 1|2)。
+local function emitUnpaired(row, fileNo)
+    local parts = {}
+    if outSpec then
+        for _, s in ipairs(outSpec) do
+            if s.file == 0 then
+                parts[#parts + 1] = row.rawKey
+            elseif s.file == fileNo then
+                parts[#parts + 1] = fieldOf(row.fields, s.field)
+            else
+                parts[#parts + 1] = emptyStr or ""
+            end
+        end
+    else
+        parts[#parts + 1] = row.rawKey
+        for k = 1, #row.fields do
+            if k ~= (fileNo == 1 and f1Field or f2Field) then parts[#parts + 1] = row.fields[k] end
+        end
+    end
+    out[#out + 1] = table.concat(parts, outSep) .. "\n"
+    if #out >= 256 then flush() end
+end
+
+-- 主循环: 流式比较两组密钥。
+local r1 = s1.next()
+local r2 = s2.next()
+while r1 ~= nil and r2 ~= nil do
+    local suppress = false
+    if r1.key < r2.key then
+        if (allA[1] or onlyV[1]) then emitUnpaired(r1, 1) end
+        r1 = s1.next()
+    elseif r1.key > r2.key then
+        if (allA[2] or onlyV[2]) then emitUnpaired(r2, 2) end
+        r2 = s2.next()
+    else
+        -- 收集两边同键的整组。
+        local g1, g2 = { r1 }, { r2 }
+        r1 = s1.next()
+        while r1 ~= nil and r1.key == g1[1].key do g1[#g1 + 1] = r1; r1 = s1.next() end
+        r2 = s2.next()
+        while r2 ~= nil and r2.key == g2[1].key do g2[#g2 + 1] = r2; r2 = s2.next() end
+        -- -v N 抑制配对输出; -a N 保留配对输出。
+        if not (onlyV[1] or onlyV[2]) then
+            for _, x in ipairs(g1) do
+                for _, y in ipairs(g2) do emitPair(x, y) end
+            end
+        end
+        -- 一组里若某侧有多行, 其它侧的行也算"被配对", 不再当不可配对输出。
+    end
+end
+while r1 ~= nil do
+    if (allA[1] or onlyV[1]) then emitUnpaired(r1, 1) end
+    r1 = s1.next()
+end
+while r2 ~= nil do
+    if (allA[2] or onlyV[2]) then emitUnpaired(r2, 2) end
+    r2 = s2.next()
+end
+flush()
+s1.close()
+s2.close()

@@ -1,0 +1,281 @@
+-- Delin cut: 按字节/字符/字段选取每行的部分内容 (POSIX + GNU 子集)。用法:
+--   cut (-b LIST | -c LIST | -f LIST) [-d DELIM] [-s] [--complement] [--output-delimiter=STR] [FILE]...
+-- 选项:
+--   -b LIST, --bytes=LIST        选取字节(1 起, 含首含尾)
+--   -c LIST, --characters=LIST   选取字符; Delin 上按字节实现(见偏离)
+--   -f LIST, --fields=LIST       选取字段
+--   -d DELIM, --delimiter=DELIM  -f 的字段分隔符(缺省 TAB); 多字符时只取第一个字符
+--   -s, --only-delimited         不输出不含分隔符的行(仅对 -f 有意义)
+--   -n                           随 -b 接受但无效(POSIX 遗留)
+--   --complement                 取反(输出未选中的部分)
+--   --output-delimiter=STR       输出时用的分隔符(缺省: -f 用 -d, -b/-c 用空串)
+-- LIST 元素形如 N、N-、N-M、-M, 用逗号或空白分隔, 可给多次。FILE 缺省或 "-" 读 stdin。
+-- 已知偏离:
+--   - -c 按**字节**实现: Delin 上没有 locale 多字节字符概念, 1 个字符 == 1 个字节。
+--   - -d 的分隔符必须恰好 1 个字符: 多字符或空串都报
+--     "cut: the delimiter must be a single character" 并退出 1(与 GNU/POSIX 一致;
+--     静默取首字符会让 `cut -dXY -f1` 这类笔误悄悄产出错误结果)。
+--   - 字符一律按字节比较, 不做 locale 处理。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+local function ioeMsg(err)
+    if err and (err:find("permission") or err:find("denied")) then return "Permission denied" end
+    -- 必须先判 ENOENT: "No such file or directory" 里本来就含 "directory" 这个词,
+    -- 先匹 "directory" 会把"文件不存在"误报成 "Is a directory"(老模板的 bug)。
+    if err and err:lower():find("no such file") then return "No such file or directory" end
+    if err and err:find("directory") then return "Is a directory" end
+    return "No such file or directory"
+end
+
+local BIG = 2000000000
+local mode = nil            -- "b" | "c" | "f"
+local ranges = {}           -- 已规整的 {lo,hi} 列表
+local delim = "\t"
+local onlyDelim, complement = false, false
+local outDelim = nil
+local files = {}
+local noMoreOpts = false
+
+-- 把一个 LIST 片段解析成区间并并入 ranges。
+local function addItem(item)
+    local lo, hi
+    local a, b = item:match("^(%d+)%-(%d+)$")
+    if a then
+        lo, hi = tonumber(a), tonumber(b)
+        if hi < lo then stderr("cut: invalid decreasing range\n"); return false end
+    elseif item:match("^%d+$") then
+        lo, hi = tonumber(item), tonumber(item)
+    elseif item:match("^%d+%-$") then
+        lo, hi = tonumber(item:match("^(%d+)")), BIG
+    elseif item:match("^%-%d+$") then
+        lo, hi = 1, tonumber(item:match("(%d+)$"))
+    else
+        stderr("cut: invalid range: '" .. item .. "'\n")
+        return false
+    end
+    if lo < 1 then stderr("cut: fields are numbered from 1\n"); return false end
+    ranges[#ranges + 1] = { lo = lo, hi = hi }
+    return true
+end
+
+local function parseList(spec)
+    if spec == "" then stderr("cut: invalid empty list\n"); return false end
+    for item in spec:gmatch("[^,%s]+") do
+        if not addItem(item) then return false end
+    end
+    if #ranges == 0 then stderr("cut: invalid empty list\n"); return false end
+    return true
+end
+
+-- 排序 + 合并重叠/相邻区间。
+local function normalize()
+    table.sort(ranges, function(x, y) return x.lo < y.lo end)
+    local out = {}
+    for _, r in ipairs(ranges) do
+        local last = out[#out]
+        if last and r.lo <= last.hi + 1 then
+            if r.hi > last.hi then last.hi = r.hi end
+        else
+            out[#out + 1] = { lo = r.lo, hi = r.hi }
+        end
+    end
+    ranges = out
+end
+
+local function setList(spec, m)
+    if mode and mode ~= m then
+        stderr("cut: only one type of list may be specified\n")
+        return false
+    end
+    mode = m
+    if not parseList(spec) then return false end
+    return true
+end
+
+-- -d 的取值校验: 与 GNU/POSIX 一致, 分隔符必须恰好是 1 个字符(多字符或空串都报错)。
+local function setDelim(val)
+    if #val ~= 1 then
+        stderr("cut: the delimiter must be a single character\n")
+        return false
+    end
+    delim = val
+    return true
+end
+
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if noMoreOpts then
+        files[#files + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "--complement" then complement = true
+    elseif a == "--only-delimited" then onlyDelim = true
+    elseif a == "-s" then onlyDelim = true
+    elseif a == "-n" then -- 接受但无效
+    elseif a:match("^%-%-bytes=") then if not setList(a:sub(9), "b") then return 1 end
+    elseif a:match("^%-%-characters=") then if not setList(a:sub(14), "c") then return 1 end
+    elseif a:match("^%-%-fields=") then if not setList(a:sub(10), "f") then return 1 end
+    elseif a == "--bytes" or a == "--characters" or a == "--fields" then
+        i = i + 1
+        if not args[i] then stderr("cut: option '" .. a .. "' requires an argument\n"); return 1 end
+        if not setList(args[i], a == "--bytes" and "b" or (a == "--characters" and "c" or "f")) then return 1 end
+    elseif a:match("^%-%-delimiter=") then
+        local v = a:sub(13)
+        if not setDelim(v) then return 1 end
+    elseif a == "--delimiter" then
+        i = i + 1
+        if not args[i] then stderr("cut: option '--delimiter' requires an argument\n"); return 1 end
+        if not setDelim(args[i]) then return 1 end
+    elseif a:match("^%-%-output%-delimiter=") then outDelim = a:sub(20)
+    elseif a == "--output-delimiter" then
+        i = i + 1
+        if not args[i] then stderr("cut: option '--output-delimiter' requires an argument\n"); return 1 end
+        outDelim = args[i]
+    elseif a == "-d" then
+        i = i + 1
+        if not args[i] then stderr("cut: option requires an argument -- 'd'\n"); return 1 end
+        if not setDelim(args[i]) then return 1 end
+    elseif a:sub(1, 1) == "-" and a ~= "-" and a:sub(1, 2) ~= "--" then
+        local k = 2
+        while k <= #a do
+            local ch = a:sub(k, k)
+            if ch == "s" then onlyDelim = true; k = k + 1
+            elseif ch == "n" then k = k + 1
+            elseif ch == "b" or ch == "c" or ch == "f" then
+                local val = a:sub(k + 1)
+                if val == "" then
+                    i = i + 1
+                    if not args[i] then stderr("cut: option requires an argument -- '" .. ch .. "'\n"); return 1 end
+                    val = args[i]
+                end
+                if not setList(val, ch) then return 1 end
+                k = #a + 1
+            elseif ch == "d" then
+                local val = a:sub(k + 1)
+                if val == "" then
+                    i = i + 1
+                    if not args[i] then stderr("cut: option requires an argument -- 'd'\n"); return 1 end
+                    val = args[i]
+                end
+                if not setDelim(val) then return 1 end
+                k = #a + 1
+            else
+                stderr("cut: invalid option -- '" .. ch .. "'\n")
+                return 1
+            end
+        end
+    elseif a:sub(1, 2) == "--" then
+        stderr("cut: unrecognized option '" .. a .. "'\n")
+        return 1
+    else
+        files[#files + 1] = a
+    end
+    i = i + 1
+end
+
+if not mode then
+    stderr("cut: you must specify a list of bytes, characters, or fields\n")
+    return 1
+end
+if #files == 0 then files = { "-" } end
+normalize()
+
+-- 某个位置是否被选中(带 --complement 取反)。
+local function selected(pos)
+    local hit = false
+    for _, r in ipairs(ranges) do
+        if pos >= r.lo and pos <= r.hi then hit = true; break end
+        if r.lo > pos then break end
+    end
+    if complement then return not hit end
+    return hit
+end
+
+local outSep
+if outDelim ~= nil then outSep = outDelim
+elseif mode == "f" then outSep = delim
+else outSep = "" end
+
+-- 把选中片段拼起来(片段间用 outSep)。
+local function render(parts)
+    return table.concat(parts, outSep)
+end
+
+-- 处理一行(-b/-c: 按位置切字节; -f: 按分隔符切字段)。
+local function processLine(line)
+    if mode == "f" then
+        local hasDelim = line:find(delim, 1, true) ~= nil
+        if not hasDelim then
+            if onlyDelim then return nil end
+            return line
+        end
+        local fields = {}
+        local pos = 1
+        while true do
+            local e = line:find(delim, pos, true)
+            if not e then fields[#fields + 1] = line:sub(pos); break end
+            fields[#fields + 1] = line:sub(pos, e - 1)
+            pos = e + 1
+        end
+        local out = {}
+        for idx = 1, #fields do
+            if selected(idx) then out[#out + 1] = fields[idx] end
+        end
+        return render(out)
+    end
+    -- -b / -c: 逐字节, 相邻选中字节成段, 段间用 outSep。
+    local segs, cur = {}, nil
+    for pos = 1, #line do
+        if selected(pos) then
+            if cur then cur = cur .. line:sub(pos, pos) else cur = line:sub(pos, pos) end
+        elseif cur then
+            segs[#segs + 1] = cur; cur = nil
+        end
+    end
+    if cur then segs[#segs + 1] = cur end
+    return render(segs)
+end
+
+local buf = {}
+local function flush()
+    if #buf > 0 then io.write(table.concat(buf)); buf = {} end
+end
+
+for _, f in ipairs(files) do
+    local h
+    if f == "-" then
+        h = io.stdin()
+        if not h then stderr("cut: 无法读取 stdin\n"); return 1 end
+    else
+        local err
+        h, err = fs.open(resolve(f), "r")
+        if not h then
+            stderr("cut: " .. f .. ": " .. ioeMsg(err) .. "\n")
+            return 1
+        end
+    end
+    while true do
+        local line = h.readLine()
+        if line == nil then break end
+        local res = processLine(line)
+        if res ~= nil then buf[#buf + 1] = res .. "\n" end
+        if #buf >= 512 then flush() end
+    end
+    if f ~= "-" then h:close() end
+end
+flush()

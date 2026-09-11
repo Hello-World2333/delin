@@ -1,0 +1,222 @@
+-- Delin uniq: 过滤输入中相邻的重复行 (POSIX + GNU 子集)。用法: uniq [OPTION]... [INPUT [OUTPUT]]
+-- 选项:
+--   -c, --count            行首显示该组出现次数(格式 "%7d " + 行内容, 与 GNU 一致)
+--   -d, --repeated         只输出重复出现的组(每组只打第一条)
+--   -u, --unique           只输出只出现一次的组
+--   -f N, --skip-fields=N  比较前跳过每行前 N 个空白分隔字段
+--   -s N, --skip-chars=N   比较前再跳过 N 个字节
+--   -w N, --check-chars=N  每组最多比较 N 个字节(0 = 全部视为相等)
+--   -i, --ignore-case      比较时忽略大小写(C locale: 只折叠 ASCII 字母)
+--   -z, --zero-terminated  记录以 NUL 分隔而非换行(GNU 扩展)
+-- INPUT 缺省或为 "-" 时读 stdin; OUTPUT 缺省写 stdout。支持 -- 与短选项粘连(如 -f2 -cd)。
+-- 已知偏离:
+--   - 字符一律按**字节**处理(C locale 语义); 不做 locale/多字节折叠。
+--   - -d 与 -u 同时给出时不输出任何行(与 GNU 相同: 两个过滤器语义上无交集)。
+--   - -z 需要整块读取(宿主测试台的 stdin 句柄没有 readAll), 故 -z 对 stdin 不可用。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+local function ioeMsg(err)
+    if err and (err:find("permission") or err:find("denied")) then return "Permission denied" end
+    -- 必须先判 ENOENT: "No such file or directory" 里本来就含 "directory" 这个词,
+    -- 先匹 "directory" 会把"文件不存在"误报成 "Is a directory"(老模板的 bug)。
+    if err and err:lower():find("no such file") then return "No such file or directory" end
+    if err and err:find("directory") then return "Is a directory" end
+    return "No such file or directory"
+end
+
+-- 组过滤器(与 GNU 一致): 只出现一次的组看 printUnique, 出现多次的组看 printDup。
+local printUnique, printDup, showCount = true, true, false
+local skipFields, skipChars, checkChars = 0, 0, nil
+local ignoreCase, zeroTerm = false, false
+local operands = {}
+local noMoreOpts = false
+
+-- 取非负整数参数; 非法返回 nil 并报错。
+local function needNum(val, what)
+    local n = tonumber(val)
+    if not n or n < 0 or n ~= math.floor(n) then
+        stderr("uniq: invalid number of " .. what .. ": '" .. tostring(val) .. "'\n")
+        return nil
+    end
+    return n
+end
+
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if noMoreOpts then
+        operands[#operands + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "-c" or a == "--count" then showCount = true
+    elseif a == "-d" or a == "--repeated" then printUnique = false
+    elseif a == "-u" or a == "--unique" then printDup = false
+    elseif a == "-i" or a == "--ignore-case" then ignoreCase = true
+    elseif a == "-z" or a == "--zero-terminated" then zeroTerm = true
+    elseif a == "--skip-fields" or a == "--skip-chars" or a == "--check-chars" then
+        local which = a:sub(3)
+        i = i + 1
+        if not args[i] then stderr("uniq: option '--" .. which .. "' requires an argument\n"); return 1 end
+        local n = needNum(args[i], which)
+        if n == nil then return 1 end
+        if which == "skip-fields" then skipFields = n
+        elseif which == "skip-chars" then skipChars = n
+        else checkChars = n end
+    elseif a:match("^%-%-skip%-fields=") then
+        local n = needNum(a:sub(15), "fields"); if n == nil then return 1 end; skipFields = n
+    elseif a:match("^%-%-skip%-chars=") then
+        local n = needNum(a:sub(14), "chars"); if n == nil then return 1 end; skipChars = n
+    elseif a:match("^%-%-check%-chars=") then
+        local n = needNum(a:sub(15), "chars"); if n == nil then return 1 end; checkChars = n
+    elseif a:sub(1, 1) == "-" and a ~= "-" and a:sub(1, 2) ~= "--" then
+        -- 短选项可合并; -f/-s/-w 的参数可粘连, 否则取下一个参数。
+        local k = 2
+        while k <= #a do
+            local ch = a:sub(k, k)
+            if ch == "c" then showCount = true; k = k + 1
+            elseif ch == "d" then printUnique = false; k = k + 1
+            elseif ch == "u" then printDup = false; k = k + 1
+            elseif ch == "i" then ignoreCase = true; k = k + 1
+            elseif ch == "z" then zeroTerm = true; k = k + 1
+            elseif ch == "f" or ch == "s" or ch == "w" then
+                local val = a:sub(k + 1)
+                if val == "" then
+                    i = i + 1
+                    if not args[i] then stderr("uniq: option requires an argument -- '" .. ch .. "'\n"); return 1 end
+                    val = args[i]
+                end
+                local n = needNum(val, ch)
+                if n == nil then return 1 end
+                if ch == "f" then skipFields = n elseif ch == "s" then skipChars = n else checkChars = n end
+                k = #a + 1
+            else
+                stderr("uniq: invalid option -- '" .. ch .. "'\n")
+                return 1
+            end
+        end
+    elseif a:sub(1, 2) == "--" then
+        stderr("uniq: unrecognized option '" .. a .. "'\n")
+        return 1
+    else
+        operands[#operands + 1] = a
+    end
+    i = i + 1
+end
+if #operands > 2 then
+    stderr("uniq: extra operand '" .. operands[3] .. "'\n")
+    return 1
+end
+
+-- 输入记录迭代器: 缺省逐行 readLine(流式); -z 按 NUL 切(需要 readAll)。
+local function lineReader(fh)
+    return function() return fh.readLine() end
+end
+local function nulReader(fh)
+    if not fh.readAll then
+        stderr("uniq: -z 需要 readAll 句柄(宿主测试台的 stdin 不支持)\n")
+        return nil
+    end
+    local content = fh.readAll() or ""
+    local pos, n = 1, #content
+    return function()
+        if pos > n then return nil end
+        local e = content:find("\0", pos, true)
+        if not e then local r = content:sub(pos); pos = n + 1; return r end
+        local r = content:sub(pos, e - 1)
+        pos = e + 1
+        return r
+    end
+end
+
+-- 比较键: 跳字段 -> 跳字节 -> 截断 -> 折叠大小写。
+local function makeKey(s)
+    if skipFields > 0 then
+        local pos = 1
+        for _ = 1, skipFields do
+            local b = s:find("[^ \t]", pos)
+            if not b then pos = #s + 1; break end
+            local e = s:find("[ \t]", b)
+            pos = e or (#s + 1)
+        end
+        s = s:sub(pos)
+    end
+    if skipChars > 0 then s = s:sub(skipChars + 1) end
+    if checkChars ~= nil then s = s:sub(1, checkChars) end
+    if ignoreCase then s = s:lower() end
+    return s
+end
+
+local inName, outName = operands[1], operands[2]
+local inH
+if inName == nil or inName == "-" then
+    inH = io.stdin()
+    if not inH then stderr("uniq: 无法读取 stdin\n"); return 1 end
+else
+    local err
+    inH, err = fs.open(resolve(inName), "r")
+    if not inH then
+        stderr("uniq: " .. inName .. ": " .. ioeMsg(err) .. "\n")
+        return 1
+    end
+end
+local nextRecord
+if zeroTerm then
+    nextRecord = nulReader(inH)
+    if not nextRecord then return 1 end
+else
+    nextRecord = lineReader(inH)
+end
+
+local outH, closeOut = io.stdout(), false
+if outName then
+    local err
+    outH, err = fs.open(resolve(outName), "w")
+    if not outH then
+        stderr("uniq: " .. outName .. ": " .. ioeMsg(err) .. "\n")
+        return 1
+    end
+    closeOut = true
+end
+local sep = zeroTerm and "\0" or "\n"
+
+-- 流式处理: 内存里只留当前组。
+local prevKey, prevLine, count = nil, nil, 0
+local function emit(k, line, n)
+    if k == nil then return end
+    local dup = n > 1
+    if dup and not printDup then return end
+    if (not dup) and not printUnique then return end
+    if showCount then outH:write(string.format("%7d ", n)) end
+    outH:write(line .. sep)
+end
+
+while true do
+    local line = nextRecord()
+    if line == nil then break end
+    local k = makeKey(line)
+    if prevKey == nil then
+        prevKey, prevLine, count = k, line, 1
+    elseif k == prevKey then
+        count = count + 1
+    else
+        emit(prevKey, prevLine, count)
+        prevKey, prevLine, count = k, line, 1
+    end
+end
+emit(prevKey, prevLine, count)
+if closeOut then outH:close() end
+if inName ~= nil and inName ~= "-" then inH:close() end

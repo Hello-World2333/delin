@@ -1,0 +1,549 @@
+-- Delin sort: 排序文本行 (POSIX + GNU 子集)。用法:
+--   sort [-bdfgihimMnrsuzV] [-k KEYDEF]... [-o FILE] [-t CHAR] [FILE]...
+-- 选项:
+--   -b, --ignore-leading-blanks  键内忽略前导空白
+--   -c, --check                  只检查是否已排序(未排序时报 "sort: FILE:LINE: disorder: LINE" 并退出 1)
+--   -d, --dictionary-order       字典序(只比较空白与字母数字)
+--   -f, --ignore-case            忽略大小写(C locale: 折叠 ASCII 字母)
+--   -g, --general-numeric-sort   按一般数值(含指数/Inf/NaN)
+--   -h, --human-numeric-sort     按人类可读数值(后缀 K/M/G/T/P/E/Z/Y = 1024^n)
+--   -i, --ignore-nonprinting     忽略不可打印字符
+--   -k KEYDEF, --key=KEYDEF      键定义 F[.C][OPTS][,F[.C][OPTS]]
+--   -m, --merge                  合并已排序文件(Delin 用稳定全排序实现, 结果等价)
+--   -n, --numeric-sort           按数值前缀(可带符号/小数点/指数)
+--   -o FILE, --output=FILE       输出到文件(可与输入同名: 先整读再写)
+--   -r, --reverse                反序
+--   -s, --stable                 稳定排序(不做"整行"兜底比较)
+--   -S N                          接受但无效(内存量, Delin 无此概念)
+--   -t CHAR, --field-separator=CHAR  字段分隔符
+--   -u, --unique                 相邻等键只留第一条
+--   -V, --version-sort           版本号排序
+--   -z, --zero-terminated        记录以 NUL 分隔
+-- FILE 缺省或 "-" 读 stdin; 支持 -- 与短选项粘连(-k2,2n / -t: / -oout)。
+-- 已知偏离:
+--   - 一律按**字节**(C locale)比较, 无 locale 折叠。
+--   - -m 用稳定全排序实现(对已排序输入输出与 GNU 的归并相同)。
+--   - -V 用"数字段按数值、其它按字节"的近似算法, 不实现 GNU filevercmp 的全部特殊规则。
+--   - 排序需要把输入全部读入内存(不做外部归并/临时文件)。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+local function ioeMsg(err)
+    if err and (err:find("permission") or err:find("denied")) then return "Permission denied" end
+    -- 必须先判 ENOENT: "No such file or directory" 里本来就含 "directory" 这个词,
+    -- 先匹 "directory" 会把"文件不存在"误报成 "Is a directory"(老模板的 bug)。
+    if err and err:lower():find("no such file") then return "No such file or directory" end
+    if err and err:find("directory") then return "Is a directory" end
+    return "No such file or directory"
+end
+
+local opt = {}         -- 全局选项
+local keydefs = {}     -- -k 规格
+local outFile = nil
+local sepTab = nil
+local checkMode = false
+local files = {}
+local noMoreOpts = false
+
+-- 解析 KEYDEF: F[.C][OPTS][,F[.C][OPTS]]
+local function parseKeydef(spec)
+    local kd = { f1 = 1, c1 = nil, o1 = {}, f2 = nil, c2 = nil, o2 = {} }
+    local first, second = spec:match("^([^,]*),(.*)$")
+    if first == nil then first = spec end
+    local function parsePart(part, isFirst)
+        local num, rest = part:match("^(%d+)(.*)$")
+        if not num then
+            stderr("sort: invalid number at field start: '" .. part .. "'\n")
+            return false
+        end
+        local pos = tonumber(num)
+        if pos < 1 then
+            stderr("sort: field number is zero: '" .. part .. "'\n")
+            return false
+        end
+        local dot, after = rest:match("^%.(%d+)(.*)$")
+        local opts = {}
+        if dot then
+            if tonumber(dot) < 1 then
+                stderr("sort: character offset is zero: '" .. part .. "'\n")
+                return false
+            end
+            after = after or ""
+        else
+            after = rest
+        end
+        for ch in (after or ""):gmatch(".") do
+            if ch:match("[bdfginrhVM]") then opts[ch] = true
+            else
+                stderr("sort: invalid field specification: '" .. spec .. "'\n")
+                return false
+            end
+        end
+        if isFirst then
+            kd.f1, kd.c1, kd.o1 = pos, dot and tonumber(dot) or nil, opts
+        else
+            kd.f2, kd.c2, kd.o2 = pos, dot and tonumber(dot) or nil, opts
+        end
+        return true
+    end
+    if not parsePart(first, true) then return nil end
+    if second ~= nil and second ~= "" then
+        if not parsePart(second, false) then return nil end
+    end
+    return kd
+end
+
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if noMoreOpts then
+        files[#files + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a:match("^%-%-key=") then
+        local kd = parseKeydef(a:sub(7))
+        if not kd then return 1 end
+        keydefs[#keydefs + 1] = kd
+    elseif a:match("^%-%-output=") then outFile = a:sub(10)
+    elseif a:match("^%-%-field%-separator=") then
+        local v = a:sub(19)
+        if #v ~= 1 then stderr("sort: multi-character tab '" .. v .. "'\n"); return 1 end
+        sepTab = v
+    elseif a:match("^%-%-check=") and a:sub(9) == "quiet" then checkMode = true
+    elseif a == "--check" or a == "-c" or a == "--quiet" then checkMode = true
+    elseif a == "--ignore-leading-blanks" then opt.b = true
+    elseif a == "--dictionary-order" then opt.d = true
+    elseif a == "--ignore-case" then opt.f = true
+    elseif a == "--general-numeric-sort" then opt.g = true
+    elseif a == "--human-numeric-sort" then opt.h = true
+    elseif a == "--ignore-nonprinting" then opt.i = true
+    elseif a == "--merge" then opt.m = true
+    elseif a == "--numeric-sort" then opt.n = true
+    elseif a == "--reverse" then opt.r = true
+    elseif a == "--stable" then opt.s = true
+    elseif a == "--unique" then opt.u = true
+    elseif a == "--version-sort" then opt.V = true
+    elseif a == "--zero-terminated" then opt.z = true
+    elseif a == "-k" or a == "--key" then
+        i = i + 1
+        if not args[i] then stderr("sort: option requires an argument -- 'k'\n"); return 1 end
+        local kd = parseKeydef(args[i])
+        if not kd then return 1 end
+        keydefs[#keydefs + 1] = kd
+    elseif a == "-o" or a == "--output" then
+        i = i + 1
+        if not args[i] then stderr("sort: option requires an argument -- 'o'\n"); return 1 end
+        outFile = args[i]
+    elseif a == "-t" or a == "--field-separator" then
+        i = i + 1
+        if not args[i] then stderr("sort: option requires an argument -- 't'\n"); return 1 end
+        if #args[i] ~= 1 then stderr("sort: multi-character tab '" .. args[i] .. "'\n"); return 1 end
+        sepTab = args[i]
+    elseif a == "-S" then
+        i = i + 1                               -- 内存量: 接受但忽略
+    elseif a:match("^%-%-") then
+        stderr("sort: unrecognized option '" .. a .. "'\n")
+        return 1
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        local k = 2
+        while k <= #a do
+            local ch = a:sub(k, k)
+            if ch == "k" or ch == "o" or ch == "t" or ch == "S" then
+                local val = a:sub(k + 1)
+                if val == "" then
+                    i = i + 1
+                    if not args[i] then stderr("sort: option requires an argument -- '" .. ch .. "'\n"); return 1 end
+                    val = args[i]
+                end
+                if ch == "k" then
+                    local kd = parseKeydef(val)
+                    if not kd then return 1 end
+                    keydefs[#keydefs + 1] = kd
+                elseif ch == "o" then outFile = val
+                elseif ch == "t" then
+                    if #val ~= 1 then stderr("sort: multi-character tab '" .. val .. "'\n"); return 1 end
+                    sepTab = val
+                end
+                k = #a + 1
+            elseif ch:match("[bdfgihmnrsuVz]") then
+                opt[ch] = true
+                k = k + 1
+            else
+                stderr("sort: invalid option -- '" .. ch .. "'\n")
+                return 1
+            end
+        end
+    else
+        files[#files + 1] = a
+    end
+    i = i + 1
+end
+if opt.n and opt.g then stderr("sort: options '-g' and '-n' are incompatible\n"); return 1 end
+if opt.h and (opt.n or opt.g) then stderr("sort: options '-h' and '-n'/'-g' are incompatible\n"); return 1 end
+
+-- 取一行的字段边界(1 起, 含端点)。有 -t 时按分隔符切; 否则按 POSIX 空白规则:
+-- 每个字段 = [一串空白][一串非空白], 行首空白归属第一个字段。
+local function fieldsOf(line)
+    local f = {}
+    if sepTab then
+        local pos = 1
+        while true do
+            local e = line:find(sepTab, pos, true)
+            if not e then f[#f + 1] = { s = pos, e = #line }; break end
+            f[#f + 1] = { s = pos, e = e - 1 }
+            pos = e + 1
+        end
+    else
+        local pos, n = 1, #line
+        while pos <= n do
+            local s = pos
+            while pos <= n and line:sub(pos, pos):match("[ \t]") do pos = pos + 1 end
+            while pos <= n and not line:sub(pos, pos):match("[ \t]") do pos = pos + 1 end
+            f[#f + 1] = { s = s, e = pos - 1 }
+        end
+    end
+    return f
+end
+
+-- 从一行里取出某个键的文本。
+local function extractKey(line, fields, kd)
+    local f1 = fields[kd.f1]
+    if not f1 then return "" end
+    local start = f1.s
+    if kd.o1.b or opt.b then
+        while start <= #line and line:sub(start, start):match("[ \t]") do start = start + 1 end
+    end
+    if kd.c1 then start = start + (kd.c1 - 1) end
+    local stop
+    if kd.f2 then
+        local f2 = fields[kd.f2]
+        if not f2 then stop = 0
+        elseif kd.c2 then stop = f2.s + (kd.c2 - 1)
+        else stop = f2.e end
+    else
+        stop = #line
+    end
+    if start > stop or start > #line then return "" end
+    if stop > #line then stop = #line end
+    return line:sub(start, stop)
+end
+
+-- 数值前缀(strtod 风格): 允许前导空白、符号、小数点、指数; 无数字则 0。
+local function numval(s)
+    s = s:gsub("^[ \t]+", "")
+    local n = #s
+    local i = 1
+    if s:sub(i, i) == "+" or s:sub(i, i) == "-" then i = i + 1 end
+    local digits = false
+    while i <= n and s:sub(i, i):match("%d") do i = i + 1; digits = true end
+    if s:sub(i, i) == "." then
+        i = i + 1
+        while i <= n and s:sub(i, i):match("%d") do i = i + 1; digits = true end
+    end
+    if not digits then return 0 end
+    local stop = i - 1
+    if s:sub(i, i) == "e" or s:sub(i, i) == "E" then
+        local k = i + 1
+        if s:sub(k, k) == "+" or s:sub(k, k) == "-" then k = k + 1 end
+        local d0 = k
+        while k <= n and s:sub(k, k):match("%d") do k = k + 1 end
+        if k > d0 then stop = k - 1 end
+    end
+    return tonumber(s:sub(1, stop)) or 0
+end
+
+-- 一般数值(-g): 额外识别 inf/nan。
+local function generalval(s)
+    local t = s:gsub("^[ \t]+", ""):lower()
+    if t:match("^%-?inf") then return t:sub(1, 1) == "-" and -math.huge or math.huge end
+    if t:match("^%-?nan") then return 0 / 0 end
+    return numval(s)
+end
+
+-- 人类可读数值(-h): 数字 + 可选二进制后缀。
+local HUMAN = { k = 1024, m = 1024, g = 1024, t = 1024, p = 1024, e = 1024, z = 1024, y = 1024 }
+local function humanval(s)
+    local t = s:gsub("^[ \t]+", "")
+    local num = t:match("^[-+]?%d*%.?%d+")
+    if not num then return 0 end
+    local v = tonumber(num) or 0
+    local suf = t:sub(#num + 1, #num + 1):lower()
+    local order = { k = 1, m = 2, g = 3, t = 4, p = 5, e = 6, z = 7, y = 8 }
+    local o = order[suf]
+    if o then
+        for _ = 1, o do v = v * 1024 end
+    end
+    return v
+end
+
+-- 版本比较(-V): 模拟 GNU filevercmp/verrevcmp 的字符权重:
+--   数字段按数值比较; 非数字段逐字符比较, 其中 '~' < 字母 < 其它字符。
+local function vorder(c)
+    if c == "" then return -1 end
+    local b = c:byte()
+    if b >= 48 and b <= 57 then return 0 end
+    if (b >= 65 and b <= 90) or (b >= 97 and b <= 122) then return b end
+    if c == "~" then return -1 end
+    return b + 256
+end
+local function vcmp(a, b)
+    local i, j = 1, 1
+    local na, nb = #a, #b
+    while i <= na or j <= nb do
+        -- 1) 非数字段
+        local si, sj = i, j
+        while i <= na and not a:sub(i, i):match("%d") do i = i + 1 end
+        while j <= nb and not b:sub(j, j):match("%d") do j = j + 1 end
+        local p, q = si, sj
+        while p < i or q < j do
+            local c1 = (p < i) and a:sub(p, p) or ""
+            local c2 = (q < j) and b:sub(q, q) or ""
+            p, q = p + 1, q + 1
+            if c1 ~= c2 then
+                if c1 == "~" then return -1 end
+                if c2 == "~" then return 1 end
+                local o1, o2 = vorder(c1), vorder(c2)
+                if o1 ~= o2 then return o1 < o2 and -1 or 1 end
+                return (c1 < c2) and -1 or 1
+            end
+        end
+        -- 2) 数字段
+        local da, db = a:match("^%d+", i), b:match("^%d+", j)
+        if da or db then
+            da, db = da or "", db or ""
+            local ta, tb = da:gsub("^0+", ""), db:gsub("^0+", "")
+            if #ta ~= #tb then return #ta < #tb and -1 or 1 end
+            if ta ~= tb then return ta < tb and -1 or 1 end
+            i, j = i + #da, j + #db
+        end
+    end
+    if i <= na then return 1 end
+    if j <= nb then return -1 end
+    return 0
+end
+
+-- 键文本的字符过滤。
+local function filterKey(s, o)
+    if o.d then
+        local t = {}
+        for k = 1, #s do
+            local c = s:sub(k, k)
+            if c:match("[ \t%w]") then t[#t + 1] = c end
+        end
+        s = table.concat(t)
+    end
+    if o.i then
+        local t = {}
+        for k = 1, #s do
+            local b = s:byte(k)
+            if b >= 32 and b <= 126 then t[#t + 1] = s:sub(k, k) end
+        end
+        s = table.concat(t)
+    end
+    return s
+end
+
+-- 比较两段键文本: 返回 -1/0/1。
+local function cmpKeyText(x, y, o)
+    x = filterKey(x, o)
+    y = filterKey(y, o)
+    if o.f then x, y = x:lower(), y:lower() end
+    if o.V then return vcmp(x, y) end
+    if o.n then
+        local a, b = numval(x), numval(y)
+        if a ~= b then return a < b and -1 or 1 end
+        return 0
+    end
+    if o.g then
+        local a, b = generalval(x), generalval(y)
+        if a ~= a and b ~= b then return 0 end          -- 都是 NaN
+        if a ~= a then return -1 end
+        if b ~= b then return 1 end
+        if a ~= b then return a < b and -1 or 1 end
+        return 0
+    end
+    if o.h then
+        local a, b = humanval(x), humanval(y)
+        if a ~= b then return a < b and -1 or 1 end
+        return 0
+    end
+    if x == y then return 0 end
+    return x < y and -1 or 1
+end
+
+-- 取一行的所有键文本。
+local function keysOf(line)
+    local fields = nil
+    local out = {}
+    if #keydefs == 0 then
+        local s = line
+        if opt.b then s = s:gsub("^[ \t]+", "") end
+        out[1] = s
+    else
+        for idx, kd in ipairs(keydefs) do
+            if not fields then fields = fieldsOf(line) end
+            out[idx] = extractKey(line, fields, kd)
+        end
+    end
+    return out
+end
+
+-- 某条键(或全局)的选项集合。
+local function optsOf(idx)
+    local o = {}
+    for k, v in pairs(opt) do o[k] = v end
+    if #keydefs > 0 and idx <= #keydefs then
+        -- 起始与结束两段上写的 OPTS 都作用于这条键(GNU 语义)。
+        for k, v in pairs(keydefs[idx].o1) do o[k] = v end
+        for k, v in pairs(keydefs[idx].o2) do o[k] = v end
+    end
+    return o
+end
+
+-- 比较两行: 返回 -1/0/1(已计入 -r)。
+local function cmpLines(la, lb)
+    local ka, kb = keysOf(la), keysOf(lb)
+    local n = #ka
+    for idx = 1, n do
+        local o = optsOf(idx)
+        local c = cmpKeyText(ka[idx], kb[idx], o)
+        if o.r then c = -c end
+        if c ~= 0 then return c end
+    end
+    -- 与 GNU 一致: -s 或 -u 时不做"整行兜底"比较(-u 下等键行保持输入顺序)。
+    if not (opt.s or opt.u) and la ~= lb then
+        local c = la < lb and -1 or 1
+        if opt.r then c = -c end
+        return c
+    end
+    return 0
+end
+
+-- 读取输入(整读; 排序本身需要全量)。
+local function readAllLines(name)
+    local h
+    if name == "-" then
+        h = io.stdin()
+        if not h then stderr("sort: 无法读取 stdin\n"); return nil end
+    else
+        local err
+        h, err = fs.open(resolve(name), "r")
+        if not h then
+            stderr("sort: " .. name .. ": " .. ioeMsg(err) .. "\n")
+            return nil
+        end
+    end
+    local lines = {}
+    if opt.z then
+        local content
+        if h.readAll then content = h.readAll() or ""
+        else
+            local t = {}
+            while true do local l = h.readLine(); if l == nil then break end; t[#t + 1] = l end
+            content = table.concat(t, "\n")
+        end
+        local pos, n = 1, #content
+        while pos <= n do
+            local e = content:find("\0", pos, true)
+            if not e then lines[#lines + 1] = content:sub(pos); break end
+            lines[#lines + 1] = content:sub(pos, e - 1)
+            pos = e + 1
+        end
+    else
+        while true do
+            local l = h.readLine()
+            if l == nil then break end
+            lines[#lines + 1] = l
+        end
+    end
+    if name ~= "-" then h:close() end
+    return lines
+end
+
+if #files == 0 then files = { "-" } end
+
+-- -c: 只检查。
+if checkMode then
+    local prev, prevName = nil, nil
+    for _, f in ipairs(files) do
+        local lines = readAllLines(f)
+        if not lines then return 1 end
+        for n, l in ipairs(lines) do
+            if prev then
+                local c = cmpLines(prev, l)
+                if c > 0 or (opt.u and c == 0) then
+                    stderr("sort: " .. f .. ":" .. n .. ": disorder: " .. l .. "\n")
+                    return 1
+                end
+            end
+            prev, prevName = l, f
+        end
+    end
+    return
+end
+
+-- 收集所有行(带原始序号, 用于稳定排序)。
+local items = {}
+for _, f in ipairs(files) do
+    local lines = readAllLines(f)
+    if not lines then return 1 end
+    for _, l in ipairs(lines) do
+        items[#items + 1] = { line = l, idx = #items + 1 }
+    end
+end
+
+table.sort(items, function(x, y)
+    local c = cmpLines(x.line, y.line)
+    if c ~= 0 then return c < 0 end
+    return x.idx < y.idx
+end)
+
+-- -u: 相邻等键只留第一条。
+local result = {}
+if opt.u then
+    local prevKeys = nil
+    for _, it in ipairs(items) do
+        local k = keysOf(it.line)
+        local same = false
+        if prevKeys then
+            same = true
+            for idx = 1, #k do
+                local o = optsOf(idx)
+                local c = cmpKeyText(prevKeys[idx], k[idx], o)
+                if c ~= 0 then same = false; break end
+            end
+        end
+        if not same then result[#result + 1] = it.line; prevKeys = k end
+    end
+else
+    for _, it in ipairs(items) do result[#result + 1] = it.line end
+end
+
+-- 输出。
+local term = opt.z and "\0" or "\n"
+local text = table.concat(result, term)
+if #result > 0 then text = text .. term end
+if outFile then
+    local h, err = fs.open(resolve(outFile), "w")
+    if not h then
+        stderr("sort: " .. outFile .. ": " .. ioeMsg(err) .. "\n")
+        return 1
+    end
+    h:write(text)
+    h:close()
+else
+    io.write(text)
+end

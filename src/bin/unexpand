@@ -1,0 +1,200 @@
+-- Delin unexpand: 把空格转换成 TAB (POSIX)。用法: unexpand [-a] [-t LIST] [FILE]...
+-- 选项:
+--   -a, --all               转换所有空白(缺省只转换行首空白)
+--   -t LIST, --tabs=LIST    制表位: 单个数字 N 表示每 N 列一个; 或用逗号/空白分隔的递增列表
+--   -t N / -N               粘连形式亦支持
+-- FILE 缺省或为 "-" 时读 stdin。
+-- 已知偏离:
+--   - 列计数按字节(TAB 前进到下一个制表位, BS 退一列, CR 归零)。
+--   - 列表型 -t: 当前列越过最后一个制表位后不再转换(与 GNU 行为一致)。
+--   - 只有在能把整段空白对齐到制表位时才输出 TAB; 不足以对齐的零头输出空格。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+local function ioeMsg(err)
+    if err and (err:find("permission") or err:find("denied")) then return "Permission denied" end
+    -- 必须先判 ENOENT: "No such file or directory" 里本来就含 "directory" 这个词,
+    -- 先匹 "directory" 会把"文件不存在"误报成 "Is a directory"(老模板的 bug)。
+    if err and err:lower():find("no such file") then return "No such file or directory" end
+    if err and err:find("directory") then return "Is a directory" end
+    return "No such file or directory"
+end
+
+local convertAll = false
+local stops, tabSize = nil, 8
+local files = {}
+local noMoreOpts = false
+
+local function setTabs(spec)
+    local list = {}
+    for tok in spec:gmatch("[^,%s]+") do
+        local n = tonumber(tok)
+        if not n or n < 1 or n ~= math.floor(n) then
+            stderr("unexpand: tab size contains invalid character(s): '" .. tok .. "'\n")
+            return false
+        end
+        list[#list + 1] = n
+    end
+    if #list == 0 then
+        stderr("unexpand: tab size contains invalid character(s): '" .. spec .. "'\n")
+        return false
+    end
+    if #list == 1 then
+        tabSize, stops = list[1], nil
+        return true
+    end
+    for idx = 2, #list do
+        if list[idx] <= list[idx - 1] then
+            stderr("unexpand: tab sizes must be ascending\n")
+            return false
+        end
+    end
+    stops = list
+    return true
+end
+
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if noMoreOpts then
+        files[#files + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "-a" or a == "--all" then convertAll = true
+    elseif a:match("^%-%-tabs=") then
+        if not setTabs(a:sub(8)) then return 1 end
+    elseif a == "-t" or a == "--tabs" then
+        i = i + 1
+        if not args[i] then stderr("unexpand: option requires an argument -- 't'\n"); return 1 end
+        if not setTabs(args[i]) then return 1 end
+    elseif a:match("^%-%d+$") then
+        if not setTabs(a:sub(2)) then return 1 end
+    elseif a:sub(1, 1) == "-" and a ~= "-" and a:sub(1, 2) ~= "--" then
+        for k = 2, #a do
+            local ch = a:sub(k, k)
+            if ch == "a" then convertAll = true
+            elseif ch == "t" then
+                local val = a:sub(k + 1)
+                if val == "" then
+                    i = i + 1
+                    if not args[i] then stderr("unexpand: option requires an argument -- 't'\n"); return 1 end
+                    val = args[i]
+                end
+                if not setTabs(val) then return 1 end
+                break
+            else
+                stderr("unexpand: invalid option -- '" .. ch .. "'\n")
+                return 1
+            end
+        end
+    elseif a:sub(1, 2) == "--" then
+        stderr("unexpand: unrecognized option '" .. a .. "'\n")
+        return 1
+    else
+        files[#files + 1] = a
+    end
+    i = i + 1
+end
+if #files == 0 then files = { "-" } end
+
+-- 当前列之后的下一个制表位; 列表型且已越过最后一个制表位时返回 nil。
+local function nextStop(column)
+    if stops then
+        for _, s in ipairs(stops) do
+            if s > column then return s end
+        end
+        return nil
+    end
+    return column + (tabSize - column % tabSize)
+end
+
+local buf = {}
+local function flush()
+    if #buf > 0 then io.write(table.concat(buf)); buf = {} end
+end
+
+local function unexpandLine(line)
+    local column, leading = 0, true
+    local pos = 1
+    while pos <= #line do
+        local c = line:sub(pos, pos)
+        local isBlank = (c == " " or c == "\t")
+        if isBlank and (convertAll or leading) then
+            -- 收集整段空白, 计算它覆盖到的列。
+            local j = pos
+            local target = column
+            while j <= #line do
+                local cj = line:sub(j, j)
+                if cj == " " then target = target + 1
+                elseif cj == "\t" then target = nextStop(target) or (target + 1)
+                else break end
+                j = j + 1
+            end
+            -- 尽量用 TAB 对齐到制表位, 剩余用空格。
+            -- 与 GNU 一致: 只有当一个 TAB 至少替代 2 个空白时才输出 TAB。
+            while true do
+                local nx = nextStop(column)
+                if not nx or nx > target or (nx - column) < 2 then break end
+                buf[#buf + 1] = "\t"
+                column = nx
+            end
+            if target > column then
+                buf[#buf + 1] = string.rep(" ", target - column)
+                column = target
+            end
+            if #buf >= 512 then flush() end
+            pos = j
+        else
+            if c == "\b" then
+                if column > 0 then column = column - 1 end
+            elseif c == "\r" then
+                column = 0
+            elseif isBlank then
+                column = column + 1
+            else
+                column = column + 1
+                leading = false
+            end
+            buf[#buf + 1] = c
+            pos = pos + 1
+            if #buf >= 512 then flush() end
+        end
+    end
+    buf[#buf + 1] = "\n"
+end
+
+for _, f in ipairs(files) do
+    local h
+    if f == "-" then
+        h = io.stdin()
+        if not h then stderr("unexpand: 无法读取 stdin\n"); return 1 end
+    else
+        local err
+        h, err = fs.open(resolve(f), "r")
+        if not h then
+            stderr("unexpand: " .. f .. ": " .. ioeMsg(err) .. "\n")
+            return 1
+        end
+    end
+    while true do
+        local line = h.readLine()
+        if line == nil then break end
+        unexpandLine(line)
+        if #buf >= 512 then flush() end
+    end
+    if f ~= "-" then h:close() end
+end
+flush()

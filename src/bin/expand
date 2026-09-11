@@ -1,0 +1,183 @@
+-- Delin expand: 把 TAB 展开成空格 (POSIX)。用法: expand [-i] [-t LIST] [FILE]...
+-- 选项:
+--   -i, --initial           只转换行首的空白中的 TAB
+--   -t LIST, --tabs=LIST    制表位: 单个数字 N 表示每 N 列一个; 或用逗号/空白分隔的递增列表
+--   -t N / -N               粘连形式亦支持
+-- FILE 缺省或为 "-" 时读 stdin。
+-- 制表位语义: 列的推进按字节计(TAB 前进到下一个制表位, BS 退一列, CR 归零)。
+-- 已知偏离:
+--   - 列表型 -t 时, 若当前列已越过最后一个制表位, 则下一个制表位按 "当前列 + 1" 处理
+--     (GNU 在同样情形下也是向前 1 列; 单一数字形式则按该数字的倍数前进)。
+--   - 字符按字节处理, 不做 locale 多字节处理。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+local function ioeMsg(err)
+    if err and (err:find("permission") or err:find("denied")) then return "Permission denied" end
+    -- 必须先判 ENOENT: "No such file or directory" 里本来就含 "directory" 这个词,
+    -- 先匹 "directory" 会把"文件不存在"误报成 "Is a directory"(老模板的 bug)。
+    if err and err:lower():find("no such file") then return "No such file or directory" end
+    if err and err:find("directory") then return "Is a directory" end
+    return "No such file or directory"
+end
+
+local onlyInitial = false
+local stops = nil      -- 递增制表位列表; nil 表示用 tabSize
+local tabSize = 8
+local files = {}
+local noMoreOpts = false
+
+-- 解析 -t 参数: 单个数字 -> 周期; 多个(递增) -> 显式制表位表。
+local function setTabs(spec, optName)
+    local list = {}
+    for tok in spec:gmatch("[^,%s]+") do
+        local n = tonumber(tok)
+        if not n or n < 1 or n ~= math.floor(n) then
+            stderr("expand: tab size contains invalid character(s): '" .. tok .. "'\n")
+            return false
+        end
+        list[#list + 1] = n
+    end
+    if #list == 0 then
+        stderr("expand: tab size contains invalid character(s): '" .. spec .. "'\n")
+        return false
+    end
+    if #list == 1 then
+        tabSize = list[1]
+        stops = nil
+        return true
+    end
+    for idx = 2, #list do
+        if list[idx] <= list[idx - 1] then
+            stderr("expand: tab sizes must be ascending\n")
+            return false
+        end
+    end
+    stops = list
+    return true
+end
+
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if noMoreOpts then
+        files[#files + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "-i" or a == "--initial" then onlyInitial = true
+    elseif a:match("^%-%-tabs=") then
+        if not setTabs(a:sub(8)) then return 1 end
+    elseif a == "-t" or a == "--tabs" then
+        i = i + 1
+        if not args[i] then stderr("expand: option requires an argument -- 't'\n"); return 1 end
+        if not setTabs(args[i]) then return 1 end
+    elseif a:match("^%-%d+$") then
+        if not setTabs(a:sub(2)) then return 1 end
+    elseif a:sub(1, 1) == "-" and a ~= "-" and a:sub(1, 2) ~= "--" then
+        for k = 2, #a do
+            local ch = a:sub(k, k)
+            if ch == "i" then onlyInitial = true
+            elseif ch == "t" then
+                local val = a:sub(k + 1)
+                if val == "" then
+                    i = i + 1
+                    if not args[i] then stderr("expand: option requires an argument -- 't'\n"); return 1 end
+                    val = args[i]
+                end
+                if not setTabs(val) then return 1 end
+                break
+            else
+                stderr("expand: invalid option -- '" .. ch .. "'\n")
+                return 1
+            end
+        end
+    elseif a:sub(1, 2) == "--" then
+        stderr("expand: unrecognized option '" .. a .. "'\n")
+        return 1
+    else
+        files[#files + 1] = a
+    end
+    i = i + 1
+end
+if #files == 0 then files = { "-" } end
+
+-- 当前列 column 之后的下一个制表位列。
+local function nextStop(column)
+    if stops then
+        for _, s in ipairs(stops) do
+            if s > column then return s end
+        end
+        return column + 1
+    end
+    return column + (tabSize - column % tabSize)
+end
+
+local buf = {}
+local function flush()
+    if #buf > 0 then io.write(table.concat(buf)); buf = {} end
+end
+
+local function expandLine(line)
+    local column, seenNonBlank = 0, false
+    for idx = 1, #line do
+        local c = line:sub(idx, idx)
+        if c == "\t" then
+            if onlyInitial and seenNonBlank then
+                buf[#buf + 1] = "\t"
+                column = nextStop(column)
+            else
+                local nxt = nextStop(column)
+                buf[#buf + 1] = string.rep(" ", nxt - column)
+                column = nxt
+            end
+        elseif c == "\b" then
+            buf[#buf + 1] = c
+            if column > 0 then column = column - 1 end
+        elseif c == "\r" then
+            buf[#buf + 1] = c
+            column = 0
+        else
+            buf[#buf + 1] = c
+            column = column + 1
+            if c ~= " " then seenNonBlank = true end
+        end
+        if #buf >= 512 then flush() end
+    end
+    buf[#buf + 1] = "\n"
+end
+
+for _, f in ipairs(files) do
+    local h
+    if f == "-" then
+        h = io.stdin()
+        if not h then stderr("expand: 无法读取 stdin\n"); return 1 end
+    else
+        local err
+        h, err = fs.open(resolve(f), "r")
+        if not h then
+            stderr("expand: " .. f .. ": " .. ioeMsg(err) .. "\n")
+            return 1
+        end
+    end
+    while true do
+        local line = h.readLine()
+        if line == nil then break end
+        expandLine(line)
+        if #buf >= 512 then flush() end
+    end
+    if f ~= "-" then h:close() end
+end
+flush()

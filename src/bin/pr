@@ -1,0 +1,362 @@
+-- Delin pr: 分页/分列格式化输出 (POSIX 子集)。用法:
+--   pr [[-COLUMN]] [-d] [-F] [-h HEADER] [-l LINES] [-n[SEP[DIGITS]]] [-o OFFSET]
+--      [-s[SEP]] [-t] [-w WIDTH] [+PAGE[:LASTPAGE]] [FILE]...
+-- 选项:
+--   -COLUMN              多列输出(列优先排布: 先填满第一列)
+--   -d, --double-space   双倍行距
+--   -F, --form-feed      用 ^L 分页而不是补空行(每页正文行数 = 页长 - 10)
+--   -h HEADER            页头标题(缺省为文件名)
+--   -l LINES             页长(缺省 66); 小于 10 时不打印页头也不补空行
+--   -n[SEP[DIGITS]]      行号(SEP 缺省 TAB, DIGITS 缺省 5)
+--   -o OFFSET            左缩进(缺省 0)
+--   -s[SEP]              用分隔符代替列间空白(缺省 TAB)
+--   -t                   省略页头与页尾补空行
+--   -w WIDTH             行宽(缺省 72)
+--   +PAGE[:LASTPAGE]     从第 PAGE 页开始输出, 到 LASTPAGE 页为止
+-- FILE 缺省或 "-" 读 stdin; 多个文件各自从新的一页开始。
+-- 页结构: 每页 LINES 行 = 5 行页头(2 空行 + "日期 文件名 第N页" + 2 空行) + 正文;
+--         除最后一页外每页都补空行到页长;-F 时用一行 ^L 结尾且不补空行。
+-- 已知偏离:
+--   - 日期用 os.date("%Y-%m-%d %H:%M")(本地时区), 与 GNU 相同。
+--   - -s 时若**未显式**给 -w, 与 GNU 一样不做列补齐/截断(GNU 的同一怪癖: 缺省宽度没进入
+--     列宽计算); 显式给 -w 时按 (WIDTH-1)/COLUMN 补齐并截断。
+--   - 双倍行距(-d)时整页补到偶数行(与 GNU 一致)。
+--   - 只实现上述选项集; -m/-e/-i/-a/-T 等 GNU 扩展未实现。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+local function ioeMsg(err)
+    if err and (err:find("permission") or err:find("denied")) then return "Permission denied" end
+    -- 必须先判 ENOENT: "No such file or directory" 里本来就含 "directory" 这个词,
+    -- 先匹 "directory" 会把"文件不存在"误报成 "Is a directory"(老模板的 bug)。
+    if err and err:lower():find("no such file") then return "No such file or directory" end
+    if err and err:find("directory") then return "Is a directory" end
+    return "No such file or directory"
+end
+
+local columns = 1
+local doubleSpace, formFeed, omitHeader = false, false, false
+local header = nil
+local linesPerPage = 66
+local numberMode, numSep, numDigits = false, "\t", 5
+local offset = 0
+local sepString = nil
+local width = 72
+local widthExplicit = false
+local startPage, lastPage = 1, nil
+local files = {}
+local useHeaderName = false
+
+-- 解析 [+PAGE[:LASTPAGE]]
+local function parsePageSpec(a)
+    local p1, p2 = a:match("^%+(%d+):(%d+)$")
+    if p1 then startPage, lastPage = tonumber(p1), tonumber(p2); return true end
+    local p = a:match("^%+(%d+)$")
+    if p then startPage = tonumber(p); return true end
+    return false
+end
+
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if a == "--" then
+        for k = i + 1, #args do files[#files + 1] = args[k] end
+        break
+    elseif a:match("^%+%d") then
+        if not parsePageSpec(a) then
+            stderr("pr: invalid page range '" .. a .. "'\n")
+            return 1
+        end
+    elseif a == "-t" or a == "--omit-header" then omitHeader = true
+    elseif a == "-d" or a == "--double-space" then doubleSpace = true
+    elseif a == "-F" or a == "--form-feed" then formFeed = true
+    elseif a:match("^%-%-") then
+        stderr("pr: unrecognized option '" .. a .. "'\n")
+        return 1
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        local k = 2
+        while k <= #a do
+            local ch = a:sub(k, k)
+            if ch:match("%d") then
+                local num = a:match("^(%d+)$", k)
+                if not num then stderr("pr: invalid number of columns: '" .. a:sub(k) .. "'\n"); return 1 end
+                columns = tonumber(num)
+                if columns < 1 then stderr("pr: invalid number of columns: '" .. num .. "'\n"); return 1 end
+                k = #a + 1
+            elseif ch == "d" then doubleSpace = true; k = k + 1
+            elseif ch == "F" then formFeed = true; k = k + 1
+            elseif ch == "t" then omitHeader = true; k = k + 1
+            elseif ch == "h" or ch == "l" or ch == "o" or ch == "w" then
+                local val = a:sub(k + 1)
+                if val == "" then
+                    i = i + 1
+                    if not args[i] then stderr("pr: option requires an argument -- '" .. ch .. "'\n"); return 1 end
+                    val = args[i]
+                end
+                if ch == "h" then
+                    header = val
+                else
+                local n = tonumber(val)
+                if not n then stderr("pr: invalid number: '" .. val .. "'\n"); return 1 end
+                if ch == "l" then
+                    if n < 1 then stderr("pr: invalid number of lines: '" .. val .. "'\n"); return 1 end
+                    linesPerPage = n
+                elseif ch == "o" then
+                    if n < 0 then stderr("pr: invalid number: '" .. val .. "'\n"); return 1 end
+                    offset = n
+                else
+                    if n < 1 then stderr("pr: invalid number of columns: '" .. val .. "'\n"); return 1 end
+                    width = n
+                    widthExplicit = true
+                end
+                end
+                k = #a + 1
+            elseif ch == "n" or ch == "s" then
+                local rest = a:sub(k + 1)
+                if ch == "n" then
+                    numberMode = true
+                    if rest ~= "" then
+                        local sep, dig = rest:match("^(.)(%d*)$")
+                        if sep then
+                            numSep = sep
+                            if dig ~= "" then numDigits = tonumber(dig) end
+                        else
+                            stderr("pr: invalid number of digits: '" .. rest .. "'\n"); return 1
+                        end
+                    end
+                else
+                    if rest == "" then sepString = "\t" else sepString = rest end
+                end
+                k = #a + 1
+            else
+                stderr("pr: invalid option -- '" .. ch .. "'\n")
+                return 1
+            end
+        end
+    else
+        files[#files + 1] = a
+        useHeaderName = true
+    end
+    i = i + 1
+end
+if #files == 0 then files = { "-" } end
+if columns < 1 then
+    stderr("pr: invalid number of columns: '" .. columns .. "'\n")
+    return 1
+end
+
+local showHeader = (not omitHeader) and linesPerPage >= 10
+local headerLines = showHeader and 5 or 0
+-- 正文行数: 有页头时 = 页长 - 5(页头) - 5(页尾保留); 无页头(-t 或页长 < 10)时 = 页长。
+local bodyLines
+if showHeader then
+    bodyLines = linesPerPage - 10
+    if doubleSpace then bodyLines = math.floor(bodyLines / 2) end
+    if bodyLines < 1 then bodyLines = 1 end
+else
+    bodyLines = linesPerPage
+    if doubleSpace then bodyLines = math.floor(bodyLines / 2) end
+    if bodyLines < 1 then bodyLines = 1 end
+end
+
+-- 列宽: 与 GNU 一致, (WIDTH-1)/COLUMN; -s 且未显式给 -w 时为 0(不补齐/不截断)。
+local charsPerColumn
+if sepString and not widthExplicit then charsPerColumn = 0
+else charsPerColumn = math.floor((width - 1) / columns) end
+
+-- 打开输入。
+local function openInput(name)
+    if name == "-" then
+        local h = io.stdin()
+        if not h then stderr("pr: 无法读取 stdin\n"); return nil end
+        return h
+    end
+    local h, err = fs.open(resolve(name), "r")
+    if not h then
+        stderr("pr: " .. name .. ": " .. ioeMsg(err) .. "\n")
+        return nil
+    end
+    return h
+end
+
+local out = {}
+local function flush()
+    if #out > 0 then io.write(table.concat(out)); out = {} end
+end
+local function emit(s)
+    out[#out + 1] = s
+    if #out >= 512 then flush() end
+end
+
+-- 空白补齐(优先用 TAB, 再补空格)。
+local function whiteSpace(from, goal)
+    local parts = {}
+    local pos = from
+    while true do
+        local nextTab = pos + (8 - pos % 8)
+        if nextTab <= goal then parts[#parts + 1] = "\t"; pos = nextTab else break end
+    end
+    if pos < goal then parts[#parts + 1] = string.rep(" ", goal - pos) end
+    return table.concat(parts), goal
+end
+
+-- 把一段正文行按列排版输出。
+-- rows = 该页的正文行数组(已截断为 bodyLines 行)。
+local function printBody(rows, firstLineNo)
+    if columns == 1 then
+        for idx, l in ipairs(rows) do
+            local prefix = ""
+            if offset > 0 then prefix = string.rep(" ", offset) end
+            if numberMode then
+                local n = firstLineNo + idx - 1
+                prefix = prefix .. string.format("%" .. numDigits .. "d", n) .. numSep
+            end
+            emit(prefix .. l .. "\n")
+            if doubleSpace then emit("\n") end
+        end
+        return
+    end
+    -- 多列: 列优先。每列的行数 = ceil(#rows / columns)
+    local perCol = math.ceil(#rows / columns)
+    if perCol < 1 then perCol = 1 end
+    local sepLen = sepString and #sepString or 0
+    local pitch = charsPerColumn + (sepString and sepLen or 1)
+    for r = 1, perCol do
+        local buf = {}
+        local cur = 0
+        if offset > 0 then
+            buf[#buf + 1] = string.rep(" ", offset)
+            cur = offset
+        end
+        local truncated = false
+        for c = 0, columns - 1 do
+            local idx = c * perCol + r
+            local cell = rows[idx]
+            if cell == nil then
+                truncated = true
+                break
+            end
+            local colStart = offset + c * pitch
+            if c > 0 then
+                if sepString then
+                    -- -s: 先把上一格补齐到列宽, 再打分隔符。
+                    local goal = colStart - sepLen
+                    if cur < goal then
+                        local ws, nc = whiteSpace(cur, goal)
+                        buf[#buf + 1] = ws
+                        cur = nc
+                    end
+                    buf[#buf + 1] = sepString
+                    cur = cur + sepLen
+                else
+                    local ws, nc = whiteSpace(cur, colStart)
+                    buf[#buf + 1] = ws
+                    cur = nc
+                end
+            end
+            local numPrefix = ""
+            if numberMode then
+                numPrefix = string.format("%" .. numDigits .. "d", firstLineNo + idx - 1) .. numSep
+            end
+            local lineText = numPrefix .. cell
+            if charsPerColumn > 0 and #lineText > charsPerColumn then
+                lineText = lineText:sub(1, charsPerColumn)
+            end
+            buf[#buf + 1] = lineText
+            cur = cur + #lineText
+        end
+        local text = table.concat(buf)
+        if text:match("%S") or not truncated then emit(text .. "\n") end
+        if doubleSpace then emit("\n") end
+    end
+end
+
+local pageNo = 0
+local now = os.date("%Y-%m-%d %H:%M")
+
+-- 页头 5 行。
+local function printHeader(name)
+    local title = header
+    if title == nil then title = name end
+    local pageText = "Page " .. pageNo
+    local avail = width - 16 - #pageText
+    local pad = string.rep(" ", offset)
+    -- 页头 5 行: "缩进+空行 / 空行 / 缩进+标题行 / 空行 / 空行"(与 GNU 一致)
+    emit(pad .. "\n\n")
+    if avail < #title then
+        -- 宽度不够: 与 GNU 一样只用单空格分隔(不居中, 也不截断)。
+        emit(pad .. now .. " " .. title .. " " .. pageText .. "\n")
+    else
+        local lhs = math.floor((avail - #title) / 2)
+        local rhs = avail - #title - lhs
+        emit(pad .. now .. string.rep(" ", lhs) .. title .. string.rep(" ", rhs) .. pageText .. "\n")
+    end
+    emit("\n\n")
+end
+
+-- 带一行回推的逐行读取器。
+local function makeReader(h)
+    local pending = nil
+    return function()
+        if pending ~= nil then local p = pending; pending = nil; return p end
+        return h.readLine()
+    end, function(l) pending = l end
+end
+
+for _, f in ipairs(files) do
+    local h = openInput(f)
+    if not h then return 1 end
+    local name = (f == "-") and "" or f
+    local reader = makeReader(h)
+    local eof = false
+    local lineNo = 1
+    pageNo = 0
+    local emptyFile = true
+    while true do
+        local rows = {}
+        -- 多列时一页容纳 columns * 正文行数(每列各占正文行数那么多行)。
+        local cap = bodyLines * columns
+        while #rows < cap do
+            local l = reader()
+            if l == nil then eof = true; break end
+            emptyFile = false
+            rows[#rows + 1] = l
+        end
+        if #rows == 0 then break end
+        pageNo = pageNo + 1
+        local inRange = (pageNo >= startPage) and (lastPage == nil or pageNo <= lastPage)
+        if inRange then
+            if showHeader then printHeader(name) end
+            printBody(rows, lineNo)
+            lineNo = lineNo + #rows
+            if showHeader and not formFeed then
+                -- 补空行按**输出行数**(每列 ceil(行数/列数) 行)计算。
+                -- 双倍行距时与 GNU 一致地把整页补到**偶数行**(-d -l11 一页 12 行)。
+                local outRows = math.ceil(#rows / columns)
+                local used = headerLines + outRows + (doubleSpace and outRows or 0)
+                local pageTarget = linesPerPage
+                if doubleSpace and pageTarget % 2 == 1 then pageTarget = pageTarget + 1 end
+                for _ = used + 1, pageTarget do emit("\n") end
+            end
+            if formFeed then emit("\f") end
+        else
+            lineNo = lineNo + #rows
+        end
+        if eof then break end
+    end
+    if f ~= "-" then h:close() end
+end
+flush()
