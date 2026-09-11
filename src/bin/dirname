@@ -1,0 +1,62 @@
+-- Delin dirname: 去掉最后一段(与尾部斜杠)后打印剩下的目录部分 (POSIX dirname(1) + GNU 多操作数/-z)。
+-- 用法: dirname [OPTION]... NAME...
+-- 选项:
+--   -z, --zero   每项以 NUL 结尾而不是换行
+--   --           结束选项(此时 "-" 也算 NAME)
+-- 语义(POSIX): 去掉尾部斜杠; 没有斜杠 -> "."; 全是斜杠 -> "/";
+--   去掉最后一段与尾部斜杠后为空 -> "/"; 空串 -> "."。
+-- 本工具是**纯字符串操作**: 不访问文件系统, 也不把相对路径拼到 cwd(与 POSIX/GNU 一致),
+--   因此本文件没有其他工具顶部那段 resolve() —— 传进来什么就按字面拆什么。
+-- 已知偏离: 不实现 --help/--version(与本项目其他工具一致); 诊断信息用英文。
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+-- 去最后一段与尾部斜杠。空串 -> ".", 全斜杠 -> "/", 无斜杠 -> "."。
+local function dirOf(s)
+    s = s or ""
+    local body = s:gsub("/+$", "")
+    if body == "" then return (s ~= "") and "/" or "." end
+    local head = body:match("^(.*)/[^/]*$")
+    if not head then return "." end
+    head = head:gsub("/+$", "")
+    if head == "" then return "/" end
+    return head
+end
+
+local zero = false
+local operands, noMoreOpts = {}, false
+for _, a in ipairs(args) do
+    if noMoreOpts then
+        operands[#operands + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "-z" or a == "--zero" then
+        zero = true
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        for k = 2, #a do
+            local ch = a:sub(k, k)
+            if ch == "z" then
+                zero = true
+            else
+                stderr("dirname: invalid option -- '" .. ch .. "'\n")
+                return 1
+            end
+        end
+    else
+        operands[#operands + 1] = a
+    end
+end
+
+if #operands == 0 then
+    stderr("dirname: missing operand\n")
+    return 1
+end
+
+local sep = zero and "\0" or "\n"
+local buf = {}
+for _, o in ipairs(operands) do buf[#buf + 1] = dirOf(o) .. sep end
+io.write(table.concat(buf))

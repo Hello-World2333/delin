@@ -1,0 +1,174 @@
+-- Delin tee: 从 stdin 读, 同时写到 stdout 与每个 FILE (POSIX tee(1) + GNU -a/-i)。
+-- 用法: tee [OPTION]... [FILE]...
+-- 选项:
+--   -a, --append             追加到 FILE, 而不是覆盖
+--   -i, --ignore-interrupts  忽略 SIGINT(经 syscalls["signal.install"] 装一个空 handler;
+--                            内核不给这个 syscall 时直接报错返回 1, 不静默降级)
+--   --                       结束选项(此时 "-" 也算文件名)
+-- 语义: 每个输入块先写 stdout, 再逐个写 FILE(POSIX 顺序)。某个 FILE 打不开或写失败
+--   要报错**并继续**处理其它 FILE, 最终退出码 1(POSIX 允许); 写 stdout 失败(对端已关,
+--   内核管道返回 "broken pipe")时只报一次错、不再写 stdout, 但继续写 FILE。
+-- 无 FILE 操作数时就是 stdin->stdout 的直通。FILE 为 "-" 时按 GNU 9.x 处理: 忽略它
+--   (stdout 本来就写一次, 既不建名为 "-" 的文件也不重复写)。
+-- 读法: 真机的管道/终端句柄支持 read(n), 按 4096 字节块流式读; 宿主测试台的 stdin 桩
+--   只实现了 readLine(见 tools/harness.lua), 那种情况下退回逐行读并补回换行(与 cat 一致)——
+--   代价是"末行没有换行符"的输入会被补一个换行(真机上不会)。
+-- 已知偏离: 不实现 --output-error/-p; 不实现 --help/--version。
+-- 让出调度器: 防止长输出/长计算饿死事件循环(CC 的 ~7s no-yield 限制)。
+-- 时间片式: 每累计 ~50ms CPU 时间让出一次, 不按字节让出 —— HSE 已改拉模式(waitNextTick),
+-- 每次让出都是一次事件往返, 高频让出会淹没事件队列并拖死键盘。50ms 时间片同时保证
+-- 长命令运行期间按键/^C 的投递延迟不超过一个时间片。
+local _msleep = os.msleep or function(ms) os.sleep(math.max((ms or 0) / 1000, 0.05)) end
+local _sliceAt = os.epoch("utc")
+local function yieldCheck(_n)
+    local now = os.epoch("utc")
+    if now - _sliceAt >= 50 then
+        _sliceAt = now
+        _msleep(0)
+    end
+end
+
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+-- 内核的 fs.open 用 (nil, err) 报失败, 但宿主测试台的桩里是 assert(io.open(...)) —— 会抛异常。
+-- tee 的 POSIX 契约要求"某个 FILE 失败也要继续处理其它 FILE", 所以这里必须能观察到失败:
+-- 用 pcall 接住(与本项目 touch 的写法一致), 报文照实报出, 不吞不换做法。
+local function openOut(path, mode)
+    local ok, h, err = pcall(fs.open, path, mode)
+    if not ok then return nil, tostring(h) end
+    return h, err
+end
+
+-- 把异常/错误串裁剪成人读的 errno 措辞(去掉宿主 pcall 包装的 "文件:行号: " 与多余路径)。
+local function errText(err)
+    local s = tostring(err or "cannot open")
+    s = s:gsub("^.-:%d+: ", "")
+    local tail = s:match(": ([^:]+)$")
+    if tail and not tail:find("/", 1, true) then return tail end
+    return s
+end
+
+local optAppend, optIgnoreInt = false, false
+local files, noMoreOpts = {}, false
+for _, a in ipairs(args) do
+    if noMoreOpts then
+        files[#files + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "-a" or a == "--append" then optAppend = true
+    elseif a == "-i" or a == "--ignore-interrupts" then optIgnoreInt = true
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        for k = 2, #a do
+            local ch = a:sub(k, k)
+            if ch == "a" then optAppend = true
+            elseif ch == "i" then optIgnoreInt = true
+            else stderr("tee: invalid option -- '" .. ch .. "'\n"); return 1 end
+        end
+    else
+        files[#files + 1] = a
+    end
+end
+
+if optIgnoreInt then
+    local install = syscalls and syscalls["signal.install"]
+    if not install then
+        stderr("tee: -i: signal.install syscall not available\n")
+        return 1
+    end
+    install(2, function() end)
+end
+
+local status = 0
+local out = io.stdout()
+local stdin = io.stdin()
+if not stdin then
+    stderr("tee: standard input: not available\n")
+    return 1
+end
+
+-- FILE 目标: "-" 指 stdout, 按 GNU 9.x 忽略它(stdout 本来就会写一次, 不重复写);
+-- 其余 fs.open。打开失败不致命: 报错后跳过该文件。
+local openMode = optAppend and "a" or "w"
+local targets = {}
+for _, name in ipairs(files) do
+    if name == "-" then
+        -- stdout: 下面的主循环已经写了, 这里什么都不做
+    else
+        local p = resolve(name)
+        local h, err = openOut(p, openMode)
+        if not h then
+            stderr("tee: " .. name .. ": " .. errText(err) .. "\n")
+            status = 1
+        else
+            targets[#targets + 1] = { name = name, h = h }
+        end
+    end
+end
+
+-- 写所有 FILE; 某个目标写失败就从表里摘掉(只报一次错), 不影响其它目标与 stdout。
+local function writeAll(chunk)
+    local i = 1
+    while i <= #targets do
+        local t = targets[i]
+        local ok, err = t.h.write(chunk)
+        if not ok then
+            stderr("tee: " .. t.name .. ": " .. tostring(err or "write failed") .. "\n")
+            status = 1
+            t.h.close()
+            table.remove(targets, i)
+        else
+            i = i + 1
+        end
+    end
+end
+
+local stdoutDead = (out == nil)
+
+-- 真机句柄有 readAll(能力探测, 与 wc 同一套约定): 有就分块流式读; 否则退回逐行读。
+local chunked = stdin.readAll ~= nil
+while true do
+    local chunk
+    if chunked then
+        chunk = stdin.read(4096)
+    else
+        local line = stdin.readLine()
+        if line ~= nil then chunk = line .. "\n" end
+    end
+    if chunk == nil then break end
+    -- 注意: 逐行模式下 "" 是一整行空行(tty 的 readLine 剥掉了换行), 不是 EOF —— 只有 nil 才是。
+    if not stdoutDead then
+        local ok, err = out.write(chunk)
+        if not ok then
+            -- 对端已关(内核管道写端返回 "broken pipe"): 只报一次, 之后不再写 stdout,
+            -- 但 FILE 照常继续写(POSIX 允许, 退出码非 0)。
+            stderr("tee: standard output: " .. tostring(err or "write failed") .. "\n")
+            status = 1
+            stdoutDead = true
+        end
+    end
+    writeAll(chunk)
+    yieldCheck(#chunk)
+end
+
+for _, t in ipairs(targets) do
+    t.h.flush()
+    t.h.close()
+end
+if out then out.flush() end
+
+return status

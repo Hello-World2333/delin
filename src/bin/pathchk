@@ -1,0 +1,114 @@
+-- Delin pathchk: 检查路径名是否可用/可移植 (POSIX pathchk(1) + GNU -p/-P)。
+-- 用法: pathchk [OPTION]... PATH...
+-- 选项:
+--   -p, --portability       按 POSIX 可移植性**下限**检查(_POSIX_* 规范值):
+--                             段 <= 14 字节   (_POSIX_NAME_MAX = 14)
+--                             整路径 <= 255 字节(_POSIX_PATH_MAX = 256, 含结尾 NUL)
+--                             每段字符只能落在可移植文件名字符集 A-Za-z0-9._- 内
+--   -P, --portability-plus  按"能安全塞进命令行"检查:
+--                             路径名非空
+--                             每段不以 '-' 开头(否则会被当成选项)
+--                             长度用本机限制: 段 <= 255, 整路径 <= 4095
+--   --                      结束选项
+--   -p 与 -P 可以同时给, 两套检查**叠加**(字符集 + 14/255 + 非空 + 前导减号), 长度取更严的。
+--   -P **不**隐含 -p(GNU 实测: `pathchk -P 'a b'` 不报字符集错), 反之亦然。
+-- 长度上限来源(单位字节, 数字是"允许的最大长度", 与 C 里 PATH_MAX/NAME_MAX 含结尾 NUL 的写法差 1):
+--   14 / 255 是 POSIX 规范值(_POSIX_NAME_MAX, _POSIX_PATH_MAX-1), 与 C 库宏一一对应;
+--   255 / 4095 是本机限制: 段 255 = ext2/CC 单个文件名上限, 路径 4095 = PATH_MAX 4096 去掉结尾 NUL。
+-- 语义: 每个非法项都往 stderr 打一行 "pathchk: '<path>': <原因>"(路径加引号, 空路径才看得清),
+--   **所有操作数都检查完**才返回 1(有任何一项非法即 1, 全合法返回 0)。
+--   同一段的报错顺序与 GNU 一致: 前导 '-' -> 段长度 -> 字符集; 整路径长度先于逐段检查。
+-- 本工具**不做 resolve()**: pathchk 检查的是传进来的那个字符串本身, 不访问文件系统、
+--   也不把它拼到 cwd 上(与 POSIX/GNU pathchk 一致; 拼了 cwd 反而会误报长度与字符集)。
+-- 已知偏离: 不实现 --help/--version; 诊断信息用英文(GNU 是 locale 文案)。
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+local optP, optPPlus = false, false
+local paths, noMoreOpts = {}, false
+for _, a in ipairs(args) do
+    if noMoreOpts then
+        paths[#paths + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "-p" or a == "--portability" then optP = true
+    elseif a == "-P" or a == "--portability-plus" then optPPlus = true
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        for k = 2, #a do
+            local ch = a:sub(k, k)
+            if ch == "p" then optP = true
+            elseif ch == "P" then optPPlus = true
+            else
+                stderr("pathchk: invalid option -- '" .. ch .. "'\n")
+                return 1
+            end
+        end
+    else
+        paths[#paths + 1] = a
+    end
+end
+
+if #paths == 0 then
+    stderr("pathchk: missing operand\n")
+    return 1
+end
+
+local POSIX_NAME_LIMIT = 14   -- _POSIX_NAME_MAX
+local POSIX_PATH_LIMIT = 255  -- _POSIX_PATH_MAX = 256(含结尾 NUL)
+local LOCAL_NAME_LIMIT = 255  -- ext2/CC 单个文件名上限 = NAME_MAX
+local LOCAL_PATH_LIMIT = 4095 -- PATH_MAX = 4096(含结尾 NUL)
+
+-- 长度上限: 默认用本机限制; 给了 -p 再套上 POSIX 下限(取更严的); -P 不额外收紧。
+local nameLimit = LOCAL_NAME_LIMIT
+local pathLimit = LOCAL_PATH_LIMIT
+if optP then
+    if POSIX_NAME_LIMIT < nameLimit then nameLimit = POSIX_NAME_LIMIT end
+    if POSIX_PATH_LIMIT < pathLimit then pathLimit = POSIX_PATH_LIMIT end
+end
+
+-- 返回 nil 或 原因串。
+local function check(path)
+    if path == "" then
+        -- 空路径名在任何模式下都不合法; 措辞按 GNU: -p/-P 说 "empty file name", 默认模式说 ENOENT。
+        if optP or optPPlus then return "empty file name" end
+        return "No such file or directory"
+    end
+
+    local n = #path
+    if n > pathLimit then
+        return "length " .. n .. " exceeds limit " .. pathLimit
+    end
+
+    -- 逐段检查; 空段(如 "a//b" 或结尾的 "/")按 POSIX 忽略, 不算"空段名"。
+    for seg in path:gmatch("[^/]+") do
+        if optPPlus and seg:sub(1, 1) == "-" then
+            return "component '" .. seg .. "' starts with '-'"
+        end
+        if #seg > nameLimit then
+            return "component '" .. seg .. "' length " .. #seg .. " exceeds limit " .. nameLimit
+        end
+        if optP then
+            -- 可移植文件名字符集 A-Za-z0-9._- : 减号本来就在里面, 所以 -p **不**禁止前导减号。
+            local bad = seg:match("[^A-Za-z0-9._%-]")
+            if bad then
+                return "non-portable character '" .. bad .. "' in component '" .. seg .. "'"
+            end
+        end
+    end
+    return nil
+end
+
+local status = 0
+for _, p in ipairs(paths) do
+    local why = check(p)
+    if why then
+        stderr("pathchk: '" .. p .. "': " .. why .. "\n")
+        status = 1
+    end
+end
+
+return status

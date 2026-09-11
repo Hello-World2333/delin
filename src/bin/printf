@@ -1,0 +1,410 @@
+-- Delin printf: 按 FORMAT 排版并打印 (POSIX printf(1) + GNU 扩展)。
+-- 用法: printf FORMAT [ARGUMENT]...
+-- 转换: %b %c %d %i %o %u %x %X %e %E %f %g %G %s %%
+--   标志: - (左对齐) + (总是带符号) ' '(正数留空格) # (0/0x 前缀) 0 (零填充)
+--   宽度/精度都支持, 也支持 * (宽度/精度从参数取; 负宽度 = 左对齐, 负精度 = 没给精度)
+-- FORMAT/%b 里的转义: \\ \a \b \f \n \r \t \v \" \' \ooo(1-3 位八进制) \xHH(1-2 位十六进制);
+--   %b 另按 POSIX 认 \0ooo; \c 终止全部输出(%b 是 POSIX 规定, FORMAT 里 GNU 也这么干)。
+-- 数字参数按 C 常量形式解析: 支持 0x/0X(十六进制)与 0 开头(八进制), 前导空白允许。
+--   "abc"/"" -> 用 0 并告警, 退出码 1; "12abc" -> 用 12 并告警, 退出码 1(与 GNU 一致)。
+-- POSIX: FORMAT 用完而参数还有 -> 从头再用一遍; 缺参数按 0 / 空串(不告警)。
+-- 已知偏离:
+--   1. 整数是 IEEE double(本机没有 64 位整数): |v| > 2^53 时不保证逐位精确, 会告警;
+--      超过 2^63 按 GNU 的做法钳到边界(但打印出来的是 double 能表示的那个邻近值)。
+--   2. %u/%o/%x/%X 的负数按 64 位无符号回绕(与 C 一致, 用 2^64 的位数做减法实现)。
+--   3. %e/%E/%f/%g/%G 的宽度与精度上限是 99(Lua string.format 的限制), 超过即报错返回 1;
+--      C 没有这个上限。
+--   4. 不实现 %q(GNU 扩展)、长度修饰符(l/ll/h/z)与 --help/--version。
+--   5. %F 按 %f 处理(INF/NAN 的大小写不区分); %b 接受宽度/精度(GNU 认为非法, 这里是超集);
+--      %s 的 '0' 标志按 glibc 行为忽略(C 标准对这组合未定义, coreutils 直接报错)。
+--   (%% 不带任何修饰符才算合法 —— 这一条与 GNU 一致, `printf '%5%'` 是无效转换。)
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+local out = {}
+local status = 0
+local stopAll = false
+
+local function warn(msg) stderr("printf: " .. msg .. "\n") end
+-- 数字参数不能完全转换 -> 告警并且退出码 1(POSIX: 不是致命错误, 继续处理)。
+local function badNumber(msg)
+    warn(msg)
+    status = 1
+end
+local function fatal(msg)
+    warn(msg)
+    status = 1
+    stopAll = true
+end
+
+-- ---------------------------------------------------------------
+-- 数字参数解析
+-- ---------------------------------------------------------------
+-- 返回 value, 是否完全转换。完全转换失败时 value 是"已转换的部分"(0 表示一点都没有)。
+local function parseIntArg(raw)
+    local leading = raw:match("^%s*")
+    local body = raw:sub(#leading + 1)
+    local trailing = (body:match("%s+$") ~= nil)
+    local sign = 1
+    if body:sub(1, 1) == "+" then body = body:sub(2)
+    elseif body:sub(1, 1) == "-" then sign = -1; body = body:sub(2) end
+
+    local base, digits, hexPrefix = 10, body, false
+    if body:match("^0[xX]") then
+        base, digits, hexPrefix = 16, body:sub(3), true
+    elseif #body > 1 and body:sub(1, 1) == "0" then
+        base, digits = 8, body:sub(2)
+    end
+
+    local good
+    if base == 16 then good = digits:match("^%x*")
+    elseif base == 8 then good = digits:match("^[0-7]*")
+    else good = digits:match("^%d*") end
+
+    if #good == 0 then
+        if hexPrefix then badNumber("'" .. raw .. "': needs a hexadecimal number")
+        else badNumber("'" .. raw .. "': needs a number") end
+        return 0, false
+    end
+    local v = sign * (tonumber(good, base) or 0)
+    local exact = (#good == #digits) and not trailing
+    if not exact then badNumber("'" .. raw .. "': not completely converted") end
+
+    -- 超出 double 能逐位表示的范围: 告警并钳到 64 位整数边界(与 GNU 的钳位精神一致)。
+    local LIMIT = 2 ^ 53
+    if v > LIMIT or v < -LIMIT then
+        warn("'" .. raw .. "': numerical result out of range")
+        local CAP = 2 ^ 63
+        if v > CAP then v = CAP elseif v < -CAP then v = -CAP end
+    end
+    return v, exact
+end
+
+-- 浮点参数: 认 C 常量形式(含 inf/nan)。GNU 对部分转换的输入会打印已转换的部分。
+local function parseFloatArg(raw)
+    local v = tonumber(raw)
+    local trailing = (raw:match("%s$") ~= nil)
+    local shaped = (raw:match("^%s*[+-]?[%d%.eExXa-fA-F]*$") ~= nil)
+    if v ~= nil and shaped and not trailing then return v, true end
+    if v == nil then
+        local pre = raw:match("^%s*([+-]?%d+%.?%d*[eE][+-]?%d+)")
+            or raw:match("^%s*([+-]?%d*%.?%d+)")
+            or raw:match("^%s*([+-]?%d+)")
+        v = pre and tonumber(pre)
+    end
+    if v == nil then
+        badNumber("'" .. raw .. "': needs a number")
+        return 0, false
+    end
+    badNumber("'" .. raw .. "': not completely converted")
+    return v, false
+end
+
+-- ---------------------------------------------------------------
+-- 整数 -> 数字串(含负数按 64 位无符号回绕)
+-- ---------------------------------------------------------------
+local DIGSET = "0123456789abcdef"
+-- 2^64 在 8/10/16 进制下的各位(高位在前): 负数回绕要用它做减法。
+local POW2_64 = {
+    [8] = "2" .. string.rep("0", 21),
+    [10] = "18446744073709551616",
+    [16] = "1" .. string.rep("0", 16),
+}
+
+local function strDigits(s, base)
+    local d = {}
+    for i = 1, #s do d[i] = tonumber(s:sub(i, i), base) end
+    return d
+end
+
+-- 非负 v 在 base 下的数字(高位在前)。
+local function digitsOf(v, base)
+    if v == 0 then return { 0 } end
+    local d = {}
+    while v > 0 do
+        local q = math.floor(v / base)
+        d[#d + 1] = v - q * base
+        v = q
+    end
+    local n = #d
+    for i = 1, math.floor(n / 2) do d[i], d[n + 1 - i] = d[n + 1 - i], d[i] end
+    return d
+end
+
+-- 无符号数字: 负数按 2^64 回绕(C 里 %u/%o/%x/%X 的参数会被转成 64 位无符号)。
+local function unsignedDigits(v, base)
+    if v >= 0 then return digitsOf(v, base) end
+    local m = strDigits(POW2_64[base], base)
+    local s = digitsOf(-v, base)
+    local r, borrow, si = {}, 0, #s
+    for i = #m, 1, -1 do
+        local d = m[i] - ((si >= 1) and s[si] or 0) - borrow
+        if d < 0 then d = d + base; borrow = 1 else borrow = 0 end
+        r[i] = d
+        si = si - 1
+    end
+    while #r > 1 and r[1] == 0 do table.remove(r, 1) end
+    return r
+end
+
+local function digitsToString(d, upper)
+    local t = {}
+    for i = 1, #d do
+        local c = DIGSET:sub(d[i] + 1, d[i] + 1)
+        t[i] = upper and c:upper() or c
+    end
+    return table.concat(t)
+end
+
+-- ---------------------------------------------------------------
+-- 排版辅助
+-- ---------------------------------------------------------------
+local function padToSpace(s, spec)
+    if spec.width and #s < spec.width then
+        local pad = string.rep(" ", spec.width - #s)
+        return spec.minus and (s .. pad) or (pad .. s)
+    end
+    return s
+end
+
+local function formatStr(s, spec)
+    if spec.prec and #s > spec.prec then s = s:sub(1, spec.prec) end
+    return padToSpace(s, spec) -- %s 的 '0' 标志按 glibc 忽略(空格填充)
+end
+
+local function formatInt(v, conv, spec)
+    local sign, digits, prefix = "", nil, ""
+    if conv == "d" or conv == "i" then
+        local av = v
+        if av < 0 then sign, av = "-", -av
+        elseif spec.plus then sign = "+"
+        elseif spec.space then sign = " " end
+        digits = digitsToString(digitsOf(av, 10), false)
+    else
+        local base = (conv == "o") and 8 or ((conv == "u") and 10 or 16)
+        digits = digitsToString(unsignedDigits(v, base), conv == "X")
+    end
+
+    if spec.prec then
+        -- C: 精度为 0 且值为 0 -> 不输出数字; 否则按精度补前导零。
+        if spec.prec == 0 and digits == "0" then digits = "" end
+        if #digits < spec.prec then digits = string.rep("0", spec.prec - #digits) .. digits end
+    end
+
+    if spec.hash then
+        if conv == "o" then
+            if digits:sub(1, 1) ~= "0" then prefix = "0" end
+        elseif (conv == "x" or conv == "X") and v ~= 0 then
+            prefix = (conv == "X") and "0X" or "0x"
+        end
+    end
+
+    -- '0' 填充只在没给精度且非左对齐时生效(加在符号/前缀之后)。
+    if spec.zero and not spec.minus and not spec.prec and spec.width then
+        local total = #sign + #prefix + #digits
+        if total < spec.width then digits = string.rep("0", spec.width - total) .. digits end
+    end
+
+    return padToSpace(sign .. prefix .. digits, spec)
+end
+
+local function formatFloat(v, conv, spec)
+    if (spec.width and spec.width > 99) or (spec.prec and spec.prec > 99) then
+        fatal("width or precision too long for %" .. conv .. " (limit 99)")
+        return ""
+    end
+    local s = "%"
+    if spec.minus then s = s .. "-" end
+    if spec.plus then s = s .. "+" end
+    if spec.space then s = s .. " " end
+    if spec.hash then s = s .. "#" end
+    if spec.zero then s = s .. "0" end
+    if spec.width then s = s .. spec.width end
+    if spec.prec then s = s .. "." .. spec.prec end
+    s = s .. ((conv == "F") and "f" or conv)
+    return string.format(s, v)
+end
+
+-- ---------------------------------------------------------------
+-- 转义(1-3 位八进制 / \xHH), %b 多认 \0ooo 与 \c
+-- ---------------------------------------------------------------
+local ESC = { a = "\a", b = "\b", f = "\f", n = "\n", r = "\r", t = "\t", v = "\v",
+              ["\\"] = "\\", ['"'] = '"', ["'"] = "'" }
+
+-- 返回 输出串, 下一个位置, 是否终止输出。\x 缺十六进制数时返回 nil(致命)。
+local function readEscape(s, i, bashMode)
+    local c = s:sub(i, i)
+    if c == "" then return "\\", i + 1, false end -- 末尾孤立反斜杠: 原样(GNU 行为)
+    if ESC[c] then return ESC[c], i + 1, false end
+    if c == "c" and bashMode then return "", i + 1, true end
+    if c == "0" and bashMode then
+        local oct = s:match("^0[0-7]?[0-7]?[0-7]?", i)
+        return string.char((tonumber(oct, 8) or 0) % 256), i + #oct, false
+    end
+    if c:match("[0-7]") then
+        local oct = s:match("^[0-7][0-7]?[0-7]?", i)
+        return string.char((tonumber(oct, 8) or 0) % 256), i + #oct, false
+    end
+    if c == "x" then
+        local hex = s:match("^%x%x?", i + 1)
+        if not hex then return nil, i + 1, false end
+        return string.char(tonumber(hex, 16) % 256), i + 1 + #hex, false
+    end
+    return "\\" .. c, i + 1, false -- 未知转义: 反斜杠照留(GNU 行为)
+end
+
+-- ---------------------------------------------------------------
+-- 主流程
+-- ---------------------------------------------------------------
+local operands = {}
+for _, a in ipairs(args) do operands[#operands + 1] = a end
+if operands[1] == "--" then table.remove(operands, 1) end
+local fmt = table.remove(operands, 1)
+if fmt == nil then
+    stderr("printf: missing operand\n")
+    return 1
+end
+local rest = operands
+
+local argi = 1
+local function nextArg()
+    if argi <= #rest then
+        local v = rest[argi]
+        argi = argi + 1
+        return v
+    end
+    return nil
+end
+
+-- 一条转换说明的 flags/宽度/精度, 返回 spec, 转换字符, 下一个位置。
+local function parseSpec(j)
+    local spec = { minus = false, plus = false, space = false, hash = false, zero = false }
+    while true do
+        local c = fmt:sub(j, j)
+        if c == "-" then spec.minus = true
+        elseif c == "+" then spec.plus = true
+        elseif c == " " then spec.space = true
+        elseif c == "#" then spec.hash = true
+        elseif c == "0" then spec.zero = true
+        else break end
+        j = j + 1
+    end
+    if fmt:sub(j, j) == "*" then
+        local a = nextArg()
+        local w = (a == nil) and 0 or (parseIntArg(a))
+        if w < 0 then spec.minus = true; w = -w end
+        spec.width = (w ~= 0) and w or nil -- 宽度 0 = 没给宽度(免得被当成 '0' 标志写进格式串)
+        j = j + 1
+    else
+        local num = fmt:match("^%d+", j)
+        if num then spec.width = tonumber(num); j = j + #num end
+    end
+    if fmt:sub(j, j) == "." then
+        j = j + 1
+        if fmt:sub(j, j) == "*" then
+            local a = nextArg()
+            local p = (a == nil) and 0 or (parseIntArg(a))
+            if p >= 0 then spec.prec = p end -- 负精度 = 没给精度
+            j = j + 1
+        else
+            local num = fmt:match("^%d+", j)
+            spec.prec = num and tonumber(num) or 0
+            j = j + (num and #num or 0)
+        end
+    end
+    return spec, fmt:sub(j, j), j + 1
+end
+
+-- 跑一遍 FORMAT。
+local function runFormat()
+    local i = 1
+    while i <= #fmt and not stopAll do
+        local c = fmt:sub(i, i)
+        if c == "\\" then
+            local s, ni, stop = readEscape(fmt, i + 1, false)
+            if s == nil then
+                fatal("missing hexadecimal number in escape")
+                break
+            end
+            out[#out + 1] = s
+            i = ni
+            if stop then stopAll = true end
+        elseif c == "%" then
+            local specStart = i
+            local spec, conv, ni = parseSpec(i + 1)
+            i = ni
+            if conv == "" then
+                fatal("%: invalid conversion specifier")
+            elseif conv == "%" then
+                -- %% 不接受任何标志/宽度/精度(GNU 也这么判: `printf '%5%'` 是无效转换)
+                if spec.minus or spec.plus or spec.space or spec.hash or spec.zero
+                   or spec.width or spec.prec then
+                    fatal(fmt:sub(specStart, ni - 1) .. ": invalid conversion specifier")
+                else
+                    out[#out + 1] = "%"
+                end
+            elseif conv == "d" or conv == "i" or conv == "o" or conv == "u" or conv == "x" or conv == "X" then
+                local a = nextArg()
+                out[#out + 1] = formatInt(a == nil and 0 or (parseIntArg(a)), conv, spec)
+            elseif conv == "e" or conv == "E" or conv == "f" or conv == "F" or conv == "g" or conv == "G" then
+                local a = nextArg()
+                out[#out + 1] = formatFloat(a == nil and 0 or (parseFloatArg(a)), conv, spec)
+            elseif conv == "c" then
+                local a = nextArg()
+                out[#out + 1] = formatStr((a ~= nil and a ~= "") and a:sub(1, 1) or "\0", spec)
+            elseif conv == "s" then
+                local a = nextArg()
+                out[#out + 1] = formatStr(a or "", spec)
+            elseif conv == "b" then
+                local a = nextArg()
+                local src, body, k = a or "", {}, 1
+                while k <= #src do
+                    local ch = src:sub(k, k)
+                    if ch ~= "\\" then
+                        local j = src:find("\\", k, true) or (#src + 1)
+                        body[#body + 1] = src:sub(k, j - 1)
+                        k = j
+                    else
+                        local s, nk, stop = readEscape(src, k + 1, true)
+                        if s == nil then
+                            fatal("missing hexadecimal number in escape")
+                            break
+                        end
+                        body[#body + 1] = s
+                        k = nk
+                        if stop then stopAll = true; break end
+                    end
+                end
+                out[#out + 1] = formatStr(table.concat(body), spec)
+            else
+                fatal("%" .. conv .. ": invalid conversion specifier")
+            end
+        else
+            local j = fmt:find("[\\%%]", i) or (#fmt + 1)
+            out[#out + 1] = fmt:sub(i, j - 1)
+            i = j
+        end
+    end
+end
+
+if #rest == 0 then
+    runFormat()
+else
+    while not stopAll and argi <= #rest do
+        local before = argi
+        runFormat()
+        if stopAll then break end
+        if argi == before then
+            -- FORMAT 一个参数都没用到(如 'x\n' 配 a b c): GNU 警告后停手, 不无限重复。
+            warn("warning: ignoring the excess arguments starting with '" .. rest[argi] .. "'")
+            break
+        end
+    end
+end
+
+io.write(table.concat(out))
+return status

@@ -1,0 +1,194 @@
+-- Delin chgrp: 修改文件属组 (POSIX chgrp(1) + GNU -R/-h/-v/-c/-f)。
+-- 与 chown 同一套结构: 同样的 resolve/walk/-h 语义/-v/-c 文案风格(见下), 只有 GROUP 解析不同。
+-- 用法: chgrp [OPTION]... GROUP FILE...
+-- 选项:
+--   -R, --recursive       递归处理目录
+--   -h, --no-dereference  只作用于符号链接本身, 不跟随链接(GNU 的 lchown 语义)
+--   -v, --verbose         每个文件都打印处理结果(走 stdout, 与 GNU 一致)
+--   -c, --changes         只在属组真的改变时打印(走 stdout)
+--   -f, --silent, --quiet 静默"文件"类错误(找不到/改不动)
+--   --                    结束选项
+-- GROUP: /etc/group 里的组名(经 syscalls["user.groupByName"] 查表), 或十进制 gid
+--   (先按名字查, 名字查不到且全数字时当 gid —— 与 chown 的"数字优先"顺序不同:
+--    chown 对 `1000` 直接当 uid, chgrp 会先找有没有名叫 1000 的组)。
+-- 符号链接语义(与 GNU 一致):
+--   命令行操作数 + 不给 -h -> 跟随链接改**目标**(chown(2) 的默认语义);
+--   命令行操作数 + 给 -h   -> 只改**链接本身**(lchown);
+--   -R 遍历中遇到的符号链接 -> 改链接本身, 不下钻(GNU 递归的默认 -P: 不跟随)。
+--   判链接用 fs.lstat(不跟随); fs.attributes 是跟随的, 判不出链接。
+-- 已知偏离:
+--   1. 不实现 --reference=RFILE / --help / --version。
+--   2. 组名找不到时报错(即使给了 -f), 与 GNU 一致: -f 只盖住文件类错误。
+-- 说明: 内核没有 fs.lchown 时(Linux lchown 缺失), -h 与 -R 里的链接会明确报错并退出 1,
+--   绝不退化成跟随链接 —— 跟随会把目标文件的属组改掉(递归时常常是树外文件), 比报错危险得多。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+local optRecursive, optNoDeref, optVerbose, optChanges, optSilent = false, false, false, false, false
+local operands, noMoreOpts = {}, false
+for _, a in ipairs(args) do
+    if noMoreOpts then
+        operands[#operands + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "-R" or a == "-r" or a == "--recursive" then optRecursive = true
+    elseif a == "-h" or a == "--no-dereference" then optNoDeref = true
+    elseif a == "-v" or a == "--verbose" then optVerbose = true
+    elseif a == "-c" or a == "--changes" then optChanges = true
+    elseif a == "-f" or a == "--silent" or a == "--quiet" then optSilent = true
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        for k = 2, #a do
+            local ch = a:sub(k, k)
+            if ch == "R" or ch == "r" then optRecursive = true
+            elseif ch == "h" then optNoDeref = true
+            elseif ch == "v" then optVerbose = true
+            elseif ch == "c" then optChanges = true
+            elseif ch == "f" then optSilent = true
+            else stderr("chgrp: invalid option -- '" .. ch .. "'\n"); return 1 end
+        end
+    else
+        operands[#operands + 1] = a
+    end
+end
+
+local spec = operands[1]
+if not spec then
+    stderr("chgrp: missing operand\n")
+    return 1
+end
+local files = {}
+for i = 2, #operands do files[#files + 1] = operands[i] end
+if #files == 0 then
+    stderr("chgrp: missing operand after '" .. spec .. "'\n")
+    return 1
+end
+
+-- 组名/数字 -> gid: 先查 /etc/group(名字), 查不到且全数字时当 gid。
+local gid
+if syscalls and syscalls["user.groupByName"] then
+    local rec = syscalls["user.groupByName"](spec)
+    if rec then gid = rec.gid end
+end
+if not gid and spec:match("^%d+$") then gid = tonumber(spec) end
+if not gid then
+    stderr("chgrp: invalid group: '" .. spec .. "'\n")
+    return 1
+end
+
+-- gid -> 名字(仅用于 -v/-c 的提示; 没有该 syscall 或查不到就打印数字)。
+local function gidName(g)
+    if syscalls and syscalls["user.groupByGid"] then
+        local rec = syscalls["user.groupByGid"](g)
+        if rec then return rec.name end
+    end
+    return tostring(g)
+end
+
+local status = 0
+
+-- 打印 -v/-c 的结果(before 是改动前那个对象的 gid)。
+local function report(path, raw, before, changed)
+    if optVerbose or (optChanges and changed) then
+        if changed then
+            io.write("changed group of '" .. raw .. "' from " .. gidName(before) ..
+                     " to " .. gidName(gid) .. "\n")
+        else
+            io.write("group of '" .. raw .. "' retained as " .. gidName(gid) .. "\n")
+        end
+    end
+end
+
+-- 跟随链接改目标(chown(2) 语义 = 命令行操作数不给 -h 时的 GNU 行为)。
+local function applyOne(path, raw)
+    local before = fs.attributes(path)
+    local ok, err = fs.chown(path, nil, gid)
+    if not ok then
+        if not optSilent then stderr("chgrp: " .. raw .. ": " .. tostring(err) .. "\n") end
+        status = 1
+        return
+    end
+    report(path, raw, before and (before.gid or 0) or 0, before ~= nil and (before.gid or 0) ~= gid)
+end
+
+-- 只改符号链接本身(Linux lchown)。内核没有 fs.lchown 时明确报错, **不**退化成跟随链接
+-- —— 跟随会把目标文件的属组改掉(常常是树外的文件), 那是改错对象。
+local function applyLink(path, raw)
+    local before = fs.lstat(path)
+    local lchown = fs.lchown
+    if not lchown then
+        stderr("chgrp: " .. raw .. ": cannot change the group of a symbolic link: " ..
+               "fs.lchown is not supported by this kernel\n")
+        status = 1
+        return
+    end
+    local ok, err = lchown(path, nil, gid)
+    if not ok then
+        if not optSilent then stderr("chgrp: " .. raw .. ": " .. tostring(err) .. "\n") end
+        status = 1
+        return
+    end
+    report(path, raw, before and (before.gid or 0) or 0, before ~= nil and (before.gid or 0) ~= gid)
+end
+
+-- 判符号链接: 必须用 lstat(fs.attributes 会跟随链接, 拿到的 kind 是目标的)。
+local function isSymlink(path)
+    local a = fs.lstat(path)
+    return a ~= nil and a.kind == "symlink"
+end
+
+-- 子项的"原始写法"(供 -v 提示用; raw 以 "/" 结尾时不要再补一个斜杠)。
+local function childRaw(raw, n)
+    return (raw:sub(-1) == "/") and (raw .. n) or (raw .. "/" .. n)
+end
+
+local function walk(raw, path)
+    if fs.isDir(path) then
+        applyOne(path, raw)
+        local names = fs.list(path) or {}
+        table.sort(names)
+        for _, n in ipairs(names) do
+            local child = (path == "/") and ("/" .. n) or (path .. "/" .. n)
+            local craw = childRaw(raw, n)
+            if isSymlink(child) then
+                applyLink(child, craw) -- GNU 递归默认(-P): 改链接本身, 不下钻
+            elseif fs.isDir(child) then
+                walk(craw, child)
+            else
+                applyOne(child, craw)
+            end
+        end
+    else
+        applyOne(path, raw)
+    end
+end
+
+for _, raw in ipairs(files) do
+    local path = resolve(raw)
+    if not fs.exists(path) and not isSymlink(path) then
+        -- 悬空链接也算"存在"(Linux 的 lstat 成功), 所以再查一次 lstat。
+        if not optSilent then stderr("chgrp: " .. raw .. ": No such file or directory\n") end
+        status = 1
+    elseif isSymlink(path) and optNoDeref then
+        applyLink(path, raw)
+    elseif optRecursive then
+        walk(raw, path)
+    else
+        applyOne(path, raw)
+    end
+end
+
+return status

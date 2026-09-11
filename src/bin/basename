@@ -1,0 +1,106 @@
+-- Delin basename: 去掉目录部分(与后缀)后打印路径的最后一段 (POSIX basename(1) + GNU -a/-s/-z)。
+-- 用法: basename STRING [SUFFIX]
+--       basename [OPTION]... NAME...
+-- 选项:
+--   -a, --multiple        NAME 可以给多个(逐项输出); 不给时第二个操作数当 SUFFIX 用
+--   -s, --suffix=SUFFIX   去掉后缀 SUFFIX(隐含 -a)
+--   -z, --zero            每项以 NUL 结尾而不是换行
+--   --                    结束选项(此时 "-" 也算 NAME)
+-- 语义(POSIX): 全斜杠 -> "/"; 空串 -> 空串; 先去尾部斜杠, 再取最后一段;
+--   SUFFIX 非空且与结果**不相同**时去掉后缀(与整个结果完全相同则保留, POSIX 明文规定)。
+-- 本工具是**纯字符串操作**: 不访问文件系统, 也不把相对路径拼到 cwd(与 POSIX/GNU 一致),
+--   因此本文件没有其他工具顶部那段 resolve() —— 传进来什么就按字面拆什么。
+-- 已知偏离: 不实现 --help/--version(与本项目其他工具一致); 诊断信息用英文。
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+-- 去掉目录部分与尾部斜杠。全斜杠输入返回 "/", 空串返回空串(与 GNU basename 一致)。
+local function baseOf(s)
+    local t = (s or ""):gsub("/+$", "")
+    if t == "" then return (s ~= "") and "/" or "" end
+    return t:match("[^/]*$")
+end
+
+-- 去后缀: 后缀非空且与结果不同时去掉(POSIX 规定后缀等于整个结果则保留)。
+local function stripSuffix(b, suf)
+    if suf and suf ~= "" and b ~= suf and b:sub(-#suf) == suf then
+        return b:sub(1, #b - #suf)
+    end
+    return b
+end
+
+local multiple, zero, suffix = false, false, nil
+local operands, noMoreOpts = {}, false
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if noMoreOpts then
+        operands[#operands + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "-a" or a == "--multiple" then
+        multiple = true
+    elseif a == "-z" or a == "--zero" then
+        zero = true
+    elseif a == "-s" or a == "--suffix" then
+        i = i + 1
+        if args[i] == nil then stderr("basename: option requires an argument -- 's'\n"); return 1 end
+        suffix, multiple = args[i], true
+    elseif a:sub(1, 9) == "--suffix=" then
+        suffix, multiple = a:sub(10), true
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        -- 短选项可合并; -s 可粘连参数(-s.txt 或 -s .txt)
+        local k = 2
+        while k <= #a do
+            local ch = a:sub(k, k)
+            if ch == "a" then
+                multiple = true
+            elseif ch == "z" then
+                zero = true
+            elseif ch == "s" then
+                if k < #a then
+                    suffix = a:sub(k + 1)
+                else
+                    i = i + 1
+                    suffix = args[i]
+                    if suffix == nil then stderr("basename: option requires an argument -- 's'\n"); return 1 end
+                end
+                multiple = true
+                k = #a
+            else
+                stderr("basename: invalid option -- '" .. ch .. "'\n")
+                return 1
+            end
+            k = k + 1
+        end
+    else
+        operands[#operands + 1] = a
+    end
+    i = i + 1
+end
+
+if #operands == 0 then
+    stderr("basename: missing operand\n")
+    return 1
+end
+
+local names = {}
+if multiple then
+    for _, o in ipairs(operands) do names[#names + 1] = stripSuffix(baseOf(o), suffix) end
+else
+    if #operands > 2 then
+        stderr("basename: extra operand '" .. operands[3] .. "'\n")
+        return 1
+    end
+    -- POSIX 形式: 第二个操作数即后缀(此时 -s 未给, suffix 恒为 nil)。
+    names[1] = stripSuffix(baseOf(operands[1]), operands[2] or suffix)
+end
+
+local sep = zero and "\0" or "\n"
+local buf = {}
+for _, n in ipairs(names) do buf[#buf + 1] = n .. sep end
+io.write(table.concat(buf))

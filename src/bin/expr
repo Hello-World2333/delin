@@ -1,0 +1,309 @@
+-- Delin expr: 求值表达式并打印结果 (POSIX expr(1) + GNU 的 + TOKEN / quote TOKEN)。
+-- 用法: expr EXPRESSION
+-- 运算符(优先级从低到高):
+--   |  &                  逻辑或/与, **短路**(左边已能定结果时不求值右边)
+--   = == != < <= > >=     比较: 两边都是整数则按数值比, 否则按字节串比; 结果为 1/0
+--   :                     同 match(字符串匹配, GNU 的写法)
+--   + -                   加减
+--   * / %                 乘除模(/ 向零截断, % 取被除数符号; 除零是错误)
+--   一元: ( EXPR ), length S, substr S POS LEN, index S CHARS, match S REGEX,
+--         + TOKEN 与 quote TOKEN(把 TOKEN 强制当字符串, 即使它是关键字/运算符)
+-- 正则用 **Lua pattern**(与项目内 grep/sed 同一约定, 这是与 GNU BRE 的最大偏离):
+--   % 是转义符, () 是捕获组; 匹配按 POSIX 语义**锚定在串首**;
+--   有捕获组时返回第一组的内容, 没有时返回匹配到的长度(GNU 的 \(...\) 语义)。
+-- 退出码(POSIX): 结果为 null("")或数值 0 -> 1; 否则 0; 语法错/求值错 -> 2。
+-- 已知偏离:
+--   1. 正则用 Lua pattern, 不是 BRE/ERE(见上)。
+--   2. length/substr/index 按**字节**计数, 与 LC_ALL=C 的 GNU expr 一致(GNU 在 UTF-8
+--      locale 下按字符数, 本内核没有 locale)。
+--   3. "null 或 0" 的判定照 GNU 的可观察行为: 结果为空串, 或形如 -?[0-9]+ 且数值为 0
+--      (`expr 00` 与 `expr -0` 退出 1, `expr +0`/`expr 0x0`/`expr 0.0` 退出 0)。
+--   4. 整数是 IEEE double: |v| > 2^53 时不再逐位精确(本机没有 64 位整数)。
+--   5. GNU coreutils 9.7 实际不接受 `quote`(语法错), 本工具按任务要求实现它。
+--   6. 不用 pcall 兜底求值, 错误一律走显式的 evalErr 通道; 只有 Lua pattern 的
+--      "malformed pattern" 异常必须接住才能映射成 expr 的"无效的正则表达式"(退出 2)。
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+local toks = args
+local pos = 1
+local function peek() return toks[pos] end
+local function advance() local t = toks[pos]; pos = pos + 1; return t end
+
+-- ---------------------------------------------------------------
+-- 语法分析(递归下降, 直接产生 AST)
+-- ---------------------------------------------------------------
+local OP_TOKENS = {
+    ["+"] = true, ["-"] = true, ["*"] = true, ["/"] = true, ["%"] = true,
+    ["|"] = true, ["&"] = true, ["="] = true, ["=="] = true, ["!="] = true,
+    ["<"] = true, ["<="] = true, [">"] = true, [">="] = true, [":"] = true, [")"] = true,
+}
+local KEY_ARITY = { length = 1, substr = 3, index = 2, match = 2 }
+
+local synErr = nil
+local function syntax(msg)
+    if not synErr then synErr = msg end
+    return { op = "lit", v = "" }
+end
+
+local parseExpr
+
+local function parsePrimary()
+    local t = peek()
+    if t == nil then return syntax("missing operand") end
+    if t == "(" then
+        advance()
+        local node = parseExpr()
+        if peek() ~= ")" then return syntax("missing )") end
+        advance()
+        return node
+    end
+    if t == "+" or t == "quote" then
+        advance()
+        local a = peek()
+        -- "+ TOKEN": TOKEN 只取一个记号, 且不能是运算符(GNU: `expr + (` 里 "(" 算字符串,
+        -- 但 `expr quote +` 是"缺参数"错误)。
+        if a == nil or OP_TOKENS[a] then return syntax("missing operand after '" .. t .. "'") end
+        advance()
+        return { op = "lit", v = a }
+    end
+    local arity = KEY_ARITY[t]
+    if arity then
+        advance()
+        local a1, a2, a3
+        a1 = parsePrimary()
+        if arity >= 2 then a2 = parsePrimary() end
+        if arity >= 3 then a3 = parsePrimary() end
+        return { op = t, a = a1, b = a2, c = a3 }
+    end
+    advance()
+    return { op = "lit", v = t }
+end
+
+local function parseMul()
+    local node = parsePrimary()
+    while true do
+        local t = peek()
+        if t == "*" or t == "/" or t == "%" then
+            advance()
+            node = { op = t, l = node, r = parsePrimary() }
+        else
+            return node
+        end
+    end
+end
+
+local function parseAdd()
+    local node = parseMul()
+    while true do
+        local t = peek()
+        if t == "+" or t == "-" then
+            advance()
+            node = { op = t, l = node, r = parseMul() }
+        else
+            return node
+        end
+    end
+end
+
+local function parseMatch()
+    local node = parseAdd()
+    while peek() == ":" do
+        advance()
+        node = { op = ":", l = node, r = parseAdd() }
+    end
+    return node
+end
+
+local function parseRel()
+    local node = parseMatch()
+    while true do
+        local t = peek()
+        if t == "=" or t == "==" or t == "!=" or t == "<" or t == "<=" or t == ">" or t == ">=" then
+            advance()
+            node = { op = t, l = node, r = parseMatch() }
+        else
+            return node
+        end
+    end
+end
+
+local function parseAnd()
+    local node = parseRel()
+    while peek() == "&" do
+        advance()
+        node = { op = "&", l = node, r = parseRel() }
+    end
+    return node
+end
+
+parseExpr = function()
+    local node = parseAnd()
+    while peek() == "|" do
+        advance()
+        node = { op = "|", l = node, r = parseAnd() }
+    end
+    return node
+end
+
+-- ---------------------------------------------------------------
+-- 求值
+-- ---------------------------------------------------------------
+local evalErr = nil
+local function fail(msg)
+    if not evalErr then evalErr = msg end
+    return ""
+end
+
+local function isInt(s) return s:match("^[+-]?%d+$") ~= nil end
+
+-- POSIX 的 "null 或 0"。判定照 GNU 的可观察行为: 空串, 或形如 -?[0-9]+ 且数值为 0
+-- (`00`/`-0` 算 0, 而 `+0`/`0.0`/`0x0` 不算 —— 见 `expr 00 | 5` 得 5 而 `expr +0 | 5` 得 +0)。
+local function nullOrZero(s)
+    if s == "" then return true end
+    if s:match("^%-?%d+$") and tonumber(s) == 0 then return true end
+    return false
+end
+
+-- 整数结果串: 用 %.0f 打印, 避免 tostring 把 1e15 写成科学计数法。
+local function intStr(v) return string.format("%.0f", v) end
+
+local function toIntOperand(s, what)
+    if not isInt(s) then return nil, fail("non-integer argument") end
+    return tonumber(s)
+end
+
+local function doMatch(s, pat)
+    if pat:sub(1, 1) ~= "^" then pat = "^" .. pat end -- POSIX: 匹配锚定在串首
+    local ok, a, b, cap = pcall(string.find, s, pat)
+    if not ok then return fail("invalid regular expression") end
+    if a == nil then return "" end -- 无匹配 -> null
+    if cap ~= nil then return cap end -- 有捕获组 -> 返回第一组(GNU 的 \(...\) 语义)
+    return tostring(b - a + 1)
+end
+
+local eval
+
+local function evalBinary(n)
+    local op = n.op
+    local l = eval(n.l)
+    if evalErr then return "" end
+
+    -- 短路: | 左边非 null/非 0 就直接是结果; & 左边是 null/0 就直接是 0。
+    if op == "|" then
+        if not nullOrZero(l) then return l end
+        return eval(n.r)
+    end
+    if op == "&" then
+        if nullOrZero(l) then return "0" end
+        local r = eval(n.r)
+        if evalErr then return "" end
+        if nullOrZero(r) then return "0" end
+        return l
+    end
+
+    local r = eval(n.r)
+    if evalErr then return "" end
+
+    if op == "+" or op == "-" or op == "*" or op == "/" or op == "%" then
+        local a = toIntOperand(l)
+        if not a then return "" end
+        local b = toIntOperand(r)
+        if not b then return "" end
+        if op == "+" then return intStr(a + b) end
+        if op == "-" then return intStr(a - b) end
+        if op == "*" then return intStr(a * b) end
+        if op == "/" then
+            if b == 0 then return fail("division by zero") end
+            local q = a / b
+            q = (q < 0) and math.ceil(q) or math.floor(q) -- C 的整数除法: 向零截断
+            return intStr(q)
+        end
+        if b == 0 then return fail("division by zero") end
+        local q = a / b
+        q = (q < 0) and math.ceil(q) or math.floor(q)
+        return intStr(a - q * b) -- C 的 %: 符号跟被除数
+    end
+
+    if op == ":" then return doMatch(l, r) end
+
+    -- 比较: 两边都能当整数就按数值比, 否则按字节串比。
+    local cmp
+    if isInt(l) and isInt(r) then
+        local a, b = tonumber(l), tonumber(r)
+        cmp = (a < b) and -1 or ((a > b) and 1 or 0)
+    else
+        cmp = (l < r) and -1 or ((l > r) and 1 or 0)
+    end
+    if op == "=" or op == "==" then return (cmp == 0) and "1" or "0" end
+    if op == "!=" then return (cmp ~= 0) and "1" or "0" end
+    if op == "<" then return (cmp < 0) and "1" or "0" end
+    if op == "<=" then return (cmp <= 0) and "1" or "0" end
+    if op == ">" then return (cmp > 0) and "1" or "0" end
+    if op == ">=" then return (cmp >= 0) and "1" or "0" end
+    return fail("unknown operator '" .. op .. "'")
+end
+
+eval = function(n)
+    if evalErr then return "" end
+    local op = n.op
+    if op == "lit" then return n.v end
+    if op == "length" then
+        local s = eval(n.a)
+        if evalErr then return "" end
+        return tostring(#s)
+    end
+    if op == "substr" then
+        local s = eval(n.a)
+        local p = eval(n.b)
+        local len = eval(n.c)
+        if evalErr then return "" end
+        local pi = toIntOperand(p)
+        if not pi then return "" end
+        local li = toIntOperand(len)
+        if not li then return "" end
+        if pi < 1 or li < 1 or pi > #s then return "" end
+        return s:sub(pi, pi + li - 1)
+    end
+    if op == "index" then
+        local s = eval(n.a)
+        local chars = eval(n.b)
+        if evalErr then return "" end
+        for i = 1, #s do
+            if chars:find(s:sub(i, i), 1, true) then return tostring(i) end
+        end
+        return "0"
+    end
+    if op == "match" then
+        local s = eval(n.a)
+        local pat = eval(n.b)
+        if evalErr then return "" end
+        return doMatch(s, pat)
+    end
+    return evalBinary(n)
+end
+
+-- ---------------------------------------------------------------
+local root = parseExpr()
+if not synErr and pos <= #toks then
+    syntax("unexpected argument '" .. toks[pos] .. "'")
+end
+if synErr then
+    stderr("expr: syntax error: " .. synErr .. "\n")
+    return 2
+end
+
+local result = eval(root)
+if evalErr then
+    stderr("expr: " .. evalErr .. "\n")
+    return 2
+end
+
+io.write(result .. "\n")
+
+-- POSIX: 结果是 null 或 0 就退出 1。
+return nullOrZero(result) and 1 or 0

@@ -1,0 +1,122 @@
+-- Delin rmdir: 删除空目录 (POSIX rmdir(1) + GNU -p/-v/--ignore-fail-on-non-empty)。
+-- 用法: rmdir [OPTION]... DIRECTORY...
+-- 选项:
+--   -p, --parents                  连同各级父目录一起删(逐级向上, 失败即停)
+--       --ignore-fail-on-non-empty 只看"目录非空"这一类失败, 不报错也不影响退出码
+--   -v, --verbose                  每删一个目录打印 "rmdir: removing directory, 'X'"
+--   --                             结束选项
+-- 语义: 只用 fs.delete 删空目录是不可靠的(本内核的 fs.delete 不拦非空目录), 所以先
+--   fs.isDir + fs.list 自己判空, 非空直接报 "Directory not empty"。
+--   -p 的"向上"只到操作数自己的第一个目录段为止(GNU 语义: 不会顺着 cwd 一路删上去)。
+--   多个操作数时逐个处理, 任一失败最终退出码为 1(其余操作数照常处理)。
+-- 已知偏离: 不实现 --help/--version; 诊断信息用英文(POSIX 措辞)。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+local optParents, optIgnoreNonEmpty, optVerbose = false, false, false
+local operands, noMoreOpts = {}, false
+for _, a in ipairs(args) do
+    if noMoreOpts then
+        operands[#operands + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "-p" or a == "--parents" then optParents = true
+    elseif a == "--ignore-fail-on-non-empty" then optIgnoreNonEmpty = true
+    elseif a == "-v" or a == "--verbose" then optVerbose = true
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        for k = 2, #a do
+            local ch = a:sub(k, k)
+            if ch == "p" then optParents = true
+            elseif ch == "v" then optVerbose = true
+            else
+                stderr("rmdir: invalid option -- '" .. ch .. "'\n")
+                return 1
+            end
+        end
+    else
+        operands[#operands + 1] = a
+    end
+end
+
+if #operands == 0 then
+    stderr("rmdir: missing operand\n")
+    return 1
+end
+
+-- 删一个目录。返回 true, 或 false + 原因(POSIX 措辞)。
+local function removeDir(raw, path)
+    if not fs.exists(path) then return false, "No such file or directory" end
+    if not fs.isDir(path) then return false, "Not a directory" end
+    local entries = fs.list(path)
+    if entries and #entries > 0 then return false, "Directory not empty" end
+    local ok, err = fs.delete(path)
+    if not ok then return false, tostring(err or "Operation not permitted") end
+    if optVerbose then io.write("rmdir: removing directory, '" .. raw .. "'\n") end
+    return true
+end
+
+local status = 0
+for _, raw in ipairs(operands) do
+    if raw == "" then
+        -- 空操作数不是 cwd(resolve("") 会拼成 cwd), 直接按 POSIX 报 ENOENT。
+        stderr("rmdir: failed to remove '': No such file or directory\n")
+        status = 1
+    else
+        -- -p 要删的层 = 操作数自己的目录段(忽略 "." 段), 不顺着 cwd 一路删上去;
+        -- labels 是这些层的"原始写法"(报错/ -v 时打印那一级, 与 GNU 一致: 删 a/b/c 失败在 a
+        -- 就报 'a', 而不是整个操作数)。
+        local labels = {}
+        if optParents then
+            local segs = {}
+            for seg in raw:gmatch("[^/]+") do if seg ~= "." then segs[#segs + 1] = seg end end
+            if #segs == 0 then
+                labels[1] = raw -- "/" 或 "." 这类没有段名的操作数
+            else
+                local lead = (raw:sub(1, 1) == "/") and "/" or ""
+                for i = #segs, 1, -1 do
+                    local t = {}
+                    for j = 1, i do t[j] = segs[j] end
+                    labels[#labels + 1] = lead .. table.concat(t, "/")
+                end
+            end
+        else
+            labels[1] = raw
+        end
+
+        local cur = resolve(raw)
+        for k = 1, #labels do
+            local why
+            if cur == "/" then
+                -- rmdir / 在 POSIX 里就是 EBUSY; 而且绝不能真去删根。
+                why = "Device or resource busy"
+            else
+                local ok, err = removeDir(labels[k], cur)
+                if not ok then why = err end
+            end
+            if why then
+                if not (optIgnoreNonEmpty and why == "Directory not empty") then
+                    stderr("rmdir: failed to remove '" .. labels[k] .. "': " .. why .. "\n")
+                    status = 1
+                end
+                break
+            end
+            cur = fs.getDir(cur)
+        end
+    end
+end
+
+return status
