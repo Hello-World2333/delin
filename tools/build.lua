@@ -294,6 +294,25 @@ local function check()
         end
         print("   OK " .. script)
     end
+    -- 3) bundle 装载自检: hosttest 与镜像树都走**真实 require**, 看不见 bundle 自己的模块清单,
+    --    于是"新加内核模块但忘了进 profile"这类问题能一路全绿到真机(静态门禁在 bundle.lua 里,
+    --    这里做一次动态装载兜底)。需要 Lua 5.2+ —— bundle 用 _ENV 做模块隔离, 5.1 测出来是假象;
+    --    没有 5.2+ 就明确跳过, 不假装通过。
+    print("-- check: bundle 装载自检 --")
+    local has52 = false
+    for _, interp in ipairs({ "lua5.4", "lua5.3", "lua5.2" }) do
+        if os.execute("command -v " .. interp .. " > /dev/null 2>&1") == true or
+           os.execute("command -v " .. interp .. " > /dev/null 2>&1") == 0 then
+            run("bundlecheck", interp .. " tools/bundlecheck.lua > /tmp/delin-bundlecheck.log 2>&1")
+            print("   OK " .. readAll("/tmp/delin-bundlecheck.log"):match("ok%s+%S+:.-\n") or "bundlecheck")
+            has52 = true
+            break
+        end
+    end
+    if not has52 then
+        print("   SKIP 没有 Lua 5.2+ 解释器(bundle 的 _ENV 隔离在 5.1 上测不出真问题)")
+    end
+
     print("-- check: 全部通过 --")
 end
 
