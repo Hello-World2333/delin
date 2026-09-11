@@ -884,8 +884,8 @@ local function installWithUi(state, targets)
     if not pok then ok, err = false, tostring(ok) end
     if ok then
         report("")
-        report("Reboot to start Delin.")
-        report("Press Enter to reboot now (other keys are ignored).")
+        report("Reboot to start Delin OS.")
+        report("Press Enter to reboot now.")
         while waitKey() ~= keys.enter do end -- 回车: 重启; 其它键: 什么都不做
         os.reboot()
     else
