@@ -182,7 +182,9 @@ def main():
                      ("scripts/proc_test.sh", "/root/proc_test.sh"),
                      ("scripts/redstone_test.sh", "/root/redstone_test.sh"),
                      ("scripts/redstone_verify.lua", "/root/redstone_verify.lua"),
-                     ("scripts/lua_test.sh", "/root/lua_test.sh")):
+                     ("scripts/lua_test.sh", "/root/lua_test.sh"),
+                     ("scripts/user_test.sh", "/root/user_test.sh"),
+                     ("scripts/user_helper.lua", "/root/user_helper.lua")):
         df_write(out, os.path.join(REPO, src), dst)
         df(out, "set_inode_field %s mode 0100755" % dst)
     unit_sh = os.path.join(work, "verify-sh.service")
@@ -245,7 +247,24 @@ def main():
             raise RuntimeError("manifest 写入校验失败: %s" % mpath)
     install_verified(os.path.join(REPO, "dist/kernel.lua"), os.path.join(DISK, "boot/delin.lua"))
     install_verified(os.path.join(REPO, "dist/dlub.lua"), os.path.join(DISK, "boot/dlub.lua"))
-    # 电脑自身 FS 的引导入口(BIOS 按 /.boot -> /main.lua 引导): 放 DLUB 装载器。
+    # 3d2) 引导配置: 磁盘 CC-fs 与电脑自身 FS 各放一对 —— BIOS 扫到哪个设备, DLUB 都能挂到**同一个**
+    #      ext2 根(电脑自身 FS: /.boot -> /main.lua(DLUB) + /dlub.cfg 指向磁盘; 磁盘: /.boot ->
+    #      /boot/dlub.lua + 该盘自己的 /dlub.cfg)。
+    #      缺 /.boot 的设备不算可引导设备, 缺 /dlub.cfg 则 DLUB 直接报错、BIOS 回退去引导电脑自带存储
+    #      上的旧安装 —— 结果是"机器起来了但跑的是旧系统", 本脚本还会拿着一份**上一轮**的
+    #      /var/log/verify.log 报成功(踩过)。实测本环境里磁盘 CC-fs 上**新增**的文件游戏侧可能读不到,
+    #      而电脑自身 FS 的改动是生效的, 所以两处都写, 并在取日志时做引导门禁(见下文 boot_guard)。
+    for base, pairs in ((DISK, ((".boot", "/boot/dlub.lua"), ("dlub.cfg", "bootdisk left\n"))),
+                        (COMPUTER, ((".boot", "/main.lua"), ("dlub.cfg", "bootdisk left\n")))):
+        for name, text in pairs:
+            p = os.path.join(base, name)
+            with open(p, "w") as f:
+                f.write(text)
+            with open(p, "r") as f:
+                if f.read() != text:
+                    raise RuntimeError("%s 写入校验失败: %s" % (name, p))
+            print("   boot config: %s = %r" % (p, text.strip()))
+    # 电脑自身 FS 放 DLUB 装载器(由上面的 /.boot 指向)。
     mainlua = os.path.join(COMPUTER, "main.lua")
     if os.path.exists(mainlua):
         shutil.copy(mainlua, mainlua + ".bak")
@@ -290,6 +309,10 @@ def main():
 
 
 def reboot_and_collect(printer=False):
+    # 引导指纹: 开机前的 verify.log, 开机后必须变 —— 否则说明这轮根本没从磁盘根启动
+    verify_before = subprocess.run([DBG, "-R", "cat /var/log/verify.log", os.path.join(DISK, "parts/root.img")],
+                                   capture_output=True, text=True).stdout
+
     # 4) 重启电脑 #3
     print("== reboot computer #3 ==")
     run("python3", RCON, "computercraft shutdown #3", check=False)
@@ -308,8 +331,31 @@ def reboot_and_collect(printer=False):
 
     # 5) 取回日志
     print("== collect logs ==")
+    print("\n===== 引导日志 =====")
+    # 三段各有出处: 磁盘 CC-fs 上的 /delin.log 是 DLUB 写的; 根镜像里的 /delin.log 是内核写的
+    # (ext2 根); 电脑自身 FS 的 /delin.log 只在这台机器**回退**去引导自带存储时才有意义。
+    for label, path in (("disk ccfs", os.path.join(DISK, "delin.log")),
+                        ("computer ccfs", os.path.join(COMPUTER, "delin.log"))):
+        print("----- %s: %s -----" % (label, path))
+        if os.path.exists(path):
+            with open(path, "r", errors="replace") as f:
+                print(f.read()[-4000:])
+        else:
+            print("(missing)")
+    # 5a) 引导门禁: 磁盘根必须真的启动了。BIOS 只有扫不到磁盘 /.boot、或 DLUB 读不到该盘
+    #     /dlub.cfg 时才会回退去引导电脑自身 FS —— 那种情况下这里读到的 verify.log 是**上一轮**的,
+    #     会让"改了什么都没生效"看起来像全绿(踩过一次: 磁盘缺 /dlub.cfg, 机器回退到 CCFS 根)。
+    fresh = subprocess.run([DBG, "-R", "cat /var/log/verify.log", os.path.join(DISK, "parts/root.img")],
+                           capture_output=True, text=True).stdout
+    if fresh == verify_before:
+        raise RuntimeError(
+            "失效验证: 磁盘根没有启动 —— /var/log/verify.log 与部署时逐字节相同(本轮的 verify.service 没跑)。\n"
+            "多半是 BIOS/DLUB 回退到电脑自身 FS 的旧安装了; 上面的 /delin.log 是那次引导的日志。")
+    if "=== verify done ===" not in fresh:
+        raise RuntimeError("失效验证: verify.log 变了但没有跑完(缺 '=== verify done ==='):\n" + fresh[-2000:])
+    print("   boot guard ok: 磁盘根已引导, verify.log 是本轮写的")
     logs = ["/var/log/verify.log", "/var/log/sh_verify.log", "/var/log/messages", "/var/log/messages.1",
-            "/var/log/secure", "/var/log/kern.log", "/var/log/redstone_verify.log"]
+            "/var/log/secure", "/var/log/kern.log", "/var/log/redstone_verify.log", "/delin.log"]
     if printer:
         logs += ["/var/log/printer_probe.log", "/var/log/printer_verify.log"]
     for path in logs:
@@ -324,13 +370,6 @@ def reboot_and_collect(printer=False):
             print(data[:12000] if data else "(empty)")
         else:
             print("(not found in image)")
-    print("\n===== computer fs /delin.log (内核引导日志) =====")
-    p = os.path.join(COMPUTER, "delin.log")
-    if os.path.exists(p):
-        with open(p, "r", errors="replace") as f:
-            print(f.read()[-8000:])
-    else:
-        print("(missing)")
 
     # 6) 停机后再对安装到磁盘的 root.img 做一次只读 fsck: 运行时读会得到撕裂的镜像。
     #    这是"Delin 自己写坏的"唯一权威判据, 有错就整体失败(exit != 0)。

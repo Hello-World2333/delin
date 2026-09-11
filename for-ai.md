@@ -14,9 +14,9 @@
 
 | 路径 | 作用 |
 |---|---|
-| `/bin/` | 用户工具：`cat ls mkdir rm cp mv touch head tail wc grep sed ed kill ps pgrep pkill killall login sh lua clear sleep systemctl syslogd logrotate logger dmesg mount umount lp` |
+| `/bin/` | 用户工具：`cat ls mkdir rm cp mv touch head tail wc grep sed ed kill ps pgrep pkill killall login sh lua clear sleep systemctl syslogd logrotate logger dmesg mount umount lp passwd useradd userdel usermod groupadd groupdel id whoami groups` |
 | `/dev/` | 设备文件：`/dev/ttyN`（字符终端）、`/dev/fbN`（像素帧缓冲）、`/dev/sdX`（磁盘，见下）、`/dev/lpN`（打印机字符设备，只写，见下）、`/dev/null`（读 EOF/写丢弃）、`/dev/console`（系统控制台 = 控制台 tty）、`/dev/kmsg`（内核 ring buffer 只读流）、`/dev/log`（用户态 syslog 输入） |
-| `/etc/` | 系统配置：`passwd` `shadow` `group`、`fstab`、`syslog.conf`、`logrotate.conf`、`systemd/system/`（管理员单元与 enable 标记） |
+| `/etc/` | 系统配置：`passwd` `shadow`（0600 root:root）`group`、`fstab`、`syslog.conf`、`logrotate.conf`、`systemd/system/`（管理员单元与 enable 标记） |
 | `/proc/` | 虚拟进程/系统信息 fs（procfs，内核提供，见下）：`/proc/<pid>/{cmdline,comm,cwd,stat,status}`、`/proc/self`、`/proc/{mounts,uptime,version}` |
 | `/sys/` | sysfs 挂载点（虚拟）：`/sys/class/<class>/<条目>/<属性>`，class 由内核/模块注册 —— `display`（每显示设备一项，`name/type/size` 只读，分辨率/位置/旋转/缩放 可读写）、`printer`（每打印设备一项，见下）与 `redstone`（每个红石面一项，见下）；属性文件是单行值，读一次即 EOF |
 | `/lib/modules/<version>/` | 内核模块目录：`.ko` 模块 + 纯文本 `manifest` + `modules.alias` |
@@ -109,6 +109,61 @@ CC 的红石 API 是函数式的（`redstone.getInput(side)` / `redstone.setAnal
 - **事件**：不提供阻塞读（没有 `/dev/kmsg` 那种语义），要等红石变化就轮询；
   事件驱动的程序直接用 CC 的 `redstone` API（`os.pullEvent("redstone")`）。
 
+### 用户管理（`passwd` / `useradd` / …）
+
+内核 `src/kernel/user.lua` 是**唯一真源**：boot（两条引导路径的 `setupUsers`）把 `/etc/{passwd,shadow,group}`
+解析进内存 db，之后所有改动只走 `user.*` 写 syscall —— syscall 先按 POSIX 授权，再改内存 db，
+最后把**变化过的**那张表特权写回 `/etc`（`process.asRoot` 包一层 uid 0，等价 setuid passwd 的 euid 0）。
+`/bin` 工具只是这套 syscall 的 CLI 外壳：直接编辑 `/etc` 文件在运行中的系统里**看不见**
+（`login`/`ps -u`/`chown`/`ls -l` 读的都是这份内存 db），所以不设第二条路径。
+
+| syscall | 语义 |
+|---|---|
+| `user.verify`/`get`/`list`/`byUid`/`groups`/`groupsOf`/`passwordStatus`/`groupByName`/`groupByGid` | 只读查询 |
+| `user.setPassword(name, oldpw, newpw)` | root 可改任何人（忽略 oldpw）；本人须给对 oldpw；`newpw == nil` = 删密码（`passwd -d`），仅 root |
+| `user.setLocked(name, bool)` | `passwd -l`/`-u`、`usermod -L`/`-U`，仅 root |
+| `user.addUser/delUser/modUser/addGroup/delGroup` | 仅 root；任何一步校验失败即整体拒绝 |
+
+- **授权在核心里**，不在工具里：工具绕不过去（`user_test.sh` 用 `spawn` 起 uid 1000 的进程逐条验证被拒）。
+- **`!` 前缀 = 锁定**（`passwd -l`，Linux shadow 同格式）；**空密码字段 = 空密码登录**（`passwd -d`）。
+  这两者与「shadow 里根本没有这个人」严格区分：后者一律拒绝登录（丢一个 `/etc/shadow` 不能变成
+  “所有人空密码可登”），`passwd -S` 报 `L`。
+- **只有哈希进 shadow**：`user.get` 只返回 uid/gid/home/shell/full/locked，**不返回盐与哈希**
+  （普通进程拿不到哈希，与 `/etc/shadow` 0600 是同一条防线）；`user.verify` 才是判定入口。
+- 失败**不留半成品**：`addUser` 先校验完（uid/gid/附加组/名字合法性）才动 db —— 失败的
+  `useradd` 不会留下一个同名私有组。
+- 名字严格校验（`[A-Za-z_][A-Za-z0-9_.-]*`）：名字会原样写进以 `:` 分隔的表，冒号/换行会让文件结构破掉。
+- 新账号**锁定**（无密码字段 + `!`），与 Linux `useradd` 一样要先 `passwd` 设密码才能登录；
+  `-m` 才建家目录（默认不建，与 useradd 一致），建完 `chown` 给新用户。
+- `usermod -l` 改名**不改组名**（Linux 同此），但组的成员名跟着改；`-G` 不带 `-a` 是**全量替换**
+  附加组，`-aG` 才追加；`groupdel` 拒绝删仍是某用户主组的组（GNU 语义）。
+- **`/etc/shadow` 是 0600 root:root**：git 只记录可执行位、存不了 0600，所以权限位由安装侧显式设
+  （`tools/deploy.py` 的 `os.chmod(..., 0o600)` 与 `tools/installer.lua` 的 `FILE_MODES`）。
+  ext2 驱动按调用者 uid 检查 r/w（`hasPerm`，root 绕过），因此普通用户**读不到**哈希、
+  也写不了 `/etc/shadow` —— `passwd` 能改成，靠的是内核 syscall 那次特权写。
+
+| 命令 | 覆盖 |
+|---|---|
+| `passwd [-d] [-l] [-u] [-S] [name]` | 改密码 / 删密码 / 锁定 / 解锁 / 打印状态 |
+| `useradd [-u UID] [-g GROUP] [-G LIST] [-d HOME] [-s SHELL] [-c COMMENT] [-m] name` | 建用户（`-m` 建家目录） |
+| `userdel [-r] name` | 删用户（`-r` 连家目录） |
+| `usermod [-u] [-g] [-G [-a]] [-d] [-s] [-c] [-l NAME] [-L\|-U] name` | 改用户 |
+| `groupadd [-g GID] name` / `groupdel name` | 建/删组 |
+| `id [-u\|-g\|-G] [-n] [-r] [USER]` / `whoami` / `groups [USER]` | 查询 |
+
+**用户管理的已知偏离**：`passwd` 无 aging 字段（`/etc/shadow` 只有 `name:salt$hash`），
+因此 `passwd -S` 只打印 `name P|L|NP` 一列（Linux 还打印最后修改日期与 min/max/warn/inactive）；
+密码从 **stdin** 读（是终端时关回显），所以 `passwd < pwfile` 可脚本化 —— shadow-utils 从 `/dev/tty` 读、
+管道一律失败，这里牺牲的是“密码不进管道”；
+uid/gid 从 1000 起分配（无 `login.defs`，`UID_MIN` 写死在 `user.lua`）；
+**没有 `su`/setuid 位**（delin 无 euid 概念，身份切换只能靠 `login`）；
+`usermod -m`（搬移家目录）未实现，给了就 fail-fast 报错；
+`useradd` 不支持 `-r`（系统账号）/`-o`（uid 可重复）等 GNU 开关，未知选项一律退出码 2。
+
+自检：`scripts/user_test.sh`（125 项）在宿主测试台与真机各跑一次并逐项比对，
+需要普通用户身份的分支由 `scripts/user_helper.lua` 用内核 `spawn(uid)` 起进程
+（没有 su/setuid，这是唯一能拿到非 root 进程的办法）。
+
 ### procfs（`/proc`）与进程管理
 
 内核提供的进程/系统信息虚拟 fs（`src/kernel/procfs.lua`，boot 挂载；与 `/sys` 同层，**不由模块提供**）。
@@ -169,6 +224,7 @@ Delin 一律按字典序解析。
 
 **用户**：`/etc/passwd` `name:x:uid:gid:fullname:home:shell`、`/etc/shadow` `name:salt$hash`、
 `/etc/group`；`login` 提示用户名/密码（隐藏回显），验证通过后按该用户 `uid/gid` 起 `sh`。
+用户管理命令（`passwd`/`useradd`/…）与内核 `user.*` 写 syscall 见下文「用户管理」。
 
 **显示抽象**：进程面向设备文件而非库接口——`/dev/ttyN`（控制台）、`/dev/fbN`（帧缓冲）。
 
@@ -196,6 +252,7 @@ Delin 一律按字典序解析。
 `mount`（挂载 `/dev/sdX`、`UUID=<uuid>` 或镜像路径；无 `-t` 时按设备类型；无参列出挂载含 `ro|rw`）、`umount`、
 `blkid`（列出设备 UUID/TYPE/LABEL）、`lsblk`（树状列出设备/大小/类型/挂载点）、
 `systemctl`（init 控制）、`syslogd`/`logger`/`dmesg`/`logrotate`（日志）、
+`passwd`/`useradd`/`userdel`/`usermod`/`groupadd`/`groupdel`/`id`/`whoami`/`groups`（用户管理，见下文）、
 `lp`（打印文件到 `/dev/lpN`）、`clear`（清屏：写 ANSI 复位+清屏+归位）、`sh`。
 各工具支持 POSIX 的 **`--` 结束选项** 标记：`rm -- --help`、`touch -- -file`、`ls -- --ff` 等，用于操作以
 `-`/`--` 开头的文件名；单独的 `-` 视为普通操作数。
@@ -353,7 +410,7 @@ PID 1 现在是**用户态服务管理器**（`src/init/unit.lua` 单元解析 +
 用户态 `/dev/log`、`syslogd` 按 `/etc/syslog.conf` 写 `/var/log/*`（SIGHUP 重开、游标续读不重放）、
 `logrotate` + `logrotate.timer` 轮转、`logger`/`dmesg`。`/etc/fstab` 由 init 生成 mount 单元
 （`local-fs.target`），`mount -a` 复用同一解析器。init 里的自检代码已全部删除，验证改为
-宿主测试台 `tools/hosttest.lua`（405 项）与真机脚本 `tools/realmachine.py` +
+宿主测试台 `tools/hosttest.lua`（503 项）与真机脚本 `tools/realmachine.py` +
 `scripts/realmachine_verify.sh`。
 
 `src/bin/sh` 已升级为 POSIX 核心子集（变量/引号/if/for/while/case/函数/test/[ ]/&&/|| /文件重定向/管道
@@ -380,6 +437,13 @@ sysfs 也从 display 专用泛化成 class 注册表（模块用 `kapi.registerS
 `-p`/`-t`/`-u`/`-o`/`--no-headers`）、`pgrep`/`pkill`（`-f`/`-x`/`-v`/`-n`/`-o`/`-u` + 信号）、
 `killall`（`-e`/`-q`/`-u`/`-l`）—— 全部是 `/proc` 的消费者，不额外开 syscall。
 `scripts/proc_test.sh`（41 项）在宿主 harness 与真机上各跑一次逐项比对。
+
+用户管理落地：内核 `kernel/user.lua` 承担全部读写 —— boot 解析 `/etc/{passwd,shadow,group}` 进内存 db，
+写操作经 `user.*` syscall（授权 → 改内存 → 特权写回 `/etc`，等价 setuid passwd），配套
+`passwd`（含 `-d/-l/-u/-S`）、`useradd`（`-m` 建家目录）、`userdel -r`、`usermod`（`-u/-g/-G/-a/-d/-s/-c/-l/-L/-U`）、
+`groupadd`/`groupdel`、`id`/`whoami`/`groups`；`/etc/shadow` 由安装侧设成 0600 root:root
+（`user.get` 也不回哈希，普通进程拿不到）。`scripts/user_test.sh`（125 项）在宿主 harness 与真机上
+各跑一次逐项比对，非 root 分支由 `scripts/user_helper.lua` 用内核 `spawn(uid)` 起普通用户进程验证。
 
 红石经 `redstone` 模块摊成 sysfs 属性文件 `/sys/class/redstone/<side>/{digital,analog,bundled}`
 （六个面恒定存在），`cat`/`echo` 即读写；读 = 该面输入、写 = 该面输出，
@@ -428,8 +492,25 @@ sysfs 也从 display 专用泛化成 class 注册表（模块用 `kapi.registerS
   根上没有 `/etc/passwd` 一律 fail-fast 报错（没有用户库等于登录不了，不静默降级）。
 
 真机流程：`tools/realmachine.py`（**先关机** → 打包 → `tools/deploy.py` 重建 ext2 根镜像 → 注入第二个 ext2 分区
-供 fstab 测试 + `verify.service` → `e2fsck -fn` 门禁 → 装盘并按 md5 校验 → 开机 → 用 `debugfs`
-从镜像取回 `/var/log/*` → 再停机 fsck 一次）；`scripts/realmachine_verify.sh` 是它在真机上跑的验证脚本。
+供 fstab 测试 + `verify.service` → `e2fsck -fn` 门禁 → 写**磁盘 CC-fs 的引导配置**（`/.boot` = `/boot/dlub.lua`
+与 `/dlub.cfg` = `bootdisk left`，缺一不可）→ 装盘并按 md5 校验 → 开机 → **引导门禁**（`/var/log/verify.log`
+必须与本轮部署时不同且跑完）→ 用 `debugfs` 从镜像取回 `/var/log/*` → 再停机 fsck 一次）；
+`scripts/realmachine_verify.sh` 是它在真机上跑的验证脚本。
+
+**真机踩过的两个坑（别改回去）**：
+
+- **回退引导 = 假绿灯**。BIOS 按 `bootOrder`（电脑 3 是 `left`→`root`）扫设备，设备上没有 `/.boot` 就不算可引导；
+  磁盘缺 `/.boot` 或 DLUB 读不到该盘的 `/dlub.cfg` 时会**静默回退**去引导电脑自身存储上的旧安装。
+  于是 `realmachine.py` 会拿着一份**上一轮**的 `/var/log/verify.log` 报成功（改了什么都没生效也全绿）。
+  所以脚本自己写两处引导配置（电脑自身 FS 的 `/.boot`=`/main.lua` + `/dlub.cfg`，磁盘 CC-fs 的
+  `/.boot`=`/boot/dlub.lua` + 同盘 `/dlub.cfg`，都指向磁盘上的 ext2 根；实测磁盘 CC-fs 上**新增**的文件
+  游戏侧可能读不到，电脑自身 FS 的改动则生效），并在取日志前做引导门禁：本轮 verify.log 必须变过、
+  且含 `=== verify done ===`，否则直接失败。（顺带把引导日志也打出来：磁盘 CC-fs 的 `/delin.log` 是 DLUB 写的、
+  根镜像里的 `/delin.log` 是内核写的、电脑自身 FS 的只在回退时才有意义。）
+- **子进程写输出文件要自己 flush**。ext2 的 `"w"` 句柄只在 flush/close 时落盘，而 `scripts/user_helper.lua`
+  不等子进程就退出（`/bin/lua` 用 xpcall 跑脚本，Lua 5.1 不能跨 pcall 让出，见其注释）——
+  真机上输出文件因此**是空的**，宿主测试台却看不出来（宿主文件是直写的）。现在那份 helper 把输出句柄包成
+  “每次写都 flush”，谁先退出都不丢内容。
 
 部署到电脑4：`tools/deploy_to_computer4.py`（支持两种启动模式）：
 - `python3 tools/deploy_to_computer4.py --mode rootfs --rootfs /parts/root.img`（从电脑自带存储启动）
@@ -508,7 +589,7 @@ sysfs 也从 display 专用泛化成 class 注册表（模块用 `kapi.registerS
 
 ```bash
 lua5.1 tools/build.lua             # 构建 dist/: 压缩内核/DLUB/BIOS/工具/模块/配置 + manifest
-lua5.1 tools/build.lua --check     # 构建 + 压缩等价性门禁(hosttest 405 项 + 6 个自检脚本差分)
+lua5.1 tools/build.lua --check     # 构建 + 压缩等价性门禁(hosttest 503 项 + 7 个自检脚本差分)
 lua5.1 tools/build.lua --release   # 构建 + 生成 dist/release/<版本>/ 发布树(安装布局的 payload)
 sh tools/serve.sh                  # 开发期: 把发布树挂在 10568 端口(游戏侧 wget 安装用)
 ```
@@ -671,7 +752,7 @@ key/char 事件**来驱动向导。喂按键的时机靠 `wait` 盯 `/delin-inst
 验证：
 
 ```bash
-lua5.1 tools/hosttest.lua        # 宿主测试: init 引擎/fstab/syslogd/logrotate/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone (405 项)
+lua5.1 tools/hosttest.lua        # 宿主测试: init 引擎/fstab/syslogd/logrotate/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone (503 项)
 DELIN_REPO=<压缩后的源码树> lua5.1 tools/hosttest.lua         # 压缩器等价性: 同一套测试跑在压缩产物上
 DELIN_SRCBIN=<压缩后的 bin> lua5.1 tools/harness.lua /bin/sh # 同上, 工具级差分比对
 lua5.4 tools/hosttest.lua        # 同上用 5.4 跑一遍(CC 是 5.2 语义, 不能只在 5.1 上验;
@@ -685,6 +766,7 @@ lua5.1 tools/installertest.lua    # 安装器宿主回归: 假 CraftOS 环境(�
 lua5.1 tools/harness.lua /bin/sh < scripts/proc_test.sh   # /proc + ps/pgrep/pkill/killall 自检(与真机比对)
 lua5.1 tools/harness.lua /bin/sh < scripts/redstone_test.sh   # /sys/class/redstone 读写/校验自检(与真机比对)
 lua5.1 tools/harness.lua /bin/sh < scripts/lua_test.sh   # /bin/lua 脚本/stdin/arg/dofile/退出码 + 进程环境白名单(与真机比对)
+lua5.1 tools/harness.lua /bin/sh < scripts/user_test.sh  # 用户管理(passwd/useradd/usermod/group*/id)自检(与真机比对)
 sh scripts/lua_repl_test.sh        # /bin/lua 交互式 REPL(宿主专用: DELIN_HARNESS_TTY=1 伪装终端)
 lua5.1 tools/ext2test.lua        # ext2 驱动宿主回归: 真实镜像上跑目录增删, 再用宿主 e2fsck -fn 判定
 python3 tools/realmachine.py --base /mnt/bak/root.base.img   # 真机: 先关机->打包->部署->重启 #3->取回 /var/log/*
@@ -802,6 +884,11 @@ scripts/posix_test.sh      可移植 POSIX 自检(host 与 Delin 各跑一次比
 scripts/jobctl_test.sh     作业控制自检(& / $! / jobs / fg / bg / wait / kill %job, host 与真机各跑一次)
 scripts/sysinfo.sh         实用小工具: 系统信息(变量/函数/for/case/if/重定向/工具)
 scripts/proc_test.sh       /proc + ps/pgrep/pkill/killall 自检(host harness 与真机各跑一次比对, 41 项)
+scripts/user_test.sh       用户管理自检(host harness 与真机各跑一次比对, 125 项): 改密码+内核 verify 判定/
+                           建删用户与组/改名/锁定/家目录/非 root 一律被拒(靠 user_helper.lua 用 spawn 起
+                           uid 1000 的进程 —— 没有 su/setuid, 这是唯一能拿到非 root 进程的办法)
+scripts/user_helper.lua    上面那份自检的辅助程序: spawn <uid> <tool> ...(起完打印 pid, 由 shell 等)与
+                           verify <name> <pw>(直接问内核 user.verify)
 scripts/redstone_test.sh   /sys/class/redstone 读写/校验自检(host harness 与真机各跑一次比对, 75 项)
 scripts/lua_test.sh        /bin/lua 自检(host harness 与真机各跑一次比对, 107 项): 脚本/stdin/arg/变参/
                            dofile+loadfile/错误消息与退出码/shebang/进程环境白名单
@@ -845,7 +932,7 @@ tools/harness.lua          host 测试台: 用真实 Delin 工具源码在宿主
                            + 桩 printer(/dev/lp0) + 桩 redstone API(加载真实 redstone.ko)
                            + 桩进程表(ps/pgrep/pkill/killall);
                            进程环境用内核同一份白名单(src/kernel/procenv.lua), 不放宽)
-tools/hosttest.lua         宿主测试: init 单元引擎/fstab 生成/syslogd 规则/logrotate 轮转/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone(405 项)
+tools/hosttest.lua         宿主测试: init 单元引擎/fstab 生成/syslogd 规则/logrotate 轮转/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone(503 项)
 tools/installertest.lua    安装器宿主回归: 假 CraftOS(fs/term/os/http/disk/peripheral + 脚本化事件队列)
                            + 假终端格子(含 fg/bg), 用 loadfile 跑 dist/install.lua, 按键序列驱动向导
                            并断言落盘文件/镜像/日志; 失败时 dump 每一屏(含反色行标记)
@@ -853,7 +940,8 @@ tools/ext2test.lua         宿主 ext2 回归: 真实镜像上跑目录增删(�
 tools/deploy.py            重建干净 ext2 根镜像(基镜像+内核/bin/单元/配置/标记), 属主按基镜像逐条写回;
                            基镜像损坏/rdump 漏文件/构建后 fsck 不过一律 fail-fast
 tools/realmachine.py       真机流程: 先关机->打包->部署->注入第二分区与 verify.service->fsck 门禁->
-                           装盘并 md5 校验->开机->debugfs 取回日志->停机后再 fsck
+                           写磁盘 CC-fs 引导配置(/.boot + /dlub.cfg)->装盘并 md5 校验->开机->
+                           引导门禁(verify.log 必须是本轮写的)->debugfs 取回日志->停机后再 fsck
                            (--printer 额外注入打印机探测/验证服务)
 dist/                      生成物(不提交)
 ```

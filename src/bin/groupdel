@@ -1,0 +1,46 @@
+-- Delin groupdel: 删除组 (shadow-utils groupdel(8) 子集)。
+--   用法: groupdel name
+--   与 GNU 一样, 如果还有用户把这个组当主组就拒绝删除
+--   ("cannot remove the primary group of user 'x'"), 要先把用户删掉。
+--   仅 root: 授权在内核 syscall(user.delGroup)里判定。
+--   退出码: 0 成功; 1 失败(组不存在/仍是某用户的主组/权限不足); 2 用法错误。
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+local function usage(msg)
+    if msg then stderr("groupdel: " .. msg .. "\n") end
+    stderr("usage: groupdel name\n")
+    return 2
+end
+
+if not (syscalls and syscalls["user.delGroup"]) then
+    stderr("groupdel: user syscalls not available\n")
+    return 1
+end
+
+local operand, noMore = nil, false
+for _, a in ipairs(args) do
+    if noMore then
+        if operand then return usage("extra operand '" .. a .. "'") end
+        operand = a
+    elseif a == "--" then
+        noMore = true
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        return usage("invalid option -- '" .. a:sub(2, 2) .. "'")
+    else
+        if operand then return usage("extra operand '" .. a .. "'") end
+        operand = a
+    end
+end
+if not operand then return usage("no group name given") end
+
+local rec, err = syscalls["user.delGroup"](operand)
+if not rec then
+    stderr("groupdel: " .. tostring(err) .. "\n")
+    return 1
+end
+return 0

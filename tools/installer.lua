@@ -67,6 +67,11 @@ local SKELETON = {
 -- payload 里需要可执行位的路径前缀
 local EXEC_PREFIXES = { "bin/", "lib/modules/" }
 
+-- 需要非默认权限位的文件(其余文件 0644、目录 0755)。
+-- /etc/shadow 只给 root 读写: 密码哈希不给普通用户读(ext2 按调用者 uid 检查 r/w, 是真门禁)。
+-- CCFS 目标没有权限位(t.setMode 是空实现), 那里也就没有这回事 —— 与其它权限语义一致。
+local FILE_MODES = { ["etc/shadow"] = 384 } -- 0600
+
 -- 向导里能改的配置文件键(保存时按这个顺序写回, 别的键丢弃)
 local CFG_KEYS = { "url", "type", "target", "size", "auto" }
 
@@ -558,6 +563,8 @@ local function writePayload(t, mf, base)
         for _, pre in ipairs(EXEC_PREFIXES) do
             if f.path:sub(1, #pre) == pre then t.setMode(f.path, 493) end -- 0755
         end
+        local mode = FILE_MODES[f.path]
+        if mode then t.setMode(f.path, mode) end
     end
     return true
 end

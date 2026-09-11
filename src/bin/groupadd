@@ -1,0 +1,56 @@
+-- Delin groupadd: 新建组 (shadow-utils groupadd(8) 子集)。
+--   用法: groupadd [-g GID] name
+--     -g GID  指定 gid(省略 = 第一个空闲 gid, 从 1000 起)
+--   仅 root: 授权在内核 syscall(user.addGroup)里判定。
+--   退出码: 0 成功; 1 失败(重名/gid 占用/权限不足); 2 用法错误。
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+local function usage(msg)
+    if msg then stderr("groupadd: " .. msg .. "\n") end
+    stderr("usage: groupadd [-g GID] name\n")
+    return 2
+end
+
+if not (syscalls and syscalls["user.addGroup"]) then
+    stderr("groupadd: user syscalls not available\n")
+    return 1
+end
+
+local gidOpt, operand, noMore = nil, nil, false
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if noMore then
+        if operand then return usage("extra operand '" .. a .. "'") end
+        operand = a
+    elseif a == "--" then
+        noMore = true
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        if a:sub(1, 2) ~= "-g" then return usage("invalid option -- '" .. a:sub(2, 2) .. "'") end
+        local rest = a:sub(3)
+        if rest == "" then
+            i = i + 1
+            rest = args[i]
+        end
+        if rest == nil then return usage("option requires an argument -- 'g'") end
+        if not rest:match("^%d+$") then return usage("invalid group ID '" .. rest .. "'") end
+        gidOpt = tonumber(rest)
+    else
+        if operand then return usage("extra operand '" .. a .. "'") end
+        operand = a
+    end
+    i = i + 1
+end
+if not operand then return usage("no group name given") end
+
+local rec, err = syscalls["user.addGroup"](operand, gidOpt)
+if not rec then
+    stderr("groupadd: " .. tostring(err) .. "\n")
+    return 1
+end
+return 0

@@ -1,0 +1,154 @@
+-- Delin useradd: 新建用户 (shadow-utils useradd(8) 子集)。
+--   用法: useradd [-u UID] [-g GROUP] [-G GROUPLIST] [-d HOME] [-s SHELL] [-c COMMENT] [-m] name
+--     -u UID      指定 uid(省略 = 第一个空闲 uid, 从 1000 起)
+--     -g GROUP    主组(组名或 gid; 省略 = 与用户同名的组, 不存在就一并建出来 ——
+--                 Linux USERGROUPS_ENAB 的默认行为)
+--     -G LIST     附加组, 逗号分隔(必须都已存在)
+--     -d HOME     家目录(省略 = /home/<name>)
+--     -s SHELL    登录 shell(省略 = /bin/sh; Delin 只有 sh)
+--     -c COMMENT  注释(full name 字段)
+--     -m          建家目录(默认不建, 与 useradd 一样: 家目录只在 -m 时创建)
+--     -M          不建家目录(默认, 显式给出只为兼容)
+--   新账号是**锁定**的(Linux useradd 建的账号要先用 passwd 设密码才能登录)。
+--   仅 root: 授权在内核 syscall(user.addUser)里判定。
+--   退出码: 0 成功; 1 失败(重名/uid 占用/组不存在/建家目录失败); 2 用法错误。
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+local function usage(msg)
+    if msg then stderr("useradd: " .. msg .. "\n") end
+    stderr("usage: useradd [-u UID] [-g GROUP] [-G GROUPLIST] [-d HOME] [-s SHELL] [-c COMMENT] [-m] name\n")
+    return 2
+end
+
+if not (syscalls and syscalls["user.addUser"]) then
+    stderr("useradd: user syscalls not available\n")
+    return 1
+end
+
+-- ---------------------------------------------------------------
+-- 选项解析
+-- ---------------------------------------------------------------
+local opt = { m = false }
+local operand, noMore = nil, false
+
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if noMore then
+        if operand then return usage("extra operand '" .. a .. "'") end
+        operand = a
+    elseif a == "--" then
+        noMore = true
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        local k = 2
+        while k <= #a do
+            local ch = a:sub(k, k)
+            if ch == "m" then opt.m = true; k = k + 1
+            elseif ch == "M" then opt.m = false; k = k + 1
+            elseif ch == "u" or ch == "g" or ch == "G" or ch == "d" or ch == "s" or ch == "c" then
+                local rest = a:sub(k + 1)
+                if rest == "" then
+                    i = i + 1
+                    rest = args[i]
+                end
+                if rest == nil then return usage("option requires an argument -- '" .. ch .. "'") end
+                if ch == "u" then
+                    if not rest:match("^%d+$") then return usage("invalid user ID '" .. rest .. "'") end
+                    opt.u = tonumber(rest)
+                elseif ch == "g" then opt.g = rest
+                elseif ch == "G" then opt.G = rest
+                elseif ch == "d" then opt.d = rest
+                elseif ch == "s" then opt.s = rest
+                else opt.c = rest end
+                k = #a + 1
+            else
+                return usage("invalid option -- '" .. ch .. "'")
+            end
+        end
+    else
+        if operand then return usage("extra operand '" .. a .. "'") end
+        operand = a
+    end
+    i = i + 1
+end
+
+if not operand then return usage("no user name given") end
+local name = operand
+
+-- ---------------------------------------------------------------
+-- 组装 syscall 参数: 组名一律在此解析成 id(kernel 只认数字, 并复查存在性)
+-- ---------------------------------------------------------------
+local spec = { name = name }
+
+if opt.u then spec.uid = opt.u end
+if opt.d then spec.home = opt.d end
+if opt.s then spec.shell = opt.s end
+if opt.c then spec.full = opt.c end
+
+if opt.g then
+    if opt.g:match("^%d+$") then
+        spec.gid = tonumber(opt.g)
+    else
+        local g = syscalls["user.groupByName"](opt.g)
+        if not g then stderr("useradd: group '" .. opt.g .. "' does not exist\n"); return 1 end
+        spec.gid = g.gid
+    end
+end
+
+if opt.G then
+    spec.groups = {}
+    for gname in (opt.G .. ","):gmatch("([^,]*),") do
+        if gname ~= "" then spec.groups[#spec.groups + 1] = gname end
+    end
+    for _, gname in ipairs(spec.groups) do
+        if not syscalls["user.groupByName"](gname) then
+            stderr("useradd: group '" .. gname .. "' does not exist\n")
+            return 1
+        end
+    end
+end
+
+local rec, err = syscalls["user.addUser"](spec)
+if not rec then
+    stderr("useradd: " .. tostring(err) .. "\n")
+    return 1
+end
+
+-- ---------------------------------------------------------------
+-- -m: 建家目录(mkdir -p 语义)并交给新用户。syscall 不做文件操作, 这里补上。
+-- ---------------------------------------------------------------
+if opt.m then
+    local home = rec.home
+    local function mkdirp(path)
+        local cur = ""
+        for seg in path:gmatch("[^/]+") do
+            cur = cur .. "/" .. seg
+            if not fs.exists(cur) then
+                local ok, merr = fs.makeDir(cur)
+                if not ok and not fs.exists(cur) then
+                    return nil, tostring(merr or "mkdir failed")
+                end
+            end
+        end
+        return true
+    end
+    if not fs.exists(home) then
+        local ok, merr = mkdirp(home)
+        if not ok then
+            stderr("useradd: cannot create home directory '" .. home .. "': " .. tostring(merr) .. "\n")
+            return 1
+        end
+    end
+    local ok, cerr = fs.chown(home, rec.uid, rec.gid)
+    if not ok then
+        stderr("useradd: cannot chown home directory '" .. home .. "': " .. tostring(cerr) .. "\n")
+        return 1
+    end
+end
+
+return 0

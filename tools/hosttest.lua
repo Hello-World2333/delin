@@ -1682,5 +1682,221 @@ do
     ok(e ~= nil, "dlubcfg: 缺值 -> 报错")
 end
 
+-- ===============================================================
+-- I. 用户库(kernel/user.lua): 解析/序列化往返、授权、增删改、落盘与 syscall 注册
+--    端到端(工具层)见 scripts/user_test.sh; 这里锁的是内核侧不变量: 文件格式往返不变形、
+--    非 root 一律拒绝、失败的写不留半成品、只写变化过的表。
+-- ===============================================================
+do
+    -- 桩: kernel.process(user.lua 用它取调用者 uid, 特权写时包一层 asRoot)
+    local callerUid = 0
+    package.loaded["kernel.process"] = {
+        current = function() return { pid = 1, uid = callerUid, gid = callerUid } end,
+        asRoot = function(fn) return fn() end, -- 宿主没有权限位: 特权写就是普通写
+    }
+    local user = require("kernel.user")
+
+    --- 内存 fs 门面: 只实现 user.save 用到的 open/readAll/write/close。
+    local function memFs(initial)
+        local files = {}
+        for k, v in pairs(initial or {}) do files[k] = v end
+        local api = {
+            open = function(path, mode)
+                if not mode or mode == "r" then
+                    if not files[path] then return nil, "no such file" end
+                    local content = files[path]
+                    return { readAll = function() return content end, close = function() end }
+                end
+                if mode:find("w") then files[path] = "" end -- w 语义: 打开即截断
+                return {
+                    write = function(_, s) files[path] = (files[path] or "") .. s; return #s end,
+                    close = function() return true end,
+                }
+            end,
+        }
+        return files, api
+    end
+
+    local PW = "root:x:0:0:root:/root:/bin/sh\nalice:x:1000:1000:Alice:/home/alice:/bin/sh\n"
+    local GR = "root:x:0:root\nalice:x:1000:alice\n"
+    local SH = "root:rs$1a2b\nalice:!as$3c4d\n"
+
+    -- 解析
+    local db = user.parse(PW, SH, GR)
+    eq(db.users.alice.uid, 1000, "user: 解析 passwd uid")
+    eq(db.users.alice.full, "Alice", "user: 解析 passwd fullname 字段")
+    eq(db.users.alice.home, "/home/alice", "user: 解析 passwd home 字段")
+    eq(db.users.root.salt, "rs", "user: 解析 shadow 盐")
+    eq(db.users.root.hash, "1a2b", "user: 解析 shadow 哈希")
+    ok(db.users.alice.locked == true, "user: shadow '!' 前缀 = 锁定")
+    eq(user.groupByName(db, "alice").gid, 1000, "user: 解析 group gid")
+
+    -- 序列化往返(三张表照抄原文, 免得每次写回都重排/掉字段)
+    local p2, s2, g2 = user.serialize(db)
+    eq(p2, PW, "user: passwd 序列化 = 原文")
+    eq(s2, SH, "user: shadow 序列化 = 原文(含锁定标记)")
+    eq(g2, GR, "user: group 序列化 = 原文")
+    ok(user.parse(p2, s2, g2).users.alice.locked == true, "user: 往返后锁定标记不丢")
+
+    -- verify: 正常 / 锁定 / 无密码字段
+    local salt = "s1"
+    local d3 = user.parse("u:x:0:0::/:/bin/sh\n", "u:" .. salt .. "$" .. user.hash(salt, "secret") .. "\n", "")
+    ok(user.verify(d3, "u", "secret"), "user: verify 正确密码")
+    ok(not user.verify(d3, "u", "wrong"), "user: verify 错误密码")
+    ok(user.setLocked(d3, "u", true), "user: 锁定账号")
+    ok(not user.verify(d3, "u", "secret"), "user: 锁定后 verify 一律拒绝")
+    local d4 = user.parse("u:x:0:0::/:/bin/sh\n", "u:\n", "")
+    ok(user.verify(d4, "u", ""), "user: 空密码字段 = 空密码可登录(passwd -d)")
+    ok(not user.verify(d4, "u", "x"), "user: 空密码字段不接受非空密码")
+    eq(user.passwordStatus(d4, "u"), "NP", "user: 空密码字段 -> passwd -S 报 NP")
+    -- shadow 里没有这个人 != 空密码: 丢一个 shadow 文件不能让所有人空密码登录
+    local d4b = user.parse("u:x:0:0::/:/bin/sh\n", "", "")
+    ok(not user.verify(d4b, "u", ""), "user: shadow 无记录时连空密码也拒绝(不静默放行)")
+    eq(user.passwordStatus(d4b, "u"), "L", "user: shadow 无记录 -> passwd -S 报 L")
+
+    -- 授权: 非 root 一律拒绝(判定在内核 syscall 里, 工具绕不过去)
+    local db5 = user.parse(PW, SH, GR)
+    callerUid = 1000 -- alice
+    local r, e = user.addUser(db5, { name = "bob" })
+    ok(r == nil and e == "permission denied", "user: 非 root 建用户被拒")
+    r, e = user.addGroup(db5, "staff")
+    ok(r == nil and e == "permission denied", "user: 非 root 建组被拒")
+    r, e = user.delUser(db5, "root")
+    ok(r == nil and e == "permission denied", "user: 非 root 删用户被拒")
+    r, e = user.modUser(db5, "alice", { shell = "/bin/sh" })
+    ok(r == nil and e == "permission denied", "user: 非 root 改用户被拒")
+    r, e = user.delGroup(db5, "alice")
+    ok(r == nil and e == "permission denied", "user: 非 root 删组被拒")
+    r, e = user.setLocked(db5, "alice", true)
+    ok(r == nil and e == "permission denied", "user: 非 root 锁密码被拒")
+    r, e = user.setPassword(db5, "root", "x", "y")
+    ok(r == nil and e == "permission denied", "user: 非 root 改别人密码被拒")
+    r, e = user.setPassword(db5, "alice", "x", "y")
+    ok(r == nil and e:find("incorrect old password") ~= nil, "user: 改自己密码必须给对旧密码")
+    r, e = user.setPassword(db5, "alice", "x", nil)
+    ok(r == nil and e == "permission denied", "user: passwd -d(删密码)仅 root")
+
+    -- 改自己密码(旧密码正确)
+    local salt2 = "s2"
+    local db6 = user.parse("bob:x:1001:1001::/home/bob:/bin/sh\n",
+                           "bob:" .. salt2 .. "$" .. user.hash(salt2, "old") .. "\n", "")
+    callerUid = 1001
+    ok(user.setPassword(db6, "bob", "old", "new"), "user: 本主用旧密码改自己密码")
+    ok(user.verify(db6, "bob", "new"), "user: 新密码生效")
+    ok(not user.verify(db6, "bob", "old"), "user: 旧密码失效")
+
+    -- addUser(root): 分配 id、私有组、锁定、附加组、失败不留残留
+    callerUid = 0
+    local db7 = user.parse(PW, SH, GR)
+    local rec = user.addUser(db7, { name = "bob", groups = { "alice" } })
+    ok(rec ~= nil, "user: addUser 成功")
+    eq(rec.uid, 1001, "user: addUser 取第一个空闲 uid")
+    eq(rec.gid, 1001, "user: addUser 建同名私有组并取它的 gid")
+    ok(db7.groups.bob ~= nil, "user: addUser 建出同名组")
+    eq(user.passwordStatus(db7, "bob"), "L", "user: 新账号锁定(设密码前登不进)")
+    ok(not user.verify(db7, "bob", ""), "user: 锁定账号空密码也登不进")
+    ok((db7.groups.alice.members or ""):find("bob") ~= nil, "user: addUser -G 把用户加进附加组")
+    r, e = user.addUser(db7, { name = "bob" })
+    ok(r == nil and e:find("already exists") ~= nil, "user: 重名用户被拒")
+    r, e = user.addUser(db7, { name = "bad:name" })
+    ok(r == nil and e:find("invalid user name") ~= nil, "user: 非法用户名被拒(冒号会破表)")
+    r, e = user.addUser(db7, { name = "carl", uid = 1000 })
+    ok(r == nil and e:find("already in use") ~= nil, "user: uid 冲突被拒")
+    r, e = user.addUser(db7, { name = "carl", gid = 4242 })
+    ok(r == nil and e:find("does not exist") ~= nil, "user: 主组不存在被拒")
+    r, e = user.addUser(db7, { name = "carl", groups = { "nogroup" } })
+    ok(r == nil and e:find("does not exist") ~= nil, "user: 附加组不存在被拒")
+    ok(db7.users.carl == nil and db7.groups.carl == nil, "user: 失败的 addUser 不留半成品")
+    ok(user.addUser(db7, { name = "carol", gid = 1000 }) ~= nil, "user: -g 用已有组当主组")
+    local rec3 = user.addUser(db7, { name = "dave", uid = 2000, home = "/srv/dave", full = "Dave" })
+    eq(rec3.uid, 2000, "user: 显式 uid")
+    eq(rec3.home, "/srv/dave", "user: 显式 home")
+
+    -- groupsOf: 主组在前, 其余按 gid 升序
+    local db8 = user.parse(PW, SH, GR)
+    user.addGroup(db8, "staff")
+    user.addUser(db8, { name = "bob", groups = { "staff" } })
+    eq(table.concat(user.groupsOf(db8, "bob"), ","), "bob,staff", "user: groupsOf 主组在前")
+    ok(user.groupsOf(db8, "nosuch") == nil, "user: groupsOf 未知用户 -> nil")
+
+    -- delUser: 摘 passwd、删同名私有组、从各组成员里移除
+    ok(user.delUser(db7, "carol") ~= nil, "user: delUser 成功")
+    ok(db7.users.carol == nil, "user: delUser 摘掉 passwd 记录")
+    ok(db7.groups.carol == nil, "user: delUser 删掉同名私有组")
+    user.delUser(db7, "bob")
+    ok(not (db7.groups.alice.members or ""):find("bob"), "user: delUser 从组的成员表里移除")
+    r, e = user.delUser(db7, "nosuch")
+    ok(r == nil and e:find("does not exist") ~= nil, "user: 删不存在的用户被拒")
+
+    -- modUser: 改名(旧名要摘掉、组成员跟着改)、uid 冲突、-G 全量替换、锁定
+    local db9 = user.parse(PW, SH, GR)
+    user.addGroup(db9, "staff")
+    user.addUser(db9, { name = "bob", groups = { "staff" } })
+    local r9 = user.modUser(db9, "bob", { name = "robert" })
+    ok(r9 ~= nil, "user: usermod -l 改名成功")
+    ok(db9.users.robert ~= nil and db9.users.bob == nil, "user: 改名后旧名查不到")
+    -- groupsOf: 主组在前 —— 注意 usermod -l 不改组名, 主组还叫 bob(Linux 同此)
+    eq(table.concat(user.groupsOf(db9, "robert"), ","), "bob,staff", "user: 改名后主组名不变, 成员名跟着改")
+    r9, e = user.modUser(db9, "robert", { uid = 1000 })
+    ok(r9 == nil and e:find("already in use") ~= nil, "user: usermod -u 冲突被拒")
+    r9, e = user.modUser(db9, "robert", { name = "alice" })
+    ok(r9 == nil and e:find("already exists") ~= nil, "user: 改成的名字已被占用被拒")
+    r9 = user.modUser(db9, "robert", { groups = { "alice" } })
+    ok(r9 ~= nil and not (db9.groups.staff.members or ""):find("robert"), "user: -G 全量替换附加组")
+    r9 = user.modUser(db9, "robert", { home = "/srv/r", shell = "/bin/sh", full = "R" })
+    eq(user.get(db9, "robert").home, "/srv/r", "user: usermod -d/-s/-c")
+    r9 = user.modUser(db9, "robert", { locked = true })
+    ok(r9 ~= nil and user.passwordStatus(db9, "robert") == "L", "user: usermod -L 锁定")
+
+    -- addGroup/delGroup
+    local dbg = user.parse(PW, SH, GR)
+    local g = user.addGroup(dbg, "staff")
+    eq(g.gid, 1001, "user: groupadd 取第一个空闲 gid")
+    local _, eg = user.addGroup(dbg, "staff")
+    ok(eg ~= nil and eg:find("already exists") ~= nil, "user: 重名组被拒")
+    _, eg = user.addGroup(dbg, "other", 1000)
+    ok(eg ~= nil and eg:find("already in use") ~= nil, "user: gid 冲突被拒")
+    _, eg = user.addGroup(dbg, "bad:name")
+    ok(eg ~= nil and eg:find("invalid group name") ~= nil, "user: 非法组名被拒")
+    _, eg = user.delGroup(dbg, "alice")
+    ok(eg ~= nil and eg:find("primary group") ~= nil, "user: 删用户的主组被拒(GNU 语义)")
+    ok(user.delGroup(dbg, "staff") ~= nil, "user: groupdel 成功")
+
+    -- save: 只写变化过的表, 且写回的内容能重新解析
+    local files, fsapi = memFs({ ["/etc/passwd"] = PW, ["/etc/shadow"] = SH, ["/etc/group"] = GR })
+    local dbS = user.parse(PW, SH, GR)
+    ok(user.save(dbS, fsapi), "user: save 无改动也返回成功")
+    eq(files["/etc/passwd"], PW, "user: 无改动时不重写 /etc/passwd")
+    eq(files["/etc/shadow"], SH, "user: 无改动时不重写 /etc/shadow")
+    ok(user.setPassword(dbS, "alice", nil, "newpw"), "user: root 改 alice 密码")
+    ok(user.save(dbS, fsapi), "user: save 落盘")
+    ok(files["/etc/shadow"] ~= SH, "user: 变化过的表写回 /etc/shadow")
+    eq(files["/etc/passwd"], PW, "user: 没变的表不写")
+    ok(user.verify(user.parse(files["/etc/passwd"], files["/etc/shadow"], files["/etc/group"]), "alice", "newpw"),
+       "user: 写回的 shadow 能重新解析且密码可用")
+    user.setLocked(dbS, "alice", true)
+    user.save(dbS, fsapi)
+    ok(files["/etc/shadow"]:find("alice:!") ~= nil, "user: 锁定的账号写成 '!salt$hash'")
+
+    -- syscall 注册: 读写接口都在(名字拼错会在这里露出来), 且写 syscall 一体落盘
+    local modules = require("kernel.modules")
+    local fw, fwapi = memFs({ ["/etc/passwd"] = PW, ["/etc/shadow"] = SH, ["/etc/group"] = GR })
+    user.registerSyscalls(user.parse(PW, SH, GR), fwapi)
+    local sc = modules.syscalls()
+    for _, n in ipairs({ "user.verify", "user.get", "user.list", "user.byUid", "user.groups",
+                         "user.groupsOf", "user.passwordStatus", "user.groupByName", "user.groupByGid",
+                         "user.setPassword", "user.setLocked", "user.addUser", "user.delUser",
+                         "user.modUser", "user.addGroup", "user.delGroup" }) do
+        ok(sc[n] ~= nil, "user: 注册 syscall " .. n)
+    end
+    callerUid = 0
+    ok(sc["user.addUser"]({ name = "zoe", password = "pw" }) ~= nil, "user: syscall user.addUser 成功")
+    ok(fw["/etc/shadow"]:find("zoe:") ~= nil, "user: syscall 写路径已落盘")
+    callerUid = 1000
+    r, e = sc["user.addUser"]({ name = "mallory" })
+    ok(r == nil and e == "permission denied", "user: 非 root 调用写 syscall 被拒")
+    eq(fw["/etc/passwd"]:find("mallory"), nil, "user: 被拒的调用没有落盘")
+end
+
 io.write(string.format("\n%d passed, %d failed\n", pass, fail))
 os.exit(fail == 0 and 0 or 1)

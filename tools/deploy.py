@@ -139,6 +139,12 @@ def main():
         # 系统配置: dist/etc/* -> /etc/ (含初始 passwd/shadow/group)
         for f in sorted(os.listdir(os.path.join(REPO, "dist/etc"))):
             shutil.copy(os.path.join(REPO, "dist/etc", f), os.path.join(rootfs, "etc", f))
+        # /etc 三张表的权限位显式设: shadow 只给 root 读写(密码哈希不给普通用户读), passwd/group 照
+        # Linux 0644。git 只记录可执行位、存不了 0600, 而 dist/etc 的普通文件权限随构建机的 umask
+        # 浮动(002 -> 0664), 所以既不能靠 git 也不能靠 umask —— 在这里钉死, 镜像才是可复现的。
+        # ext2 驱动按调用者 uid 检查 r/w, 所以这是真门禁(非 root 读 /etc/shadow 会被拒)。
+        for name, mode in (("shadow", 0o600), ("passwd", 0o644), ("group", 0o644)):
+            os.chmod(os.path.join(rootfs, "etc", name), mode)
         # 启用单元: /etc/systemd/system/<target>.wants/<unit> 空标记(systemd 的 enable)
         for target, unit in (("multi-user.target", "syslogd.service"),
                              ("timers.target", "logrotate.timer")):

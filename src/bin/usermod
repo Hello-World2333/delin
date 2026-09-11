@@ -1,0 +1,137 @@
+-- Delin usermod: 修改用户 (shadow-utils usermod(8) 子集)。
+--   用法: usermod [-u UID] [-g GROUP] [-G GROUPLIST [-a]] [-d HOME] [-s SHELL]
+--                 [-c COMMENT] [-l NEWNAME] [-L | -U] name
+--     -u UID      改 uid(不能与别人重复)
+--     -g GROUP    改主组(组名或 gid)
+--     -G LIST     改附加组(逗号分隔); 不带 -a 时是**全量替换**(GNU 语义),
+--                 带 -a(append)则追加
+--     -d HOME     改家目录字段(不搬文件; GNU 的 -m 搬目录未实现, 给了就报错)
+--     -s SHELL    改登录 shell
+--     -c COMMENT  改注释
+--     -l NAME     改登录名(组里的成员名一并跟着改)
+--     -L / -U     锁定 / 解锁密码
+--   一个选项都不给 = 无事发生(GNU: 打印 "usermod: no changes" 并以 0 退出)。
+--   仅 root: 授权在内核 syscall(user.modUser)里判定。
+--   退出码: 0 成功; 1 失败(用户/组不存在, uid 或名字被占用, 权限不足); 2 用法错误。
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+local function usage(msg)
+    if msg then stderr("usermod: " .. msg .. "\n") end
+    stderr("usage: usermod [-u UID] [-g GROUP] [-G GROUPLIST [-a]] [-d HOME] [-s SHELL] [-c COMMENT] [-l NEWNAME] [-L|-U] name\n")
+    return 2
+end
+
+if not (syscalls and syscalls["user.modUser"]) then
+    stderr("usermod: user syscalls not available\n")
+    return 1
+end
+
+-- ---------------------------------------------------------------
+-- 选项解析
+-- ---------------------------------------------------------------
+local opt, operand, noMore = {}, nil, false
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if noMore then
+        if operand then return usage("extra operand '" .. a .. "'") end
+        operand = a
+    elseif a == "--" then
+        noMore = true
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        local k = 2
+        while k <= #a do
+            local ch = a:sub(k, k)
+            if ch == "a" then opt.a = true; k = k + 1
+            elseif ch == "L" then opt.lock = true; k = k + 1
+            elseif ch == "U" then opt.unlock = true; k = k + 1
+            elseif ch == "m" then
+                -- -d 搬家: 未实现(fail-fast, 不悄悄按不搬处理)
+                return usage("moving the home directory (-m) is not supported")
+            elseif ch == "u" or ch == "g" or ch == "G" or ch == "d" or ch == "s" or ch == "c" or ch == "l" then
+                local rest = a:sub(k + 1)
+                if rest == "" then
+                    i = i + 1
+                    rest = args[i]
+                end
+                if rest == nil then return usage("option requires an argument -- '" .. ch .. "'") end
+                if ch == "u" then
+                    if not rest:match("^%d+$") then return usage("invalid user ID '" .. rest .. "'") end
+                    opt.u = tonumber(rest)
+                elseif ch == "g" then opt.g = rest
+                elseif ch == "G" then opt.G = rest
+                elseif ch == "d" then opt.d = rest
+                elseif ch == "s" then opt.s = rest
+                elseif ch == "c" then opt.c = rest
+                else opt.l = rest end
+                k = #a + 1
+            else
+                return usage("invalid option -- '" .. ch .. "'")
+            end
+        end
+    else
+        if operand then return usage("extra operand '" .. a .. "'") end
+        operand = a
+    end
+    i = i + 1
+end
+
+if not operand then return usage("no user name given") end
+if not syscalls["user.get"](operand) then
+    stderr("usermod: user '" .. operand .. "' does not exist\n")
+    return 1
+end
+if opt.a and not opt.G then return usage("-a may only be used together with -G") end
+if opt.lock and opt.unlock then return usage("the options -L and -U are mutually exclusive") end
+if not (opt.u or opt.g or opt.G or opt.d or opt.s or opt.c or opt.l or opt.lock or opt.unlock) then
+    stderr("usermod: no changes\n") -- GNU 的行为: 没有任何修改就以 0 退出
+    return 0
+end
+
+-- ---------------------------------------------------------------
+-- 组装 changes(kernel 只认 id 与组名; 组存在性由 kernel 复查)
+-- ---------------------------------------------------------------
+local changes = {}
+if opt.u then changes.uid = opt.u end
+if opt.d then changes.home = opt.d end
+if opt.s then changes.shell = opt.s end
+if opt.c then changes.full = opt.c end
+if opt.l then changes.name = opt.l end
+if opt.lock then changes.locked = true end
+if opt.unlock then changes.locked = false end
+
+if opt.g then
+    if opt.g:match("^%d+$") then
+        changes.gid = tonumber(opt.g)
+    else
+        local g = syscalls["user.groupByName"](opt.g)
+        if not g then stderr("usermod: group '" .. opt.g .. "' does not exist\n"); return 1 end
+        changes.gid = g.gid
+    end
+end
+
+if opt.G then
+    local list = {}
+    for gname in (opt.G .. ","):gmatch("([^,]*),") do
+        if gname ~= "" then list[#list + 1] = gname end
+    end
+    for _, gname in ipairs(list) do
+        if not syscalls["user.groupByName"](gname) then
+            stderr("usermod: group '" .. gname .. "' does not exist\n")
+            return 1
+        end
+    end
+    if opt.a then changes.groupsAdd = list else changes.groups = list end
+end
+
+local rec, err = syscalls["user.modUser"](operand, changes)
+if not rec then
+    stderr("usermod: " .. tostring(err) .. "\n")
+    return 1
+end
+return 0

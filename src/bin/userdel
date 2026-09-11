@@ -1,0 +1,75 @@
+-- Delin userdel: 删除用户 (shadow-utils userdel(8) 子集)。
+--   用法: userdel [-r] name
+--     -r  连家目录一起删(fs.delete 递归, 与 rm -r 同语义)
+--   用户从 /etc/passwd,/etc/shadow 摘掉, 并从所有组的成员表里移除; 与 Linux 一样,
+--   同名且 gid 相同的用户私有组也一并删掉。
+--   仅 root: 授权在内核 syscall(user.delUser)里判定。
+--   退出码: 0 成功; 1 失败(用户不存在/权限不足/家目录删不掉); 2 用法错误。
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+local function usage(msg)
+    if msg then stderr("userdel: " .. msg .. "\n") end
+    stderr("usage: userdel [-r] name\n")
+    return 2
+end
+
+if not (syscalls and syscalls["user.delUser"]) then
+    stderr("userdel: user syscalls not available\n")
+    return 1
+end
+
+local optR, operand, noMore = false, nil, false
+for _, a in ipairs(args) do
+    if noMore then
+        if operand then return usage("extra operand '" .. a .. "'") end
+        operand = a
+    elseif a == "--" then
+        noMore = true
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        for k = 2, #a do
+            if a:sub(k, k) == "r" then optR = true
+            else return usage("invalid option -- '" .. a:sub(k, k) .. "'") end
+        end
+    else
+        if operand then return usage("extra operand '" .. a .. "'") end
+        operand = a
+    end
+end
+if not operand then return usage("no user name given") end
+
+local rec, err = syscalls["user.delUser"](operand)
+if not rec then
+    stderr("userdel: " .. tostring(err) .. "\n")
+    return 1
+end
+
+if optR then
+    local home = rec.home
+    -- 删家目录: 只删 passwd 里记的那个 home(与 Linux 一致), 空路径/根目录拒绝
+    if home == nil or home == "" or home == "/" then
+        stderr("userdel: refusing to remove home directory '" .. tostring(home) .. "'\n")
+        return 1
+    end
+    -- 递归删除: 先删空子项再删目录本身(ext2 后端只摘目录项, 不递归)
+    local function rmTree(p)
+        if fs.isDir(p) then
+            for _, n in ipairs(fs.list(p) or {}) do rmTree(fs.combine(p, n)) end
+        end
+        local ok, derr = pcall(fs.delete, p)
+        if not ok then return nil, tostring(derr) end
+        return true
+    end
+    if fs.exists(home) then
+        local ok, derr = rmTree(home)
+        if not ok then
+            stderr("userdel: cannot remove '" .. home .. "': " .. tostring(derr) .. "\n")
+            return 1
+        end
+    end
+end
+return 0

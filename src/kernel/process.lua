@@ -305,15 +305,34 @@ function process.setExitHook(fn)
     process.onExit = fn
 end
 
+-- 内核特权凭据覆盖(按协程): syscall 在**自己完成授权**后, 需要以 root 身份落盘系统文件
+-- (如 /etc/shadow)时用 process.asRoot 包一段代码 —— 等价于 setuid 程序(euid 0)。
+local credOverride = {}
+
 --- 当前进程的 {pid, uid, gid}。通过 coroutine.running() 查进程表。
 ---@return table
 function process.current()
     local co = coroutine.running()
     local pid = co and coPid[co]
+    local ov = co and credOverride[co]
+    if ov then return { pid = pid or 0, uid = ov.uid, gid = ov.gid } end
     if not pid then return { pid = 0, uid = 0, gid = 0 } end -- 内核/主线程 -> root
     local p = registry[pid]
     if not p then return { pid = 0, uid = 0, gid = 0 } end
     return { pid = pid, uid = p.uid, gid = p.gid }
+end
+
+--- 以 root 凭据运行 fn(仅限内核在**自行授权之后**写系统文件, 见 kernel/user.lua)。
+--- 覆盖按协程记录, fn 返回/抛错都恢复; 调用者负责把错误往上抛(fail-fast)。
+---@param fn function
+function process.asRoot(fn)
+    local co = coroutine.running()
+    local prev = co and credOverride[co]
+    if co then credOverride[co] = { uid = 0, gid = 0 } end
+    local ok, a, b = pcall(fn)
+    if co then credOverride[co] = prev end
+    if not ok then error(a, 0) end
+    return a, b
 end
 
 --- 当前进程的 pgrp/sid(供 sh 作业控制查询)。

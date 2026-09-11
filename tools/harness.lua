@@ -240,8 +240,6 @@ end
 -- ---------------------------------------------------------------
 local procs = {}
 local curPid = nil -- 调度器当前 resume 的进程(供 job.group/signal.install 定位调用者)
-local users = {}
-local groups = {}
 local syscalls = {}
 local PIPE = nil -- 内核 pipe 模块(lazy require), 提供 pipe.create
 local function pipeCreate()
@@ -342,19 +340,8 @@ syscalls["tty.console"] = function() return "tty0" end
 syscalls["tty.list"] = function() return { "tty0", "tty1" } end
 syscalls["tty.setFocus"] = function() return true end
 syscalls["tty.getFocus"] = function() return "tty0" end
-syscalls["user.get"] = function(name) return users[name] end
-syscalls["user.verify"] = function(name, pw) return users[name] and users[name].hash == pw end
-syscalls["user.list"] = function() local o = {}; for n in pairs(users) do o[#o + 1] = n end; return o end
-syscalls["user.byUid"] = function(u)
-    for _, usr in pairs(users) do if usr.uid == u then return usr end end
-    return nil
-end
-syscalls["user.groupByName"] = function(name) return groups[name] end
-syscalls["user.groupByGid"] = function(gid)
-    for _, g in pairs(groups) do if g.gid == gid then return g end end
-    return nil
-end
-syscalls["user.register"] = function() end
+-- user.* syscalls 不在这里放桩: 用**真实的** kernel/user.lua(与真机同一份源码), 在 setupRoot()
+-- 之后从 /etc 三张表装载并注册。用户管理工具(passwd/useradd/...)的授权与落盘逻辑因此在宿主上也是真的。
 
 -- 挂载/卸载桩: 记录到内存表, 供 `mount`/`umount` 命令在宿主上验证参数与列表。
 -- 行为对齐内核 devdisk: 按节点名/UUID 解析设备, 未知设备或 fstype 不符即报错。
@@ -521,24 +508,22 @@ local SRCBIN = os.getenv("DELIN_SRCBIN") or (REPO .. "/src/bin")
 local function setupRoot()
     os.execute("rm -rf " .. ROOT .. " && mkdir -p " .. ROOT)
     os.execute("mkdir -p " .. ROOT .. "/bin " .. ROOT .. "/etc " .. ROOT .. "/home/alice " .. ROOT .. "/root " .. ROOT .. "/tmp " .. ROOT .. "/mnt/cc")
-    for _, f in ipairs({ "cat","clear","cp","ed","grep","head","kill","login","ls","mkdir","mv","rm","sed","sh","sleep","tail","touch","wc","chmod","chown","mount","umount","blkid","lsblk","lp","ps","pgrep","pkill","killall","lua" }) do
+    for _, f in ipairs({ "cat","clear","cp","ed","grep","head","kill","login","ls","mkdir","mv","rm","sed","sh","sleep","tail","touch","wc","chmod","chown","mount","umount","blkid","lsblk","lp","ps","pgrep","pkill","killall","lua",
+                          "passwd","useradd","userdel","usermod","groupadd","groupdel","id","whoami","groups" }) do
         os.execute("cp -f " .. SRCBIN .. "/" .. f .. " " .. ROOT .. "/bin/" .. f)
         os.execute("chmod 755 " .. ROOT .. "/bin/" .. f)
     end
-    -- 用户库
-    users = {
-        root  = { name = "root",  uid = 0,    gid = 0,    home = "/root",  shell = "/bin/sh" },
-        alice = { name = "alice", uid = 1000, gid = 1000, home = "/home/alice", shell = "/bin/sh" },
-    }
-    groups = {
-        root  = { name = "root",  gid = 0,    members = "root" },
-        alice = { name = "alice", gid = 1000, members = "alice" },
-    }
-    local pw = "root:x:0:0:root:/root:/bin/sh\nalice:x:1000:1000:alice:/home/alice:/bin/sh\n"
+    -- 用户库: 格式与真机一致(哈希用内核同一份 user.hash 算, 所以 verify 是真判定)。
+    local user = require("kernel.user")
+    local function mksecret(pw, salt) return salt .. "$" .. user.hash(salt, pw) end
+    local pw = "root:x:0:0:root:/root:/bin/sh\nalice:x:1000:1000:Alice:/home/alice:/bin/sh\n"
     local gr = "root:x:0:root\nalice:x:1000:alice\n"
-    local sh = "root:$1$root$abc\n"
+    local sh = "root:" .. mksecret("rootpw", "r00ts4lt") .. "\nalice:" .. mksecret("alicepw", "a1b2c3d4") .. "\n"
     local function w(path, s) local f = assert(io.open(ROOT .. path, "w")); f:write(s); f:close() end
     w("/etc/passwd", pw); w("/etc/group", gr); w("/etc/shadow", sh)
+    -- 测试负载: 用户管理自检(scripts/user_test.sh)要用的辅助程序, 真机上由 realmachine.py
+    -- 注入到同一个路径, 于是那份自检在两个环境里跑的是同一段脚本。
+    os.execute("mkdir -p " .. ROOT .. "/root && cp -f " .. REPO .. "/scripts/user_helper.lua " .. ROOT .. "/root/user_helper.lua")
     w("/etc/hostname", "delin-host\n")
     w("/pub", "public data\n"); w("/secret", "top secret content\n"); w("/readonly", "ro\n")
     w("/home/alice/x.txt", "alice file\n")
@@ -576,6 +561,8 @@ package.loaded["kernel.process"] = {
         local p = curPid and procs[curPid]
         return { pid = curPid or 0, uid = (p and p.uid) or 0, gid = (p and p.gid) or 0 }
     end,
+    -- 特权写(与内核同签名): 宿主 fs 没有权限位, 直接运行即可。
+    asRoot = function(fn) return fn() end,
     info = function(pid) return procs[pid] end,
     list = function()
         local out = {}
@@ -646,7 +633,23 @@ function F.open(p, mode)
     return hostOpen(p, mode)
 end
 
+-- kernel.modules/vfs_api 装载时会抓全局 fs(与内核同一份源码); 宿主上没有 CC 的 fs,
+-- 用宿主门面顶上 —— 下面 setupRoot / user 库的 require 都会走到它。
+_G.fs = _G.fs or F
+
 setupRoot()
+
+-- ---------------------------------------------------------------
+-- user.* syscalls: 用真实内核模块(与真机同一份源码)。db 从上面写好的 /etc 三张表解析,
+-- 写接口照 syscall 语义授权后特权写回 —— 所以 passwd/useradd/... 在宿主上跑的是真逻辑。
+-- ---------------------------------------------------------------
+do
+    local user = require("kernel.user")
+    user.registerSyscalls(user.init(F), F)
+    -- user.registerSyscalls 写进的是**内核的** syscall 表(kernel.modules), 而工具拿到的是
+    -- 测试台自己那张(proc/job/signal/... 的桩都在这儿) —— 把 user.* 并进来。
+    for k, v in pairs(require("kernel.modules").syscalls()) do syscalls[k] = v end
+end
 
 -- ---------------------------------------------------------------
 -- 桩 printer: /dev/lp0 的写入落到 ROOT/printer.out, /sys/class/printer/lp0 提供状态与可写标题。
@@ -766,7 +769,11 @@ local src = tsrc:readAll(); tsrc:close()
 
 local argv0 = { [0] = toolPath }
 for i = 1, #toolArgs do argv0[i] = toolArgs[i] end
-local topPid = spawn(src, toolPath, nil, nil, nil, argv0, { cwd = "/" })
+-- DELIN_HARNESS_UID/GID: 顶层工具的 uid/gid(默认 root), 用于验证普通用户视角的权限行为
+-- (如 alice 跑 passwd 改自己密码 / 试改别人的 / 被拒绝建用户)。
+local topUid = tonumber(os.getenv("DELIN_HARNESS_UID") or "")
+local topGid = tonumber(os.getenv("DELIN_HARNESS_GID") or "")
+local topPid = spawn(src, toolPath, nil, topUid, topGid, argv0, { cwd = "/" })
 
 -- 运行协作式调度器, 驱动顶层进程及其 spawn 出的子进程(管道/作业控制)。
 schedulerRun()

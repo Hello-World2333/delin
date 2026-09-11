@@ -99,8 +99,10 @@ local function setupUsers()
     end
     local user = require("kernel.user")
     local db = user.init(vfs_api.fs)
-    user.registerSyscalls(db)
-    kprint("users loaded: " .. table.concat(user.list(db), ","))
+    user.registerSyscalls(db, vfs_api.fs)
+    local names = {}
+    for _, u in ipairs(user.list(db)) do names[#names + 1] = u.name end
+    kprint("users loaded: " .. table.concat(names, ","))
     return db
 end
 

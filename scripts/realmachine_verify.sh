@@ -115,6 +115,8 @@ ls -l $CD/d/f.sh >> $LOG
 chmod -x -w $CD/x.sh
 ls -l $CD/x.sh >> $LOG
 rm -rf $CD
+echo "-- user_test.sh (用户管理: passwd/useradd/usermod/group*/id 自检) --" >> $LOG
+sh /root/user_test.sh >> $LOG
 echo "-- redstone_verify.lua (sysfs 与 CC 原始 redstone API 交叉核对) --" >> $LOG
 /root/redstone_verify.lua
 cat /var/log/redstone_verify.log >> $LOG

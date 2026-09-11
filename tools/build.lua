@@ -269,6 +269,7 @@ end
 local CHECK_SCRIPTS = {
     "posix_test.sh", "jobctl_test.sh", "proc_test.sh",
     "redstone_test.sh", "lua_test.sh", "sh_builtin_test.sh",
+    "user_test.sh",
 }
 
 local function check()

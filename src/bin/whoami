@@ -1,0 +1,24 @@
+-- Delin whoami: 打印当前有效用户名 (coreutils whoami)。
+--   用法: whoami
+--   数据源 = user.byUid syscall(内核内存里的用户库); 找不到即报错(GNU 同此)。
+--   退出码: 0 正常; 1 当前 uid 在 /etc/passwd 里没有记录 / 有多余操作数。
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+if args[1] then
+    stderr("whoami: extra operand '" .. tostring(args[1]) .. "'\n")
+    stderr("Try 'whoami --help' for more information.\n")
+    return 1
+end
+
+local rec = syscalls and syscalls["user.byUid"] and syscalls["user.byUid"](uid)
+if not rec then
+    stderr("whoami: cannot find name for user ID " .. tostring(uid) .. "\n")
+    return 1
+end
+io.write(rec.name .. "\n")
+return 0

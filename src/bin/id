@@ -1,0 +1,114 @@
+-- Delin id: 打印用户的 uid/gid/组 (coreutils id 子集)。
+--   用法: id [-u] [-g] [-G] [-n] [-r] [USER]
+--     无选项: uid=1000(alice) gid=1000(alice) groups=1000(alice)
+--     -u/-g/-G 只打印 uid/主 gid/全部 gid(空格分隔), -n 配它们打印**名字**而非数字。
+--     -u/-g/-G 最多给一个(coreutils: "cannot print \"only\" of more than one choice");
+--     -n 必须与其中之一同用。
+--     -r(真实 ID): Delin 只有一个 uid/gid(无 euid/suid), 该选项接受但不改变输出。
+--     -Z/-z(SELinux 上下文)与 --help/--version 未实现。
+--   数据源 = user.* syscalls(内核内存里的用户库), 不是直接读 /etc。
+--   退出码: 0 正常; 1 用户不存在等运行错误; 2 用法错误。
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+local function usage(msg)
+    if msg then stderr("id: " .. msg .. "\n") end
+    stderr("usage: id [-u] [-g] [-G] [-n] [-r] [USER]\n")
+    return 2
+end
+
+local just, names, operand, noMore = nil, false, nil, false
+for _, a in ipairs(args) do
+    if noMore then
+        if operand then return usage("extra operand '" .. a .. "'") end
+        operand = a
+    elseif a == "--" then
+        noMore = true
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        for k = 2, #a do
+            local ch = a:sub(k, k)
+            if ch == "u" or ch == "g" or ch == "G" then
+                if just and just ~= ch then return usage("cannot print \"only\" of more than one choice") end
+                just = ch
+            elseif ch == "n" then names = true
+            elseif ch == "r" then -- Delin 无 euid: 真实 ID 就是唯一的那份 ID
+            else return usage("invalid option -- '" .. ch .. "'") end
+        end
+    else
+        if operand then return usage("extra operand '" .. a .. "'") end
+        operand = a
+    end
+end
+if names and not just then return usage("cannot print only names in default format") end
+
+if not (syscalls and syscalls["user.byUid"] and syscalls["user.groupByName"]) then
+    stderr("id: user syscalls not available\n")
+    return 1
+end
+
+-- 目标用户: 给了操作数按名字查, 否则按调用者的 uid 查(查不到就是"无用户记录的 uid")。
+local rec, uidv
+if operand then
+    rec = syscalls["user.get"](operand)
+    if not rec then
+        stderr("id: '" .. operand .. "': no such user\n")
+        return 1
+    end
+    uidv = rec.uid
+else
+    uidv = uid
+    rec = syscalls["user.byUid"](uid)
+end
+
+local gidv = rec and rec.gid
+if gidv == nil then
+    -- 没有 passwd 记录: 用进程的 gid(与 GNU 打印裸数字的行为一致)
+    gidv = gid
+end
+
+--- 该 uid 的全部组 { gid, name }(主组在前)。
+local function allGroups()
+    local out = {}
+    local primary = syscalls["user.groupByGid"] and syscalls["user.groupByGid"](gidv)
+    out[#out + 1] = { gid = gidv, name = primary and primary.name or nil }
+    if rec and syscalls["user.groupsOf"] then
+        for _, gname in ipairs(syscalls["user.groupsOf"](rec.name) or {}) do
+            local g = syscalls["user.groupByName"](gname)
+            if g and g.gid ~= gidv then out[#out + 1] = { gid = g.gid, name = gname } end
+        end
+    end
+    return out
+end
+
+local function fmt(id, name)
+    return name and (id .. "(" .. name .. ")") or tostring(id)
+end
+
+-- 只打印一份量(-u/-g/-G): 默认数字, -n 时换成名字(coreutils 语义)
+local function fmtId(id, name)
+    if names then return tostring(name or id) end
+    return tostring(id)
+end
+
+if just == "u" then
+    io.write(fmtId(uidv, rec and rec.name) .. "\n")
+elseif just == "g" then
+    local primary = syscalls["user.groupByGid"] and syscalls["user.groupByGid"](gidv)
+    io.write(fmtId(gidv, primary and primary.name) .. "\n")
+elseif just == "G" then
+    local parts = {}
+    for _, g in ipairs(allGroups()) do parts[#parts + 1] = fmtId(g.gid, g.name) end
+    io.write(table.concat(parts, " ") .. "\n")
+else
+    local groups = allGroups()
+    local gs = {}
+    for _, g in ipairs(groups) do gs[#gs + 1] = fmt(g.gid, g.name) end
+    io.write("uid=" .. fmt(uidv, rec and rec.name) ..
+             " gid=" .. fmt(gidv, groups[1] and groups[1].name) ..
+             " groups=" .. table.concat(gs, ",") .. "\n")
+end
+return 0
