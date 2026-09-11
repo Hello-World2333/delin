@@ -110,6 +110,10 @@ local function newSigState()
     return {
         pending  = {},   -- sigNo -> true
         handlers = {},   -- sigNo -> fun|nil
+        -- ignored: sigNo -> true, 被**显式忽略**的信号。与 Linux 一样, 这个状态跨 exec/spawn
+        -- 继承给子进程(handler 不继承, 但"忽略"继承)—— nohup(1) 就是靠这条让 COMMAND 免疫
+        -- SIGHUP 的。见 process.spawn 的 opts.sigIgnore 与 process.applySignals。
+        ignored  = {},
         stopped  = false,
         stopSig  = nil,
         termSig  = nil,
@@ -205,8 +209,22 @@ function process.spawn(src, name, ppid, uid, gid, argv, opts)
         envvars = env.env, -- 环境块(子进程 spawn 时继承)
         stdio = env.__stdio,
         pgrp = pgrp, sid = sid,
+        -- 文件创建掩码(POSIX umask): 从父进程继承, 缺省 022。
+        -- 由**内核在创建文件/目录时应用**(见 kernel/ext2.lua 的 applyUmask), 而不是让每个工具
+        -- 自己去收窄权限 —— 那样只要有一个工具忘了就漏, 而且很容易把 umask 叠加两次。
+        umask = (parentProc and parentProc.umask) or tonumber("022", 8),
         sig = newSigState(),
     }
+    -- 被忽略的信号跨 spawn 继承(和 Linux 的 exec 一样): nohup 就靠这条让子命令免疫 SIGHUP。
+    -- 调用方经 opts.sigIgnore = { [1] = true, ... } 传入(proc.exec 会原样透传 opts)。
+    do
+        local ign = opts and opts.sigIgnore
+        local parentSig = parentProc and parentProc.sig
+        if parentSig and parentSig.ignored then
+            for s in pairs(parentSig.ignored) do proc.sig.ignored[s] = true end
+        end
+        if ign then for s in pairs(ign) do proc.sig.ignored[s] = true end end
+    end
 
     -- onExit: 更新 registry 里的规范 proc 表(status/exitCode), 不是调度器的临时 proc 对象。
     -- 否则 process.info(pid) 永远看到 status="running", proc.wait 无法感知子进程退出。
@@ -315,11 +333,11 @@ function process.current()
     local co = coroutine.running()
     local pid = co and coPid[co]
     local ov = co and credOverride[co]
-    if ov then return { pid = pid or 0, uid = ov.uid, gid = ov.gid } end
-    if not pid then return { pid = 0, uid = 0, gid = 0 } end -- 内核/主线程 -> root
+    if ov then return { pid = pid or 0, uid = ov.uid, gid = ov.gid, umask = tonumber("022", 8) } end
+    if not pid then return { pid = 0, uid = 0, gid = 0, umask = tonumber("022", 8) } end -- 内核/主线程 -> root
     local p = registry[pid]
-    if not p then return { pid = 0, uid = 0, gid = 0 } end
-    return { pid = pid, uid = p.uid, gid = p.gid }
+    if not p then return { pid = 0, uid = 0, gid = 0, umask = tonumber("022", 8) } end
+    return { pid = pid, uid = p.uid, gid = p.gid, umask = p.umask or tonumber("022", 8) }
 end
 
 --- 以 root 凭据运行 fn(仅限内核在**自行授权之后**写系统文件, 见 kernel/user.lua)。
@@ -397,11 +415,26 @@ end
 ---@param sig integer
 ---@param fn function|nil   nil 恢复默认动作
 ---@return boolean, string|nil
+--- 安装信号处置。
+---@param sig integer
+---@param fn function|string "ignore" => SIG_IGN, "default" => SIG_DFL, 其余按处理函数
 function process.setHandler(sig, fn)
     if not signal.catchable(sig) then return nil, "uncatchable signal: " .. signal.name(sig) end
     local cur = process.current()
     local p = registry[cur.pid]
     if not p then return nil, "no current process" end
+    if fn == "ignore" then
+        -- SIG_IGN: 与 Linux 一样, 这个处置会**跨 spawn 继承给子进程**(nohup 靠它)。
+        p.sig.handlers[sig] = nil
+        p.sig.ignored[sig] = true
+        return true
+    end
+    if fn == "default" then
+        p.sig.handlers[sig] = nil
+        p.sig.ignored[sig] = nil
+        return true
+    end
+    p.sig.ignored[sig] = nil
     p.sig.handlers[sig] = fn
     return true
 end
@@ -549,7 +582,10 @@ function process.applySignals(p)
             pending[s] = nil
         else
             local h = sig.handlers[s]
-            if h then
+            if sig.ignored and sig.ignored[s] then
+                -- 被显式忽略(或从父进程继承的忽略): POSIX 规定丢弃, 连停止/终止默认动作都不走。
+                pending[s] = nil
+            elseif h then
                 pending[s] = nil
                 local ok, err = pcall(h, s)
                 if not ok then
@@ -627,6 +663,114 @@ sc["job.tcsetpgrp"] = function(ttyName, pgid) return process.tcsetpgrp(ttyName, 
 sc["job.tcgetpgrp"] = function(ttyName) return process.tcgetpgrp(ttyName) end
 sc["job.group"]     = function() return process.currentGroup() end
 sc["job.sessfor"]   = function(ttyName) return process.sessionForTty(ttyName) end
+
+-- 文件创建掩码(POSIX umask)。内核在 create 时统一应用(见 kernel/ext2.lua 的 applyUmask),
+-- 这两个 syscall 只是给 shell 的 `umask` 内建读写它 —— 与 Linux 一样, umask 是**进程属性**
+-- 且被子进程继承(`umask 077; sh -c 'touch x'` 建出来的文件必须是 0600)。
+sc["umask.get"] = function() return process.current().umask or tonumber("022", 8) end
+sc["umask.set"] = function(mask)
+    local cur = process.current()
+    local p = registry[cur.pid]
+    if not p then return nil, "umask: no such process" end
+    if type(mask) ~= "number" or mask < 0 or mask > tonumber("777", 8) then
+        return nil, "umask: mask out of range (0..0777)"
+    end
+    local old = p.umask or tonumber("022", 8)
+    p.umask = math.floor(mask)
+    return old
+end
+
+-- ---------------------------------------------------------------
+-- proc.exec: 按 PATH 查找并启动一个程序(execvp 的最小实现)
+-- ---------------------------------------------------------------
+-- 为什么放内核里: 任何"我要起一个外部命令"的工具(xargs、nohup、sh 的 command 内建)都得做
+-- 同一件事 —— 查 PATH、查 x 位、读文件、处理 shebang —— 而 spawn() 只收**源码字符串**,
+-- 每个工具自己抄一遍这段逻辑既冗长又容易抄漏 shebang 的 `env` 特判。所以在这里收成一个口子。
+-- 注意: 这是"起一个新进程", 不是 POSIX exec 的"替换当前进程映像"(Delin 没有那个语义)。
+local function fsapi() return require("kernel.vfs_api").fs end
+
+--- 按 PATH 查找可执行文件。名字里含 "/" 时按路径处理, 不做 PATH 搜索(POSIX 语义)。
+---@param name string
+---@param pathEnv string|nil
+---@return string|nil
+local function findInPath(name, pathEnv)
+    if name:find("/", 1, true) then return name end
+    for dir in tostring(pathEnv or "/bin"):gmatch("[^:]+") do
+        local cand = (dir == "/" and "" or dir) .. "/" .. name
+        if fsapi().exists(cand) then return cand end
+    end
+    return nil
+end
+
+--- 解析 shebang 行。返回解释器路径与"可选的一个参数"(POSIX 只保证一个参数)。
+local function parseShebang(firstLine)
+    if firstLine:sub(1, 2) ~= "#!" then return nil, nil end
+    local rest = firstLine:sub(3):gsub("^[ \t]+", "")
+    local interp = rest:match("^(%S+)")
+    if not interp then return nil, nil end
+    local arg = rest:match("^%S+[ \t]+(.-)[ \t]*$")
+    return interp, arg
+end
+
+--- 读一个文件(经 VFS, 走进程的权限检查)。
+local function readFile(path)
+    local f, err = fsapi().open(path, "r")
+    if not f then return nil, err end
+    local s = f.readAll() or ""
+    f.close()
+    return s
+end
+
+--- 按 PATH 查找并启动一个程序(不等待)。返回子进程 pid。
+---@param cmd string 命令名(含 "/" 则按路径)或绝对路径
+---@param argv table|nil 传给子进程的位置参数(argv[0] 由本函数填)
+---@param opts table|nil 透传给 process.spawn 的选项(cwd/env/stdio/uid/gid)
+---@return integer|nil pid, string|nil err
+function process.exec(cmd, argv, opts)
+    opts = opts or {}
+    local cur = process.current()
+    local caller = registry[cur.pid]
+    local pathEnv = (caller and caller.envvars and caller.envvars.PATH) or "/bin"
+
+    local path = findInPath(cmd, pathEnv)
+    if not path then return nil, cmd .. ": command not found" end
+    if not fsapi().canExecute(path) then return nil, path .. ": permission denied" end
+    local src, rerr = readFile(path)
+    if not src then return nil, path .. ": " .. tostring(rerr) end
+
+    local interp, iarg = parseShebang(src:match("^([^\n]*)") or "")
+    local childArgv = { [0] = path }
+    if interp then
+        -- `#!/usr/bin/env prog [arg]`: JSON 之外最常见的写法, 特判取下一段程序名。
+        local prog, arg = interp, iarg
+        if interp:match("[^/]+$") == "env" then
+            if not arg or arg == "" then return nil, "shebang: env without a program" end
+            prog = arg:match("^(%S+)")
+            arg = arg:match("^%S+%s+(.*)$")
+        end
+        local ipath = findInPath(prog, pathEnv)
+        if not ipath then return nil, "shebang interpreter not found: " .. prog end
+        if not fsapi().canExecute(ipath) then return nil, "shebang interpreter not executable: " .. prog end
+        local isrc, ierr = readFile(ipath)
+        if not isrc then return nil, "shebang interpreter: " .. tostring(ierr) end
+        local n = 0
+        childArgv = { [0] = ipath }
+        if arg and arg ~= "" then n = 1; childArgv[n] = arg end
+        n = n + 1; childArgv[n] = path
+        for i = 1, #(argv or {}) do n = n + 1; childArgv[n] = argv[i] end
+        local pid, _, cerr = process.spawn(isrc, ipath, cur.pid, opts.uid, opts.gid, childArgv, opts)
+        if not pid then return nil, tostring(cerr) end
+        return pid
+    end
+
+    for i = 1, #(argv or {}) do childArgv[i] = argv[i] end
+    local pid, _, cerr = process.spawn(src, path, cur.pid, opts.uid, opts.gid, childArgv, opts)
+    if not pid then return nil, tostring(cerr) end
+    return pid
+end
+
+--- 注册为 syscall。参数与 process.exec 相同。
+sc["proc.exec"] = function(cmd, argv, opts) return process.exec(cmd, argv, opts) end
 
 -- 调度器在 resume 前经此投递信号。
 scheduler.setSignalCheck(process.applySignals)

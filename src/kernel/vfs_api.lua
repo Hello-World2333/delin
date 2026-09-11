@@ -42,8 +42,14 @@ local devBackend = vfs.virtual({
     end,
     isDir = function(rel) return strip(rel) == "" end,
     attributes = function(rel)
-        if strip(rel) == "" then return { size = 0, isDir = true, isReadOnly = true, name = "dev", created = 0, modified = 0 } end
-        if devices[strip(rel)] then return { size = 0, isDir = false, isReadOnly = true, name = strip(rel), created = 0, modified = 0 } end
+        -- kind 不能漏: 工具靠它区分"文件"与"设备节点"。`dd of=/dev/sda1` 就是例子 ——
+        -- 没有 kind 时会按普通文件走, 于是把整个分区镜像读进内存(CC 上直接 OOM)。
+        if strip(rel) == "" then
+            return { size = 0, isDir = true, isReadOnly = true, kind = "dir", name = "dev", created = 0, modified = 0 }
+        end
+        if devices[strip(rel)] then
+            return { size = 0, isDir = false, isReadOnly = true, kind = "device", name = strip(rel), created = 0, modified = 0 }
+        end
         return nil
     end,
     getSize = function(rel) return 0 end,
@@ -83,23 +89,86 @@ local function dispatch(path)
     return backend, rel
 end
 
+--- 与 dispatch 相同, 但**不跟随最后一段**的符号链接(供 lstat/readlink/unlink/symlink 用)。
+local function dispatchNoFollow(path)
+    local backend, rel, err = vfs.resolveNoFollow(path)
+    if not backend then error(tostring(err) or "bad path", 2) end
+    return backend, rel
+end
+
 function fsapi.list(path) local b, r = dispatch(path); return b.list(r) end
 function fsapi.exists(path) local b, r = dispatch(path); return b.exists(r) end
 function fsapi.isDir(path) local b, r = dispatch(path); return b.isDir(r) end
 function fsapi.isReadOnly(path) local b, r = dispatch(path); return b.isReadOnly(r) end
 function fsapi.attributes(path) local b, r = dispatch(path); return b.attributes(r) end
+--- 不跟随符号链接的 stat(等价 Linux 的 lstat): 对符号链接本身返回 kind="symlink"。
+function fsapi.lstat(path) local b, r = dispatchNoFollow(path); return b.attributes(r) end
 function fsapi.getSize(path) local b, r = dispatch(path); return b.getSize(r) end
 function fsapi.getDrive(path) local b, r = dispatch(path); return b.getDrive(r) end
 function fsapi.getFreeSpace(path) local b, r = dispatch(path); return b.getFreeSpace(r) end
 function fsapi.getCapacity(path) local b, r = dispatch(path); return b.getCapacity(r) end
-function fsapi.makeDir(path) local b, r = dispatch(path); return b.makeDir(r) end
-function fsapi.move(a, b) local ba, ra = dispatch(a); local bb, rb = dispatch(b); return ba.move(ra, rb) end
+-- makeDir/move/delete 的**目标**最后一段不跟随符号链接: 否则 `rm link` 会删掉链接指向的
+-- 文件(Linux 的 unlink/rename/mkdir 都不跟随最后一段)。源路径 move 同理(rename 不动链接本身)。
+function fsapi.makeDir(path) local b, r = dispatchNoFollow(path); return b.makeDir(r) end
+function fsapi.move(a, b)
+    local ba, ra = dispatchNoFollow(a)
+    local bb, rb = dispatchNoFollow(b)
+    return ba.move(ra, rb)
+end
 function fsapi.copy(a, b) local ba, ra = dispatch(a); local bb, rb = dispatch(b); return ba.copy(ra, rb) end
-function fsapi.delete(path) local b, r = dispatch(path); return b.delete(r) end
+function fsapi.delete(path) local b, r = dispatchNoFollow(path); return b.delete(r) end
 function fsapi.open(path, mode) local b, r = dispatch(path); return b.open(r, mode) end
 function fsapi.chmod(path, mode) local b, r = dispatch(path); if b.chmod then return b.chmod(r, mode) end return nil, "chmod not supported" end
 function fsapi.chown(path, uid, gid) local b, r = dispatch(path); if b.chown then return b.chown(r, uid, gid) end return nil, "chown not supported" end
+--- 不跟随最后一段的 chown(= Linux `lchown`)。`chown -h` / `chgrp -h` / 递归遍历里的链接
+--- 必须用它: 用跟随版本会把**链接指向的文件**改掉 —— 递归时常改到树外的文件, 比报错危险得多。
+--- ext2 的 lookup 本来就不逐段跟随最后一段, 所以 dispatchNoFollow + b.chown 就是正确的 lchown。
+function fsapi.lchown(path, uid, gid)
+    local b, r = dispatchNoFollow(path)
+    if not b.chown then return nil, "chown not supported" end
+    return b.chown(r, uid, gid)
+end
 function fsapi.canExecute(path) local b, r = dispatch(path); if b.canExecute then return b.canExecute(r) end return true end
+-- ---------------- 符号链接 / 硬链接 ----------------
+-- 语义对齐 Linux: symlink 的 target 原样保存(不解析), linkpath 的最后一段不跟随符号链接
+-- (否则 ln -s 到"已存在的链接"会变成改别人的方向); link 的 oldpath 要跟随(硬链接指向目标
+-- 本身而不是链接), newpath 不跟随(必须不存在)。
+---@param target string 链接目标(原样保存, 不解析)
+---@param linkpath string 新链接路径
+function fsapi.symlink(target, linkpath)
+    local b, r = dispatchNoFollow(linkpath)
+    if not b.symlink then return nil, "symbolic links are not supported on this filesystem" end
+    return b.symlink(target, r)
+end
+--- 读符号链接目标(不跟随)。
+function fsapi.readlink(path)
+    local b, r = dispatchNoFollow(path)
+    if not b.readlink then return nil, "not a symbolic link" end
+    return b.readlink(r)
+end
+--- 硬链接。与 Linux 的 link(2) 一致: **不跟随** oldpath 最后一段的符号链接
+--- (给链接本身再挂一个名字), newpath 必须不存在。
+function fsapi.link(oldpath, newpath)
+    local b, r = dispatchNoFollow(oldpath)
+    local b2, r2 = dispatchNoFollow(newpath)
+    if b ~= b2 then return nil, "cross-filesystem hard link is not allowed" end
+    if not b.link then return nil, "hard links are not supported on this filesystem" end
+    return b.link(r, r2)
+end
+--- 建命名管道(POSIX FIFO)。
+---@param path string
+---@param mode integer|nil 权限位(八进制数值); **umask 由调用方先算好**, 内核不重复收窄
+function fsapi.mkfifo(path, mode)
+    local b, r = dispatchNoFollow(path)
+    if not b.mkfifo then return nil, "named pipes are not supported on this filesystem" end
+    return b.mkfifo(r, mode)
+end
+--- 该路径是否是命名管道(FIFO)。CC 原生 fs 不支持 FIFO, 一律返回 false。
+function fsapi.isFifo(path)
+    local b, r = dispatchNoFollow(path)
+    local a = b.attributes(r)
+    return a ~= nil and a.kind == "fifo"
+end
 function fsapi.isFile(path)
     local b, r = dispatch(path)
     if b.isFile then return b.isFile(r) end

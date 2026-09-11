@@ -62,10 +62,10 @@ function vfs.list()
     return out
 end
 
---- 解析路径到最长的挂载根。
+--- 解析路径到最长的挂载根(**不做符号链接展开**)。
 ---@param path string  VFS 路径(绝对; 相对路径按根处理)
 ---@return table|nil backend, string rel, string|nil err
-function vfs.resolve(path)
+local function rawResolve(path)
     -- 归一化: 去掉 "."/".."(见 normalize), 绝对化、去重复与末尾斜杠
     path = normalize(path)
 
@@ -89,6 +89,87 @@ function vfs.resolve(path)
         end
     end
     return best.backend, rel, nil
+end
+
+-- ---------------------------------------------------------------
+-- 符号链接(Linux 语义)
+-- ---------------------------------------------------------------
+-- 展开发生在**这一层**而不是后端里: 后端(ext2/CCFS/procfs)只认"路径中不含符号链接"
+-- 这种平坦路径 —— ext2.lookup 遇到 T_SYM 的中间段会直接返回 nil(它不做跟随),
+-- 于是让 VFS 先把路径展开成平坦形式, 后端实现可以完全不知道符号链接这回事。
+--
+-- 已知偏离(Linux 会跟随, 这里不跟随): 因为展开是纯字典序的, ".." 之前若经过符号链接目录,
+-- 语义与 Linux 不同 —— 与 normalize 里已记录的那条偏离同源, 不另立一套。
+
+--- 符号链接嵌套上限(Linux 的 MAXSYMLINKS = 40)。
+local MAX_SYMLINKS = 40
+
+--- 逐段展开符号链接, 返回展开后的绝对路径。
+--- `followLast=false` 时最后一段不跟随(供 lstat/readlink/unlink/symlink 自身使用)。
+--- 只有实现了 `readlink` 的后端才可能有符号链接, 因此其它后端(CCFS/procfs/devtmpfs)
+--- 一次额外查询都不会发生。
+---@param path string
+---@param followLast boolean
+---@return string|nil expanded, string|nil err
+local function expandLinks(path, followLast)
+    local segs = {}
+    for seg in normalize(path):gmatch("[^/]+") do segs[#segs + 1] = seg end
+    local resolved = {}
+    local hops = 0
+    while #segs > 0 do
+        local seg = table.remove(segs, 1)
+        if seg == "." then -- 丢掉
+        elseif seg == ".." then
+            if #resolved > 0 then resolved[#resolved] = nil end
+        else
+            local cur = (#resolved == 0) and "/" or ("/" .. table.concat(resolved, "/"))
+            local child = (cur == "/") and ("/" .. seg) or (cur .. "/" .. seg)
+            local target = nil
+            if #segs > 0 or followLast then
+                local b, r = rawResolve(child)
+                if b and b.readlink then
+                    local a = b.attributes(r)
+                    if a and a.kind == "symlink" then
+                        local t, terr = b.readlink(r)
+                        if not t then return nil, "cannot read symlink " .. child .. ": " .. tostring(terr) end
+                        target = t
+                    end
+                end
+            end
+            if target then
+                hops = hops + 1
+                if hops > MAX_SYMLINKS then
+                    return nil, "too many levels of symbolic links: " .. path
+                end
+                if target:sub(1, 1) == "/" then resolved = {} end
+                local tsegs = {}
+                for t in target:gmatch("[^/]+") do tsegs[#tsegs + 1] = t end
+                for k = #tsegs, 1, -1 do table.insert(segs, 1, tsegs[k]) end
+            else
+                resolved[#resolved + 1] = seg
+            end
+        end
+    end
+    if #resolved == 0 then return "/" end
+    return "/" .. table.concat(resolved, "/")
+end
+
+--- 解析路径(跟随符号链接, 与 Linux 的路径解析一致)。
+---@param path string
+---@return table|nil backend, string rel, string|nil err
+function vfs.resolve(path)
+    local real, lerr = expandLinks(path, true)
+    if not real then return nil, nil, lerr end
+    return rawResolve(real)
+end
+
+--- 解析路径但**不跟随最后一段**的符号链接(等价 Linux 的 lstat 路径解析)。
+---@param path string
+---@return table|nil backend, string rel, string|nil err
+function vfs.resolveNoFollow(path)
+    local real, lerr = expandLinks(path, false)
+    if not real then return nil, nil, lerr end
+    return rawResolve(real)
 end
 
 -- ---------------------------------------------------------------

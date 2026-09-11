@@ -9,8 +9,31 @@ local ext2 = {}
 local process = nil
 pcall(function() process = require("kernel.process") end)
 
+-- 命名管道(FIFO)的缓冲区注册表。ext2 只负责"这个 inode 是 FIFO"这件事; 读写与阻塞语义
+-- 全在 kernel/fifo.lua(与匿名管道共用一套缓冲与协作式阻塞)。同一 inode 被反复 open 时,
+-- 每次都从同一个缓冲区上挂一端, 所以 `cat fifo` 与 `echo x > fifo` 互不干扰。
+local fifo = require("kernel.fifo")
+
 -- 权限强制辅助(及早定义, 供 create/backend 使用)
 local function cred() if not process then return { uid = 0, gid = 0 } end return process.current() end
+--- 按位"a AND NOT mask"(不用位运算符: 宿主 Lua 5.1 没有, 项目统一用算术实现)。
+local function andNot(a, mask)
+    local r, bit = 0, 1
+    for _ = 1, 12 do
+        if a % 2 == 1 and mask % 2 == 0 then r = r + bit end
+        a = math.floor(a / 2); mask = math.floor(mask / 2); bit = bit * 2
+    end
+    return r
+end
+
+--- 把 POSIX umask 应用到新建节点的权限位。
+--- 放在**内核这一层**而不是各工具里: 新建文件的地方有好几处(fs.open "w"、makeDir、mkfifo),
+--- 让每个工具自己收窄权限, 漏一个就多出几个"世界可写"的文件; 而且工具往往先收窄一遍、
+--- 内核再来一遍 —— 那就是叠了两次, 权限会比用户要的更紧。
+---@param mode integer 含类型位的完整 mode
+---@return integer
+local applyUmask
+
 local function hasPerm(inode, uid, gid, perm) -- perm: 1=x,2=w,4=r
     if uid == 0 then return true end
     local c = (uid == inode.uid) and 6 or ((gid == inode.gid) and 3 or 0)
@@ -37,10 +60,25 @@ local function readBlockStr(fs, blockNum) return fs.bd.read(blockNum * fs.blockS
 local function writeBlockStr(fs, blockNum, data) return fs.bd.write(blockNum * fs.blockSize, data) end
 
 -- inode 类型与文件类型字节
-local T_DIR, T_REG, T_SYM = 0x4000, 0x8000, 0xA000
+local T_FIFO, T_DIR, T_REG, T_SYM = 0x1000, 0x4000, 0x8000, 0xA000
 local FT_REG, FT_DIR, FT_SYM, FT_CHR, FT_BLK, FT_FIFO, FT_SOCK, FT_UNK = 1, 2, 7, 3, 4, 5, 6, 0
 local function itype(mode) return math.floor(mode / 0x1000) * 0x1000 end
 local function iperms(mode) return mode % 0x1000 end
+
+--- 把 POSIX umask 应用到新建节点的权限位(定义在这里是因为要用 itype/iperms)。
+--- 放在**内核这一层**而不是各工具里: 新建文件的入口有好几处(fs.open "w"、makeDir、mkfifo),
+--- 让每个工具自己收窄权限, 漏一个就多出几个"世界可写"的文件; 而且工具往往先收窄一遍、
+--- 内核再来一遍 —— 那就是叠了两次, 权限会比用户要的更紧。
+---@param mode integer 含类型位的完整 mode
+---@return integer
+applyUmask = function(mode)
+    -- 符号链接**不受 umask 影响**: Linux 上链接的权限位恒为 0777(lchmod 都不允许改),
+    -- 它只是历史遗留, 内核从不拿它做权限判定。若在这里一并收窄, `ln -s` 建出来的链接
+    -- 会变成 0755, 与 Linux 不一致(也被 ls -l 直接看出来)。
+    if itype(mode) == T_SYM then return mode end
+    local u = cred().umask or tonumber("022", 8)
+    return itype(mode) + andNot(iperms(mode), u)
+end
 local function typeToFileType(t)
     if t == T_DIR then return FT_DIR end
     if t == T_REG then return FT_REG end
@@ -336,14 +374,28 @@ function ext2.ensureBlock(fs, inode, idx)
     return nil
 end
 
+--- inode 实际占用的数据块数。
+--- **不能用 size 直接推**: ext2 的"快速符号链接"把目标(<=60 字节)内联在 inode 的 i_block 区里,
+--- 此时 size = 目标长度, 但 i_blocks = 0、一个数据块都没占 —— 而那 15 个"指针"位置上放的是
+--- 目标字符串的原始字节。若按 size 遍历指针去释放, 就会把 "targ" 这种字节当块号释放,
+--- 直接读坏块组描述符崩掉(创建符号链接后 rm 一下就复现)。
+---@param fs Ext2Fs
+---@param inode table
+---@return integer
+local function dataBlockCount(fs, inode)
+    if (inode.blocks or 0) == 0 then return 0 end
+    return math.ceil((inode.size or 0) / fs.blockSize)
+end
+
 --- 释放 inode 引用的所有数据块 + 间接指针块。
 function ext2.freeBlocksOfInode(fs, inode)
-    local nBlocks = math.ceil((inode.size or 0) / fs.blockSize)
+    local nBlocks = dataBlockCount(fs, inode)
     for idx = 0, nBlocks - 1 do
         local blk = ext2.getBlock(fs, inode, idx)
         if blk and blk ~= 0 then ext2.freeBlock(fs, blk) end
     end
-    -- 释放间接指针块
+    -- 释放间接指针块(快速符号链接的 ptrs[13]/[14] 也是目标字节, 所以同样要先判 i_blocks)
+    if (inode.blocks or 0) == 0 then return end
     local per = perIndirect(fs)
     if inode.ptrs[13] ~= 0 then ext2.freeBlock(fs, inode.ptrs[13]) end
     if inode.ptrs[14] ~= 0 then
@@ -510,6 +562,8 @@ function ext2.create(fs, dirPath, name, mode, uid, gid)
     local c = cred()
     uid = uid or c.uid
     gid = gid or c.gid
+    -- umask 在**唯一的创建点**应用(见 applyUmask 的说明)。
+    mode = applyUmask(mode)
     local ino = ext2.allocInode(fs, mode, uid, gid)
     if not ino then return nil, "alloc inode failed" end
     local inode = ext2.readInode(fs, ino)
@@ -542,7 +596,7 @@ function ext2.writeFile(fs, ino, content)
     local inode = ext2.readInode(fs, ino)
     if not inode or (inode.type ~= T_REG and inode.type ~= T_SYM) then return nil, "not a regular file" end
     local blockSize = fs.blockSize
-    local oldBlocks = math.ceil((inode.size or 0) / blockSize)
+    local oldBlocks = dataBlockCount(fs, inode)
     local nBlocks = math.ceil(#content / blockSize)
     for b = 0, nBlocks - 1 do
         local blk = ext2.ensureBlock(fs, inode, b)
@@ -581,6 +635,71 @@ end
 ---@param ino integer
 ---@param content string
 ---@return boolean|nil ok, string|nil err
+--- 写符号链接目标。ext2 的"快速符号链接"把 <=60 字节的目标直接内联在 inode 的 i_block
+--- 区(15 个 u32), 更长的才分配数据块 —— `readSymlink` 正是按 60 字节这个分界读的, 两边必须一致,
+--- 否则短目标会被当成块号读出一堆垃圾(或真正的块内容)。
+---@param fs Ext2Fs
+---@param ino integer
+---@param target string
+---@return boolean|nil ok, string|nil err
+function ext2.setSymlink(fs, ino, target)
+    local inode = ext2.readInode(fs, ino)
+    if not inode or inode.type ~= T_SYM then return nil, "not a symlink" end
+    if #target > 60 then return ext2.writeFile(fs, ino, target) end
+    local s = target .. string.rep("\0", 60 - #target)
+    inode.ptrs = {}
+    for n = 0, 14 do
+        local b1, b2, b3, b4 = s:byte(n * 4 + 1, n * 4 + 4)
+        inode.ptrs[n + 1] = b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
+    end
+    inode.size = #target
+    inode.blocks = 0
+    inode.mtime = math.floor(os.epoch("utc") / 1000)
+    inode.ctime = inode.mtime
+    return ext2.writeInode(fs, inode)
+end
+
+--- 读符号链接目标(不跟随)。非符号链接返回 nil, err。
+---@param fs Ext2Fs
+---@param ino integer
+---@return string|nil target, string|nil err
+function ext2.getSymlink(fs, ino)
+    local inode = ext2.readInode(fs, ino)
+    if not inode then return nil, "no such file" end
+    if inode.type ~= T_SYM then return nil, "not a symlink" end
+    local t = readSymlink(fs, inode)
+    if not t then return nil, "cannot read symlink" end
+    return t
+end
+
+--- 硬链接: 给已存在的 inode 再挂一个目录项并递增 links。
+--- POSIX/Linux 都不允许给目录做硬链接(会成环), 这里明确拒绝。
+---@param fs Ext2Fs
+---@param oldPath string 已存在路径
+---@param newPath string 新链接路径(必须不存在)
+---@return boolean|nil ok, string|nil err
+function ext2.link(fs, oldPath, newPath)
+    local src = ext2.lookup(fs, oldPath)
+    if not src then return nil, "no such file" end
+    if src.type == T_DIR then return nil, "hard link to a directory is not allowed" end
+    local pdir = newPath:match("^(.*)/[^/]*$") or "/"
+    local pname = newPath:match("([^/]*)$") or newPath
+    if pname == "" then return nil, "invalid path" end
+    local parent = ext2.lookup(fs, pdir)
+    if not parent or parent.type ~= T_DIR then return nil, "parent not a dir" end
+    if findDirEntry(fs, parent, pname) then return nil, "file exists" end
+    local c = cred()
+    if not (hasPerm(parent, c.uid, c.gid, 2) and hasPerm(parent, c.uid, c.gid, 1)) then
+        return nil, "permission denied (dir)"
+    end
+    local ok, err = ext2.addDirEntry(fs, parent, pname, src.ino, typeToFileType(src.type))
+    if not ok then return nil, err end
+    local inode = ext2.readInode(fs, src.ino)
+    inode.links = (inode.links or 1) + 1
+    inode.ctime = math.floor(os.epoch("utc") / 1000)
+    return ext2.writeInode(fs, inode)
+end
+
 function ext2.appendFile(fs, ino, content)
     if content == "" then return true end
     local inode = ext2.readInode(fs, ino)
@@ -650,6 +769,9 @@ function ext2.delete(fs, dirPath, name)
         -- 目录的 links 含 "." 与 "..": 删空目录后剩 1 即应回收, 否则会漏一个未连接 inode。
         local free = (child.type == T_DIR) and (child.links <= 1) or (child.links <= 0)
         if free then
+            -- FIFO 的缓冲区挂在 inode 上: inode 回收时必须一起放掉, 否则缓冲区会一直留着,
+            -- 之后在同一位置新建的 FIFO 会"继承"上一个的残留数据与读写端计数。
+            if child.type == T_FIFO then fifo.forget(fs, child.ino) end
             ext2.freeBlocksOfInode(fs, child)
             ext2.freeInode(fs, child.ino)
         else
@@ -698,7 +820,10 @@ function ext2.backend(fs)
             ino = inode.ino,
             links = inode.links,
             mtime = inode.mtime,
-            kind = inode.type == T_DIR and "dir" or (inode.type == T_REG and "file" or (inode.type == T_SYM and "symlink" or "device")),
+            kind = inode.type == T_DIR and "dir"
+                or (inode.type == T_REG and "file"
+                or (inode.type == T_SYM and "symlink"
+                or (inode.type == T_FIFO and "fifo" or "device"))),
         }
     end
     return {
@@ -719,6 +844,48 @@ function ext2.backend(fs)
         isDir = function(rel) local i = ext2.lookup(fs, rel); return i and i.type == T_DIR or false end,
         isFile = function(rel) local i = ext2.lookup(fs, rel); return i and i.type == T_REG or false end,
         attributes = function(rel) local i = ext2.lookup(fs, rel); return i and attr(i) or nil end,
+        -- 符号链接/硬链接。注意 `rel` 已经是**最后一段未被展开**的路径(由 VFS 的
+        -- 不跟随解析给出), 后端只负责这一层的创建/读取。
+        symlink = function(target, rel)
+            local pdir = rel:match("^(.*)/[^/]*$") or "/"
+            local pname = rel:match("([^/]*)$") or rel
+            if pname == "" then return nil, "invalid path" end
+            local c = cred()
+            local parent = ext2.lookup(fs, pdir)
+            if not parent or parent.type ~= T_DIR then return nil, "parent not a dir" end
+            if not (hasPerm(parent, c.uid, c.gid, 2) and hasPerm(parent, c.uid, c.gid, 1)) then
+                return nil, "permission denied (dir)"
+            end
+            local ino, err = ext2.create(fs, pdir, pname, T_SYM + tonumber("777", 8))
+            if not ino then return nil, err end
+            local ok, werr = ext2.setSymlink(fs, ino, target)
+            if not ok then return nil, werr end
+            return true
+        end,
+        readlink = function(rel)
+            local i = ext2.lookup(fs, rel)
+            if not i then return nil, "no such file" end
+            return ext2.getSymlink(fs, i.ino)
+        end,
+        link = function(oldrel, newrel) return ext2.link(fs, oldrel, newrel) end,
+        -- 命名管道(FIFO): 只在 inode 类型上有区别 —— 数据不在文件里, 在 kernel/fifo 的缓冲区里。
+        mkfifo = function(rel, mode)
+            local pdir = rel:match("^(.*)/[^/]*$") or "/"
+            local pname = rel:match("([^/]*)$") or rel
+            if pname == "" then return nil, "invalid path" end
+            local c = cred()
+            local parent = ext2.lookup(fs, pdir)
+            if not parent or parent.type ~= T_DIR then return nil, "parent not a dir" end
+            if not (hasPerm(parent, c.uid, c.gid, 2) and hasPerm(parent, c.uid, c.gid, 1)) then
+                return nil, "permission denied (dir)"
+            end
+            -- mkfifo(1) 的缺省权限是 0666(再由 umask 收窄)。umask 由 shell 侧算好后传进来,
+            -- 这里不做二次收窄, 否则 umask 会被应用两遍。
+            local perm = iperms(mode or tonumber("666", 8))
+            local ino, err = ext2.create(fs, pdir, pname, T_FIFO + perm)
+            if not ino then return nil, err end
+            return true
+        end,
         getSize = function(rel) local i = ext2.lookup(fs, rel); return i and i.size or 0 end,
         getDrive = function() return "ext2" end,
         getFreeSpace = function() return math.max(0, sbFreeBlocks(fs) - fs.rBlocks) * fs.blockSize end,
@@ -726,6 +893,15 @@ function ext2.backend(fs)
         open = function(rel, mode)
             local i = ext2.lookup(fs, rel)
             local c = cred()
+            -- 命名管道: 读写都走 kernel/fifo 的缓冲区, **不能**走到下面的文件路径去
+            -- (那会把 FIFO 当空文件截断/当空内容读)。权限按 open 的方向查(读要 r, 写要 w);
+            -- 打开会阻塞到对端出现, 这是 POSIX 语义(见 kernel/fifo.lua)。
+            if i and i.type == T_FIFO then
+                local wantW = mode and (mode:find("w") or mode:find("a"))
+                local need = wantW and 2 or 4
+                if not hasPerm(i, c.uid, c.gid, need) then return nil, "permission denied (fifo)" end
+                return fifo.open(fs, i.ino, mode or "r")
+            end
             local function checkDirWrite(pdir)
                 local parent = ext2.lookup(fs, pdir)
                 if parent and not (hasPerm(parent, c.uid, c.gid, 2) and hasPerm(parent, c.uid, c.gid, 1)) then
@@ -749,12 +925,32 @@ function ext2.backend(fs)
                 -- 句柄方法同时支持 `.method(s)` 与 `:method(s)`(CC 原生句柄两者皆可)。
                 -- flush/close 把累积内容整体写回(w 模式语义: 全量重写)。
                 local function commit() return ext2.writeFile(fs, i.ino, table.concat(parts)) end
+                -- 句柄是"整表缓冲、close 时全量重写"模型, 所以向后 seek 只能用 0 填充缓冲区
+                -- (逻辑内容与稀疏文件一致, 只是不省块); 向前 seek 做不到, 明确报错而不是假装成功
+                -- —— dd seek= 依赖它, 静默返回 0 会让 dd 悄悄写错位置。
+                local function buflen() local n = 0; for k = 1, #parts do n = n + #parts[k] end; return n end
+                local function seekTo(whence, off)
+                    off = off or 0
+                    local cur = buflen()
+                    local target
+                    if whence == nil or whence == "cur" then target = cur + off
+                    elseif whence == "set" then target = off
+                    elseif whence == "end" then target = cur + off
+                    else return nil, "bad whence" end
+                    if target < 0 then return nil, "negative seek" end
+                    if target < cur then return nil, "cannot seek backwards on a buffered write handle" end
+                    if target > cur then parts[#parts + 1] = string.rep("\0", target - cur) end
+                    return target
+                end
                 return {
                     write = function(self, s) if s == nil then s = self end; parts[#parts + 1] = s; return #s end,
                     writeLine = function(self, s) if s == nil then s = self end; parts[#parts + 1] = s .. "\n"; return #s + 1 end,
                     flush = commit,
                     close = commit,
-                    seek = function() return 0 end,
+                    seek = function(p1, p2, p3)
+                        if type(p1) == "table" then return seekTo(p2, p3) end
+                        return seekTo(p1, p2)
+                    end,
                 }
             end
             if mode and mode:find("a") then
@@ -776,12 +972,22 @@ function ext2.backend(fs)
                     parts = {}
                     return ext2.appendFile(fs, i.ino, data)
                 end
+                -- 追加模式每次 close 都把新内容接到文件末尾, 无法回头改写, 因此只支持
+                -- "当前位置" 查询: 其它 whence 一律明确报错(fail-fast, 见 w 模式处的说明)。
                 return {
                     write = function(self, s) if s == nil then s = self end; parts[#parts + 1] = s; return #s end,
                     writeLine = function(self, s) if s == nil then s = self end; parts[#parts + 1] = s .. "\n"; return #s + 1 end,
                     flush = commit,
                     close = commit,
-                    seek = function() return 0 end,
+                    seek = function(p1, p2, p3)
+                        local whence = (type(p1) == "table") and p2 or p1
+                        local off = (type(p1) == "table") and p3 or p2
+                        if (whence == nil or whence == "cur") and (off == nil or off == 0) then
+                            local n = 0; for k = 1, #parts do n = n + #parts[k] end
+                            return (i.size or 0) + n
+                        end
+                        return nil, "append handle only supports seek(0) to query the position"
+                    end,
                 }
             end
             if not i then return nil, "no such file" end
@@ -816,7 +1022,21 @@ function ext2.backend(fs)
                 end,
                 write = function() end, writeLine = function() end,
                 close = function() end, flush = function() return true end,
-                seek = function() return 0 end,
+                -- 读句柄是"整文件读进内存 + pos"模型, 所以 set/cur/end 三种 whence 都是精确的。
+                -- 与 CC 原生句柄一致: 越界 seek 不报错, 之后的 read 返回空串。
+                seek = function(p1, p2, p3)
+                    local whence, off
+                    if type(p1) == "table" then whence, off = p2, p3 else whence, off = p1, p2 end
+                    off = off or 0
+                    local target
+                    if whence == nil or whence == "cur" then target = pos + off
+                    elseif whence == "set" then target = off
+                    elseif whence == "end" then target = #content + off
+                    else return nil, "bad whence" end
+                    if target < 0 then return nil, "negative seek" end
+                    pos = target
+                    return target
+                end,
             }
         end,
         makeDir = function(rel)
