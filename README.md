@@ -6,7 +6,7 @@
 
 在CC电脑上运行此命令即可安装:
 ```
-wget run https://raw.githubusercontent.com/Hello-World2333/delin/refs/heads/release/0.0.2/install.lua
+wget run https://raw.githubusercontent.com/Hello-World2333/delin/refs/heads/release/0.0.3/install.lua
 ```
 推荐使用ext2安装，因为Delin在CCFS上不支持文件权限。  
 安装后使用用户名root和密码12345678登录。

@@ -1739,7 +1739,7 @@ end)
 -- ---------------------------------------------------------------
 -- case 4: custom 镜像大小
 -- ---------------------------------------------------------------
-runCase("4", "EXT2 + custom image size 640 KB", function()
+runCase("4", "EXT2 + custom image size 896 KB", function()
     local w = newSession({ name = "case4-custom-size", capacity = 4 * 1024 * 1024, drives = { "left" } })
     out("  dir: " .. w.dir .. "\n")
     w:play({ key = keys.down })   -- CCFS -> EXT2
@@ -1751,8 +1751,8 @@ runCase("4", "EXT2 + custom image size 640 KB", function()
     w:play({ key = keys.enter })  -- 打开 custom 数字输入
     -- 实现约定: 自定义数字框**从空串开始**(不预填当前值, 免得改数字要先擦)。
     -- 所以这里不能先按退格 —— 空框上再按退格是"回上一步"(见 case 3b)。
-    w:playText("640")
-    w:play({ key = keys.enter })  -- 收下 640 KB
+    w:playText("896")
+    w:play({ key = keys.enter })  -- 收下 896 KB
     w:play({ key = keys.enter })  -- 5 摘要 = Start installation
     w:play({ key = keys.enter })  -- 装完提示键
     w:play({ key = keys.enter })
@@ -1773,7 +1773,7 @@ runCase("4", "EXT2 + custom image size 640 KB", function()
     else
         ok(false, "Image size 列表渲染过")
     end
-    ok(logHas(w, "making ext2 image: 640 KB"), "日志含 'making ext2 image: 640 KB'",
+    ok(logHas(w, "making ext2 image: 896 KB"), "日志含 'making ext2 image: 896 KB'",
        "log: " .. short(w:log() or "", 400))
     ok(logHas(w, "Install OK"), "日志含 Install OK")
     ok(ext2MagicOk(w:hostPath("/parts/root.img")), "镜像 magic 0xEF53")

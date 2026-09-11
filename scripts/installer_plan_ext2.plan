@@ -1,7 +1,9 @@
-# 真机计划: EXT2 -> 电脑自身存储, 镜像大小手输 512 KB, 装完按回车重启进 Delin
+# 真机计划: EXT2 -> 电脑自身存储, 镜像大小手输 1024 KB, 装完按回车重启进 Delin
 # 用法见 README「安装」与 scripts/installer_interactive_test.lua 的注释。
 # 注意第 1 步的 step 计数是 1/4(此刻还是 CCFS, 没有 size 那一步), 选了 EXT2 之后变成 n/5。
-url http://127.0.0.1:10568/0.0.2/install.lua
+# 手输的容量必须 >= installer 的 autoBlocks 结果(0.0.3 的 payload 已 607 KB, auto 算出 832 KB),
+# 否则 ext2 写到一半就 fail-fast 报 "no block"。这里留余量取 1024 KB。
+url http://127.0.0.1:10568/0.0.3/install.lua
 wait wizard step 1/4: type
 key down
 key enter
@@ -17,7 +19,7 @@ key down
 key down
 key enter
 wait wizard input: Image size
-text 512
+text 1024
 key enter
 wait wizard step 5/5: summary
 key enter

@@ -95,7 +95,7 @@ end
 -- ---------------------------------------------------------------
 local loadDir = nil  -- 真实 fs 目录, 由 boot 初始化
 
----@param dir string 模块目录(modules.fs 是真 fs 时为真实路径, 如 "disk/lib/modules/0.0.2"; 为 vfs 时为 VFS 路径, 如 "/lib/modules/0.0.2")
+---@param dir string 模块目录(modules.fs 是真 fs 时为真实路径, 如 "disk/lib/modules/0.0.3"; 为 vfs 时为 VFS 路径, 如 "/lib/modules/0.0.3")
 function modules.init(dir)
     loadDir = dir
 end

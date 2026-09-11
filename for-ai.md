@@ -539,6 +539,11 @@ sysfs 也从 display 专用泛化成 class 注册表（模块用 `kapi.registerS
 （如 `/boot/delin.lua`）。BIOS 启动前有 0.1s 窗口，按 `DELETE` 进 BIOS 设置（`C` 进 CraftOS shell），
 无 `/.boot` 的设备不会被选为引导设备。
 
+**BIOS 的版本号是它自己的，不跟内核版本走**：BIOS 是独立启动器（虽然属于 Delin 项目），
+`src/bios/startup.lua` 里的 `Delin BIOS x.y.z` 字面量与 `src/kernel/version.lua` **无关**，
+升内核版本时**不要**顺手改它，`tools/build.lua` 也没有（不该有）两者的版本一致性门禁 ——
+所以 `dist/release/<版本>/payload/startup.lua` 里的 BIOS 横幅显示旧版本是正常的，不是漏改。
+
 两条引导路径：
 
 - **CC-fs 引导**（默认）：`kernel.lua` 直接跑 `boot.boot()`——`setupVfs` 挂根 hdd 到 `/` +
@@ -884,6 +889,7 @@ python3 ~/docs/tools/rcon.py "computercraft turn-on #3"   # 注入按键走完�
 src/kernel/version.lua     版本号唯一真源(`return "x.y.z"`, 同时是 /lib/modules/<version>/ 的目录名)
 src/bios/startup.lua       Delin BIOS(装到电脑自身 FS 的 /startup.lua): 扫描设备的 /.boot -> loadfile
                            引导入口; DELETE 进设置 TUI, C 进 CraftOS shell
+                           (版本号独立, 不与 src/kernel/version.lua 同步, 见"引导"一节)
 src/kernel/scheduler.lua   协程调度器(事件循环) + resume 前信号投递
 src/kernel/process.lua     进程表/进程树/spawn/隔离 env + cwd + argv + 会话/进程组/信号/作业控制
                             + 子进程退出钩子(init 服务监督) + opts.ppid
