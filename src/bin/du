@@ -1,0 +1,241 @@
+-- Delin du: 估算文件/目录占用空间 (POSIX/GNU du 子集)。
+-- 用法: du [-a] [-s] [-k] [-h] [-c] [-x] [-b] [--max-depth=N] [FILE...]
+-- 选项:
+--   -a, --all              连普通文件一起列出(缺省只列目录)
+--   -s, --summarize        只输出每个操作数的总计(等价 --max-depth=0)
+--   -k                     块大小按 1024 字节计
+--   -b, --bytes            按精确字节数输出(GNU apparent-size, 不做块取整)
+--   -h, --human-readable   人类可读(512 / 4.0K / 2.9G 风格)
+--   -c, --total            最后追加一行 "total" 总计
+--   -x, --one-file-system  不跨文件系统(用 fs.getDrive 判断, 见偏离 4)
+--   --block-size=N         块大小 N 字节(正整数)
+--   --max-depth=N          只列到第 N 层(操作数自身是第 0 层); --max-depth N 亦可
+--   --                     之后一律按操作数处理
+-- 输出: 每行 "大小<TAB>路径"(POSIX du 就是 TAB 分隔, 已与宿主 GNU du 逐字节核对)。
+--       缺省块大小 512 字节(POSIX 默认; GNU du 缺省是 1024, 对照时请用 du --block-size=512)。
+--       无操作数时操作数是当前目录 "."。
+--
+-- 已知偏离(GNU du 对照, 全部在报告里明列):
+-- 1) 目录自身按 0 字节计。Delin 的 fs.getSize 对目录返回 0(内核不编造目录大小, 见
+--    src/kernel/ext2.lua 的 getSize 与 src/kernel/vfs_api.lua), 所以只有**文件内容**计入
+--    目录树; 真实 GNU du 走 st_blocks, ext4 上每个目录自身还要算 4096 字节。于是
+--    "Delin 结果 == 宿主 du 结果 - 4096 × 目录数"(字节), 对照时必须解释这个差值来源。
+-- 2) 不做硬链接去重。内核 fs.attributes() 不提供 ino/链接计数(见
+--    src/kernel/ext2.lua 的 attributes 只给 size/isDir/mode/uid/gid/mtime/kind), 无法识别
+--    同一 inode, 同一文件被 fs.link 链接多次会重复计入。不做静默近似, 直接不实现。
+-- 3) 跳过块设备与虚拟文件系统条目: 路径在 /dev、/proc、/sys 之下, 或
+--    fs.attributes(p).kind == "device"(ext2 的字符/块设备 inode)的条目, 递归时不计数也不列出。
+--    宿主测试台 fs.attributes 没有 kind 字段, 所以测试台上只有路径前缀生效。
+--    显式作为操作数给出的路径不套用该过滤(用户点名要看就照看), 过滤只作用于递归子条目。
+-- 4) -x 用 fs.getDrive 判断。真机 fs 门面的 getDrive 返回的是**后端类型**
+--    ("ext2"/"proc"/"sys"/CC 盘名), 不是挂载点 id, 所以两个 ext2 挂载点之间的跨越检测不出来;
+--    宿主测试台的 getDrive 返回路径首段("mnt/cc" -> "mnt"), 语义与真机不同。两处都是已知限制。
+--    另外: 若操作数自身的 getDrive 给不出盘名(nil 或空串, 例如真机上路径正好等于某个
+--    挂载根 "/" 时 vfs 会把相对路径归成空串再交给 CC fs.getDrive), 本工具**报错退出**
+--    而不是当作"所有子目录都在别的文件系统上"从而静默算出 0。
+-- 5) 单文件按块向上取整: Delin 没有 st_blocks, 只能把 fs.getSize 向上取整到块大小来估算;
+--    GNU 用的是实际分配块数。文件大小恰是块大小整数倍时两者一致。
+-- 6) 单独 "-" 不是操作数: du 不读 stdin(POSIX du 没有 stdin 语义), 遇到 "-" 直接报
+--    "No such file or directory" 并 return 1(SPEC 的"单独的 - 是操作数"在 du 上按任务特判)。
+-- 7) 每个目录里的条目先按名字排序再遍历(fs.list 顺序由后端决定), 使输出可复现;
+--    GNU 用 readdir 顺序(FTS)。
+-- 8) -h 显示的是精确字节总量的人类可读形式(等价 -b -h); GNU 的 -h 显示 st_blocks 磁盘占用量。
+-- 9) -s 与 -a 同时给出时以 -s 为准(GNU 9.x 直接报错 "cannot both summarize and show all entries")。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+local function ioeMsg(err)
+    if err and (err:find("permission") or err:find("denied")) then return "Permission denied" end
+    -- 注意顺序: "No such file or directory" 里也有 "directory", 先判 ENOENT,
+    -- 否则缺文件会被误报成 "Is a directory"(wc/cat 那版模板就有这个问题)。
+    if err and (err:find("[Nn]o such") or err:find("not found")) then return "No such file or directory" end
+    -- 必须先判 ENOENT: "No such file or directory" 里本来就含 "directory" 这个词,
+    -- 先匹 "directory" 会把"文件不存在"误报成 "Is a directory"(老模板的 bug)。
+    if err and err:lower():find("no such file") then return "No such file or directory" end
+    if err and err:find("directory") then return "Is a directory" end
+    return "No such file or directory"
+end
+
+local showAll, summarize, oneFs, totalOpt = false, false, false, false
+local blockSize, humanOut = 512, false
+local maxDepth, operands, noMoreOpts = math.huge, {}, false
+
+local function setShort(ch)
+    if ch == "a" then showAll = true
+    elseif ch == "s" then summarize = true
+    elseif ch == "k" then blockSize, humanOut = 1024, false
+    elseif ch == "b" then blockSize, humanOut = 1, false
+    elseif ch == "h" then blockSize, humanOut = 1, true
+    elseif ch == "c" then totalOpt = true
+    elseif ch == "x" then oneFs = true
+    else stderr("du: invalid option -- '" .. ch .. "'\n"); return false end
+    return true
+end
+
+local function setMaxDepth(s)
+    local n = tonumber(s)
+    if not n or n < 0 or n ~= math.floor(n) then
+        stderr("du: invalid maximum depth '" .. tostring(s) .. "'\n")
+        return false
+    end
+    maxDepth = n
+    return true
+end
+
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if noMoreOpts then
+        operands[#operands + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "--all" then showAll = true
+    elseif a == "--summarize" then summarize = true
+    elseif a == "--bytes" then blockSize, humanOut = 1, false
+    elseif a == "--human-readable" then blockSize, humanOut = 1, true
+    elseif a == "--total" then totalOpt = true
+    elseif a == "--one-file-system" then oneFs = true
+    elseif a == "--max-depth" then
+        if not args[i + 1] then stderr("du: option '--max-depth' requires an argument\n"); return 1 end
+        if not setMaxDepth(args[i + 1]) then return 1 end
+        i = i + 1
+    elseif a:match("^%-%-max%-depth=") then
+        if not setMaxDepth(a:sub(13)) then return 1 end
+    elseif a:match("^%-%-block%-size=") then
+        local s = a:sub(14)
+        local n = tonumber(s)
+        if not n or n < 1 or n ~= math.floor(n) then
+            stderr("du: invalid block size '" .. s .. "'\n")
+            return 1
+        end
+        blockSize, humanOut = n, false
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        for k = 2, #a do if not setShort(a:sub(k, k)) then return 1 end end
+    else
+        operands[#operands + 1] = a
+    end
+    i = i + 1
+end
+if summarize then maxDepth = 0 end
+
+--- 人类可读: 1024 进制, 值 < 10 保留 1 位小数, 一律向上取整(GNU du/df -h 的舍入方向)。
+local function human(n)
+    if n < 1024 then return string.format("%d", n) end
+    local units = { "K", "M", "G", "T", "P", "E" }
+    local idx, v = 1, n / 1024
+    while v >= 1024 and idx < #units do v = v / 1024; idx = idx + 1 end
+    if v < 10 then
+        local tenths = math.ceil(v * 10) / 10
+        if tenths < 10 then return string.format("%.1f", tenths) .. units[idx] end
+    end
+    local iv = math.ceil(v)
+    if iv >= 1024 and idx < #units then iv, idx = 1, idx + 1 end
+    return string.format("%d", iv) .. units[idx]
+end
+
+--- 一个文件的占用: 向上取整到块大小(blockSize==1 时即精确字节数)。
+local function roundUp(size)
+    return math.ceil(size / blockSize) * blockSize
+end
+
+local function emit(bytes, path, depth)
+    if depth > maxDepth then return end
+    local s = humanOut and human(bytes) or string.format("%d", bytes / blockSize)
+    io.write(s .. "\t" .. path .. "\n")
+end
+
+--- /dev、/proc、/sys 下的条目(块设备与虚拟文件系统)在递归中一律跳过。
+local function isVirtual(p)
+    return p == "/dev" or p == "/proc" or p == "/sys"
+        or p:sub(1, 5) == "/dev/" or p:sub(1, 6) == "/proc/" or p:sub(1, 5) == "/sys/"
+end
+
+--- ext2 的字符/块设备 inode(kind == "device"); 宿主测试台没有 kind 字段, 恒为 false。
+local function isDeviceNode(p)
+    local a = fs.attributes(p)
+    return a ~= nil and a.kind == "device"
+end
+
+local function joinPath(dir, name)
+    if dir == "/" then return "/" .. name end
+    return dir .. "/" .. name
+end
+
+--- 递归一个目录: 返回该子树(向上取整后的)字节总量, 并按深度/选项决定是否列出自己。
+local function walk(dir, dispSelf, dispBase, depth, drive)
+    local names = fs.list(dir) or {}
+    table.sort(names)
+    local total = 0
+    for _, n in ipairs(names) do
+        if n ~= "." and n ~= ".." then
+            local child = joinPath(dir, n)
+            local cdisp = joinPath(dispBase, n)
+            if not isVirtual(child) then
+                if fs.isDir(child) then
+                    if not (oneFs and fs.getDrive(child) ~= drive) then
+                        total = total + walk(child, cdisp, cdisp, depth + 1, drive)
+                    end
+                elseif not isDeviceNode(child) then
+                    local bytes = roundUp(fs.getSize(child))
+                    if showAll then emit(bytes, cdisp, depth + 1) end
+                    total = total + bytes
+                end
+            end
+        end
+    end
+    emit(total, dispSelf, depth)
+    return total
+end
+
+if #operands == 0 then operands = { "." } end
+
+local grand = 0
+for _, raw in ipairs(operands) do
+    if raw == "-" then
+        -- 不是操作数, 也不是 stdin: 按"不存在的路径"报错(POSIX du 没有 stdin 语义)。
+        stderr("du: -: No such file or directory\n")
+        return 1
+    end
+    local path = resolve(raw)
+    if not fs.exists(path) then
+        stderr("du: " .. raw .. ": No such file or directory\n")
+        return 1
+    end
+    local dispBase = raw:gsub("/+$", "")
+    if dispBase == "" then dispBase = "/" end
+    local total
+    if fs.isDir(path) then
+        local drive = nil
+        if oneFs then
+            drive = fs.getDrive(path)
+            if drive == nil or drive == "" then
+                stderr("du: -x: cannot determine the filesystem of '" .. raw
+                    .. "': fs.getDrive returned no drive name\n")
+                return 1
+            end
+        end
+        total = walk(path, raw, dispBase, 0, drive)
+    else
+        total = roundUp(fs.getSize(path))
+        emit(total, raw, 0)
+    end
+    grand = grand + total
+end
+
+if totalOpt then
+    local s = humanOut and human(grand) or string.format("%d", grand / blockSize)
+    io.write(s .. "\ttotal\n")
+end

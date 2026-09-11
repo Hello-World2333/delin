@@ -1,0 +1,802 @@
+-- Delin patch: 把 diff 生成的补丁应用回文件 (POSIX patch(1) 子集)。
+-- 用法: patch [选项]... [原文件 [补丁文件]]
+-- 支持的补丁格式: unified(`--- a/x`/`+++ b/x` + `@@`)、context(`*** `/`--- ` + `********`)、
+--   normal(`5c5` 指令 + `<`/`>` 行)。多文件 unified 补丁逐文件处理。
+-- 选项:
+--   -p N, --strip=N          从补丁头文件名里剥掉 N 层前缀(`-p1` 与 `-p 1` 都行)
+--   -i FILE, --input=FILE    从 FILE 读补丁(缺省: 补丁文件操作数, 再缺省 stdin)
+--   -o FILE, --output=FILE   结果写到 FILE(原文件不动); 只允许单文件补丁
+--   -R, --reverse            反向应用(把 + 当 -, 反之亦然)
+--   -b, --backup             写回前把原文件备份为 <文件>.orig
+--   -d DIR, --directory=DIR  先把工作目录切到 DIR(相对路径都相对它解析)
+--   -f, --force              假定用户知道自己在做什么(不因"疑似已应用"而跳过)
+--   -N, --forward            忽略"看起来已经应用过/反向"的补丁
+--   -l, --ignore-whitespace  匹配上下文时忽略空白差异(行尾空白忽略, 空白串等价)
+--   --dry-run                只演算不落盘(打印 `checking file ...`)
+--   --                       结束选项
+-- 行为与退出码: 0 = 全部应用成功; 1 = 有 hunk 失败或被忽略(会写 <文件>.rej);
+--   2 = 严重错误(选项/补丁无法解析/找不到要打补丁的文件)。
+-- 已知偏离:
+--   * hunk 定位用**上下文匹配**: 先按期望行号, 再在文件里顺序搜索; fuzz 只允许丢 1 行
+--     首/尾上下文(GNU 缺省允许 2 行 —— 这里按规格收紧, 报告里注明)。
+--   * 非交互: GNU 在"补丁疑似已应用"时会问 `Assume -R?`, 在"找不到文件"时会问
+--     `File to patch:`。Delin 的 patch 没有可用的交互 tty 通道(stdin 常是补丁本身),
+--     因此这两种情况一律: 打印同样的诊断行, 该 hunk 记为 ignored 并最终退出 1。
+--   * 不做 GNU 的"mismatch 时自动备份"; 只有 -b 才写 .orig(行为更可预测)。
+--   * -p 缺省时按补丁头的名字原样使用(与 GNU 一致); 不自动剥离目录前缀,
+--     需要剥前缀请显式给 -p N。
+--   * 时间戳行(文件名后跟 TAB + 日期)在读入时整体丢掉。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local workDir = nil -- -d DIR 之后的工作目录
+local function resolve(p)
+    p = p or ""
+    local base = workDir or cwd
+    if p == "" then return (base == "/") and "/" or base end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local b = (base == "/") and "" or base
+    return (b .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+local function ioeMsg(err)
+    if err and (err:find("permission") or err:find("denied")) then return "Permission denied" end
+    -- 注意顺序: "No such file or directory" 里也有 "directory", 先判 ENOENT,
+    -- 否则缺文件会被误报成 "Is a directory"(wc/cat 那版模板就有这个问题)。
+    if err and (err:find("[Nn]o such") or err:find("not found")) then return "No such file or directory" end
+    -- 必须先判 ENOENT: "No such file or directory" 里本来就含 "directory" 这个词,
+    -- 先匹 "directory" 会把"文件不存在"误报成 "Is a directory"(老模板的 bug)。
+    if err and err:lower():find("no such file") then return "No such file or directory" end
+    if err and err:find("directory") then return "Is a directory" end
+    return "No such file or directory"
+end
+
+-- ---------------------------------------------------------------
+-- 选项解析
+-- ---------------------------------------------------------------
+local opt = {
+    strip = nil, input = nil, output = nil, dir = nil,
+    reverse = false, backup = false, force = false, forward = false,
+    loose = false, dryrun = false,
+}
+local operands = {}
+
+local function needArg(a, i, ch)
+    if i > #args then
+        stderr("patch: option requires an argument -- '" .. ch .. "'\n")
+        return nil
+    end
+    return args[i]
+end
+
+local i = 1
+local noMoreOpts = false
+while i <= #args do
+    local a = args[i]
+    if noMoreOpts then
+        operands[#operands + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "-" then
+        operands[#operands + 1] = a
+    elseif a:sub(1, 2) == "--" then
+        local name, val = a:match("^%-%-([^=]+)=(.*)$")
+        if not name then name = a:sub(3) end
+        if name == "strip" then
+            if not val then i = i + 1; val = needArg(a, i, "strip") end
+            if not val or not tonumber(val) then stderr("patch: invalid strip count\n"); return 2 end
+            opt.strip = tonumber(val)
+        elseif name == "input" then
+            if not val then i = i + 1; val = needArg(a, i, "input") end
+            if not val then return 2 end
+            opt.input = val
+        elseif name == "output" then
+            if not val then i = i + 1; val = needArg(a, i, "output") end
+            if not val then return 2 end
+            opt.output = val
+        elseif name == "directory" then
+            if not val then i = i + 1; val = needArg(a, i, "directory") end
+            if not val then return 2 end
+            opt.dir = val
+        elseif name == "reverse" then opt.reverse = true
+        elseif name == "backup" then opt.backup = true
+        elseif name == "force" then opt.force = true
+        elseif name == "forward" then opt.forward = true
+        elseif name == "ignore-whitespace" then opt.loose = true
+        elseif name == "dry-run" then opt.dryrun = true
+        elseif name == "posix" then
+            -- POSIX 模式: 本实现本来就按 POSIX 语义, 接受并忽略
+        else
+            stderr("patch: unrecognized option '--" .. name .. "'\n")
+            return 2
+        end
+    elseif a:sub(1, 1) == "-" and #a > 1 then
+        local k = 2
+        while k <= #a do
+            local ch = a:sub(k, k)
+            if ch == "p" or ch == "i" or ch == "o" or ch == "d" then
+                local val = a:sub(k + 1)
+                if val == "" then
+                    i = i + 1
+                    val = needArg(a, i, ch)
+                    if not val then return 2 end
+                end
+                if ch == "p" then
+                    if not tonumber(val) then stderr("patch: invalid strip count '" .. val .. "'\n"); return 2 end
+                    opt.strip = tonumber(val)
+                elseif ch == "i" then opt.input = val
+                elseif ch == "o" then opt.output = val
+                else opt.dir = val end
+                k = #a + 1
+            elseif ch == "R" then opt.reverse = true; k = k + 1
+            elseif ch == "b" then opt.backup = true; k = k + 1
+            elseif ch == "f" then opt.force = true; k = k + 1
+            elseif ch == "N" then opt.forward = true; k = k + 1
+            elseif ch == "l" then opt.loose = true; k = k + 1
+            elseif ch == "r" then
+                -- GNU 的历史选项(把整个目录当文件): Delin 只支持文件, 明确报错
+                stderr("patch: -r (treat directories as files) is not supported\n")
+                return 2
+            else
+                stderr("patch: invalid option -- '" .. ch .. "'\n")
+                return 2
+            end
+        end
+    else
+        operands[#operands + 1] = a
+    end
+    i = i + 1
+end
+
+if opt.dir then
+    local d = resolve(opt.dir)
+    if not fs.isDir(d) then
+        stderr("patch: " .. opt.dir .. ": " .. (fs.exists(d) and "Not a directory" or "No such file or directory") .. "\n")
+        return 2
+    end
+    workDir = d
+end
+
+-- 操作数: [原文件 [补丁文件]]。-i 给了就只剩原文件。
+local origFile, patchFile
+if opt.input then
+    if #operands > 1 then
+        stderr("patch: extra operand '" .. operands[2] .. "'\n")
+        return 2
+    end
+    origFile = operands[1]
+else
+    if #operands > 2 then
+        stderr("patch: extra operand '" .. operands[3] .. "'\n")
+        return 2
+    end
+    origFile, patchFile = operands[1], operands[2]
+end
+
+-- ---------------------------------------------------------------
+-- 读补丁文本
+-- ---------------------------------------------------------------
+local function readWhole(path)
+    if path == nil or path == "-" then
+        local h = io.stdin()
+        if not h then error("patch: standard input is not available") end
+        return h.readAll() or ""
+    end
+    local p = resolve(path)
+    local f, err = fs.open(p, "r")
+    if not f then
+        stderr("patch: " .. p .. ": " .. ioeMsg(err) .. "\n")
+        return nil
+    end
+    local s = f.readAll() or ""
+    f.close()
+    return s
+end
+
+local patchText = readWhole(opt.input or patchFile)
+if patchText == nil then return 2 end
+
+--- 拆成行表(丢掉行尾 \n, 保留空行)。
+local function splitLines(s)
+    local out = {}
+    local pos = 1
+    while true do
+        local nl = s:find("\n", pos, true)
+        if not nl then
+            if pos <= #s then out[#out + 1] = s:sub(pos) end
+            return out
+        end
+        out[#out + 1] = s:sub(pos, nl - 1)
+        pos = nl + 1
+    end
+end
+
+--- 去掉补丁头文件名后面的时间戳(TAB 之后全部丢掉)。
+local function cleanName(s)
+    if not s then return nil end
+    s = s:match("^([^\t]*)\t") or s
+    s = s:gsub("%s+$", "")
+    if s == "" then return nil end
+    return s
+end
+
+--- 按 -p N 剥掉 N 层前缀。返回 nil 表示剥没了(GNU 会报 "can't find file to patch")。
+local function stripName(name, n)
+    if n == nil then return name end
+    local s = name
+    for _ = 1, n do
+        local rest = s:match("^[^/]*/(.*)$")
+        if not rest then return nil end
+        s = rest
+    end
+    return s
+end
+
+-- ---------------------------------------------------------------
+-- 补丁解析
+-- 每个 hunk: { oldStart, oldCount, newStart, newCount, ops = {{k=" "/"-"/"+", t=.., noEol=bool}}, raw = {...} }
+-- ---------------------------------------------------------------
+local function newHunk()
+    return { ops = {}, raw = {} }
+end
+
+--- 解析 unified 的 hunk(@@ 头之后的正文由调用方按计数读取)。
+local function parseUnifiedBody(lines, i, hunk)
+    local oldLeft, newLeft = hunk.oldCount, hunk.newCount
+    while oldLeft > 0 or newLeft > 0 do
+        local l = lines[i]
+        if l == nil then
+            stderr("patch: **** unexpected end of file in patch\n")
+            return nil
+        end
+        local c = l:sub(1, 1)
+        if c == "\\" then
+            -- "\ No newline at end of file": 标记上一行没有换行符
+            local prev = hunk.ops[#hunk.ops]
+            if prev then prev.noEol = true end
+            hunk.raw[#hunk.raw + 1] = l
+            i = i + 1
+        elseif c == "-" then
+            hunk.ops[#hunk.ops + 1] = { k = "-", t = l:sub(2) }
+            hunk.raw[#hunk.raw + 1] = l
+            oldLeft = oldLeft - 1
+            i = i + 1
+        elseif c == "+" then
+            hunk.ops[#hunk.ops + 1] = { k = "+", t = l:sub(2) }
+            hunk.raw[#hunk.raw + 1] = l
+            newLeft = newLeft - 1
+            i = i + 1
+        elseif c == " " then
+            hunk.ops[#hunk.ops + 1] = { k = " ", t = l:sub(2) }
+            hunk.raw[#hunk.raw + 1] = l
+            oldLeft, newLeft = oldLeft - 1, newLeft - 1
+            i = i + 1
+        elseif l == "" then
+            -- 有些工具会把"空上下文行"的行首空格吃掉, 容错按空上下文行处理
+            hunk.ops[#hunk.ops + 1] = { k = " ", t = "" }
+            hunk.raw[#hunk.raw + 1] = l
+            oldLeft, newLeft = oldLeft - 1, newLeft - 1
+            i = i + 1
+        else
+            stderr("patch: **** malformed patch at line " .. i .. ": " .. l .. "\n")
+            return nil
+        end
+    end
+    return i
+end
+
+local function parsePatch(lines)
+    local sections = {}
+    local i, n = 1, #lines
+    while i <= n do
+        local l = lines[i]
+        if l:match("^%-%-%- ") and lines[i + 1] and lines[i + 1]:match("^%+%+%+ ") then
+            -- ---------------- unified ----------------
+            local sec = { oldName = cleanName(l:sub(5)), newName = cleanName(lines[i + 1]:sub(5)), hunks = {} }
+            i = i + 2
+            while i <= n and lines[i]:match("^@@") do
+                local a1, a2, b1, b2 = lines[i]:match("^@@ %-(%d+),?(%d*) %+(%d+),?(%d*) @@")
+                if not a1 then
+                    stderr("patch: **** malformed unified hunk header: " .. lines[i] .. "\n")
+                    return nil
+                end
+                local hunk = newHunk()
+                hunk.oldStart = tonumber(a1)
+                hunk.oldCount = (a2 == "") and 1 or tonumber(a2)
+                hunk.newStart = tonumber(b1)
+                hunk.newCount = (b2 == "") and 1 or tonumber(b2)
+                hunk.raw[#hunk.raw + 1] = lines[i]
+                i = i + 1
+                local ni = parseUnifiedBody(lines, i, hunk)
+                if not ni then return nil end
+                i = ni
+                sec.hunks[#sec.hunks + 1] = hunk
+            end
+            if #sec.hunks == 0 then
+                stderr("patch: **** no hunks found after header for " .. tostring(sec.oldName) .. "\n")
+                return nil
+            end
+            sections[#sections + 1] = sec
+        elseif l:match("^%*%*%* ") and lines[i + 1] and lines[i + 1]:match("^%-%-%- ") then
+            -- ---------------- context ----------------
+            local sec = { oldName = cleanName(l:sub(5)), newName = cleanName(lines[i + 1]:sub(5)), hunks = {} }
+            i = i + 2
+            while i <= n and lines[i]:match("^%*%*%*%*%*%*%*%*%*%*%*%*%*%*%*") do
+                i = i + 1 -- 吃掉 "***************"
+                local h1 = lines[i]
+                local a1, a2
+                if h1 then a1, a2 = h1:match("^%*%*%* (%d+),?(%d*) %*%*%*%*$") end
+                if not a1 then
+                    stderr("patch: **** malformed context hunk header: " .. tostring(h1) .. "\n")
+                    return nil
+                end
+                local hunk = newHunk()
+                hunk.oldStart = tonumber(a1)
+                local aEnd = (a2 == "") and tonumber(a1) or tonumber(a2)
+                hunk.oldCount = (aEnd >= hunk.oldStart) and (aEnd - hunk.oldStart + 1) or 0
+                hunk.raw[#hunk.raw + 1] = h1
+                i = i + 1
+                -- 左半正文(有删除行时才存在; GNU 对纯新增的 hunk 不打印正文)
+                local leftBody = {}
+                local hasLeft = false
+                if lines[i] and not lines[i]:match("^%-%-%- %d") then
+                    hasLeft = true
+                    for _ = 1, hunk.oldCount do
+                        local bl = lines[i]
+                        if bl == nil then
+                            stderr("patch: **** unexpected end of context hunk\n"); return nil
+                        end
+                        leftBody[#leftBody + 1] = bl
+                        hunk.raw[#hunk.raw + 1] = bl
+                        i = i + 1
+                    end
+                end
+                local h2 = lines[i]
+                local b1, b2
+                if h2 then b1, b2 = h2:match("^%-%-%- (%d+),?(%d*) %-%-%-%-$") end
+                if not b1 then
+                    stderr("patch: **** malformed context hunk header: " .. tostring(h2) .. "\n")
+                    return nil
+                end
+                hunk.newStart = tonumber(b1)
+                local bEnd = (b2 == "") and tonumber(b1) or tonumber(b2)
+                hunk.newCount = (bEnd >= hunk.newStart) and (bEnd - hunk.newStart + 1) or 0
+                hunk.raw[#hunk.raw + 1] = h2
+                i = i + 1
+                local rightBody = {}
+                local hasRight = false
+                do
+                    local bl = lines[i]
+                    if bl and (bl:sub(1, 2) == "  " or bl:sub(1, 2) == "+ " or bl:sub(1, 2) == "! " or bl == "") then
+                        hasRight = true
+                        for _ = 1, hunk.newCount do
+                            bl = lines[i]
+                            if bl == nil then
+                                stderr("patch: **** unexpected end of context hunk\n"); return nil
+                            end
+                            rightBody[#rightBody + 1] = bl
+                            hunk.raw[#hunk.raw + 1] = bl
+                            i = i + 1
+                        end
+                    end
+                end
+                -- 把左右两半合并成 unified 风格的 ops 序列。
+                -- 纯新增: 左半被 GNU 省略(正文只有右半); 纯删除: 右半被省略。
+                if not hasLeft and not hasRight then
+                    stderr("patch: **** context hunk has no body\n"); return nil
+                end
+                if not hasLeft then
+                    for _, bl in ipairs(rightBody) do
+                        local mark, text = bl:sub(1, 2), bl:sub(3)
+                        if mark == "  " then hunk.ops[#hunk.ops + 1] = { k = " ", t = text }
+                        else hunk.ops[#hunk.ops + 1] = { k = "+", t = text } end
+                    end
+                elseif not hasRight then
+                    for _, bl in ipairs(leftBody) do
+                        local mark, text = bl:sub(1, 2), bl:sub(3)
+                        if mark == "  " then hunk.ops[#hunk.ops + 1] = { k = " ", t = text }
+                        else hunk.ops[#hunk.ops + 1] = { k = "-", t = text } end
+                    end
+                else
+                    -- 两半都在: 上下文行两边各出现一次, `!` 表示"该块是替换", 成对配成 -/+。
+                    local li, ri = 1, 1
+                    while li <= #leftBody or ri <= #rightBody do
+                        local lm = leftBody[li] and leftBody[li]:sub(1, 2)
+                        local rm = rightBody[ri] and rightBody[ri]:sub(1, 2)
+                        if lm == "  " and rm == "  " then
+                            hunk.ops[#hunk.ops + 1] = { k = " ", t = leftBody[li]:sub(3) }
+                            li, ri = li + 1, ri + 1
+                        elseif lm == "- " or lm == "! " then
+                            if lm == "! " then
+                                -- 替换块: 先记删除, 后记新增(与 unified 顺序一致)
+                                hunk.ops[#hunk.ops + 1] = { k = "-", t = leftBody[li]:sub(3) }
+                                li = li + 1
+                            else
+                                hunk.ops[#hunk.ops + 1] = { k = "-", t = leftBody[li]:sub(3) }
+                                li = li + 1
+                            end
+                        elseif rm == "+ " or rm == "! " then
+                            hunk.ops[#hunk.ops + 1] = { k = "+", t = rightBody[ri]:sub(3) }
+                            ri = ri + 1
+                        else
+                            stderr("patch: **** malformed context hunk body\n")
+                            return nil
+                        end
+                    end
+                end
+                sec.hunks[#sec.hunks + 1] = hunk
+            end
+            if #sec.hunks == 0 then
+                stderr("patch: **** no hunks found in context patch\n")
+                return nil
+            end
+            sections[#sections + 1] = sec
+        elseif l:match("^%d+[,%d]*[acd]%d+") then
+            -- ---------------- normal ----------------
+            local sec = { oldName = nil, newName = nil, hunks = {} }
+            while i <= n do
+                local l2 = lines[i]
+                local a1, a2, cmd, b1, b2 = l2:match("^(%d+),?(%d*)([acd])(%d+),?(%d*)$")
+                if not a1 then break end
+                local hunk = newHunk()
+                hunk.raw[#hunk.raw + 1] = l2
+                local aEnd = (a2 == "") and tonumber(a1) or tonumber(a2)
+                local bEnd = (b2 == "") and tonumber(b1) or tonumber(b2)
+                hunk.oldStart = tonumber(a1)
+                hunk.newStart = tonumber(b1)
+                if cmd == "a" then
+                    hunk.oldCount = 0
+                    hunk.newCount = bEnd - hunk.newStart + 1
+                elseif cmd == "d" then
+                    hunk.oldCount = aEnd - hunk.oldStart + 1
+                    hunk.newCount = 0
+                else
+                    hunk.oldCount = aEnd - hunk.oldStart + 1
+                    hunk.newCount = bEnd - hunk.newStart + 1
+                end
+                i = i + 1
+                for _ = 1, hunk.oldCount do
+                    local bl = lines[i]
+                    if bl == nil or bl:sub(1, 1) ~= "<" then
+                        stderr("patch: **** malformed normal diff (expected '<' line)\n")
+                        return nil
+                    end
+                    hunk.ops[#hunk.ops + 1] = { k = "-", t = bl:sub(3) }
+                    hunk.raw[#hunk.raw + 1] = bl
+                    i = i + 1
+                end
+                if cmd == "c" then
+                    if lines[i] ~= "---" then
+                        stderr("patch: **** malformed normal diff (expected '---')\n")
+                        return nil
+                    end
+                    i = i + 1
+                end
+                for _ = 1, hunk.newCount do
+                    local bl = lines[i]
+                    if bl == nil or bl:sub(1, 1) ~= ">" then
+                        stderr("patch: **** malformed normal diff (expected '>' line)\n")
+                        return nil
+                    end
+                    hunk.ops[#hunk.ops + 1] = { k = "+", t = bl:sub(3) }
+                    hunk.raw[#hunk.raw + 1] = bl
+                    i = i + 1
+                end
+                sec.hunks[#sec.hunks + 1] = hunk
+            end
+            if #sec.hunks > 0 then sections[#sections + 1] = sec end
+        else
+            -- "diff ..."、"Index: ..."、"Prereq:" 等噪声行: 跳过
+            i = i + 1
+        end
+    end
+    return sections
+end
+
+local sections = parsePatch(splitLines(patchText))
+if not sections then return 2 end
+if opt.reverse then
+    -- -R: 把补丁整体反过来(名字、hunk 方向、行号/计数), 之后走同一条应用路径。
+    for _, sec in ipairs(sections) do
+        for _, h in ipairs(sec.hunks) do
+            for _, op in ipairs(h.ops) do
+                if op.k == "-" then op.k = "+"
+                elseif op.k == "+" then op.k = "-" end
+            end
+            h.oldStart, h.newStart = h.newStart, h.oldStart
+            h.oldCount, h.newCount = h.newCount, h.oldCount
+        end
+        sec.oldName, sec.newName = sec.newName, sec.oldName
+    end
+end
+if #sections == 0 then
+    stderr("patch: **** Only garbage was found in the patch input.\n")
+    return 2
+end
+if opt.output and #sections > 1 then
+    stderr("patch: -o/--output only works with a single-file patch\n")
+    return 2
+end
+
+-- ---------------------------------------------------------------
+-- 应用
+-- ---------------------------------------------------------------
+local MAX_FUZZ = 1 -- 规格要求: 允许 1 行 fuzz(GNU 缺省允许 2)
+
+--- 补丁文本 -> 行记录(带"是否有换行符")。
+local function splitRecords(content)
+    local recs = {}
+    local pos = 1
+    while true do
+        local nl = content:find("\n", pos, true)
+        if not nl then
+            if pos <= #content then recs[#recs + 1] = { t = content:sub(pos), eol = false } end
+            return recs
+        end
+        recs[#recs + 1] = { t = content:sub(pos, nl - 1), eol = true }
+        pos = nl + 1
+    end
+end
+
+local function loadRecords(path)
+    local f, err = fs.open(path, "r")
+    if not f then return nil, err end
+    local content = f.readAll() or ""
+    f.close()
+    return splitRecords(content)
+end
+
+--- -l: 行尾空白忽略, 空白串彼此等价。
+local function looseNorm(s)
+    s = s:gsub("[ \t]+$", "")
+    s = s:gsub("[ \t]+", " ")
+    return s
+end
+
+local function lineMatch(a, b)
+    if opt.loose then return looseNorm(a) == looseNorm(b) end
+    return a == b
+end
+
+--- hunk 的 ops 去掉首尾各 fuzz 行**上下文**(删/增行不能丢)。
+local function trimFuzz(ops, fuzz)
+    if fuzz == 0 then return ops end
+    local s, e, dropped = 1, #ops, 0
+    while dropped < fuzz and s <= e and ops[s].k == " " do
+        s, dropped = s + 1, dropped + 1
+    end
+    if dropped < fuzz then return nil end
+    dropped = 0
+    while dropped < fuzz and e >= s and ops[e].k == " " do
+        e, dropped = e - 1, dropped + 1
+    end
+    if dropped < fuzz then return nil end
+    local out = {}
+    for k = s, e do out[#out + 1] = ops[k] end
+    return out
+end
+
+--- 从 ops 取"旧侧"行(上下文 + 删除)与"新侧"行(上下文 + 新增)。
+local function sidesOf(ops)
+    local pat, rep = {}, {}
+    for _, op in ipairs(ops) do
+        if op.k ~= "+" then pat[#pat + 1] = op end
+        if op.k ~= "-" then rep[#rep + 1] = op end
+    end
+    return pat, rep
+end
+
+local function matchAt(recs, pos, pat)
+    if pos < 1 then return false end
+    for k = 1, #pat do
+        local r = recs[pos + k - 1]
+        if not r then return false end
+        if not lineMatch(r.t, pat[k].t) then return false end
+    end
+    return true
+end
+
+--- 定位: 先试期望行号, 再在 [from, #recs] 里顺序找。返回位置(对应 pat[1])。
+local function locate(recs, from, pat, expected)
+    if expected >= from and matchAt(recs, expected, pat) then return expected end
+    for pos = from, #recs - #pat + 1 do
+        if matchAt(recs, pos, pat) then return pos end
+    end
+    return nil
+end
+
+--- 在若干 fuzz 级别上定位 hunk; 返回 pos, fuzz, pat, rep 或 nil。
+local function findHunk(recs, from, hunk, expected)
+    for fuzz = 0, MAX_FUZZ do
+        local ops = trimFuzz(hunk.ops, fuzz)
+        if ops then
+            local pat, rep = sidesOf(ops)
+            local pos = locate(recs, from, pat, expected + fuzz)
+            if pos then return pos, fuzz, pat, rep end
+        end
+    end
+    return nil
+end
+
+--- 反向/已应用的判定: 用"新侧"当模式找得到就是已经打过了。
+local function looksReversed(recs, from, hunk, expected)
+    for fuzz = 0, MAX_FUZZ do
+        local ops = trimFuzz(hunk.ops, fuzz)
+        if ops then
+            local _, rep = sidesOf(ops)
+            if locate(recs, from, rep, expected + fuzz) then return true end
+        end
+    end
+    return false
+end
+
+local function writeRecords(path, recs)
+    local f, err = fs.open(path, "w")
+    if not f then
+        stderr("patch: " .. path .. ": " .. ioeMsg(err) .. "\n")
+        return false
+    end
+    for _, r in ipairs(recs) do
+        f.write(r.t .. (r.eol and "\n" or ""))
+    end
+    f.close()
+    return true
+end
+
+--- 写 <文件>.rej(失败的与被忽略的 hunk, 原样)。
+local function writeRej(path, sec, idxs)
+    local h = fs.open(path .. ".rej", "w")
+    if not h then
+        stderr("patch: " .. path .. ".rej: cannot write rejects\n")
+        return 1
+    end
+    if sec.oldName then h.write("--- " .. sec.oldName .. "\n") end
+    if sec.newName then h.write("+++ " .. sec.newName .. "\n") end
+    for _, hi in ipairs(idxs) do
+        for _, raw in ipairs(sec.hunks[hi].raw) do h.write(raw .. "\n") end
+    end
+    h.close()
+end
+
+--- 找一个 section 要打的文件。
+--- 规则(见文件头): 操作数 > 补丁头名(缺省不剥前缀, 除非给了 -p)。
+--- 返回 (显示名, 绝对路径)。显示名 = 用户/补丁里给的名字(与 GNU 一致, 不回显绝对路径)。
+local function targetFor(sec)
+    if origFile then return origFile, resolve(origFile) end
+    local name = sec.oldName
+    if name == nil or name == "/dev/null" then name = sec.newName end
+    if name == nil then return nil end
+    local stripped = stripName(name, opt.strip)
+    if not stripped then return nil end
+    return stripped, resolve(stripped)
+end
+
+local anyFailure = false
+
+for si, sec in ipairs(sections) do
+    local targetRaw, target = targetFor(sec)
+    if not target then
+        stderr("patch: **** can't find file to patch (no file name in patch header and no ORIGFILE)\n")
+        return 2
+    end
+    if opt.output then
+        io.write((opt.dryrun and "checking file " or "patching file ") .. opt.output
+            .. " (read from " .. targetRaw .. ")\n")
+    else
+        io.write((opt.dryrun and "checking file " or "patching file ") .. targetRaw .. "\n")
+    end
+
+    local exists = fs.exists(target) and fs.isFile(target)
+    local created = false
+    local recs
+    if exists then
+        local err
+        recs, err = loadRecords(target)
+        if not recs then
+            stderr("patch: " .. target .. ": " .. ioeMsg(err) .. "\n")
+            return 2
+        end
+    else
+        -- 目标不存在: 只有"新建"补丁(老名字是 /dev/null 或该节全是纯新增)才允许建,
+        -- 否则明确报错(GNU 这里会交互问 File to patch:, 我们非交互 → 报错退出 1)。
+        local allAdd = true
+        for _, h in ipairs(sec.hunks) do
+            if h.oldCount > 0 then allAdd = false break end
+        end
+        local isCreation = (sec.oldName == "/dev/null") or allAdd
+        if not (isCreation or origFile) then
+            stderr("patch: **** can't find file to patch\n")
+            return 1
+        end
+        if fs.isDir(target) then
+            stderr("patch: " .. target .. ": Is a directory\n")
+            return 2
+        end
+        local parent = fs.getDir(target)
+        if not fs.isDir(parent) then
+            stderr("patch: " .. target .. ": No such file or directory\n")
+            return 2
+        end
+        recs = {}
+        created = true
+    end
+
+    local out = {}
+    local src = 1
+    local delta = 0
+    local failed, ignored = {}, {}
+    for hi, hunk in ipairs(sec.hunks) do
+        local expected = hunk.oldStart + delta
+        if hunk.oldCount == 0 then expected = hunk.oldStart + 1 + delta end
+        local pos, fuzz, pat, rep = findHunk(recs, src, hunk, expected)
+        if not pos then
+            if not opt.force and looksReversed(recs, src, hunk, expected) then
+                io.write("Reversed (or previously applied) patch detected!  Skipping patch.\n")
+                ignored[#ignored + 1] = hi
+            else
+                io.write("Hunk #" .. hi .. " FAILED at " .. hunk.oldStart .. ".\n")
+                failed[#failed + 1] = hi
+            end
+        else
+            for k = src, pos - 1 do out[#out + 1] = recs[k] end
+            for _, r in ipairs(rep) do out[#out + 1] = { t = r.t, eol = not r.noEol } end
+            src = pos + #pat
+            delta = delta + (#rep - #pat)
+            if fuzz > 0 or pos ~= expected then
+                local off = pos - expected
+                local msg = "Hunk #" .. hi .. " succeeded at " .. pos
+                if fuzz > 0 then msg = msg .. " with fuzz " .. fuzz end
+                if off ~= 0 then
+                    msg = msg .. " (offset " .. off .. " " .. ((math.abs(off) == 1) and "line" or "lines") .. ")"
+                end
+                io.write(msg .. ".\n")
+            end
+        end
+    end
+    for k = src, #recs do out[#out + 1] = recs[k] end
+
+    local nFailed, nIgnored = #failed, #ignored
+    local function plural(n) return (n == 1) and "hunk" or "hunks" end
+    if nFailed > 0 or nIgnored > 0 then
+        anyFailure = true
+        local rejectPath = (opt.output or targetRaw) .. ".rej"
+        if not opt.dryrun then
+            writeRej(opt.output and resolve(opt.output) or target, sec, (function()
+                local all = {}
+                for _, x in ipairs(failed) do all[#all + 1] = x end
+                for _, x in ipairs(ignored) do all[#all + 1] = x end
+                table.sort(all)
+                return all
+            end)())
+        end
+        if nFailed > 0 then
+            io.write(nFailed .. " out of " .. #sec.hunks .. " " .. plural(#sec.hunks) .. " FAILED"
+                .. (opt.dryrun and "\n" or (" -- saving rejects to file " .. rejectPath .. "\n")))
+        end
+        if nIgnored > 0 and nFailed == 0 then
+            io.write(nIgnored .. " out of " .. #sec.hunks .. " " .. plural(#sec.hunks) .. " ignored"
+                .. (opt.dryrun and "\n" or (" -- saving rejects to file " .. rejectPath .. "\n")))
+        end
+    end
+
+    if opt.dryrun then
+        -- 不落盘
+    else
+        local outPath = opt.output and resolve(opt.output) or target
+        if opt.backup and exists and not created then
+            if not fs.copy(target, target .. ".orig") then
+                stderr("patch: cannot create backup " .. target .. ".orig\n")
+                return 2
+            end
+        end
+        if not writeRecords(outPath, out) then return 2 end
+    end
+end
+
+if anyFailure then return 1 end
+return 0

@@ -1,0 +1,315 @@
+-- Delin uudecode: 解码 uuencode/base64 编码的文本, 还原文件与权限。
+-- 用法: uudecode [-o OUTFILE] [FILE]
+-- 选项:
+--   -o OUTFILE / -oOUTFILE   写到 OUTFILE(缺省用 begin 行里的 NAME, 相对 cwd 解析);
+--                            "-o -" 表示写 stdout(此时不设权限)
+--   --                       结束选项解析
+-- 参数: FILE 是编码文件, 省略或为 "-" 时读 stdin。只接受一个 FILE。
+-- 行为:
+--   忽略 begin 之前的行与空行; 行尾 \r/\v/\f 一律丢弃, 传统 uu 行尾的空格/制表保留
+--   (空格是合法的"补零"字符, python binascii/uu 就用空格补零), base64 行用去空白的版本;
+--   接受 "begin MODE NAME"(传统 uu 或 base64) 与 GNU 的 "begin-base64 MODE NAME";
+--   零长度行(反引号或空格)、end 行或 base64 的 "====" 收尾行结束数据;
+--   解码结束后按 MODE 调 fs.chmod(chmod 失败即报错退出)。NAME 为相对路径时按 cwd 解析。
+--   缺 begin 行 / 缺 end 行 / 非法编码行一律 stderr 诊断 + return 1(fail-fast, 不静默跳过,
+--   不留半截结果而不报错 —— 输出已写出的部分不回收, 与 GNU/busybox 一致)。
+--   已知的一处宽松(与 GNU 相同): 传统 uu 行按首字符声明的字节数解码, 行尾多出来的
+--   合法 uu 字符被忽略; 行长不足或需要的位置上出现非法字符仍然报错。
+-- 已知偏离:
+--   1) 宿主没有 GNU sharutils 的 uudecode, 行为基准用 busybox 1.37 的 uudecode。
+--      busybox/GNU sharutils 只在出现 "begin-base64" 时才按 base64 解, 而本仓库的
+--      uuencode -m 写的是 "begin MODE NAME" + base64 行, 所以这里对 begin 之后的首个数据行
+--      做结构判定: 首字符隐含的行长 ≤ 45、该行足够放下 4*ceil(n/3) 个字符、且这些字符
+--      都落在 0x20..0x60 → 传统 uu, 否则 base64(GNU 也是自动识别格式)。纯大写字母/数字组成的 base64 行理论上可能被
+--      误判为传统, 概率极低(76 列 base64 行不含小写字母的概率 < 1e-9)。
+--   2) 零长度行同时接受 0x60(反引号, GNU/busybox 写法)与 0x20(空格, python uu 缺省写法),
+--      两者在 (c - 0x20) % 0x40 下都等于 0。
+--   3) 未实现 GNU 的 NAME=/dev/stdout 特例与"去掉 setuid/可执行位": MODE 原样 chmod
+--      (任务要求 755 往返后仍是 755; busybox uudecode 也是原样保留)。
+--   4) 只解第一个 begin 段(一个文件里多段编码时后面的段被忽略), GNU 会逐段还原。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+local function ioeMsg(err)
+    if err and (err:find("permission") or err:find("denied")) then return "Permission denied" end
+    -- 注意顺序: "No such file or directory" 里也有 "directory", 先判 ENOENT,
+    -- 否则缺文件会被误报成 "Is a directory"(wc/cat 那版模板就有这个问题)。
+    if err and (err:find("[Nn]o such") or err:find("not found")) then return "No such file or directory" end
+    -- 必须先判 ENOENT: "No such file or directory" 里本来就含 "directory" 这个词,
+    -- 先匹 "directory" 会把"文件不存在"误报成 "Is a directory"(老模板的 bug)。
+    if err and err:lower():find("no such file") then return "No such file or directory" end
+    if err and err:find("directory") then return "Is a directory" end
+    return "No such file or directory"
+end
+
+local USAGE = "Usage: uudecode [-o OUTFILE] [FILE]\n"
+
+local outArg, files = nil, {}
+local noMoreOpts = false
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if noMoreOpts then
+        files[#files + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "-o" then
+        i = i + 1
+        if not args[i] then
+            stderr("uudecode: option requires an argument -- 'o'\n" .. USAGE)
+            return 1
+        end
+        outArg = args[i]
+    elseif a:sub(1, 2) == "-o" then
+        outArg = a:sub(3)
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        stderr("uudecode: invalid option -- '" .. a:sub(2, 2) .. "'\n" .. USAGE)
+        return 1
+    else
+        files[#files + 1] = a
+    end
+    i = i + 1
+end
+
+if #files > 1 then
+    stderr("uudecode: extra operand '" .. files[2] .. "'\n" .. USAGE)
+    return 1
+end
+
+local srcName = "<stdin>"
+local inH
+if files[1] and files[1] ~= "-" then
+    local p = resolve(files[1])
+    srcName = p
+    local f, err = fs.open(p, "r")
+    if not f then
+        stderr("uudecode: " .. p .. ": " .. ioeMsg(err) .. "\n")
+        return 1
+    end
+    inH = f
+else
+    inH = io.stdin()
+    if not inH then
+        stderr("uudecode: cannot read stdin\n")
+        return 1
+    end
+end
+
+-- 找 begin 行: 忽略之前的一切内容。
+local lineno = 0
+local modeStr, name, forcedB64
+while true do
+    local line = inH:readLine()
+    if line == nil then
+        stderr("uudecode: " .. srcName .. ": no `begin' line\n")
+        return 1
+    end
+    lineno = lineno + 1
+    line = line:gsub("[ \t\r\v\f]+$", "")
+    local md, nm = line:match("^begin%-base64%s+(%S+)%s+(.+)$")
+    if md then
+        modeStr, name, forcedB64 = md, nm, true
+        break
+    end
+    md, nm = line:match("^begin%s+(%S+)%s+(.+)$")
+    if md then
+        modeStr, name, forcedB64 = md, nm, false
+        break
+    end
+end
+
+local mode = tonumber(modeStr, 8)
+if not mode then
+    stderr("uudecode: " .. srcName .. ":" .. lineno .. ": invalid mode '" .. modeStr .. "'\n")
+    return 1
+end
+
+-- 输出目标: -o 优先; 否则补丁头里的 NAME(相对 cwd)。
+local outH, outPath, toStdout
+if outArg == "-" then
+    toStdout = true
+elseif outArg then
+    outPath = resolve(outArg)
+else
+    outPath = resolve(name)
+end
+if not toStdout then
+    local f, err = fs.open(outPath, "w")
+    if not f then
+        stderr("uudecode: " .. outPath .. ": " .. ioeMsg(err) .. "\n")
+        return 1
+    end
+    outH = f
+end
+
+local function writeOut(s)
+    if toStdout then io.write(s) else outH:write(s) end
+end
+
+local function fail(msg)
+    if outH then outH:close() end
+    stderr("uudecode: " .. srcName .. ":" .. lineno .. ": " .. msg .. "\n")
+    return 1
+end
+
+-- 传统 uu 行: 首字符给出该行字节数, 全部字符必须落在 0x20..0x60。
+local function looksLikeUU(line)
+    local n = (line:byte(1) or 0) - 0x20
+    n = n % 0x40
+    if n > 45 then return false end
+    local need = 1 + 4 * math.ceil(n / 3)
+    -- 允许行尾多出空白(某些编码器用空格补零): 只校验真正用到的那些字符。
+    if #line < need then return false end
+    for k = 1, need do
+        local b = line:byte(k)
+        if b < 0x20 or b > 0x60 then return false end
+    end
+    return true
+end
+
+local function uuLen(line)
+    local c = line:byte(1)
+    if not c or c < 0x20 or c > 0x60 then return nil end
+    return (c - 0x20) % 0x40
+end
+
+local function decodeUULine(line)
+    local n = uuLen(line)
+    if not n or n > 45 or #line < 1 + 4 * math.ceil(n / 3) then
+        return nil, "invalid uuencoded line"
+    end
+    -- 与 GNU 一致: 只解码首字符声明的那 n 个字节需要的 4 字符组, 行尾多余的空白忽略。
+    for k = 1, 1 + 4 * math.ceil(n / 3) do
+        local b = line:byte(k)
+        if b < 0x20 or b > 0x60 then return nil, "invalid uuencoded character" end
+    end
+    local parts, produced, g = {}, 0, 0
+    while produced < n do
+        local base = 2 + 4 * g
+        local v1 = (line:byte(base) - 0x20) % 0x40
+        local v2 = (line:byte(base + 1) - 0x20) % 0x40
+        local v3 = (line:byte(base + 2) - 0x20) % 0x40
+        local v4 = (line:byte(base + 3) - 0x20) % 0x40
+        local b1 = v1 * 4 + math.floor(v2 / 16)
+        local b2 = (v2 % 16) * 16 + math.floor(v3 / 4)
+        local b3 = (v3 % 4) * 64 + v4
+        local triple = { b1, b2, b3 }
+        local keep = n - produced
+        if keep > 3 then keep = 3 end
+        for k = 1, keep do parts[#parts + 1] = string.char(triple[k]) end
+        produced = produced + 3
+        g = g + 1
+    end
+    return table.concat(parts)
+end
+
+local function b64Val(ch)
+    local b = ch:byte(1)
+    if not b then return nil end -- 越界取到的空串: 交给调用方报"非法 base64 字符"
+    if b >= 0x41 and b <= 0x5A then return b - 0x41 end
+    if b >= 0x61 and b <= 0x7A then return b - 0x61 + 26 end
+    if b >= 0x30 and b <= 0x39 then return b - 0x30 + 52 end
+    if b == 0x2B then return 62 end
+    if b == 0x2F then return 63 end
+    return nil
+end
+
+local function decodeB64Line(line)
+    if #line % 4 ~= 0 then return nil, "invalid base64 line length" end
+    local pad = 0
+    if line:sub(-2) == "==" then pad = 2
+    elseif line:sub(-1) == "=" then pad = 1 end
+    local parts = {}
+    for k = 1, #line, 4 do
+        local isLast = k + 3 >= #line
+        local v = {}
+        for j = 0, 3 do
+            local ch = line:sub(k + j, k + j)
+            if ch == "=" then
+                -- = 只允许出现在整行的最末尾补齐位。
+                if not isLast or j < 4 - pad then return nil, "invalid base64 character" end
+                v[j + 1] = 0
+            else
+                local val = b64Val(ch)
+                if not val then return nil, "invalid base64 character" end
+                v[j + 1] = val
+            end
+        end
+        local triple = {
+            v[1] * 4 + math.floor(v[2] / 16),
+            (v[2] % 16) * 16 + math.floor(v[3] / 4),
+            (v[3] % 4) * 64 + v[4],
+        }
+        local keep = isLast and (3 - pad) or 3
+        for j = 1, keep do parts[#parts + 1] = string.char(triple[j]) end
+    end
+    return table.concat(parts)
+end
+
+-- 数据段。格式在首个数据行上定一次: begin-base64 强制 base64, 其余按结构判定(见头部偏离 1)。
+local fmt, dataDone, sawEnd = forcedB64 and "b64" or nil, false, false
+while true do
+    local rawLine = inH:readLine()
+    if rawLine == nil then break end
+    lineno = lineno + 1
+    -- 行尾空白分两种: \r/\v/\f 一律丢弃; **空格/制表不能丢** —— 传统 uu 的
+    -- 行尾空格是合法的"补零"字符(python binascii/uu 模块就用空格补零), 丢了会把
+    -- 一行的 4 字符组截断, 于是整行被判成非法。base64 那边用去掉空白的版本。
+    local payload = rawLine:gsub("[\r\v\f]+$", "")
+    local line = payload:gsub("[ \t]+$", "")
+    if line == "end" then
+        sawEnd = true
+        break
+    end
+    -- GNU base64 变体("begin-base64 ... ====")用一行等号结束, 没有 end 行。
+    if fmt == "b64" and line:match("^=+$") then
+        sawEnd = true
+        break
+    end
+    if line ~= "" and not dataDone then
+        if not fmt then fmt = looksLikeUU(payload) and "uu" or "b64" end
+        local bytes, err
+        if fmt == "uu" then
+            if uuLen(payload) == 0 then
+                dataDone = true -- 零长度行: 数据结束
+            else
+                bytes, err = decodeUULine(payload)
+            end
+        else
+            bytes, err = decodeB64Line(line)
+        end
+        if err then return fail(err) end
+        if bytes and #bytes > 0 then writeOut(bytes) end
+    end
+end
+
+if not sawEnd then
+    if outH then outH:close() end
+    stderr("uudecode: " .. srcName .. ": no `end' line\n")
+    return 1
+end
+if inH.close then inH:close() end
+
+if toStdout then
+    io.flush()
+    return
+end
+outH:close()
+local ok, cerr = fs.chmod(outPath, mode)
+if not ok then
+    stderr("uudecode: " .. outPath .. ": chmod " .. modeStr .. " failed: " .. tostring(cerr or "unknown error") .. "\n")
+    return 1
+end

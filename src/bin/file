@@ -1,0 +1,578 @@
+-- Delin file: 判定文件类型 (POSIX file(1) 子集, 内建 magic 表, 每个文件只读前 5KB)。
+-- 用法: file [-b] [-L] [-h] [-i] FILE...
+-- 选项:
+--   -b, --brief            只打印描述, 不打印 "<文件名>: " 前缀
+--   -L, --dereference      跟随符号链接, 判定链接目标(GNU file -L)
+--   -h, --no-dereference   不跟随符号链接, 判定链接本身(缺省)
+--   -i, --mime             打印 MIME 类型, 形如 "text/plain; charset=us-ascii"
+--       --mime-type        只打印 MIME type(与 -i 同族的 GNU 长选项)
+--       --mime-encoding    只打印 charset
+--   --                     结束选项解析(其后的 -x 一律当文件名)
+--   -                      操作数, 表示标准输入(前缀名用 "standard input")
+--   短选项可合并(-bi= -b -i); 多文件时每个文件一行; 文件打不开时按 GNU 措辞诊断并
+--   继续处理其余文件, 最终 return 1(见"已知偏离"第 2 条)。
+--
+-- 内建 magic 表(按此顺序判定, 与 GNU file 的输出措辞对齐, 宿主 file 5.46 实测对照):
+--   PNG(\x89PNG\r\n\x1a\n, 有 IHDR 时补 "W x H, N-bit <色彩>, [non-]interlaced")
+--   JPEG(\xff\xd8\xff) / GIF87a|89a(补 "version 87a|89a, W x H") / BMP(BM, DIB=40 时补
+--   "Windows 3.x format, W x H x BPP") / gzip(\x1f\x8b, OS 字节=3 时补 ", from Unix")
+--   PDF(%PDF-, 补 ", version X.Y") / ZIP(PK\x03\x04, 空归档 PK\x05\x06)
+--   ext2(偏移 0x438 小端 0x53EF, 补 rev / state / UUID) / shebang(#!)
+--   文本(ASCII / UTF-8 / ISO-8859 / Non-ISO) / data
+--
+-- 已知偏离(逐条对照宿主 GNU file 5.46 实测结果):
+--   1) 只读每个文件的前 5KB 判定(ext2 需要的 0x438 魔数与 0x468 UUID 都在这个窗口内)。
+--      超过 5KB 的文件, 若 5KB 里没有 NUL/坏字节, 会被判成文本 —— GNU 看整文件;
+--      5KB 边界处的行结束符注记按截断处理(不误报半个 CRLF)。
+--   2) 打不开的文件: 走 GNU 措辞 "file: <名字>: cannot open `<名字>' (No such file or
+--      directory)" 并最终 return 1。宿主 GNU file 对同一情形**退出码是 0**(实测), 这里按
+--      任务要求选了非 0; 措辞也带 "file: " 前缀(GNU 不带前缀, 只打 "名字: cannot open ...")。
+--   3) "-" (stdin) 的前缀名用 "standard input"; GNU 打印 "/dev/stdin"。
+--   4) 多文件时不做列对齐(GNU 会按最长文件名补空格); 这里每行就是 "<名字>: <描述>"。
+--   5) ext2 只给 rev/state/UUID, 不附加 GNU 的特性注记("(large files)" 等)。
+--   6) JPEG 只给 "JPEG image data", 不附加 JFIF/Exif 段信息(那需要逐段解析);
+--      ZIP 只给 "Zip archive data", 不附加 "made by v1.0 ... method=store";
+--      BMP 的 "image size/resolution/cbSize" 等也不给。
+--   7) 符号链接用 fs.lstat(拿链接本身)+ fs.readlink(取目标), 真机 ext2 后端有这两个函数,
+--      现在的宿主测试台也已经有了(能测)。按 SPEC §3 仍保留一行兼容
+--      `local lstat = fs.lstat or fs.attributes`: 万一某个后端没有 fs.lstat, 就会退化成
+--      跟随链接的 fs.attributes, 那时拿不到 kind=="symlink", 链接会按普通文件处理。
+--   8) fs.attributes 的 kind=="device"(真机设备文件)不单独识别: 按普通文件读内容判定,
+--      0 字节的设备文件会被判成 "empty"。GNU 会打 "character special"。
+--   9) 有 stat 但读不了的文件(权限位 000): 这里是 "cannot open ... (Permission denied)" +
+--      return 1; GNU 打的是 "regular file, no read permission" 且退出码 0。
+--  10) 文本/数据阈值(自定, 任务书允许): 含 \0 即 data; 不可打印字节(\t \n \r \f \b \x1b
+--      与 0x20..0x7E 之外的 <0x80 字节)占比 > 30% 即 data; 其余按
+--      ASCII(<0x80) / 合法 UTF-8 / 含 0x80..0x9F 的 Non-ISO extended-ASCII / 其余 ISO-8859
+--      分类。行注记同 GNU: "with very long lines (N)"(行长 > 300)、
+--      "with no|CR|CRLF[|LF] line terminators"。
+--  11) 1 字节文件按 GNU 打 "very short file (no magic)"(mime: application/octet-stream)。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+local function ioeMsg(err)
+    if err and (err:find("permission") or err:find("denied")) then return "Permission denied" end
+    -- 注意顺序: "No such file or directory" 里也有 "directory", 先判 ENOENT,
+    -- 否则缺文件会被误报成 "Is a directory"(wc/cat 那版模板就有这个问题)。
+    if err and (err:find("[Nn]o such") or err:find("not found")) then return "No such file or directory" end
+    -- 必须先判 ENOENT: "No such file or directory" 里本来就含 "directory" 这个词,
+    -- 先匹 "directory" 会把"文件不存在"误报成 "Is a directory"(老模板的 bug)。
+    if err and err:lower():find("no such file") then return "No such file or directory" end
+    if err and err:find("directory") then return "Is a directory" end
+    return "No such file or directory"
+end
+
+-- 真机 ext2 后端有 fs.lstat(不跟随最后一段链接)/fs.readlink。SPEC §3 要求的一行兼容:
+-- 后端若没有 fs.lstat, 就退化成跟随链接的 fs.attributes(那时链接按普通文件处理)。
+local lstat = fs.lstat or fs.attributes
+local readlink = fs.readlink
+
+-- 判定窗口: ext2 的 UUID 在偏移 0x468+16 = 1144, 5KB 足够覆盖所有已实现的魔数。
+local MAXSAMPLE = 5120
+
+-- ---------------------------------------------------------------
+-- 选项解析
+-- ---------------------------------------------------------------
+local optBrief, optDeref, optMime, optMimeType, optMimeEnc = false, false, false, false, false
+local files = {}
+local noMoreOpts = false
+
+local function setShort(ch)
+    if ch == "b" then optBrief = true
+    elseif ch == "L" then optDeref = true
+    elseif ch == "h" then optDeref = false
+    elseif ch == "i" then optMime = true
+    else stderr("file: invalid option -- '" .. ch .. "'\n"); return false end
+    return true
+end
+
+for _, a in ipairs(args) do
+    if noMoreOpts then
+        files[#files + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "--brief" then optBrief = true
+    elseif a == "--dereference" then optDeref = true
+    elseif a == "--no-dereference" then optDeref = false
+    elseif a == "--mime" then optMime = true
+    elseif a == "--mime-type" then optMimeType = true
+    elseif a == "--mime-encoding" then optMimeEnc = true
+    elseif a:sub(1, 2) == "--" then
+        stderr("file: unrecognized option '" .. a .. "'\n"); return 1
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        for k = 2, #a do if not setShort(a:sub(k, k)) then return 1 end end
+    else
+        files[#files + 1] = a
+    end
+end
+if #files == 0 then
+    stderr("Usage: file [-bLhi] FILE...\n")
+    return 1
+end
+
+-- ---------------------------------------------------------------
+-- 小工具: 按 0 基偏移读小端/大端整数(取不到就 nil, 不猜)
+-- ---------------------------------------------------------------
+local function le16(s, off)
+    local a, b = s:byte(off + 1), s:byte(off + 2)
+    if not a or not b then return nil end
+    return a + b * 256
+end
+local function le32(s, off)
+    local a, b, c, d = s:byte(off + 1), s:byte(off + 2), s:byte(off + 3), s:byte(off + 4)
+    if not a or not b or not c or not d then return nil end
+    return ((d * 256 + c) * 256 + b) * 256 + a
+end
+local function be32(s, off)
+    local a, b, c, d = s:byte(off + 1), s:byte(off + 2), s:byte(off + 3), s:byte(off + 4)
+    if not a or not b or not c or not d then return nil end
+    return ((a * 256 + b) * 256 + c) * 256 + d
+end
+
+-- 描述里要打出来的字符串: GNU 会把非可打印字节转义成 \ooo(如 shebang 里的 UTF-8 路径)。
+local function escapeBytes(s)
+    if not s:find("[^\32-\126]") then return s end
+    local out = {}
+    for i = 1, #s do
+        local b = s:byte(i)
+        if b >= 32 and b <= 126 then out[#out + 1] = string.char(b)
+        else out[#out + 1] = string.format("\\%03o", b) end
+    end
+    return table.concat(out)
+end
+
+-- ---------------------------------------------------------------
+-- 文本判定(阈值见文件头第 9 条)
+-- ---------------------------------------------------------------
+local function isPrintableByte(b)
+    if b >= 32 and b <= 126 then return true end
+    return b == 9 or b == 10 or b == 13 or b == 12 or b == 8 or b == 27
+end
+
+-- 合法性: 允许末尾一个被 5KB 边界切断的 UTF-8 序列(truncated 时才放过)。
+local function isUtf8(s, truncated)
+    local i, n = 1, #s
+    while i <= n do
+        local b = s:byte(i)
+        if b < 128 then
+            i = i + 1
+        else
+            local len
+            if b >= 194 and b <= 223 then len = 2
+            elseif b >= 224 and b <= 239 then len = 3
+            elseif b >= 240 and b <= 244 then len = 4
+            else return false end
+            if i + len - 1 > n then return truncated end
+            for k = 1, len - 1 do
+                local c = s:byte(i + k)
+                if c < 128 or c > 191 then return false end
+            end
+            i = i + len
+        end
+    end
+    return true
+end
+
+-- 最长行(字节数, 不含 \n)。截断样本里未结束的尾行不算 —— 否则会把半个长行当整行。
+local function longestLine(s, truncated)
+    local max, pos = 0, 1
+    while true do
+        local nl = s:find("\n", pos, true)
+        if not nl then break end
+        local len = nl - pos
+        if len > max then max = len end
+        pos = nl + 1
+    end
+    if not truncated then
+        local len = #s - pos + 1
+        if len > max then max = len end
+    end
+    return max
+end
+
+local function terminatorNote(s, truncated)
+    if truncated and s:sub(-1) == "\r" then s = s:sub(1, -2) end
+    local nl = 0
+    for _ in s:gmatch("\n") do nl = nl + 1 end
+    if nl == 0 then
+        if s:find("\r", 1, true) then return "with CR line terminators" end
+        return "with no line terminators"
+    end
+    local crlf = 0
+    for _ in s:gmatch("\r\n") do crlf = crlf + 1 end
+    if crlf == 0 then return nil end
+    if crlf == nl then return "with CRLF line terminators" end
+    return "with CRLF, LF line terminators"
+end
+
+-- 返回 { binary = true } 或 { binary = false, base = "ASCII text", enc = "us-ascii",
+-- notes = ", with ..." }。base 与 notes 分开返回: shebang 那种 "<脚本描述>, <base>
+-- executable<notes>" 的拼法要用到(实测 GNU 就是 "a /bin/lua script, ASCII text executable,
+-- with no line terminators")。
+local function classifyText(s, truncated)
+    local nul, bad, high, nonIso = false, 0, 0, false
+    for i = 1, #s do
+        local b = s:byte(i)
+        if b == 0 then nul = true; break end
+        if b >= 128 then
+            high = high + 1
+            if b < 160 then nonIso = true end
+        elseif not isPrintableByte(b) then
+            bad = bad + 1
+        end
+    end
+    if nul then return { binary = true } end
+    if bad * 10 > #s * 3 then return { binary = true } end
+    local base, enc
+    if high == 0 then
+        base, enc = "ASCII text", "us-ascii"
+    elseif isUtf8(s, truncated) then
+        enc = "utf-8"
+        if s:sub(1, 3) == "\239\187\191" then
+            base = "Unicode text, UTF-8 (with BOM) text"
+        else
+            base = "Unicode text, UTF-8 text"
+        end
+    elseif nonIso then
+        base, enc = "Non-ISO extended-ASCII text", "unknown-8bit"
+    else
+        base, enc = "ISO-8859 text", "iso-8859-1"
+    end
+    local notes = {}
+    local maxLen = longestLine(s, truncated)
+    if maxLen > 300 then notes[#notes + 1] = "with very long lines (" .. maxLen .. ")" end
+    local term = terminatorNote(s, truncated)
+    if term then notes[#notes + 1] = term end
+    return {
+        binary = false,
+        base = base,
+        enc = enc,
+        notes = (#notes > 0) and (", " .. table.concat(notes, ", ")) or "",
+    }
+end
+
+-- ---------------------------------------------------------------
+-- shebang: GNU 的口径是 "<整行去掉 #! 后的内容>" 当脚本名(如 "/bin/busybox sh"),
+-- 走 /usr/bin/env 时用 env 后面的那一段; 常见解释器有专门措辞(实测 5.46)。
+-- dirs = 允许的解释器目录(空表 = 只认裸名字, 即 env 形式)。
+-- prefix = 名字前缀匹配(python3.11 也算 Python script)。env = /usr/bin/env 是否认它。
+-- glue = 该描述在 GNU 里自带 "text executable", 不再按文本类型另拼(perl 的怪癖)。
+-- ---------------------------------------------------------------
+local INTERP = {
+    { match = "sh", dirs = { ["/bin"] = true },
+      desc = "POSIX shell script", mime = "text/x-shellscript" },
+    { match = "ksh", dirs = { ["/bin"] = true },
+      desc = "Korn shell script", mime = "text/x-shellscript" },
+    { match = "dash", dirs = { ["/bin"] = true, ["/usr/bin"] = true },
+      desc = "Dash shell script", mime = "text/x-shellscript" },
+    { match = "bash", dirs = { ["/bin"] = true, ["/usr/bin"] = true, ["/usr/local/bin"] = true }, env = true,
+      desc = "Bourne-Again shell script", mime = "text/x-shellscript" },
+    { match = "zsh", dirs = { ["/bin"] = true, ["/usr/bin"] = true, ["/usr/local/bin"] = true }, env = true,
+      desc = "Paul Falstad's zsh script", mime = "text/x-shellscript" },
+    { match = "tcsh", dirs = { ["/bin"] = true, ["/usr/bin"] = true, ["/usr/local/bin"] = true }, env = true,
+      desc = "Tenex C shell script", mime = "text/x-shellscript" },
+    { match = "fish", dirs = { ["/usr/bin"] = true, ["/usr/local/bin"] = true }, env = true,
+      desc = "fish shell script", mime = "text/x-shellscript" },
+    { match = "python", prefix = true, dirs = { ["/usr/bin"] = true, ["/usr/local/bin"] = true }, env = true,
+      desc = "Python script", mime = "text/x-script.python" },
+    { match = "lua", prefix = true, dirs = { ["/usr/bin"] = true, ["/usr/local/bin"] = true }, env = true,
+      desc = "Lua script", mime = "text/x-lua" },
+    { match = "ruby", dirs = { ["/usr/bin"] = true, ["/usr/local/bin"] = true }, env = true,
+      desc = "Ruby script", mime = "text/x-ruby" },
+    { match = "php", dirs = { ["/usr/bin"] = true, ["/usr/local/bin"] = true }, env = true,
+      desc = "PHP script", mime = "text/x-php" },
+    { match = "awk", dirs = { ["/bin"] = true, ["/usr/bin"] = true }, env = true,
+      desc = "awk script", mime = "text/x-awk" },
+    { match = "perl", dirs = { ["/bin"] = true, ["/usr/bin"] = true, ["/usr/local/bin"] = true }, env = true,
+      desc = "Perl script", mime = "text/x-perl", glue = true },
+}
+
+local function nameMatches(entry, base)
+    if entry.prefix then return base:sub(1, #entry.match) == entry.match end
+    return base == entry.match
+end
+
+local function lookupInterp(base, dir, isEnv)
+    for _, e in ipairs(INTERP) do
+        if nameMatches(e, base) then
+            if isEnv then
+                if e.env then return e end
+            elseif e.dirs[dir] then
+                return e
+            end
+        end
+    end
+    return nil
+end
+
+-- s 以 "#!" 开头。返回 { desc = ..., mtype = ..., menc = ... }。
+local function detectScript(s, truncated)
+    local line = s:match("^#!(.-)[\r\n]") or s:sub(3)
+    line = line:gsub("^%s+", ""):gsub("%s+$", "")
+    local first = line:match("^%S+") or ""
+    local base = first:match("([^/]+)$") or first
+    local name, entry, isEnv = line, nil, false
+    if base == "env" then
+        isEnv = true
+        local rest = line:match("^%S+%s+(.*)$") or ""
+        name = rest:gsub("%s+$", "")
+        local tok = name:match("^%S+")
+        if tok then entry = lookupInterp(tok:match("([^/]+)$") or tok, nil, true) end
+    else
+        local dir = first:match("^(.*)/[^/]+$") or ""
+        entry = lookupInterp(base, dir, false)
+    end
+
+    local txt = classifyText(s, truncated)
+    local desc, mtype, menc
+    if entry and entry.glue then
+        -- perl: GNU 直接给固定串 "Perl script text executable", 不按文本类型另拼。
+        desc = entry.desc .. " text executable"
+        mtype = entry.mime
+        menc = txt.binary and "binary" or txt.enc
+    else
+        local head = entry and entry.desc or ("a " .. escapeBytes(name) .. " script")
+        if txt.binary then
+            -- 通用解释器(表里没有)配二进制内容时, 实测 GNU 的 mime 是
+            -- application/octet-stream 而不是 text/plain。
+            desc = head .. " executable (binary data)"
+            mtype = entry and entry.mime or "application/octet-stream"
+            menc = "binary"
+        else
+            desc = head .. ", " .. txt.base .. " executable" .. txt.notes
+            mtype = entry and entry.mime or "text/plain"
+            menc = txt.enc
+        end
+    end
+    return { desc = desc, mtype = mtype, menc = menc }
+end
+
+-- ---------------------------------------------------------------
+-- magic 表
+-- ---------------------------------------------------------------
+local PNG_COLOR = { [0] = "grayscale", [2] = "color RGB", [3] = "colormap",
+                    [4] = "gray+alpha", [6] = "color RGBA" }
+local PNG_SLASH = { [2] = true, [6] = true }
+
+local function uuidAt(s, off)
+    local hex = {}
+    for i = 0, 15 do
+        local b = s:byte(off + i + 1)
+        if not b then return nil end
+        hex[#hex + 1] = string.format("%02x", b)
+    end
+    local h = table.concat(hex)
+    return h:sub(1, 8) .. "-" .. h:sub(9, 12) .. "-" .. h:sub(13, 16) .. "-" ..
+           h:sub(17, 20) .. "-" .. h:sub(21, 32)
+end
+
+local function detectMagic(s)
+    if s:sub(1, 8) == "\137PNG\r\n\26\n" then
+        local desc = "PNG image data"
+        if s:sub(13, 16) == "IHDR" then
+            local w, h = be32(s, 16) or 0, be32(s, 20) or 0
+            local bd, ct = s:byte(25) or 0, s:byte(26) or 0
+            local color = PNG_COLOR[ct] or "unknown"
+            local sep = PNG_SLASH[ct] and "/" or " "
+            local il = (s:byte(29) == 1) and "interlaced" or "non-interlaced"
+            desc = desc .. ", " .. w .. " x " .. h .. ", " .. bd .. "-bit" .. sep .. color .. ", " .. il
+        end
+        return { desc = desc, mtype = "image/png", menc = "binary" }
+    end
+    if s:sub(1, 3) == "\255\216\255" then
+        return { desc = "JPEG image data", mtype = "image/jpeg", menc = "binary" }
+    end
+    local gifVer = s:match("^GIF(87a)") or s:match("^GIF(89a)")
+    if gifVer then
+        local desc = "GIF image data, version " .. gifVer
+        if #s >= 10 then
+            desc = desc .. ", " .. le16(s, 6) .. " x " .. le16(s, 8)
+        else
+            desc = desc .. ","     -- GNU 5.46 实测: 尺寸读不到时会留一个尾逗号
+        end
+        return { desc = desc, mtype = "image/gif", menc = "binary" }
+    end
+    if s:sub(1, 2) == "BM" then
+        local desc = "PC bitmap"
+        local w, h, bpp = le32(s, 18), le32(s, 22), le16(s, 28)
+        if le32(s, 14) == 40 and w and h and bpp then
+            desc = desc .. ", Windows 3.x format, " .. w .. " x " .. h .. " x " .. bpp
+        end
+        return { desc = desc, mtype = "image/bmp", menc = "binary" }
+    end
+    if s:sub(1, 2) == "\31\139" then
+        local desc = "gzip compressed data"
+        if s:byte(10) == 3 then desc = desc .. ", from Unix" end
+        return { desc = desc, mtype = "application/gzip", menc = "binary" }
+    end
+    if s:sub(1, 5) == "%PDF-" then
+        local ver = s:match("^%%PDF%-(%d%.%d)")
+        local desc = "PDF document"
+        if ver then desc = desc .. ", version " .. ver end
+        -- 实测 GNU file 5.46 对 PDF 给的就是这个 charset。
+        return { desc = desc, mtype = "application/pdf", menc = "iso-8859-1" }
+    end
+    local pk = s:sub(1, 4)
+    if pk == "PK\3\4" then
+        return { desc = "Zip archive data", mtype = "application/zip", menc = "binary" }
+    end
+    if pk == "PK\5\6" then
+        return { desc = "Zip archive data (empty)", mtype = "application/zip", menc = "binary" }
+    end
+    if s:sub(1 + 0x438, 2 + 0x438) == "\83\239" then
+        local rev = le32(s, 0x44C) or 0
+        local state = le16(s, 0x43A) or 0
+        local desc = "Linux rev " .. rev .. ".0 ext2 filesystem data"
+        if state ~= 1 then desc = desc .. " (mounted or unclean)" end
+        local uuid = uuidAt(s, 0x468)
+        if uuid then desc = desc .. ", UUID=" .. uuid end
+        if state == 2 then desc = desc .. " (errors)" end
+        return { desc = desc, mtype = "application/octet-stream", menc = "binary" }
+    end
+    return nil
+end
+
+-- ---------------------------------------------------------------
+-- 整体判定: 目录/链接/空/魔数/文本
+-- ---------------------------------------------------------------
+local function contentRecord(s, truncated)
+    if #s == 1 then
+        return { desc = "very short file (no magic)", mtype = "application/octet-stream", menc = "binary" }
+    end
+    if s:sub(1, 2) == "#!" then return detectScript(s, truncated) end
+    local m = detectMagic(s)
+    if m then return m end
+    local txt = classifyText(s, truncated)
+    if txt.binary then
+        return { desc = "data", mtype = "application/octet-stream", menc = "binary" }
+    end
+    return { desc = txt.base .. txt.notes, mtype = "text/plain", menc = txt.enc }
+end
+
+-- ---------------------------------------------------------------
+-- 读前 MAXSAMPLE 字节。循环读是因为句柄 read(n) 允许少给(EOF)。
+-- ---------------------------------------------------------------
+local function readSample(h)
+    local parts, total = {}, 0
+    while total < MAXSAMPLE do
+        local chunk = h.read(MAXSAMPLE - total)
+        if not chunk or chunk == "" then break end
+        parts[#parts + 1] = chunk
+        total = total + #chunk
+    end
+    return table.concat(parts)
+end
+
+-- 宿主测试台的顶层 stdin 句柄只实现了 readLine(read(n) 是空实现), 所以补一条按行读的
+-- 路径 —— 真机内核的 stdin 句柄 read(n) 可用, 走不到这里(wc 对 stdin 也是这么处理的)。
+local function readStdinSample()
+    local h = io.stdin()
+    if not h then return nil end
+    local s = readSample(h)
+    if s == "" and h.readLine then
+        local lines = {}
+        while true do
+            local l = h.readLine()
+            if l == nil then break end
+            lines[#lines + 1] = l
+        end
+        if #lines > 0 then s = table.concat(lines, "\n") .. "\n" end
+    end
+    return s
+end
+
+local function linkTargetPath(p, target)
+    if target:sub(1, 1) == "/" then return target end
+    local dir = p:match("^(.*)/[^/]*$") or ""
+    return (dir .. "/" .. target):gsub("/+", "/")
+end
+
+-- ---------------------------------------------------------------
+-- 主循环
+-- ---------------------------------------------------------------
+local failed = false
+
+for _, raw in ipairs(files) do
+    local name = (raw == "-") and "standard input" or raw
+    local rec
+
+    if raw == "-" then
+        local s = readStdinSample()
+        if not s then
+            stderr("file: " .. name .. ": cannot open `" .. name .. "' (No such file or directory)\n")
+            failed = true
+        elseif #s == 0 then
+            -- stdin 判不了大小: 0 字节就是空输入。GNU 对管道给的 mime 是
+            -- application/x-empty(对真实存在的 0 字节文件才是 inode/x-empty), 这里照搬。
+            rec = { desc = "empty", mtype = "application/x-empty", menc = "binary" }
+        else
+            rec = contentRecord(s, #s >= MAXSAMPLE)
+        end
+    else
+        local p = resolve(raw)
+        -- -L 跟随链接(用 fs.attributes 看目标), 缺省用 fs.lstat 看链接本身。
+        local a = optDeref and fs.attributes(p) or lstat(p)
+        -- 链接分支要先判: 断链的 fs.exists 是 false, 但那正是要报的 "broken symbolic link"。
+        -- 其余情况必须过 fs.exists: 宿主测试台的 F.attributes 对不存在的路径也会返回一张
+        -- 表(size=0), 光看 stat 会把不存在的文件误判成 "empty"。
+        if a and a.kind == "symlink" then
+            local target = readlink and readlink(p) or nil
+            if not target then
+                stderr("file: " .. name .. ": cannot read link `" .. name .. "'\n")
+                failed = true
+            else
+                local kind = "symbolic link to "
+                if not fs.exists(linkTargetPath(p, target)) then kind = "broken symbolic link to " end
+                rec = { desc = kind .. target, mtype = "inode/symlink", menc = "binary" }
+            end
+        elseif not a or not fs.exists(p) then
+            stderr("file: " .. name .. ": cannot open `" .. name .. "' (No such file or directory)\n")
+            failed = true
+        elseif a.isDir then
+            rec = { desc = "directory", mtype = "inode/directory", menc = "binary" }
+        else
+            local size = tonumber(a.size) or 0
+            if size == 0 then
+                rec = { desc = "empty", mtype = "inode/x-empty", menc = "binary" }
+            else
+                local h, err = fs.open(p, "r")
+                if not h then
+                    stderr("file: " .. name .. ": cannot open `" .. name .. "' (" .. ioeMsg(err) .. ")\n")
+                    failed = true
+                else
+                    local s = readSample(h)
+                    h.close()
+                    rec = contentRecord(s, size > #s)
+                end
+            end
+        end
+    end
+
+    if rec then
+        local body
+        if optMimeType then body = rec.mtype
+        elseif optMimeEnc then body = rec.menc
+        elseif optMime then body = rec.mtype .. "; charset=" .. rec.menc
+        else body = rec.desc end
+        if optBrief then
+            io.write(body .. "\n")
+        else
+            io.write(name .. ": " .. body .. "\n")
+        end
+    end
+end
+
+if failed then return 1 end

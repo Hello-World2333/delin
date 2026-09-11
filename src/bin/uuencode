@@ -1,0 +1,262 @@
+-- Delin uuencode: 把二进制数据编码成 uuencode 文本(传统 uu 或 -m base64)。
+-- 用法: uuencode [-m] [FILE] REMOTEFILE
+-- 选项:
+--   -m, --base64   改用 base64 编码(GNU 扩展), 输出 begin MODE REMOTEFILE / base64 行 / end
+--   --             结束选项解析(其后的 -m 之类按操作数处理)
+-- 参数:
+--   只给一个操作数时它是 REMOTEFILE, 数据从 stdin 读, MODE 固定为 644;
+--   给两个操作数时 FILE 是要编码的文件(FILE 为 "-" 亦表示 stdin, 仍用 644),
+--   MODE 取 fs.attributes(FILE).mode % 0x1000 的八进制(644/755/600 ...)。
+--   REMOTEFILE 只写进 begin 行(uudecode 按它还原文件名), 本命令既不读也不写它。
+-- 输出(stdout, 每行以 \n 结尾): begin MODE REMOTEFILE / 数据行 / end。
+--   传统格式每行最多 45 字节: 首字符 = 0x20 + 该行实际字节数, 其后每 3 字节编码成 4 个字符
+--   (每字符 = 0x20 + 6bit, 6bit 值 0 写成 0x60 反引号), 末组不足 3 字节用 \0 补齐;
+--   数据行之后固定写一行单独的反引号(零长度行)再写 end。空输入即 begin/`/end 三行。
+--   -m 用标准 base64(A-Za-z0-9+/ 与 = 补齐), 每行 76 列折行。
+-- 已知偏离:
+--   1) 宿主没有 GNU sharutils 的 uuencode, 逐字节对照基准用 busybox 1.37 的 uuencode
+--      (传统格式与它一致: 0 值写反引号、零长度反引号行结尾)。GNU 与本实现在"多给操作数"
+--      "未知选项"的报错文案上不逐字相同, 退出码一致(1)。
+--   2) -m 按本仓库约定用 POSIX 风格的 begin/end 包裹; GNU sharutils 实际写
+--      "begin-base64 MODE NAME" ... "====" 形式; uudecode 两种都接受, 因此可以互操作。
+--   3) 宿主测试台顶层进程的 stdin 伪装句柄只实现了 readLine(read 是空桩、没有 readAll),
+--      所以 stdin 读取处有唯一一处兼容(见 makeStdinPull): 先探测 read(1) 的块读能力,
+--      不可用时退回逐行读取并在行间补回 \n(数据末尾是否带换行无法区分, 与 wc 的 stdin
+--      逐行路径同限制)。内核句柄/管道走块读, 字节精确。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+local function ioeMsg(err)
+    if err and (err:find("permission") or err:find("denied")) then return "Permission denied" end
+    -- 注意顺序: "No such file or directory" 里也有 "directory", 先判 ENOENT,
+    -- 否则缺文件会被误报成 "Is a directory"(wc/cat 那版模板就有这个问题)。
+    if err and (err:find("[Nn]o such") or err:find("not found")) then return "No such file or directory" end
+    -- 必须先判 ENOENT: "No such file or directory" 里本来就含 "directory" 这个词,
+    -- 先匹 "directory" 会把"文件不存在"误报成 "Is a directory"(老模板的 bug)。
+    if err and err:lower():find("no such file") then return "No such file or directory" end
+    if err and err:find("directory") then return "Is a directory" end
+    return "No such file or directory"
+end
+
+local USAGE = "Usage: uuencode [-m] [FILE] REMOTEFILE\n"
+
+local base64mode = false
+local ops = {}
+local noMoreOpts = false
+
+for _, a in ipairs(args) do
+    if noMoreOpts then
+        ops[#ops + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "-m" or a == "--base64" then
+        base64mode = true
+    elseif a:sub(1, 2) == "--" then
+        stderr("uuencode: unrecognized option '" .. a .. "'\n" .. USAGE)
+        return 1
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        for k = 2, #a do
+            local ch = a:sub(k, k)
+            if ch == "m" then
+                base64mode = true
+            else
+                stderr("uuencode: invalid option -- '" .. ch .. "'\n" .. USAGE)
+                return 1
+            end
+        end
+    else
+        ops[#ops + 1] = a
+    end
+end
+
+if #ops == 0 then
+    stderr("uuencode: missing operand\n" .. USAGE)
+    return 1
+end
+if #ops > 2 then
+    stderr("uuencode: extra operand '" .. ops[3] .. "'\n" .. USAGE)
+    return 1
+end
+
+local inArg, remoteName
+if #ops == 1 then
+    remoteName = ops[1]
+else
+    inArg = ops[1]
+    remoteName = ops[2]
+end
+
+local inH, mode, fromFile
+if inArg and inArg ~= "-" then
+    local p = resolve(inArg)
+    if fs.isDir(p) then
+        stderr("uuencode: " .. p .. ": Is a directory\n")
+        return 1
+    end
+    local f, err = fs.open(p, "r")
+    if not f then
+        stderr("uuencode: " .. p .. ": " .. ioeMsg(err) .. "\n")
+        return 1
+    end
+    local a = fs.attributes(p)
+    if not a or not a.mode then
+        f:close()
+        stderr("uuencode: " .. p .. ": cannot stat\n")
+        return 1
+    end
+    inH, fromFile, mode = f, true, string.format("%o", a.mode % 0x1000)
+else
+    inH, fromFile = io.stdin(), false
+    if not inH then
+        stderr("uuencode: cannot read stdin\n")
+        return 1
+    end
+    mode = "644"
+end
+
+-- 逐块取原始字节: 返回 string(最多 45 字节, 可能短读)或 nil(EOF)。
+-- 保证每次不超过 45 字节, 主循环的累加缓冲才有界(逐行分支可能一次读到超长行)。
+-- stdin 兼容分支见文件头"已知偏离 3": 内核句柄/管道支持 read(n), 宿主测试台顶层 stdin 只有 readLine。
+local function makeStdinPull(h)
+    -- 句柄方法一律用冒号调用: 内核管道 read 端是 read(_, fmt), 点号调用会把 1 当 self 从而变成 readLine。
+    local first = h.read and h:read(1) or nil
+    if first and first ~= "" then
+        local pending = first
+        return function()
+            if pending then local p = pending; pending = nil; return p end
+            return h:read(45)
+        end
+    end
+    local line = h.readLine and h:readLine() or nil
+    if line == nil then return function() return nil end end
+    -- 逐行分支: 行间补回 \n(内核 readLine 会吃掉换行; 数据末尾是否带换行无法区分)。
+    local buf, pos, firstDone = line, 1, true
+    return function()
+        while true do
+            if pos <= #buf then
+                local p = buf:sub(pos, pos + 44)
+                pos = pos + 45
+                return p
+            end
+            local l = h:readLine()
+            if l == nil then return nil end
+            buf, pos = (firstDone and ("\n" .. l) or l), 1
+            firstDone = true
+        end
+    end
+end
+
+local pull
+if fromFile then
+    pull = function() return inH:read(45) end
+else
+    pull = makeStdinPull(inH)
+end
+
+-- 传统 uu: 6bit 值 -> 字符(0 -> 0x60 反引号, 1..63 -> 0x21..0x5F)。
+local function uuChar(v)
+    if v == 0 then return "`" end
+    return string.char(0x20 + v)
+end
+
+-- 一行最多 45 字节: 行长字符 + 每 3 字节 4 字符(末组用 \0 补齐)。
+local function uuLine(s)
+    local parts = { string.char(0x20 + #s) }
+    local i = 1
+    while i <= #s do
+        local b1 = s:byte(i)
+        local b2 = s:byte(i + 1) or 0
+        local b3 = s:byte(i + 2) or 0
+        parts[#parts + 1] = uuChar(math.floor(b1 / 4))
+        parts[#parts + 1] = uuChar((b1 % 4) * 16 + math.floor(b2 / 16))
+        parts[#parts + 1] = uuChar((b2 % 16) * 4 + math.floor(b3 / 64))
+        parts[#parts + 1] = uuChar(b3 % 64)
+        i = i + 3
+    end
+    return table.concat(parts) .. "\n"
+end
+
+local B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+local function b64Char(v) return B64:sub(v + 1, v + 1) end
+
+-- 长度是 3 的倍数的输入 -> base64 字符。
+local function b64Groups(s)
+    local parts = {}
+    for i = 1, #s, 3 do
+        local b1, b2, b3 = s:byte(i), s:byte(i + 1), s:byte(i + 2)
+        parts[#parts + 1] = b64Char(math.floor(b1 / 4))
+        parts[#parts + 1] = b64Char((b1 % 4) * 16 + math.floor(b2 / 16))
+        parts[#parts + 1] = b64Char((b2 % 16) * 4 + math.floor(b3 / 64))
+        parts[#parts + 1] = b64Char(b3 % 64)
+    end
+    return table.concat(parts)
+end
+
+-- 末尾 1 或 2 字节 -> 带 = 补齐的 base64 字符。
+local function b64Tail(s)
+    local b1 = s:byte(1)
+    local b2 = s:byte(2)
+    if not b2 then
+        return b64Char(math.floor(b1 / 4)) .. b64Char((b1 % 4) * 16) .. "=="
+    end
+    return b64Char(math.floor(b1 / 4)) .. b64Char((b1 % 4) * 16 + math.floor(b2 / 16))
+        .. b64Char((b2 % 16) * 4) .. "="
+end
+
+io.write("begin " .. mode .. " " .. remoteName .. "\n")
+
+if base64mode then
+    local acc, line = "", ""
+    local function put(chars)
+        line = line .. chars
+        while #line >= 76 do
+            io.write(line:sub(1, 76) .. "\n")
+            line = line:sub(77)
+        end
+    end
+    while true do
+        local chunk = pull()
+        if chunk == nil then break end
+        if chunk ~= "" then
+            acc = acc .. chunk
+            local n = #acc - (#acc % 3)
+            if n > 0 then
+                put(b64Groups(acc:sub(1, n)))
+                acc = acc:sub(n + 1)
+            end
+        end
+    end
+    if #acc > 0 then put(b64Tail(acc)) end
+    if #line > 0 then io.write(line .. "\n") end
+else
+    local acc = ""
+    while true do
+        local chunk = pull()
+        if chunk == nil then break end
+        if chunk ~= "" then
+            acc = acc .. chunk
+            while #acc >= 45 do
+                io.write(uuLine(acc:sub(1, 45)))
+                acc = acc:sub(46)
+            end
+        end
+    end
+    if #acc > 0 then io.write(uuLine(acc)) end
+    io.write("`\n")
+end
+
+io.write("end\n")
+if fromFile then inH:close() end

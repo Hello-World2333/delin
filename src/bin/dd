@@ -1,0 +1,465 @@
+-- Delin dd: 按块读写并转换的文件拷贝 (POSIX dd(1) 子集)。
+-- 用法: dd [OPERAND]...
+-- 操作数(全部形如 key=value, 没有位置参数):
+--   if=FILE     输入; 缺省 / `-` / /dev/stdin 都表示 stdin
+--   of=FILE     输出; 缺省 / `-` / /dev/stdout 都表示 stdout
+--   ibs=N       输入块大小, 缺省 512
+--   obs=N       输出块大小, 缺省 512
+--   bs=N        同时设置 ibs 与 obs(读整块直写快路径)
+--   cbs=N       转换块大小: 只解析校验后丢弃(conv=block/unblock 未实现, 见"已知偏离")
+--   count=N     最多拷贝 N 个输入块
+--   skip=N      先跳过 N 个输入块(按 ibs 计, 逐块读取丢弃)
+--   seek=N      输出先跳过 N 个输出块(按 obs 计): 用 h:seek("set", N*obs) 实现,
+--               返回 nil 即报 "dd: '<of>': cannot seek: ..." 到 stderr 并 return 1
+--   conv=LIST   逗号分隔: notrunc | sync | ucase | lcase | swab | noerror
+--   status=LVL  none(全抑制) | noxfer(只留两行 records) | progress(另加周期性进度行)
+-- 结束统计(stderr): "A+B records in" / "A+B records out" /
+--   "N bytes[ (SI[, IEC])] copied, T s, R/s" (A=整块数, B=部分块数; 格式对齐 GNU dd)
+--
+-- 已知偏离(全部与宿主 GNU coreutils dd 9.7 实测对照过):
+--   1) (已对齐) bs= 一律覆盖 ibs=/obs=, 与命令行顺序无关 —— 实测 GNU dd 9.7:
+--      `bs=4 ibs=3` 与 `ibs=3 bs=4` 的 records 相同(都是 ibs=obs=4)。
+--      本实现同样在解析完全部操作数后统一让 bs= 生效。
+--   2) conv=block/unblock/ascii/ebcdic/ibm/fsync/fdatasync/excl/nocreat 未实现: 未知或未
+--      实现的转换一律明确报错退出 1(不静默忽略), 因此 cbs= 只解析不使用。
+--   3) skip= 越过输入末尾时与 GNU 一样只警告 "cannot skip to specified offset" 并继续
+--      (退出码 0); seek= 时输出若是 stdout(可能是管道)则不做 seek, 直接报 cannot seek 并
+--      退出 1(GNU 对管道 stdout 的结果相同: "cannot seek: Illegal seek")。
+--   4) 裸 `-` 既不是操作数也不是选项: 按 GNU 报 "unrecognized operand '-'" 并退出 1;
+--      表示 stdin/stdout 要写成 if=- / of=- / if=/dev/stdin / of=/dev/stdout。
+--   5) 没有 --help/--version(未要求); `--` 之后的参数一律按操作数 (key=value) 解析。
+--   6) conv=noerror 只能在读句柄返回 (nil, err) 时起作用(内核与宿主句柄都用 nil 表示 EOF,
+--      两者无法区分): 报错后按 ibs 跳过坏块继续; 跳不过去就 fail-fast 退出 1(不写死循环)。
+--   7) conv=notrunc 且 count=0(或输入立即 EOF)时文件一个字节都不动(与 GNU 一致); 但若目标
+--      文件原本不存在, GNU 会创建一个空文件, 本实现不会创建(延迟打开, 见下)。
+--   8) 宿主测试台的 stdin 是"只有 readLine"的桩句柄(inputHandle.read = function() end 恒返
+--      nil), 所以 `dd < 文件` 在测试台上直接读到 EOF; 真机 stdin 是 tty/管道句柄, 有 read(n)
+--      (管道按 n 字节切块, 实测 `cat /pub | dd bs=5` 的 records 与宿主 dd 完全一致)。
+--   9) 实测内核当前没有后端给 kind == "device": /dev 是 vfs_api 的 devtmpfs 后端(attributes
+--      无 kind), ext2 的 kind="device" 只在 ext2 里存在设备 inode 时才有。所以 of=/dev/sdaN
+--      实际会走"普通文件"分支(整体读旧内容), 设备分支只在真有 kind=="device" 时生效;
+--      另外 devdisk.openRaw 的原始句柄没有 seek 方法, 那种情况下本实现报 cannot seek 退出 1。
+--
+-- conv=notrunc 的实现依据(内核源码核实, 必须照此实现):
+--   内核 ext2 **没有** "r+" 模式: fs.open(p,"r+") 会落到只读分支, 而那个读句柄的 write 是
+--   空实现(写进去被静默丢弃), 所以不能用 r+ 探测"能否随机写"。因此:
+--     * kind == "device"(块设备)时用 fs.open(p,"r+") 拿不截断的读写句柄(内核 blockdev.lua
+--       就是这么用块设备的, seek 可用); 该句柄没有 seek 方法时明确报 cannot seek 退出 1;
+--     * 普通文件(宿主测试台的 attributes 没有 kind)则: 先 fs.open(p,"r"):readAll() 把旧内容
+--       整体读出(必须在 "w" 清空它之前), 再 fs.open(p,"w"), 写回 start 之前的旧前缀,
+--       seek("set", start)(越过的地方内核写句柄自动补 \0, 宿主是稀疏空洞), 写新数据, 最后把
+--       旧内容里 start+已写字节数 之后没被覆盖的尾部原样写回 —— 结果与宿主 dd 逐字节一致。
+--     * 打开 "w" 会立刻清空文件, 所以这件事推迟到"首次真正写数据"之前做(notruncPrepare),
+--       这样空拷贝不会破坏已有内容(与宿主 dd 一致);
+--     * of= 指向已有文件且没有 notrunc 时用 fs.open(p,"w") 创建/截断(默认语义)。
+--   读块设备节点用 fs.open(p,"r") 拿原始字节; 输入侧一律不用 seek(skip 逐块读丢弃)。
+--   所有句柄方法都用**冒号调用**(h:read(n)/h:write(s)/h:seek(...)/h:close()): 内核管道句柄的
+--   签名是 read(_, fmt), 点号调用 h.read(4) 会被当成 fmt=nil 而退化成"读一整行"(实测
+--   `cat /pub | dd bs=4 count=2` 会一次拿到整行 11 字节), 只有冒号调用才拿到 4 字节的块。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+local function ioeMsg(err)
+    if err and (err:find("permission") or err:find("denied")) then return "Permission denied" end
+    -- 注意顺序: "No such file or directory" 里也有 "directory", 先判 ENOENT,
+    -- 否则缺文件会被误报成 "Is a directory"(wc/cat 那版模板就有这个问题)。
+    if err and (err:find("[Nn]o such") or err:find("not found")) then return "No such file or directory" end
+    -- 必须先判 ENOENT: "No such file or directory" 里本来就含 "directory" 这个词,
+    -- 先匹 "directory" 会把"文件不存在"误报成 "Is a directory"(老模板的 bug)。
+    if err and err:lower():find("no such file") then return "No such file or directory" end
+    if err and err:find("directory") then return "Is a directory" end
+    return "No such file or directory"
+end
+
+-- ================= 操作数解析 =================
+local CONV_UNSUPPORTED = {
+    block = true, unblock = true, ascii = true, ebcdic = true, ibm = true,
+    fsync = true, fdatasync = true, excl = true, nocreat = true,
+}
+
+local ifArg, ofArg = "-", "-"
+local ibs, obs = 512, 512
+local bsArg = nil -- bs= 的值: 解析完之后覆盖 ibs/obs(GNU 语义)
+local count = nil
+local skip, seek = 0, 0
+local cNotrunc, cSync, cUcase, cLcase, cSwab, cNoerror = false, false, false, false, false, false
+local status = "default"
+
+local function parseNum(v)
+    -- 只接受纯十进制(不支持 GNU 的 1024 倍数字面量与 c/w/b 后缀: 未要求)
+    if not v:match("^%d+$") then
+        stderr("dd: invalid number: '" .. v .. "'\n")
+        return nil
+    end
+    return tonumber(v)
+end
+
+-- 块大小必须 >= 1(0 会让读写空转; GNU 对 ibs=0/bs=0 同样报 invalid number)
+local function parseSize(v)
+    local n = parseNum(v)
+    if n and n < 1 then
+        stderr("dd: invalid number: '" .. v .. "'\n")
+        return nil
+    end
+    return n
+end
+
+local function setOperand(a)
+    local key, val = a:match("^([%a_][%w_]*)=(.*)$")
+    if not key then
+        stderr("dd: unrecognized operand '" .. a .. "'\n")
+        return false
+    end
+    if key == "if" then
+        ifArg = val
+    elseif key == "of" then
+        ofArg = val
+    elseif key == "ibs" then
+        local n = parseSize(val); if not n then return false end
+        ibs = n
+    elseif key == "obs" then
+        local n = parseSize(val); if not n then return false end
+        obs = n
+    elseif key == "bs" then
+        -- bs= 同时设 ibs/obs。GNU 的规则是 **bs 一律覆盖 ibs/obs(与命令行顺序无关)**,
+        -- 所以先记下来, 解析完所有操作数后再统一生效(见下面的 bsArg 处理)。
+        local n = parseSize(val); if not n then return false end
+        bsArg = n
+    elseif key == "cbs" then
+        if not parseNum(val) then return false end -- conv=block/unblock 未实现, 值丢弃
+    elseif key == "count" then
+        local n = parseNum(val); if not n then return false end
+        count = n
+    elseif key == "skip" then
+        local n = parseNum(val); if not n then return false end
+        skip = n
+    elseif key == "seek" then
+        local n = parseNum(val); if not n then return false end
+        seek = n
+    elseif key == "conv" then
+        for c in val:gmatch("[^,]+") do
+            if c == "notrunc" then cNotrunc = true
+            elseif c == "sync" then cSync = true
+            elseif c == "ucase" then cUcase = true
+            elseif c == "lcase" then cLcase = true
+            elseif c == "swab" then cSwab = true
+            elseif c == "noerror" then cNoerror = true
+            elseif CONV_UNSUPPORTED[c] then
+                stderr("dd: conversion '" .. c .. "' is not supported\n")
+                return false
+            else
+                stderr("dd: invalid conversion: '" .. c .. "'\n")
+                return false
+            end
+        end
+    elseif key == "status" then
+        if val ~= "none" and val ~= "noxfer" and val ~= "progress" then
+            stderr("dd: invalid status level: '" .. val .. "'\n")
+            return false
+        end
+        status = val
+    else
+        stderr("dd: unrecognized operand '" .. a .. "'\n")
+        return false
+    end
+    return true
+end
+
+local noMoreOpts = false
+for _, a in ipairs(args) do
+    if noMoreOpts then
+        if not setOperand(a) then return 1 end
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        if a:sub(1, 2) == "--" then
+            stderr("dd: unrecognized option '" .. a .. "'\n")
+        else
+            stderr("dd: invalid option -- '" .. a:sub(2, 2) .. "'\n")
+        end
+        return 1
+    else
+        if not setOperand(a) then return 1 end
+    end
+end
+-- bs= 一律覆盖 ibs/obs(与顺序无关, 实测 GNU dd 9.7: `bs=4 ibs=3` 也是 ibs=4)。
+if bsArg then ibs, obs = bsArg, bsArg end
+
+-- ================= 输入端 =================
+local inH, inIsStd, inName
+if ifArg == "-" or ifArg == "/dev/stdin" then
+    inIsStd, inName = true, "standard input"
+    inH = io.stdin()
+    if not inH then stderr("dd: standard input: cannot open\n"); return 1 end
+else
+    inIsStd, inName = false, ifArg
+    local h, err = fs.open(resolve(ifArg), "r")
+    if not h then
+        stderr("dd: failed to open '" .. ifArg .. "': " .. ioeMsg(err) .. "\n")
+        return 1
+    end
+    inH = h
+end
+
+-- ================= 输出端 =================
+local outH, outIsStd = nil, false
+local outDesc = ofArg
+local start = seek * obs
+local notruncOld = nil      -- notrunc 普通文件分支: 旧内容(整体读入)
+local notruncPrepare = nil  -- notrunc 普通文件分支: 首次写入前才执行的"清空 + 写前缀 + seek"
+local notruncTouched = false
+local outErr = nil
+
+if ofArg == "-" or ofArg == "/dev/stdout" then
+    outIsStd, outDesc = true, "standard output"
+    if start > 0 then
+        -- stdout 可能是管道, 不能 seek; 绝不假装 seek 成功后写错位置(见文件头"已知偏离")
+        stderr("dd: 'standard output': cannot seek: Illegal seek\n")
+        return 1
+    end
+else
+    local p = resolve(ofArg)
+    local a = fs.attributes(p)
+    if cNotrunc and a and a.kind == "device" then
+        -- 块设备: 不截断的读写句柄(见文件头)
+        local h, err = fs.open(p, "r+")
+        if not h then
+            stderr("dd: failed to open '" .. ofArg .. "': " .. ioeMsg(err) .. "\n")
+            return 1
+        end
+        outH = h
+    elseif cNotrunc and fs.exists(p) then
+        local rf, rerr = fs.open(p, "r")
+        if not rf then
+            stderr("dd: failed to open '" .. ofArg .. "': " .. ioeMsg(rerr) .. "\n")
+            return 1
+        end
+        -- 内核/宿主普通句柄都有 readAll; 字符设备句柄(如 /dev/null)没有 → 无旧内容
+        notruncOld = (rf.readAll and rf:readAll()) or ""
+        rf:close()
+        notruncPrepare = function()
+            local h, oerr = fs.open(p, "w")
+            if not h then
+                return nil, "dd: failed to open '" .. ofArg .. "': " .. ioeMsg(oerr)
+            end
+            outH = h
+            notruncTouched = true
+            local prefix = notruncOld:sub(1, math.min(start, #notruncOld))
+            if prefix ~= "" then h:write(prefix) end
+            if start > 0 then
+                if not h.seek then
+                    return nil, "dd: '" .. ofArg .. "': cannot seek: handle does not support seek"
+                end
+                local pos, serr = h:seek("set", start)
+                if pos == nil then
+                    return nil, "dd: '" .. ofArg .. "': cannot seek: " .. tostring(serr or "Illegal seek")
+                end
+            end
+            return true
+        end
+    else
+        -- 缺省(以及 notrunc 但目标不存在 = 普通创建)语义: 创建/截断
+        local h, err = fs.open(p, "w")
+        if not h then
+            stderr("dd: failed to open '" .. ofArg .. "': " .. ioeMsg(err) .. "\n")
+            return 1
+        end
+        outH = h
+    end
+end
+
+-- 输出定位: notrunc 普通文件的 seek 在 notruncPrepare 里做(见文件头)
+if start > 0 and not outIsStd and not notruncPrepare then
+    if not outH.seek then
+        stderr("dd: '" .. outDesc .. "': cannot seek: handle does not support seek\n")
+        return 1
+    end
+    local pos, serr = outH:seek("set", start)
+    if pos == nil then
+        stderr("dd: '" .. outDesc .. "': cannot seek: " .. tostring(serr or "Illegal seek") .. "\n")
+        return 1
+    end
+end
+
+-- ================= 统计与数字格式(GNU dd 对齐) =================
+local inFull, inPartial, outFull, outPartial, bytes = 0, 0, 0, 0, 0
+
+local SI_UNITS = { "kB", "MB", "GB", "TB", "PB", "EB" }
+local IEC_UNITS = { "KiB", "MiB", "GiB", "TiB", "PiB", "EiB" }
+
+-- GNU human_readable(human_autoscale|human_round_to_nearest) 的两位有效数字写法
+local function fmt2(v)
+    if v >= 9.95 then return string.format("%.0f", v) end
+    return string.format("%.1f", v)
+end
+
+local function scale(n, base, units)
+    local v, i = n, 0
+    while v >= base and i < #units do v = v / base; i = i + 1 end
+    if i == 0 then return v, "B" end
+    return v, units[i]
+end
+
+-- "<N> bytes" 之后的部分: <1000 不印括号; 1000..1023 只印 SI; >=1024 印 SI+IEC
+local function bytesPart(n)
+    if n < 1000 then return "" end
+    local si, siu = scale(n, 1000, SI_UNITS)
+    local iec, iecu = scale(n, 1024, IEC_UNITS)
+    if iecu == "B" then return " (" .. fmt2(si) .. " " .. siu .. ")" end
+    return " (" .. fmt2(si) .. " " .. siu .. ", " .. fmt2(iec) .. " " .. iecu .. ")"
+end
+
+-- 速率的最小单位是 kB(实测: 50 B/s 印 "0.1 kB/s")
+local function ratePart(bps)
+    local v, u = scale(bps, 1000, SI_UNITS)
+    if u == "B" then v, u = v / 1000, "kB" end
+    return fmt2(v) .. " " .. u .. "/s"
+end
+
+local function xferLine(n, secs)
+    if secs < 0 then secs = 0 end
+    local bps = (secs > 0) and (n / secs) or 0
+    return string.format("%d bytes%s copied, %g s, %s\n", n, bytesPart(n), secs, ratePart(bps))
+end
+
+-- ================= 输出写入 =================
+local obuf, obufLen = {}, 0
+
+local function rawWrite(s)
+    if notruncPrepare then
+        local prep = notruncPrepare
+        notruncPrepare = nil
+        local ok, err = prep()
+        if not ok then outErr = err; return end
+    end
+    if outIsStd then io.write(s) else outH:write(s) end
+end
+
+-- 输出按 obs 重组成整块: 满 obs 的写出去算一个整块, 收尾的零头算一个部分块(与 GNU 相同)
+local function outAppend(s)
+    if s == "" then return end
+    obuf[#obuf + 1] = s
+    obufLen = obufLen + #s
+    if obufLen < obs then return end
+    local buf = table.concat(obuf)
+    local off = 1
+    while obufLen >= obs do
+        rawWrite(buf:sub(off, off + obs - 1))
+        outFull = outFull + 1
+        bytes = bytes + obs
+        off = off + obs
+        obufLen = obufLen - obs
+    end
+    obuf = {}
+    if off <= #buf then obuf[1] = buf:sub(off); obufLen = #buf - off + 1 end
+end
+
+local function outFlushTail()
+    if obufLen == 0 then return end
+    rawWrite(table.concat(obuf))
+    outPartial = outPartial + 1
+    bytes = bytes + obufLen
+    obuf, obufLen = {}, 0
+end
+
+-- ================= 转换 =================
+-- 大小写转换表自己建, 不走 string.upper/lower(字节精确, 只动 ASCII 字母)
+local UPPER, LOWER = {}, {}
+for i = 97, 122 do
+    UPPER[string.char(i)] = string.char(i - 32)
+    LOWER[string.char(i - 32)] = string.char(i)
+end
+
+-- ================= 拷贝 =================
+local t0 = os.clock()
+
+-- skip: 逐输入块读取丢弃(按 ibs 计; 跳过末尾与 GNU 一样只警告并继续)
+if skip > 0 then
+    local left = skip * ibs
+    while left > 0 do
+        local d, derr = inH:read(math.min(left, ibs))
+        if d == nil then
+            if derr then
+                stderr("dd: error reading '" .. inName .. "': " .. tostring(derr) .. "\n")
+                return 1
+            end
+            break -- EOF
+        end
+        if d == "" then break end
+        left = left - #d
+    end
+    if left > 0 then stderr("dd: " .. inName .. ": cannot skip to specified offset\n") end
+end
+
+-- 整块快路径: ibs == obs 且没有任何会改变字节/长度的转换与定位时, 一次 read(bs) 一次 write
+local fast = (ibs == obs) and not (cSync or cSwab or cUcase or cLcase) and skip == 0 and seek == 0
+local lastProg = 0
+
+while true do
+    if count and (inFull + inPartial) >= count then break end
+    local d, derr = inH:read(ibs)
+    if d == nil then
+        if not derr then break end -- EOF(nil 无错误值)
+        stderr("dd: error reading '" .. inName .. "': " .. tostring(derr) .. "\n")
+        if not cNoerror then return 1 end
+        -- noerror: 跳过坏块继续; 跳不过去就退出, 免得原地死循环
+        if not (inH.seek and inH:seek("cur", ibs)) then
+            stderr("dd: " .. inName .. ": cannot skip past read error\n")
+            return 1
+        end
+        d = ""
+    elseif d == "" then
+        break -- EOF
+    end
+    if #d == ibs then inFull = inFull + 1 else inPartial = inPartial + 1 end
+    if cSync and #d < ibs then d = d .. string.rep("\0", ibs - #d) end  -- 补满整块(算整块)
+    if cSwab then d = d:gsub("(.)(.)", "%2%1") end                     -- 每块内交换相邻字节对
+    if cUcase then d = d:gsub("%l", UPPER)
+    elseif cLcase then d = d:gsub("%u", LOWER) end
+    if fast then
+        rawWrite(d)
+        if #d == obs then outFull = outFull + 1 else outPartial = outPartial + 1 end
+        bytes = bytes + #d
+    else
+        outAppend(d)
+    end
+    if outErr then stderr(tostring(outErr) .. "\n"); return 1 end
+    if status == "progress" then
+        local el = os.clock() - t0
+        if el - lastProg >= 1 then
+            lastProg = el
+            stderr(xferLine(bytes, el))
+        end
+    end
+end
+
+if not fast then outFlushTail() end
+if outErr then stderr(tostring(outErr) .. "\n"); return 1 end
+
+-- notrunc: 把旧内容里没被覆盖的尾部原样写回(见文件头; 空拷贝时 notruncTouched 为 false)
+if notruncTouched then
+    local tail = notruncOld:sub(start + bytes + 1)
+    if tail ~= "" then outH:write(tail) end
+end
+
+if outH then outH:close() end
+if not inIsStd then inH:close() end
+
+if status ~= "none" then
+    stderr(string.format("%d+%d records in\n", inFull, inPartial))
+    stderr(string.format("%d+%d records out\n", outFull, outPartial))
+    if status ~= "noxfer" then stderr(xferLine(bytes, os.clock() - t0)) end
+end

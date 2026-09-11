@@ -1,0 +1,245 @@
+-- Delin df: 报告已挂载文件系统的空间用量 (POSIX df 子集)。
+-- 用法: df [-k] [-P] [-a] [-h] [-T] [-i] [FILE...]
+-- 选项:
+--   -k, --kilobytes        以 1024 字节块显示(缺省 512 字节块, POSIX 默认)
+--   -h, --human-readable   人类可读(0 / 880K / 2.9G 风格)
+--   -P, --portability      POSIX 单行格式: 用 POSIX 规定的最小字段宽度
+--                          (文件系统名 14, 数字列 10, 百分比 5, 1 空格分隔), 列位置固定
+--   -a, --all              连伪文件系统(procfs/sysfs/devtmpfs)一起列出; 缺省不列
+--   -T, --print-type       增加 Type 列(取 mount 表里的 fstype)
+--   -i, --inodes           不支持: 内核没有 inode 统计, 见"已知偏离" 3), 报错并 return 1
+--   --                     之后一律按操作数处理
+-- 输出列: Filesystem [Type] 512-blocks Used Available Capacity "Mounted on"
+--   (列名用 POSIX 的; 缺省用动态列宽 + 2 空格分隔, -P 用 POSIX 固定列宽 + 1 空格;
+--    -h 时大小列标题变成 Size/Used/Avail。 -T 时 Type 紧跟 Filesystem, 与 GNU df -T 同位置。)
+-- 无操作数: 列出 mount 表里每个存在的挂载点(伪文件系统要 -a);
+-- 有操作数: 用 resolve() 解析后用**最长前缀匹配**找出所在挂载点再显示该挂载点。
+--
+-- 已知偏离 / 决策点:
+-- 1) 数据来源: syscalls["fs.mounts"]()(同 /bin/mount 的用法)给挂载表, fs.getCapacity/
+--    fs.getFreeSpace 给容量/可用字节。 宿主测试台的 fs.mounts 是**空桩**(只有先跑
+--    /bin/mount /dev/sda1 /mnt/cc 才有条目), getCapacity/getFreeSpace 映射到宿主真实 df,
+--    所以测试台上数字是宿主磁盘的。
+-- 2) Used = Capacity - Free(**注意与 GNU 不同**): 内核只给"可用空间"(相当于 GNU 的 Available,
+--    即只算 f_bavail), 不给 f_bfree, 所以 Delin 的 Used 比 GNU 的 Used 大(把保留块也算进去了);
+--    于是 Used + Available == Capacity 恒成立, 而 GNU 的 Used 只是"非保留块里已用的部分"。
+-- 3) -i(inode 用量)不支持: 内核 fs 门面**没有** inode 计数接口(见 src/kernel/vfs_api.lua 的
+--    fsapi 只有 getSize/getCapacity/getFreeSpace; src/kernel/ext2.lua 的 backend 也只给块数),
+--    按 fail-fast 原则明确报错 `df: -i: inode statistics are not available` 并 return 1,
+--    绝不编造数字。这是需要人决策的点: 要么补内核接口, 要么让 df -i 永久报错。
+-- 4) 伪文件系统判定 = 容量为 0。内核里 procfs/sysfs(以及 /dev 的 devtmpfs 后端)的
+--    getFreeSpace/getCapacity 都返回 0(见 src/kernel/procfs.lua、src/kernel/sysfs.lua),
+--    ext2 才返回真实块数×块大小。所以: 容量 0 → Capacity 列显示 "-"(Used/Available 显示 0),
+--    缺省不列出, -a 才列出。 显式写在操作数上的挂载点一定显示(用户点名要看)。
+-- 5) 挂载点按 mount 表顺序输出(不排序); 操作数重复指向同一挂载点时只输出一次;
+--    mount 表里有 root 不存在的条目时向 stderr 报一行并跳过, 退出码置 1(与 GNU 对陈旧挂载的处理一致)。
+-- 6) 百分比用向上取整(GNU df 也是向上取整: 1052/3033520 会显示 1% 而不是 0%)。
+-- 7) 操作数路径存在但不在任何挂载点之下时报 `not a mounted filesystem` 并 return 1:
+--    真机上 "/" 一定在 mount 表里(rootfs, 见 src/kernel/boot.lua 的 vfs.mount("/", ...)),
+--    所以正常路径一定匹配得到; 宿主测试台 mount 表初始为空, 需要先 mount 或直接给挂载点。
+-- 8) 单独 "-" 按普通操作数处理(SPEC 约定), 会解析成不存在的路径并报 No such file or directory。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+local function ioeMsg(err)
+    if err and (err:find("permission") or err:find("denied")) then return "Permission denied" end
+    -- 注意顺序: "No such file or directory" 里也有 "directory", 先判 ENOENT,
+    -- 否则缺文件会被误报成 "Is a directory"(wc/cat 那版模板就有这个问题)。
+    if err and (err:find("[Nn]o such") or err:find("not found")) then return "No such file or directory" end
+    -- 必须先判 ENOENT: "No such file or directory" 里本来就含 "directory" 这个词,
+    -- 先匹 "directory" 会把"文件不存在"误报成 "Is a directory"(老模板的 bug)。
+    if err and err:lower():find("no such file") then return "No such file or directory" end
+    if err and err:find("directory") then return "Is a directory" end
+    return "No such file or directory"
+end
+
+local blockSize, humanOut, showAll, showType, posixFmt = 512, false, false, false, false
+local doInodes = false
+local operands, noMoreOpts = {}, false
+
+local function setShort(ch)
+    if ch == "k" then blockSize, humanOut = 1024, false
+    elseif ch == "h" then humanOut = true
+    elseif ch == "P" then posixFmt = true
+    elseif ch == "a" then showAll = true
+    elseif ch == "T" then showType = true
+    elseif ch == "i" then doInodes = true
+    else stderr("df: invalid option -- '" .. ch .. "'\n"); return false end
+    return true
+end
+
+for _, a in ipairs(args) do
+    if noMoreOpts then
+        operands[#operands + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "--kilobytes" then blockSize, humanOut = 1024, false
+    elseif a == "--human-readable" then humanOut = true
+    elseif a == "--portability" then posixFmt = true
+    elseif a == "--all" then showAll = true
+    elseif a == "--print-type" then showType = true
+    elseif a == "--inodes" then doInodes = true
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        for k = 2, #a do if not setShort(a:sub(k, k)) then return 1 end end
+    else
+        operands[#operands + 1] = a
+    end
+end
+
+-- 内核没有 inode 统计接口: fail-fast, 不编造数字。
+if doInodes then
+    stderr("df: -i: inode statistics are not available\n")
+    return 1
+end
+
+local mountsFn = syscalls and syscalls["fs.mounts"]
+if not mountsFn then
+    stderr("df: fs.mounts syscall not available\n")
+    return 1
+end
+local mounts = mountsFn() or {}
+
+--- 人类可读: 1024 进制, 值 < 10 保留 1 位小数, 一律向上取整(GNU df -h 的舍入方向)。
+local function human(n)
+    if n < 1024 then return string.format("%d", n) end
+    local units = { "K", "M", "G", "T", "P", "E" }
+    local idx, v = 1, n / 1024
+    while v >= 1024 and idx < #units do v = v / 1024; idx = idx + 1 end
+    if v < 10 then
+        local tenths = math.ceil(v * 10) / 10
+        if tenths < 10 then return string.format("%.1f", tenths) .. units[idx] end
+    end
+    local iv = math.ceil(v)
+    if iv >= 1024 and idx < #units then iv, idx = 1, idx + 1 end
+    return string.format("%d", iv) .. units[idx]
+end
+
+--- 一个挂载点的一行数据(全部按字节保存, 显示时才换算)。
+local function rowFor(mt)
+    local cap = fs.getCapacity(mt.root)
+    local free = fs.getFreeSpace(mt.root)
+    local used = cap - free
+    if used < 0 then used = 0 end
+    return {
+        dev = mt.device or ((mt.root == "/") and "rootfs" or "-"),
+        fstype = mt.fstype or "-",
+        root = mt.root,
+        cap = cap, used = used, free = free,
+        pct = (cap > 0) and math.ceil(used * 100 / cap) or nil,
+    }
+end
+
+local rows, rc = {}, 0
+if #operands == 0 then
+    for _, mt in ipairs(mounts) do
+        if not fs.exists(mt.root) then
+            stderr("df: " .. mt.root .. ": No such file or directory\n")
+            rc = 1
+        else
+            local row = rowFor(mt)
+            if showAll or row.cap > 0 then rows[#rows + 1] = row end
+        end
+    end
+else
+    local seen = {}
+    for _, raw in ipairs(operands) do
+        local path = resolve(raw)
+        if not fs.exists(path) then
+            stderr("df: " .. raw .. ": No such file or directory\n")
+            return 1
+        end
+        local best
+        for _, mt in ipairs(mounts) do
+            local root = mt.root
+            if root == "/" or path == root or path:sub(1, #root + 1) == root .. "/" then
+                if not best or #root > #best.root then best = mt end
+            end
+        end
+        if not best then
+            stderr("df: " .. raw .. ": not a mounted filesystem\n")
+            return 1
+        end
+        if not seen[best.root] then
+            seen[best.root] = true
+            rows[#rows + 1] = rowFor(best)
+        end
+    end
+end
+
+--- 字节数 -> 单元格文本。
+local function cell(bytes)
+    if humanOut then return human(bytes) end
+    return string.format("%d", math.ceil(bytes / blockSize))
+end
+
+local cols = {}
+cols[#cols + 1] = { head = "Filesystem", right = false, min = posixFmt and 14 or 0, vals = {} }
+if showType then
+    cols[#cols + 1] = { head = "Type", right = false, min = 0, vals = {} }
+end
+local sizeHead = humanOut and "Size" or (blockSize == 1024 and "1024-blocks" or "512-blocks")
+cols[#cols + 1] = { head = sizeHead, right = true, min = posixFmt and 10 or 0, vals = {} }
+cols[#cols + 1] = { head = "Used", right = true, min = posixFmt and 10 or 0, vals = {} }
+cols[#cols + 1] = { head = humanOut and "Avail" or "Available", right = true, min = posixFmt and 10 or 0, vals = {} }
+cols[#cols + 1] = { head = "Capacity", right = true, min = posixFmt and 5 or 0, vals = {} }
+cols[#cols + 1] = { head = "Mounted on", right = false, min = 0, vals = {} }
+
+for _, row in ipairs(rows) do
+    local n = 1
+    cols[n].vals[#cols[n].vals + 1] = row.dev; n = n + 1
+    if showType then cols[n].vals[#cols[n].vals + 1] = row.fstype; n = n + 1 end
+    cols[n].vals[#cols[n].vals + 1] = cell(row.cap); n = n + 1
+    cols[n].vals[#cols[n].vals + 1] = cell(row.used); n = n + 1
+    cols[n].vals[#cols[n].vals + 1] = cell(row.free); n = n + 1
+    cols[n].vals[#cols[n].vals + 1] = row.pct and (row.pct .. "%") or "-"; n = n + 1
+    cols[n].vals[#cols[n].vals + 1] = row.root
+end
+
+local width = {}
+for ci, col in ipairs(cols) do
+    local w = math.max(#col.head, col.min)
+    for _, v in ipairs(col.vals) do if #v > w then w = #v end end
+    width[ci] = w
+end
+
+local sep = posixFmt and " " or "  "
+
+local function render(cells)
+    local parts = {}
+    for ci, col in ipairs(cols) do
+        parts[ci] = col.right and string.format("%" .. width[ci] .. "s", cells[ci])
+            or string.format("%-" .. width[ci] .. "s", cells[ci])
+    end
+    return (table.concat(parts, sep):gsub("%s+$", ""))
+end
+
+local heads = {}
+for ci, col in ipairs(cols) do heads[ci] = col.head end
+io.write(render(heads) .. "\n")
+for _, row in ipairs(rows) do
+    local cells = {}
+    local n = 1
+    cells[n] = row.dev; n = n + 1
+    if showType then cells[n] = row.fstype; n = n + 1 end
+    cells[n] = cell(row.cap); n = n + 1
+    cells[n] = cell(row.used); n = n + 1
+    cells[n] = cell(row.free); n = n + 1
+    cells[n] = row.pct and (row.pct .. "%") or "-"; n = n + 1
+    cells[n] = row.root
+    io.write(render(cells) .. "\n")
+end
+
+if rc ~= 0 then return rc end
