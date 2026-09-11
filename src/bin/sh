@@ -626,6 +626,14 @@ parseCommand = function()
 end
 
 parsePipeline = function()
+    -- `time` 是 POSIX 保留字(不是内建): `time [-p] pipeline` 只在**管道/命令的首词**位置识别。
+    -- 写成变量赋值(`time=5`)、被引用(`echo time`)或在管道中段时都不是保留字。
+    local isTime, timePosix = false, false
+    if isKw(T[ti], "time") then
+        ti = ti + 1
+        isTime = true
+        if isKw(T[ti], "-p") then timePosix = true; ti = ti + 1 end
+    end
     local node, err, inc = parseCommand()
     if node == nil then return nil, err, inc end
     -- 管道: command ( | command )*, 优先级高于 &&/||。`|` 后允许换行(POSIX)。
@@ -638,8 +646,9 @@ parsePipeline = function()
             if n2 == nil then return nil, e2, i2 end
             items[#items + 1] = n2
         end
-        return { kind = "pipe", items = items }
+        node = { kind = "pipe", items = items }
     end
+    if isTime then return { kind = "time", node = node, posix = timePosix } end
     return node
 end
 
@@ -701,7 +710,7 @@ local specialBuiltins = { [":"] = true, ["exit"] = true, ["return"] = true, ["sh
     ["unset"] = true }
 
 local builtins = {}
-local evalNode, evalList, evalSimple, restoreRedir, matchGlob, evalPipe, spawnChild, evalProgram, promptExpand
+local evalNode, evalList, evalSimple, restoreRedir, matchGlob, evalPipe, spawnChild, evalProgram, promptExpand, runExternal
 
 local function expandWords(words)
     local out = {}
@@ -760,15 +769,25 @@ end
 --   - 否则按 $PATH 逐目录查找(空条目 = 当前目录), PATH 未设置时用 /bin;
 --   - needExec 为真(命令查找)时优先可执行文件; 若只找到不可执行的候选, 返回它,
 --     由调用方给出 permission denied(与 bash 一致)。未找到返回 nil。
-local function searchPath(name, needExec)
+-- 命令路径缓存(POSIX `hash` 内建维护它, 见下文 builtins.hash)。
+-- searchPath 每次都用它: 命中就不走 PATH 搜索。**PATH 一变整个缓存作废** —— 否则改了 PATH
+-- 还用着老路径, 是真实 shell 里非常经典的坑。定义在这里是因为 searchPath 要用到它。
+local hashCache = { path = nil, map = {} }
+local function hashSync()
+    if hashCache.path ~= vars.PATH then
+        hashCache.path = vars.PATH
+        hashCache.map = {}
+    end
+end
+
+--- 在**指定**的 PATH 串里查找(不读 $PATH)。`command -p` 用它走系统缺省路径。
+local function searchInPath(name, path, needExec)
     if name:find("/") then
         local p = resolve(name)
         if fs.exists(p) then return p end
         return nil
     end
-    local path = vars.PATH
-    if path == nil then path = "/bin" end
-    if path == "" then return nil end
+    if path == nil or path == "" then return nil end
     local fallback = nil
     for dir in (path .. ":"):gmatch("([^:]*):") do
         local cand = (dir == "") and resolve(name) or resolve(dir .. "/" .. name)
@@ -778,6 +797,22 @@ local function searchPath(name, needExec)
         end
     end
     return fallback
+end
+
+local function searchPath(name, needExec)
+    if name:find("/") then
+        local p = resolve(name)
+        if fs.exists(p) then return p end
+        return nil
+    end
+    -- 先查 hash 缓存(POSIX hash 内建维护它)。PATH 变了缓存整体作废(见 hashSync)。
+    hashSync()
+    local hit = hashCache.map[name]
+    if hit and fs.exists(hit) then return hit end
+    hashCache.map[name] = nil
+    local found = searchInPath(name, vars.PATH, needExec)
+    if found then hashCache.map[name] = found end
+    return found
 end
 
 builtins.pwd = function(args) outln(cwd) end
@@ -1176,6 +1211,437 @@ builtins.read = function(args)
     lastExit = eof and 1 or 0
 end
 
+-- ===============================================================
+-- 别名 (POSIX alias/unalias)
+-- ===============================================================
+-- POSIX 的别名是在**解析期**做首词替换(词法阶段就换掉了), 因此别名体里可以写完整语法
+-- (`alias ll='ls -l | more'`), 也能写 `alias e=echo` 后 `e$x`。
+-- Delin 的解析器是手写递归下降, 在词法/语法层插钩子要改的面向很大, 所以改成**求值期**替换:
+-- 认出首词是别名后, 把"别名体 + 其余已展开的词"重新解析执行(红由外层 evalSimple 已布好, 会
+-- 一并继承)。对日常用法(别名带参数/管道/重定向/多条命令)与 POSIX 行为一致。
+-- 已知偏离(写进 for-ai.md): 别名体里的位置参数($1 等)展开时机与 POSIX 不同; 别名不参与
+-- "词内"替换(`alias e=echo; e$x` 这种在 POSIX 里能展开, 这里不能)。
+local aliases = {}
+local aliasExpanding = {} -- name -> true: 正在展开的别名(防 `alias ls='ls -a'` 这类自递归)
+
+--- 把已展开的一个词重新引用成字面量(别名体重新解析时要保持"参数已经展开过"这个事实)。
+local function quoteAsLiteral(s)
+    if s == "" then return "''" end
+    if s:match("^[%w_%-%.%/:=@%%,%+%^]+$") then return s end
+    return "'" .. s:gsub("'", "'\\''") .. "'"
+end
+
+--- 若 cmd 命中别名则接管执行; 返回 true 表示已处理。
+local function tryAlias(cmd, rest)
+    local val = aliases[cmd]
+    if not val or aliasExpanding[cmd] then return false end
+    local parts = { val }
+    for _, w in ipairs(rest) do parts[#parts + 1] = quoteAsLiteral(w) end
+    aliasExpanding[cmd] = true
+    local ok, inc, err, ctrl = evalProgram(table.concat(parts, " "))
+    aliasExpanding[cmd] = nil
+    if not ok then
+        if inc then
+            errln("sh: alias '" .. cmd .. "': unexpected end of input")
+        elseif err then
+            errln("sh: alias '" .. cmd .. "': " .. tostring(err))
+        end
+        lastExit = 2
+        return true
+    end
+    if ctrl == "exit" then return true, "exit" end
+    return true
+end
+
+builtins.alias = function(args)
+    if #args == 0 then
+        -- 无操作数: 按名排序列出全部别名, 形如 `alias name=value`(可直接重输入)。
+        local names = {}
+        for n in pairs(aliases) do names[#names + 1] = n end
+        table.sort(names)
+        for _, n in ipairs(names) do outln("alias " .. n .. "=" .. quoteAsLiteral(aliases[n])) end
+        lastExit = 0
+        return
+    end
+    local rc = 0
+    for _, a in ipairs(args) do
+        local n, v = a:match("^([^=]+)=(.*)$")
+        if n then
+            aliases[n] = v
+        elseif aliases[a] then
+            outln("alias " .. a .. "=" .. quoteAsLiteral(aliases[a]))
+        else
+            errln("sh: alias: " .. a .. ": not found")
+            rc = 1
+        end
+    end
+    lastExit = rc
+    return
+end
+
+builtins.unalias = function(args)
+    if #args == 0 then
+        errln("sh: unalias: usage: unalias [-a] name [name ...]")
+        lastExit = 2
+        return
+    end
+    local rc = 0
+    for _, a in ipairs(args) do
+        if a == "-a" then
+            aliases = {}
+        elseif aliases[a] then
+            aliases[a] = nil
+        else
+            errln("sh: unalias: " .. a .. ": not found")
+            rc = 1
+        end
+    end
+    lastExit = rc
+end
+
+-- ===============================================================
+-- 命令路径缓存 (POSIX hash)
+-- ===============================================================
+-- 缓存本体(hashCache/hashSync)定义在 searchPath 之前 —— 那里就要用它; 这里只是 `hash` 内建。
+
+builtins.hash = function(args)
+    if #args > 0 and args[1] == "-r" then
+        table.remove(args, 1)
+        hashCache.map = {}
+        hashCache.path = vars.PATH
+        if #args == 0 then lastExit = 0; return end
+    end
+    if #args == 0 then
+        local names = {}
+        for n in pairs(hashCache.map) do names[#names + 1] = n end
+        table.sort(names)
+        for _, n in ipairs(names) do outln(n .. "=" .. hashCache.map[n]) end
+        lastExit = 0
+        return
+    end
+    -- 带操作数: 重新定位这些命令并写入缓存(POSIX: 找不到则退出码非 0)。
+    local rc = 0
+    hashSync()
+    for _, n in ipairs(args) do
+        local p = searchPath(n, true)
+        if p then hashCache.map[n] = p
+        else errln("sh: hash: " .. n .. ": not found"); rc = 1 end
+    end
+    lastExit = rc
+    return
+end
+
+-- ===============================================================
+-- umask (POSIX 特殊内建之一; 本内核把它当普通内建, 见下)
+-- ===============================================================
+local function umaskBitSet(v, b) return math.floor(v / (2 ^ b)) % 2 == 1 end
+local function umaskSetBit(v, b, on)
+    local bit = 2 ^ b
+    if on then return umaskBitSet(v, b) and v or (v + bit) end
+    return umaskBitSet(v, b) and (v - bit) or v
+end
+
+--- 把一个符号模式(如 u=rwx,g=rx,o=)在基准权限上求值, 返回权限位; 语法错返回 nil。
+local function parseSymbolicPerms(base, spec)
+    local cur = base % 512
+    for clause in spec:gmatch("[^,]+") do
+        local who, op, perms = clause:match("^([ugoa]*)([-+=])([rwx]*)$")
+        -- perms 允许为空: `o=` 是"清掉 o 的全部权限", 完全合法。
+        if not who then return nil end
+        if who == "" then who = "a" end
+        local ops = {}
+        for i = 1, #perms do
+            local c = perms:sub(i, i)
+            if c == "r" then ops[#ops + 1] = 2
+            elseif c == "w" then ops[#ops + 1] = 1
+            else ops[#ops + 1] = 0 end
+        end
+        local groups = {}
+        if who:find("u") then groups[#groups + 1] = 6 end
+        if who:find("g") then groups[#groups + 1] = 3 end
+        if who:find("o") then groups[#groups + 1] = 0 end
+        if #groups == 0 then return nil end
+        for _, shift in ipairs(groups) do
+            if op == "=" then
+                for _, b in ipairs({ 2, 1, 0 }) do cur = umaskSetBit(cur, shift + b, false) end
+            end
+            for _, b in ipairs(ops) do cur = umaskSetBit(cur, shift + b, op ~= "-") end
+        end
+    end
+    return cur
+end
+
+--- 权限位 -> 符号形式 u=rwx,g=rx,o=rx (umask -S 用)。
+local function permsToSymbolic(perms)
+    local function part(shift)
+        local g = math.floor(perms / (2 ^ shift)) % 8
+        return (g % 2 == 1 and "" or "") .. ((math.floor(g / 4) % 2 == 1) and "r" or "")
+            .. ((math.floor(g / 2) % 2 == 1) and "w" or "") .. ((g % 2 == 1) and "x" or "")
+    end
+    return "u=" .. part(6) .. ",g=" .. part(3) .. ",o=" .. part(0)
+end
+
+local function umaskGet()
+    if syscalls and syscalls["umask.get"] then return syscalls["umask.get"]() end
+    return tonumber("022", 8)
+end
+
+builtins.umask = function(args)
+    local symbolic = false
+    local operands = {}
+    for _, a in ipairs(args) do
+        if a == "-S" then symbolic = true else operands[#operands + 1] = a end
+    end
+    if #operands == 0 then
+        local m = umaskGet()
+        if symbolic then outln(permsToSymbolic(tonumber("777", 8) - m)) else outln(string.format("%04o", m)) end
+        lastExit = 0
+        return
+    end
+    if #operands > 1 then
+        errln("sh: umask: too many arguments")
+        lastExit = 2
+        return
+    end
+    local spec = operands[1]
+    local mask
+    if spec:match("^[0-7]+$") then
+        mask = tonumber(spec, 8)
+        if not mask or mask > tonumber("777", 8) then
+            errln("sh: umask: " .. spec .. ": octal number out of range")
+            lastExit = 2
+            return
+        end
+    else
+        -- 符号模式: POSIX 规定按"允许的权限"给出, 再取补得到掩码。
+        local perms = parseSymbolicPerms(tonumber("777", 8), spec)
+        if not perms then
+            errln("sh: umask: " .. spec .. ": invalid symbolic mode")
+            lastExit = 2
+            return
+        end
+        mask = tonumber("777", 8) - perms
+    end
+    if not (syscalls and syscalls["umask.set"]) then
+        errln("sh: umask: kernel does not support umask.set")
+        lastExit = 1
+        return
+    end
+    local ok, err = syscalls["umask.set"](mask)
+    if ok == nil then
+        errln("sh: umask: " .. tostring(err))
+        lastExit = 1
+        return
+    end
+    lastExit = 0
+end
+
+-- ===============================================================
+-- getopts (POSIX 内建)
+-- ===============================================================
+-- 状态只有"当前参数内已消费到第几个字符", 以及它属于哪一个 OPTIND —— OPTIND 被脚本改动过
+-- 就必须重新开始扫描该参数(POSIX 要求 OPTIND 可写且语义如此)。
+local getoptsChar = 0
+local getoptsOptind = nil
+
+builtins.getopts = function(args)
+    local optstring = args[1]
+    local name = args[2]
+    if not optstring or not name then
+        errln("sh: getopts: usage: getopts optstring name [arg...]")
+        lastExit = 2
+        return
+    end
+    local silent = false
+    if optstring:sub(1, 1) == ":" then silent = true; optstring = optstring:sub(2) end
+    local list
+    if #args > 2 then
+        list = {}
+        for i = 3, #args do list[#list + 1] = args[i] end
+    else
+        list = posArgs
+    end
+
+    local optind = tonumber(vars.OPTIND or "1") or 1
+    if getoptsOptind ~= optind then getoptsChar = 0; getoptsOptind = optind end
+
+    local function finish() getoptsOptind = optind; vars.OPTIND = tostring(optind) end
+
+    while true do
+        local arg = list[optind]
+        if arg == nil then
+            -- 选项结束(POSIX: 返回 >0, 并把 name 置为 "?")。
+            vars[name] = "?"
+            finish()
+            lastExit = 1; return
+        end
+        if getoptsChar == 0 then
+            if arg == "--" then
+                optind = optind + 1
+                vars[name] = "?"
+                finish()
+                lastExit = 1; return
+            end
+            -- 非选项(不以 "-" 开头, 或就是单独的 "-")即结束。
+            if arg:sub(1, 1) ~= "-" or arg == "-" then
+                vars[name] = "?"
+                finish()
+                lastExit = 1; return
+            end
+            getoptsChar = 2 -- 跳过前导 "-"
+        end
+        if getoptsChar > #arg then
+            optind = optind + 1
+            getoptsChar = 0
+        else
+            local ch = arg:sub(getoptsChar, getoptsChar)
+            getoptsChar = getoptsChar + 1
+            local pos = optstring:find(ch, 1, true)
+            if not pos then
+                -- 未知选项
+                if getoptsChar > #arg then optind = optind + 1; getoptsChar = 0 end
+                if silent then
+                    vars.OPTARG = nil
+                    vars[name] = "?"
+                else
+                    vars.OPTARG = nil
+                    vars[name] = "?"
+                    errln("sh: illegal option -- " .. ch)
+                end
+                finish()
+                lastExit = 0; return
+            end
+            if optstring:sub(pos + 1, pos + 1) == ":" then
+                -- 需要参数: 粘连在同一个词里, 或取下一个词
+                if getoptsChar <= #arg then
+                    vars.OPTARG = arg:sub(getoptsChar)
+                    optind = optind + 1
+                    getoptsChar = 0
+                    vars[name] = ch
+                    finish()
+                    lastExit = 0; return
+                end
+                optind = optind + 1
+                getoptsChar = 0
+                local nxt = list[optind]
+                if nxt == nil then
+                    if silent then
+                        vars[name] = ":"
+                        vars.OPTARG = ch
+                    else
+                        vars[name] = "?"
+                        vars.OPTARG = nil
+                        errln("sh: option requires an argument -- " .. ch)
+                    end
+                    finish()
+                    lastExit = 0; return
+                end
+                vars.OPTARG = nxt
+                optind = optind + 1
+                vars[name] = ch
+                finish()
+                lastExit = 0; return
+            end
+            -- 普通选项
+            if getoptsChar > #arg then optind = optind + 1; getoptsChar = 0 end
+            vars.OPTARG = nil
+            vars[name] = ch
+            finish()
+            lastExit = 0; return
+        end
+    end
+end
+
+-- ===============================================================
+-- command (POSIX: 绕过函数/别名直接执行; -v/-V 查询)
+-- ===============================================================
+--- 判断一个名字是不是"用户定义的 shell 函数"(funcSrcs 里登记的就是)。
+local function isFunction(n) return funcSrcs[n] ~= nil end
+--- 判断一个名字是不是 shell 自己的内建(排除同名函数覆盖)。
+local function isShellBuiltin(n) return builtins[n] ~= nil and not isFunction(n) end
+
+builtins.command = function(args)
+    local useDefaultPath, verbose, describe = false, false, false
+    local i = 1
+    while i <= #args do
+        local a = args[i]
+        if a == "--" then i = i + 1; break
+        elseif a == "-p" then useDefaultPath = true
+        elseif a == "-v" then verbose = true
+        elseif a == "-V" then describe = true
+        elseif a:sub(1, 1) == "-" and #a > 1 then
+            errln("sh: command: illegal option -- " .. a:sub(2, 2))
+            lastExit = 2
+            return
+        else break end
+        i = i + 1
+    end
+    local rest = {}
+    for k = i, #args do rest[#rest + 1] = args[k] end
+
+    if verbose or describe then
+        if #rest == 0 then
+            errln("sh: command: usage: command [-pVv] command [arg ...]")
+            lastExit = 2
+            return
+        end
+        local rc = 0
+        for _, n in ipairs(rest) do
+            local how, detail
+            if aliases[n] then
+                how, detail = "alias", "an alias for " .. quoteAsLiteral(aliases[n])
+            elseif isFunction(n) then
+                how, detail = "function", "a shell function"
+            elseif isShellBuiltin(n) then
+                how, detail = "builtin", "a shell builtin"
+            else
+                local p = useDefaultPath and searchInPath(n, "/bin", true) or searchPath(n, true)
+                if p then how, detail = "file", p end
+            end
+            if not how then
+                errln("sh: command: " .. n .. ": not found")
+                rc = 1
+            elseif describe then
+                outln(n .. " is " .. detail)
+            elseif how == "file" then
+                outln(detail)
+            else
+                outln(n)
+            end
+        end
+        lastExit = rc
+        return
+    end
+
+    if #rest == 0 then
+        errln("sh: command: usage: command [-pVv] command [arg ...]")
+        lastExit = 2
+        return
+    end
+    local cmd = rest[1]
+    local cargs = {}
+    for k = 2, #rest do cargs[#cargs + 1] = rest[k] end
+    -- 绕过函数: 函数登记在 builtins 里, 这里显式跳过它们(别名本来就在首词替换阶段绕过了,
+    -- 因为 `command` 自己才是首词)。
+    if builtins[cmd] and not isFunction(cmd) then
+        local ctrl = builtins[cmd](cargs)
+        if ctrl == "exit" then return "exit" end
+        return
+    end
+    if isFunction(cmd) then
+        -- 有同名函数时按 PATH 找外部命令执行。
+        local p = useDefaultPath and searchInPath(cmd, "/bin", true) or searchPath(cmd, true)
+        if not p then
+            errln("sh: command: " .. cmd .. ": not found")
+            lastExit = 127
+            return
+        end
+        runExternal(p, cargs, nil, cmd)
+        return
+    end
+    runExternal(cmd, cargs, nil, cmd)
+end
+
 builtins.help = function(args)
     outln("Delin sh (POSIX core subset)")
     outln("builtins : cd pwd echo read exit help jobs fg bg wait kill test [ true false :")
@@ -1555,7 +2021,7 @@ local function newJobGroup(pid, pgid)
     return pgid or pid
 end
 
-local function runExternal(cmd, argv, stdio, text)
+runExternal = function(cmd, argv, stdio, text)
     local child, cerr = spawnChild(cmd, argv, stdio)
     if not child then
         errln("sh: " .. cmd .. ": " .. tostring(cerr))
@@ -1673,7 +2139,13 @@ evalSimple = function(node)
             xtraceCmd(node, argvs)
             local cmd, rest = argvs[1], {}
             for i = 2, #argvs do rest[#rest + 1] = argvs[i] end
-            if builtins[cmd] then
+            -- 别名先于内建/外部命令(POSIX: 别名替换发生在查找内建之前)。
+            local aliasCtrl
+            local handled
+            handled, aliasCtrl = tryAlias(cmd, rest)
+            if handled then
+                ctrl = aliasCtrl
+            elseif builtins[cmd] then
                 ctrl = builtins[cmd](rest)
             else
                 local s = (needOut or needIn) and { input = inH, output = outH } or nil
@@ -1753,7 +2225,11 @@ evalPipe = function(node)
             else
                 local cmd, rest = argvs[1], {}
                 for k = 2, #argvs do rest[#rest + 1] = argvs[k] end
-                info[i] = { cmd = cmd, rest = rest, inH = inp, outH = outp, builtin = builtins[cmd] ~= nil, kind = "simple" }
+                -- 别名优先于内建(POSIX 语义); 命中的元素由 Pass C 用 tryAlias 跑。
+                local isAlias = aliases[cmd] ~= nil
+                info[i] = { cmd = cmd, rest = rest, inH = inp, outH = outp,
+                            alias = isAlias, builtin = (not isAlias) and builtins[cmd] ~= nil,
+                            kind = "simple" }
             end
         else
             -- 复合命令(if/for/while/case/funcdef/brace)作为管道元素: 内联运行, 经 inH/outH 连通管道。
@@ -1764,7 +2240,7 @@ evalPipe = function(node)
     local pgid, leader = nil, nil
     for i = 1, n do
         local it = info[i]
-        if it.cmd and not it.builtin then
+        if it.cmd and not it.builtin and not it.alias then
             local pid, cerr = spawnChild(it.cmd, it.rest, { input = it.inH, output = it.outH })
             if pid then
                 spawned[i] = pid
@@ -1788,11 +2264,13 @@ evalPipe = function(node)
         if it.noop then
             closePipeEl(i, n, pipes)
             codes[i] = 0
-        elseif it.cmd and it.builtin then
+        elseif it.cmd and (it.builtin or it.alias) then
             inH, outH = it.inH, it.outH
             lastExit = 0
             local restore = applyAssigns(items[i])
-            local ctrl = builtins[it.cmd](it.rest)
+            local ctrl, handled
+            if it.alias then handled, ctrl = tryAlias(it.cmd, it.rest) end
+            if not handled and not it.alias then ctrl = builtins[it.cmd](it.rest) end
             undoAssigns(restore)
             inH, outH = savedIn, savedOut
             closePipeEl(i, n, pipes)
@@ -1845,6 +2323,22 @@ local condCtx = 0
 evalNode = function(node)
     if node.kind == "simple" then return evalSimple(node) end
     if node.kind == "pipe" then return evalPipe(node) end
+    if node.kind == "time" then
+        -- POSIX `time [-p] pipeline`: 计时并报告 real/user/sys。
+        -- 报告走 stderr(POSIX 明文规定, 免得被 `time cmd > f` 混进命令输出)。
+        -- Delin 只提供 os.clock()(CC: "本程序消耗的 CPU 时间"), 所以 user 由它取差,
+        -- **sys 恒为 0**(没有内核/用户态分离的记账) —— 这是已知偏离, 写在 for-ai.md。
+        local t0, c0 = os.epoch("utc"), os.clock()
+        local rt, ctrl = evalNode(node.node)
+        local real = (os.epoch("utc") - t0) / 1000
+        local user = os.clock() - c0
+        if real < 0 then real = 0 end
+        if user < 0 then user = 0 end
+        errln(string.format("real\t%dm%.3fs", math.floor(real / 60), real % 60))
+        errln(string.format("user\t%dm%.3fs", math.floor(user / 60), user % 60))
+        errln(string.format("sys\t%dm%.3fs", 0, 0))
+        return rt, ctrl
+    end
     if node.kind == "chain" then
         -- 连接符存于下一个 item 的 op: item[i].op 是 item[i-1] 与 item[i] 之间的 &&/||。
         -- 用布尔"最近一条已执行命令是否成功"做左结合短路:
