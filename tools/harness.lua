@@ -57,9 +57,19 @@ local F = {}
 local function norm(p)
     if p == nil or p == "" then return "/" end
     if p:sub(1, 1) ~= "/" then p = "/" .. p end
-    p = p:gsub("/+$", "")
-    if p == "" then p = "/" end
-    return p
+    -- 消解 "." 与 ".."(到根为止): 内核 VFS 的 normalize 就是这么做的, 测试台里以路径为键的
+    -- 东西(FIFO 表等)必须用同一套视角 —— 否则 `find . -type p` 会因为 "./x" != "/x" 把管道
+    -- 当普通文件(实测踩过)。
+    local out = {}
+    for seg in p:gmatch("[^/]+") do
+        if seg == ".." then
+            if #out > 0 then out[#out] = nil end
+        elseif seg ~= "." then
+            out[#out + 1] = seg
+        end
+    end
+    if #out == 0 then return "/" end
+    return "/" .. table.concat(out, "/")
 end
 local function host(p) local n = norm(p); return ROOT .. n end
 
@@ -207,6 +217,9 @@ end
 function F.lstat(p)
     local h = io.popen("test -L " .. shq(host(p)) .. " && echo l")
     local isLink = h:read("*a"); h:close()
+    -- 不存在的路径必须返回 nil(与内核 fs.lstat 一致)。hostAttrs 永远给出一张表, 所以这里
+    -- 自己先判存在性 —— 否则任何"用 lstat 判存在性"的工具在宿主上都会与真机不一致。
+    if isLink == "" and not F.exists(p) then return nil end
     local a = F.attributes(p)
     if not a then return nil end
     if isLink ~= "" then
@@ -528,9 +541,12 @@ local running = {} -- 调度器进程队列 { pid, co, status }
 local function spawn(src, name, ppid, uid, gid, argv, opts)
     nextPid = nextPid + 1
     local pid = nextPid
-    local stdio = (opts and opts.stdio) or curStdio
-    -- 环境块(与内核 process.spawn 一致): 继承父进程, opts.env 覆盖/追加(值为 nil 删除)。
+    -- 未显式给 stdio 时继承**父进程**的 stdio(内核 process.spawn 的语义)。
+    -- 原来取的是顶层的 curStdio, 于是子进程的输出会跑到测试台自己的 stdout 上,
+    -- 用管道/重定向跑 `find -exec`、`xargs` 时宿主与真机对不上。
     local parent = procs[ppid]
+    local stdio = (opts and opts.stdio) or (parent and parent.stdio) or curStdio
+    -- 环境块(与内核 process.spawn 一致): 继承父进程, opts.env 覆盖/追加(值为 nil 删除)。
     local envvars = {}
     if parent and parent.envvars then for k, v in pairs(parent.envvars) do envvars[k] = v end end
     if opts and opts.env then
@@ -1020,14 +1036,46 @@ local toolPath = argsIn[1] or "/bin/sh"
 local toolArgs = {}
 for i = 2, #argsIn do toolArgs[#toolArgs + 1] = argsIn[i] end
 
--- 读 stdin(作为脚本内容)
-local stdinBuf = {}
-for line in io.lines() do stdinBuf[#stdinBuf + 1] = line end
-local li = 0
+-- 读 stdin(作为脚本内容)。**按字节缓冲**, 不是按行 —— 按行读会吃掉 NUL 与行尾换行信息,
+-- 于是 cksum/od/tr 这类"字节级 stdin"的工具在测试台上根本没法与宿主逐字节对照
+-- (以前只能用文件操作数绕开)。readLine/read(n)/read("*a") 都从这个游标上取。
+local stdinData = io.read("*a") or ""
+local stdinPos = 1
 -- DELIN_HARNESS_TTY=1: 把 stdin 伪装成终端, 让 sh 走交互式分支(测 PS1/PS2 提示符)。
 local ttyMode = os.getenv("DELIN_HARNESS_TTY") == "1"
-local inputHandle = { isTTY = ttyMode, readLine = function() li = li + 1; return stdinBuf[li] end }
-inputHandle.read = function() end
+local inputHandle = { isTTY = ttyMode }
+inputHandle.readLine = function()
+    if stdinPos > #stdinData then return nil end
+    local nl = stdinData:find("\n", stdinPos, true)
+    if not nl then
+        local line = stdinData:sub(stdinPos)
+        stdinPos = #stdinData + 1
+        return line
+    end
+    local line = stdinData:sub(stdinPos, nl - 1)
+    stdinPos = nl + 1
+    return line
+end
+inputHandle.read = function(fmt)
+    if stdinPos > #stdinData then return nil end
+    if fmt == nil or fmt == "*l" or fmt == "l" then return inputHandle.readLine() end
+    if fmt == "*a" or fmt == "a" then
+        local rest = stdinData:sub(stdinPos)
+        stdinPos = #stdinData + 1
+        return rest
+    end
+    local n = tonumber(fmt)
+    if not n or n <= 0 then return "" end
+    if stdinPos + n - 1 > #stdinData then
+        local rest = stdinData:sub(stdinPos)
+        stdinPos = #stdinData + 1
+        return rest ~= "" and rest or nil
+    end
+    local chunk = stdinData:sub(stdinPos, stdinPos + n - 1)
+    stdinPos = stdinPos + n
+    return chunk
+end
+inputHandle.readAll = function() return inputHandle.read("*a") end
 
 local outputHandle = Handle.new(io.stdout, "<stdout>")
 
