@@ -1,0 +1,828 @@
+-- Delin find: 遍历目录树并按表达式筛选/动作 (POSIX find(1) 核心子集 + 常用 GNU 项)。
+-- 用法: find [PATH...] [EXPRESSION]
+--   缺省 PATH 是 "."; 缺省动作是 -print(表达式里已有别的动作时不追加)。
+-- 谓词:
+--   -name PAT -iname PAT      名字匹配(shell 式通配 * ? [...], 不是 Lua pattern)
+--   -path PAT -ipath PAT      整条打印路径匹配(同上通配)
+--   -type X                   X 取 f d l p c b 的组合(逗号分隔, 如 -type f,d); c 与 b 都看设备
+--   -size N[cwbkMG]           大小(缺省单位 512B; c=字节 w=2B b=512B k/M/G), 向上取整后比较
+--   -empty                    空文件或空目录
+--   -perm [-]MODE             权限位: 无前缀=完全相等, "-"=所有位都要有, "/"=任一位(GNU)
+--   -user NAME -group NAME   属主/属组名;  -uid N -gid N 数字形式
+--   -links N                 硬链接数
+--   -newer FILE              修改时间晚于 FILE
+--   -mtime N -mmin N         N*24 小时 / N 分钟前修改过(+/-, 秒数向下取整)
+--   -maxdepth N -mindepth N  遍历深度限制(全局选项, 可出现在表达式任意位置)
+-- 动作/运算符:
+--   -print -print0 -printf FMT(-printf 支持 %p %f %s %y %h 与 %%, 以及 \n \t \r \0 \\ 转义)
+--   -delete(隐含 -depth: 先删子项再删目录) -prune -quit -exec CMD {} ; -exec CMD {} +
+--   -ls 未实现(见下);  -a/-and -o/-or !/-not ( ) ,
+-- 语义要点:
+--   - 每个条目用 fs.lstat(不跟随符号链接, -type l 才看得见链接本身); 目录遍历用 fs.list + fs.combine,
+--     并用 fs.lstat 判类型(不用 fs.find: 它一次把整棵树读进内存且不区分类型)。
+--   - 遍历顺序: 每个目录内按**目录项名排序**递归(宿主 GNU find 用 readdir 原始顺序, 因此两者的
+--     输出顺序可能不同; 排序是刻意的 —— 结果可复现)。
+--   - -exec ... ; : 命令返回非 0 **不**改变 find 的退出码(GNU 实测如此); 每个匹配执行一次。
+--   - -exec ... + : 攒够一批执行一次(批上限 1024 项/64KB), 任一次调用失败(含 exec 失败)退出码 1。
+-- 已知偏离:
+--   - -ls 未实现(遇到即报错退出), 因为 inode/块数/属主在 CC 原生 fs 上不存在。
+--   - -mtime/-mmin/-newer 依赖 fs.attributes().mtime: ext2 有(秒), CC 原生 fs 没有(nil)。
+--     **拿不到时间戳时明确报错并停止**(find: -mtime: this filesystem has no timestamps), 不静默判为不匹配。
+--     同理 -user/-group/-uid/-gid 需要 uid/gid, -links 需要链接数, 缺了都明确报错。
+--   - -perm 不支持符号模式(如 u=rw); -type 不支持 s/D 等其它类型码: 都报错, 不静默忽略。
+--   - -printf 只支持 %p %f %s %y %h %%(其它指示符报错); 不支持宽度/精度(%-10p)。
+--   - -delete 隐含 -depth, 此时 -prune 无意义(GNU 也会警告)。-maxdepth 之外的 -depth/-xdev/-follow
+--     未实现; -L/-H/-P 未实现(一律不跟随符号链接)。
+--   - 诊断信息用英文(与本项目其他工具一致)。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+local function ioeMsg(err)
+    if err and (err:find("permission") or err:find("denied")) then return "Permission denied" end
+    return tostring(err or "I/O error")
+end
+
+-- ---------------------------------------------------------------
+-- 基础工具
+-- ---------------------------------------------------------------
+--- 取不跟随符号链接的属性; 路径(最后一段)不存在时返回 nil。
+--- fs.exists 复核一次: 宿主测试台的 fs.lstat 桩对不存在的路径也会给出一张表(真机返回 nil);
+--- 只把 kind == "symlink" 的表当作链接, 于是悬空链接(链接本身存在)仍算存在。
+local function lstat(p)
+    local a = fs.lstat(p)
+    if not a then return nil end
+    if a.kind == "symlink" then return a end
+    if fs.exists(p) then return a end
+    return nil
+end
+
+--- 类型字符(与 -type / -printf %y 一致)。
+local function typeChar(a)
+    if a.kind == "symlink" then return "l" end
+    if a.kind == "fifo" then return "p" end
+    if a.kind == "device" then return "c" end
+    if a.isDir then return "d" end
+    if a.kind == "file" then return "f" end
+    -- CC 原生 fs 只给 isDir: 当作普通文件。
+    return "f"
+end
+
+--- 遍历用的子路径拼接: 保留操作数原样(GNU: `find d1/` 打印 "d1/" 与 "d1/x")。
+local function joinPath(parent, name)
+    if parent == "/" then return "/" .. name end
+    if parent:sub(-1) == "/" then return parent .. name end
+    return parent .. "/" .. name
+end
+
+local function baseName(p)
+    local q = p:gsub("/+$", "")
+    if q == "" then return "/" end
+    return (q:match("([^/]+)$")) or q
+end
+local function dirName(p)
+    local d = p:match("^(.*)/[^/]*$")
+    if d == nil then return "." end
+    if d == "" then return "/" end
+    return d
+end
+
+--- 位与(不用位运算符: 宿主要跑 Lua 5.1)。
+local function band(a, b)
+    local r, bit = 0, 1
+    while a > 0 and b > 0 do
+        if a % 2 == 1 and b % 2 == 1 then r = r + bit end
+        a = math.floor(a / 2)
+        b = math.floor(b / 2)
+        bit = bit * 2
+    end
+    return r
+end
+
+-- ---------------------------------------------------------------
+-- shell 式通配(-name/-path; 不是 Lua pattern)
+-- ---------------------------------------------------------------
+--- 匹配一个 [] 字符组。i 指向 '[' 之后, ch 是待判字符。
+--- 返回 (下一个位置, 是否命中); 未闭合的组返回 nil(整个匹配失败)。
+local function classAt(pat, i, ch)
+    local neg = false
+    local c0 = pat:sub(i, i)
+    if c0 == "!" or c0 == "^" then neg = true; i = i + 1 end
+    local hit, first = false, true
+    while i <= #pat do
+        local c = pat:sub(i, i)
+        if c == "]" and not first then return i + 1, (hit ~= neg) end
+        first = false
+        if c == "\\" and i < #pat then
+            local lit = pat:sub(i + 1, i + 1)
+            if ch == lit then hit = true end
+            i = i + 2
+        elseif pat:sub(i + 1, i + 1) == "-" and i + 2 <= #pat and pat:sub(i + 2, i + 2) ~= "]" then
+            local lo, hi = c, pat:sub(i + 2, i + 2)
+            if ch >= lo and ch <= hi then hit = true end
+            i = i + 3
+        else
+            if ch == c then hit = true end
+            i = i + 1
+        end
+    end
+    return nil, false
+end
+
+--- shell 式通配匹配(* 也匹配 "/", 与 find 的 -name/-path 一致)。
+local function globMatch(pat, str)
+    local function m(pi, si)
+        while pi <= #pat do
+            local c = pat:sub(pi, pi)
+            if c == "*" then
+                while pat:sub(pi, pi) == "*" do pi = pi + 1 end
+                if pi > #pat then return true end
+                for k = si, #str do
+                    if m(pi, k) then return true end
+                end
+                return false
+            elseif c == "?" then
+                if si > #str then return false end
+                pi, si = pi + 1, si + 1
+            elseif c == "[" then
+                if si > #str then return false end
+                local np, ok = classAt(pat, pi + 1, str:sub(si, si))
+                if not np or not ok then return false end
+                pi, si = np, si + 1
+            elseif c == "\\" then
+                if pi == #pat then return false end
+                if str:sub(si, si) ~= pat:sub(pi + 1, pi + 1) then return false end
+                pi, si = pi + 2, si + 1
+            else
+                if str:sub(si, si) ~= c then return false end
+                pi, si = pi + 1, si + 1
+            end
+        end
+        return si > #str
+    end
+    return m(1, 1)
+end
+
+local function lower(s) return (s:gsub("%u", function(c) return c:lower() end)) end
+local function globMatchOpt(pat, str, icase)
+    if icase then return globMatch(lower(pat), lower(str)) end
+    return globMatch(pat, str)
+end
+
+-- ---------------------------------------------------------------
+-- 数值参数解析
+-- ---------------------------------------------------------------
+--- 解析 "[+-]?N" (allowSign 决定是否接受 +/-)。返回 符号(-1/0/1) 与数值, 或 nil。
+local function parseSignedNum(s, allowSign)
+    local sign, digits = 0, s
+    if s:sub(1, 1) == "+" or s:sub(1, 1) == "-" then
+        if not allowSign then return nil end
+        sign = (s:sub(1, 1) == "+") and 1 or -1
+        digits = s:sub(2)
+    end
+    if not digits:match("^%d+$") then return nil end
+    return sign, tonumber(digits)
+end
+
+--- 按符号比较: 0 = 相等, 1 = 大于, -1 = 小于。
+local function cmpSigned(value, sign, n)
+    if sign == 0 then return value == n end
+    if sign > 0 then return value > n end
+    return value < n
+end
+
+--- -size 的单位(字节)。
+local SIZE_UNITS = { c = 1, w = 2, b = 512, k = 1024, M = 1024 * 1024, G = 1024 * 1024 * 1024 }
+
+-- ---------------------------------------------------------------
+-- 表达式解析
+-- ---------------------------------------------------------------
+local toks, tp = {}, 1
+local fatal = false -- 致命错误(如缺时间戳): 立即停止遍历
+local status = 0    -- find 自己的退出码(非 0 表示有错误发生)
+local quitFlag = false
+local pruneFlag = false
+local depthFirst = false -- -delete 隐含 -depth
+local maxDepth, minDepth = math.huge, 0
+local plusExecs = {}     -- -exec ... + 的节点(遍历结束后统一 flush)
+local timestampWarned = false
+local ownerWarned = false
+local linksWarned = false
+
+local function syntaxErr(msg)
+    stderr("find: " .. msg .. "\n")
+    fatal = true
+end
+
+local function peek() return toks[tp] end
+local function advance() local t = toks[tp]; tp = tp + 1; return t end
+
+local function needArg(pred)
+    local t = toks[tp]
+    if t == nil then syntaxErr("missing argument to `" .. pred .. "'"); return nil end
+    tp = tp + 1
+    return t
+end
+
+--- 需要 mtime 的谓词: 拿不到(CC 原生 fs)就报错并停止 —— 绝不静默当成"不匹配"。
+local function requireMtime(a, pred)
+    if a.mtime then return a.mtime end
+    if not timestampWarned then
+        timestampWarned = true
+        stderr("find: " .. pred .. ": this filesystem has no timestamps\n")
+    end
+    fatal = true
+    return nil
+end
+local function requireOwner(a, pred)
+    if a.uid ~= nil and a.gid ~= nil then return true end
+    if not ownerWarned then
+        ownerWarned = true
+        stderr("find: " .. pred .. ": this filesystem has no owner/group\n")
+    end
+    fatal = true
+    return false
+end
+local function requireLinks(a, pred)
+    if a.links ~= nil then return a.links end
+    if not linksWarned then
+        linksWarned = true
+        stderr("find: " .. pred .. ": this filesystem does not report link counts\n")
+    end
+    fatal = true
+    return nil
+end
+
+-- ---------------------------------------------------------------
+-- -exec / -printf 的准备工作
+-- ---------------------------------------------------------------
+--- -exec 的 argv 里把 "{}" 全部替换成 path(与 GNU 一样在**每个**参数里替换)。
+local function substBraces(argv, path)
+    local out = {}
+    for i, a in ipairs(argv) do
+        out[i] = a:gsub("{}", (path:gsub("%%", "%%%%")))
+    end
+    return out
+end
+
+--- 执行一条命令, 返回 (ok, code)。ok=false 表示连启动都没成功。
+--- stdio 显式传本进程的 stdin/stdout: 内核里这与"继承父进程 stdio"完全等价,
+--- 但宿主测试台的 spawn 不继承父进程 stdio(它只有顶层那一份), 显式传才对得上真机。
+local function runCommand(cmd, argv)
+    local stdio = { output = io.stdout() }
+    if io.stdin() then stdio.input = io.stdin() end
+    local pid, err = syscalls["proc.exec"](cmd, argv, { cwd = cwd, stdio = stdio })
+    if not pid then
+        -- 内核的错误串是 "cmd: command not found" / "path: permission denied";
+        -- 这里映射成 GNU find 的措辞(No such file or directory / Permission denied)。
+        local reason = tostring(err)
+        if reason:find("command not found") then
+            reason = "No such file or directory"
+        elseif reason:find("permission denied") then
+            reason = "Permission denied"
+        end
+        stderr("find: '" .. cmd .. "': " .. reason .. "\n")
+        return false, nil
+    end
+    return true, syscalls["proc.wait"](pid)
+end
+
+--- flush 一个 -exec ... + 节点攒下的路径。
+local function flushPlus(node)
+    if #node.pending == 0 then return end
+    local argv = {}
+    for i, a in ipairs(node.argv) do argv[i] = a end
+    for _, p in ipairs(node.pending) do argv[#argv + 1] = p end
+    node.pending = {}
+    local ok, code = runCommand(node.cmd, argv)
+    -- GNU: + 形式的任一次调用失败(含 exec 失败)都把 find 的退出码设为 1。
+    if not ok or code ~= 0 then status = 1 end
+end
+
+--- -printf 的格式串 -> 片段表({lit=} 或 {spec=})。返回 nil, 未知指示符。
+local function parsePrintf(fmt)
+    local items, lit = {}, {}
+    local function flush()
+        if #lit > 0 then items[#items + 1] = { lit = table.concat(lit) }; lit = {} end
+    end
+    local i = 1
+    while i <= #fmt do
+        local c = fmt:sub(i, i)
+        if c == "\\" then
+            local n = fmt:sub(i + 1, i + 1)
+            if n == "n" then lit[#lit + 1] = "\n"; i = i + 2
+            elseif n == "t" then lit[#lit + 1] = "\t"; i = i + 2
+            elseif n == "r" then lit[#lit + 1] = "\r"; i = i + 2
+            elseif n == "0" then lit[#lit + 1] = string.char(0); i = i + 2
+            elseif n == "\\" then lit[#lit + 1] = "\\"; i = i + 2
+            elseif n == "" then lit[#lit + 1] = "\\"; i = i + 1
+            else lit[#lit + 1] = "\\" .. n; i = i + 2 end -- 未知转义原样保留(GNU 亦然)
+        elseif c == "%" then
+            local d = fmt:sub(i + 1, i + 1)
+            if d == "%" then lit[#lit + 1] = "%"; i = i + 2
+            elseif d == "p" or d == "f" or d == "s" or d == "y" or d == "h" then
+                flush(); items[#items + 1] = { spec = d }; i = i + 2
+            else
+                return nil, (d == "" and "%" or d)
+            end
+        else
+            lit[#lit + 1] = c; i = i + 1
+        end
+    end
+    flush()
+    return items
+end
+
+local function renderPrintf(items, entry)
+    local out = {}
+    for i, it in ipairs(items) do
+        if it.lit then out[i] = it.lit
+        elseif it.spec == "p" then out[i] = entry.path
+        elseif it.spec == "f" then out[i] = baseName(entry.path)
+        elseif it.spec == "h" then out[i] = dirName(entry.path)
+        elseif it.spec == "s" then out[i] = tostring(entry.st.size or 0)
+        else out[i] = typeChar(entry.st) end
+    end
+    return table.concat(out)
+end
+
+-- ---------------------------------------------------------------
+-- 谓词工厂: 每个谓词/动作都编译成一个 node { op=..., f=entry->bool }
+-- ---------------------------------------------------------------
+local parseExpr -- 前向声明
+
+local function parsePrimary()
+    local t = peek()
+    if t == nil then syntaxErr("missing expression"); return nil end
+    if t == "(" then
+        tp = tp + 1
+        local e = parseExpr()
+        if peek() ~= ")" then syntaxErr("expected ')'"); return nil end
+        tp = tp + 1
+        return e
+    end
+    if t == "!" or t == "-not" then
+        tp = tp + 1
+        local a = parsePrimary()
+        if not a then return nil end
+        return { op = "not", a = a }
+    end
+    if t:sub(1, 1) ~= "-" then
+        syntaxErr("paths must precede expression: '" .. t .. "'")
+        return nil
+    end
+    tp = tp + 1
+
+    -- 全局选项(可出现在表达式任意位置, 求值时恒真)
+    if t == "-maxdepth" or t == "-mindepth" then
+        local v = needArg(t)
+        if not v then return nil end
+        local _, n = parseSignedNum(v, false)
+        if not n then syntaxErr("invalid argument '" .. v .. "' to '" .. t .. "'"); return nil end
+        if t == "-maxdepth" then maxDepth = n else minDepth = n end
+        return { op = "true" }
+    end
+
+    if t == "-name" or t == "-iname" or t == "-path" or t == "-ipath" then
+        local pat = needArg(t)
+        if not pat then return nil end
+        local icase = (t == "-iname" or t == "-ipath")
+        local whole = (t == "-path" or t == "-ipath")
+        return { op = "test", f = function(e)
+            local s = whole and e.path or e.name
+            return globMatchOpt(pat, s, icase)
+        end }
+    end
+
+    if t == "-type" then
+        local v = needArg(t)
+        if not v then return nil end
+        local set = {}
+        for c in v:gmatch("[^,]+") do
+            if c == "f" or c == "d" or c == "l" or c == "p" or c == "c" or c == "b" then
+                set[c] = true
+            else
+                syntaxErr("unknown argument to -type: " .. c)
+                return nil
+            end
+        end
+        return { op = "test", f = function(e)
+            local k = typeChar(e.st)
+            -- 设备节点分不出字符/块(内核只给 kind="device"): c 与 b 都算命中。
+            if k == "c" and (set.c or set.b) then return true end
+            return set[k] == true
+        end }
+    end
+
+    if t == "-size" then
+        local v = needArg(t)
+        if not v then return nil end
+        local sign, num, unit = v:match("^([+-]?)(%d+)([cwbkMG]?)$")
+        if not sign then syntaxErr("invalid -size type '" .. v .. "'"); return nil end
+        sign = (sign == "+") and 1 or (sign == "-") and -1 or 0
+        local unitSize = SIZE_UNITS[unit == "" and "b" or unit]
+        num = tonumber(num)
+        return { op = "test", f = function(e)
+            local sz = e.st.size or 0
+            -- GNU: 单位数向上取整后再比较(-size -1k 只命中 0 字节的文件)。
+            local units = math.ceil(sz / unitSize)
+            return cmpSigned(units, sign, num)
+        end }
+    end
+
+    if t == "-empty" then
+        return { op = "test", f = function(e)
+            if e.st.isDir then
+                local names, lerr = fs.list(e.real)
+                if not names then
+                    stderr("find: '" .. e.path .. "': " .. ioeMsg(lerr) .. "\n")
+                    status = 1
+                    return false
+                end
+                return #names == 0
+            end
+            -- GNU: -empty 只对**普通文件**或目录为真(符号链接/FIFO/设备一律为假)。
+            if e.st.kind ~= nil and e.st.kind ~= "file" then return false end
+            return (e.st.size or 0) == 0
+        end }
+    end
+
+    if t == "-perm" then
+        local v = needArg(t)
+        if not v then return nil end
+        local kind, digits = v:match("^([%-/]?)(.*)$")
+        if not digits:match("^[0-7]+$") then
+            syntaxErr("invalid mode '" .. v .. "' (只支持八进制, 不支持符号模式)")
+            return nil
+        end
+        local mode = tonumber(digits, 8) % 4096
+        return { op = "test", f = function(e)
+            local m = (e.st.mode or 0) % 4096
+            if kind == "-" then return band(m, mode) == mode end
+            if kind == "/" then return mode == 0 or band(m, mode) ~= 0 end
+            return m == mode
+        end }
+    end
+
+    if t == "-user" or t == "-group" or t == "-uid" or t == "-gid" then
+        local v = needArg(t)
+        if not v then return nil end
+        local want
+        if t == "-user" or t == "-group" then
+            local rec
+            if t == "-user" then
+                rec = syscalls["user.get"] and syscalls["user.get"](v)
+                if not rec then syntaxErr("'" .. v .. "' is not the name of a known user"); return nil end
+                want = rec.uid
+            else
+                rec = syscalls["user.groupByName"] and syscalls["user.groupByName"](v)
+                if not rec then syntaxErr("'" .. v .. "' is not the name of a known group"); return nil end
+                want = rec.gid
+            end
+        else
+            local _, n = parseSignedNum(v, false)
+            if not n then syntaxErr("invalid argument '" .. v .. "' to '" .. t .. "'"); return nil end
+            want = n
+        end
+        local isUser = (t == "-user" or t == "-uid")
+        return { op = "test", f = function(e)
+            if not requireOwner(e.st, t) then return false end
+            return (isUser and e.st.uid or e.st.gid) == want
+        end }
+    end
+
+    if t == "-links" then
+        local v = needArg(t)
+        if not v then return nil end
+        local sign, n = parseSignedNum(v, true)
+        if not n then syntaxErr("invalid argument '" .. v .. "' to '-links'"); return nil end
+        return { op = "test", f = function(e)
+            local l = requireLinks(e.st, "-links")
+            if not l then return false end
+            return cmpSigned(l, sign, n)
+        end }
+    end
+
+    if t == "-newer" then
+        local v = needArg(t)
+        if not v then return nil end
+        local refPath = resolve(v)
+        -- GNU 的 -newer 用 stat(跟随符号链接)读参考文件。
+        local ref = fs.exists(refPath) and fs.attributes(refPath) or nil
+        if not ref then
+            syntaxErr("-newer: '" .. v .. "': No such file or directory")
+            return nil
+        end
+        if not ref.mtime then
+            stderr("find: -newer: this filesystem has no timestamps\n")
+            fatal = true
+            return nil
+        end
+        local refTime = ref.mtime
+        return { op = "test", f = function(e)
+            local t2 = requireMtime(e.st, "-newer")
+            if not t2 then return false end
+            return t2 > refTime
+        end }
+    end
+
+    if t == "-mtime" or t == "-mmin" then
+        local v = needArg(t)
+        if not v then return nil end
+        local sign, n = parseSignedNum(v, true)
+        if not n then syntaxErr("invalid argument '" .. v .. "' to '" .. t .. "'"); return nil end
+        local per = (t == "-mtime") and 86400 or 60
+        return { op = "test", f = function(e)
+            local mt = requireMtime(e.st, t)
+            if not mt then return false end
+            local age = math.floor((os.time() - mt) / per)
+            if age < 0 then age = 0 end
+            return cmpSigned(age, sign, n)
+        end }
+    end
+
+    if t == "-print" then
+        return { op = "test", action = true, f = function(e) io.write(e.path .. "\n"); return true end }
+    end
+    if t == "-print0" then
+        return { op = "test", action = true,
+                 f = function(e) io.write(e.path .. string.char(0)); return true end }
+    end
+    if t == "-printf" then
+        local fmt = needArg(t)
+        if not fmt then return nil end
+        local items, bad = parsePrintf(fmt)
+        if not items then syntaxErr("-printf: unknown format directive '%" .. bad .. "'"); return nil end
+        return { op = "test", action = true,
+                 f = function(e) io.write(renderPrintf(items, e)); return true end }
+    end
+    if t == "-delete" then
+        depthFirst = true
+        return { op = "test", action = true, f = function(e)
+            local ok, err = fs.delete(e.real)
+            if not ok then
+                stderr("find: cannot delete '" .. e.path .. "': " .. ioeMsg(err) .. "\n")
+                status = 1
+                return false
+            end
+            return true
+        end }
+    end
+    -- 注意: -prune/-quit 不是"动作"(GNU: 表达式里只有它们时仍然补 -print)。
+    if t == "-prune" then
+        return { op = "test", f = function(e)
+            pruneFlag = true
+            return true
+        end }
+    end
+    if t == "-quit" then
+        return { op = "test", f = function() quitFlag = true; return true end }
+    end
+    if t == "-ls" then
+        syntaxErr("-ls: not implemented (CC 原生 fs 没有 inode/块数/属主)")
+        return nil
+    end
+
+    if t == "-exec" then
+        -- 收集命令与其参数, 直到 ";" 或 "+"。
+        local cmdArgs, term = {}, nil
+        while true do
+            local a = toks[tp]
+            if a == nil then syntaxErr("missing argument to '-exec'"); return nil end
+            tp = tp + 1
+            if a == ";" or a == "+" then term = a; break end
+            cmdArgs[#cmdArgs + 1] = a
+        end
+        if #cmdArgs == 0 then syntaxErr("missing argument to '-exec'"); return nil end
+        local cmd = cmdArgs[1]
+        local rest = {}
+        for i = 2, #cmdArgs do rest[#rest + 1] = cmdArgs[i] end
+        if term == ";" then
+            return { op = "test", action = true, f = function(e)
+                local argv = substBraces(rest, e.path)
+                local c = cmd:gsub("{}", (e.path:gsub("%%", "%%%%")))
+                local ok, code = runCommand(c, argv)
+                -- GNU: ";" 形式的非 0 返回**不**影响 find 的退出码(实测)。
+                if not ok then return false end
+                return code == 0
+            end }
+        end
+        -- "+" 形式: {} 必须单独出现且是最后一个参数。
+        local count, lastIdx = 0, nil
+        for i, a in ipairs(rest) do
+            local _, n = a:gsub("{}", "")
+            if n > 0 then count = count + n; lastIdx = i end
+        end
+        if count ~= 1 or lastIdx ~= #rest or rest[#rest] ~= "{}" then
+            syntaxErr("In '-exec ... {} +' the '{}' must appear by itself and last")
+            return nil
+        end
+        local argvTemplate = {}
+        for i = 1, #rest - 1 do argvTemplate[#argvTemplate + 1] = rest[i] end
+        local node = { op = "test", action = true, plus = true, cmd = cmd, argv = argvTemplate, pending = {} }
+        node.f = function(e)
+            node.pending[#node.pending + 1] = e.path
+            -- 批上限: 一次攒太多会把 argv 撑爆(真机上还有 ARG_MAX 限制)。
+            local bytes = 0
+            for _, p in ipairs(node.pending) do bytes = bytes + #p + 1 end
+            if #node.pending >= 1024 or bytes >= 65536 then flushPlus(node) end
+            return true
+        end
+        plusExecs[#plusExecs + 1] = node
+        return node
+    end
+
+    syntaxErr("unknown predicate `" .. t .. "'")
+    return nil
+end
+
+local function parseNot()
+    -- ! 的优先级最高(比 -a 高), 已在 parsePrimary 里处理。
+    return parsePrimary()
+end
+
+local function parseAnd()
+    local left = parseNot()
+    if not left then return nil end
+    while true do
+        local t = peek()
+        if t == nil or t == ")" or t == "-o" or t == "-or" or t == "," then break end
+        if t == "-a" or t == "-and" then
+            tp = tp + 1
+        elseif t:sub(1, 1) ~= "-" and t ~= "!" and t ~= "(" then
+            syntaxErr("paths must precede expression: '" .. t .. "'")
+            return nil
+        end
+        local right = parseNot()
+        if not right then return nil end
+        left = { op = "and", a = left, b = right }
+    end
+    return left
+end
+
+local function parseOr()
+    local left = parseAnd()
+    if not left then return nil end
+    while true do
+        local t = peek()
+        if t ~= "-o" and t ~= "-or" then break end
+        tp = tp + 1
+        local right = parseAnd()
+        if not right then return nil end
+        left = { op = "or", a = left, b = right }
+    end
+    return left
+end
+
+parseExpr = function()
+    local left = parseOr()
+    if not left then return nil end
+    while peek() == "," do
+        tp = tp + 1
+        local right = parseOr()
+        if not right then return nil end
+        left = { op = "comma", a = left, b = right }
+    end
+    return left
+end
+
+local function evalNode(n, e)
+    if fatal then return false end
+    local op = n.op
+    if op == "true" then return true
+    elseif op == "and" then
+        if not evalNode(n.a, e) then return false end
+        return evalNode(n.b, e)
+    elseif op == "or" then
+        if evalNode(n.a, e) then return true end
+        return evalNode(n.b, e)
+    elseif op == "not" then
+        return not evalNode(n.a, e)
+    elseif op == "comma" then
+        evalNode(n.a, e)
+        return evalNode(n.b, e)
+    end
+    return n.f(e)
+end
+
+-- ---------------------------------------------------------------
+-- 命令行: 路径操作数 + 表达式
+-- ---------------------------------------------------------------
+local paths = {}
+local exprToks = {}
+local i = 1
+local inExpr = false
+local forcePath = false
+while i <= #args do
+    local a = args[i]
+    if inExpr then
+        exprToks[#exprToks + 1] = a
+    elseif forcePath then
+        paths[#paths + 1] = a
+        forcePath = false
+    elseif a == "--" then
+        forcePath = true -- GNU find 接受 --, 之后的下一个操作数一定是路径
+    elseif a == "-" or (a:sub(1, 1) ~= "-" and a ~= "!" and a ~= "(") then
+        paths[#paths + 1] = a
+    else
+        inExpr = true
+        exprToks[#exprToks + 1] = a
+    end
+    i = i + 1
+end
+if #paths == 0 then paths = { "." } end
+toks = exprToks
+
+-- ---------------------------------------------------------------
+-- 解析表达式 + 补隐含的 -print
+-- ---------------------------------------------------------------
+local expr = nil
+if #toks > 0 then
+    expr = parseExpr()
+    if not fatal and tp <= #toks then syntaxErr("unexpected token '" .. tostring(toks[tp]) .. "'") end
+    if fatal then return 1 end
+end
+
+-- 隐含 -print: 表达式里没有(除 -prune/-quit 之外的)动作时, 对整条表达式生效。
+local hasAction = false
+local function scanActions(n)
+    if not n then return end
+    if n.action then hasAction = true end
+    scanActions(n.a)
+    scanActions(n.b)
+end
+scanActions(expr)
+if not hasAction then
+    local pr = { op = "test", action = true, f = function(e) io.write(e.path .. "\n"); return true end }
+    if expr then expr = { op = "and", a = expr, b = pr } else expr = pr end
+end
+
+-- ---------------------------------------------------------------
+-- 遍历
+-- ---------------------------------------------------------------
+local visit -- 前向声明(descend 与 visit 互相递归)
+
+-- 两个路径一起走:
+--   real = 解析后的绝对路径(所有 fs.* 调用都用它)
+--   disp = 操作数原样的打印路径(GNU: `find .` 打印 "."、"./d1"; `find d1/` 打印 "d1/"、"d1/a")
+-- -print/-printf/-exec 的 {} 都用 disp(与 GNU 一致)。
+local function descend(real, disp, depth)
+    local names, lerr = fs.list(real)
+    if not names then
+        stderr("find: '" .. disp .. "': " .. ioeMsg(lerr) .. "\n")
+        status = 1
+        return true
+    end
+    table.sort(names)
+    for _, n in ipairs(names) do
+        if not visit(joinPath(real, n), joinPath(disp, n), n, depth + 1) then return false end
+    end
+    return true
+end
+
+--- 处理一个条目; 返回 false 表示应立刻停止整个遍历(-quit/致命错误)。
+visit = function(real, disp, name, depth)
+    if fatal or quitFlag then return false end
+    local st = lstat(real)
+    if not st then
+        stderr("find: '" .. disp .. "': No such file or directory\n")
+        status = 1
+        return true
+    end
+    -- -delete 隐含 -depth: 先处理子项, 再对目录本身求值。
+    if depthFirst and st.isDir and depth < maxDepth then
+        if not descend(real, disp, depth) then return false end
+    end
+    local pruned = false
+    if depth >= minDepth then
+        pruneFlag = false
+        evalNode(expr, { path = disp, real = real, name = name, depth = depth, st = st })
+        pruned = pruneFlag
+    end
+    if st.isDir and not depthFirst and not pruned and depth < maxDepth then
+        if not descend(real, disp, depth) then return false end
+    end
+    return true
+end
+
+for _, p in ipairs(paths) do
+    if not visit(resolve(p), p, baseName(p), 0) then break end
+    if quitFlag or fatal then break end
+end
+
+-- -exec ... + : 把最后一批跑完(GNU: -quit 时也会把已攒的命令跑掉)。
+for _, node in ipairs(plusExecs) do flushPlus(node) end
+
+if fatal or status ~= 0 then return 1 end

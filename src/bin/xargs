@@ -1,0 +1,472 @@
+-- Delin xargs: 从 stdin 读参数并分批调用命令 (POSIX xargs(1) + GNU 常用项)。
+-- 用法: xargs [OPTION]... [COMMAND [ARG...]]
+-- 选项:
+--   -0, --null                输入按 NUL 分隔, **不做**引号/反斜杠处理(同时使 -E 失效)
+--   -E STR, --eof=STR         读到等于 STR 的参数就停止(缺省无)
+--   -I STR, --replace=STR     按**行**读, 每行整体替换初始参数里出现的 STR(隐含 -L 1)
+--   -L N, --max-lines=N       每条命令行最多用 N 个输入行(POSIX 的 -l 同义)
+--   -n N, --max-args=N        每条命令行最多 N 个参数
+--   -s SIZE, --max-chars=SIZE 每条命令行的字节上限(缺省 4096; 按 "每个参数 len+1" 估算, 与 GNU 一致)
+--   -t, --verbose             执行前把命令行打到 stderr
+--   -x, --exit                若因 -s 限制而无法满足 -n/-L 的批次, 直接报错退出 1
+--   -p, --interactive         执行前询问(从 stdin 读一行, y/Y 才执行); 隐含 -t
+--   -r, --no-run-if-empty     输入为空时不执行(GNU 缺省是执行一次)
+--   --                        结束选项
+-- 引号与反斜杠(POSIX, 非 -0 模式): 单引号内字面; 双引号内 \ 只转义 " 与 \;
+-- 引号外 \ 转义下一个字符(**含换行**, 于是参数里可以有换行 —— 与 GNU 实测一致)。
+-- 换行在引号内是错误(GNU: unmatched single/double quote, 退出 1)。
+-- -L 的"逻辑行": 行尾是空白时与下一行连成同一逻辑行(POSIX 的 trailing blank continuation)。
+-- 退出码(POSIX): 子命令退出 1..125 -> 123; 255 -> 124(并立即停止);
+-- 被信号杀死 -> 125; 命令找不到 -> 127; 无法执行 -> 126; 其它错误 -> 1; 否则 0。
+-- 已知偏离:
+--   - 缺省 COMMAND 是 echo(与 POSIX/GNU 一致), 但 Delin 目前没有 /bin/echo(echo 是 sh 内建),
+--     所以不带 COMMAND 时内核报 127 command not found —— 这是缺 /bin/echo, 不是 xargs 的语义。
+--   - -s 缺省取 4096 字节(POSIX 要求的**下限**), GNU 缺省是 128KiB。
+--   - -p 从 **stdin** 读确认(GNU 是打开 /dev/tty; Delin 没有 /dev/tty 这个节点)。
+--   - -I 与 -n/-L 互斥: 与 GNU 一样"后出现的生效"并打警告; -I 只隐含 -L 1(不隐含 -x)。
+--   - 不实现 -d/--delimiter, -a/--arg-file, -P/--max-procs, -o/--open-tty, --show-limits:
+--     未实现, 出现即报错。
+--   - 诊断信息用英文(与本项目其他工具一致)。
+local unpack = table.unpack or unpack
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+-- ---------------------------------------------------------------
+-- 选项解析
+-- ---------------------------------------------------------------
+local optNull, optVerbose, optExit, optInteractive, optNoRunIfEmpty = false, false, false, false, false
+local eofStr, replaceStr, maxArgs, maxLines = nil, nil, nil, nil
+local maxChars = 4096
+local cmd, initial = nil, {}
+local noMoreOpts = false
+
+local function warn(s) stderr("xargs: warning: " .. s .. "\n") end
+
+local function setReplace(s)
+    if maxArgs or maxLines then
+        warn("options --replace and --max-args/--max-lines are mutually exclusive, ignoring previous value")
+    end
+    replaceStr = s
+    maxArgs, maxLines = nil, nil
+end
+local function setLimit(which, n)
+    if replaceStr then
+        warn("options --replace and " .. which .. " are mutually exclusive, ignoring previous --replace value")
+        replaceStr = nil
+    end
+    if which == "-n" then maxArgs = n else maxLines = n end
+end
+
+--- 解析正整数选项值(-n/-L/-s)。非法值直接报错退出。
+local function optNum(name, val)
+    if not val or not val:match("^%d+$") then
+        stderr("xargs: invalid number for " .. name .. " option\n")
+        return nil
+    end
+    val = tonumber(val)
+    if val < 1 then
+        stderr("xargs: value " .. tostring(val) .. " for " .. name .. " option should be >= 1\n")
+        return nil
+    end
+    return val
+end
+
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if noMoreOpts or cmd then
+        if not cmd then cmd = a else initial[#initial + 1] = a end
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "-" then
+        cmd = a
+    elseif a == "--null" then optNull = true
+    elseif a == "--verbose" then optVerbose = true
+    elseif a == "--exit" then optExit = true
+    elseif a == "--interactive" then optInteractive = true; optVerbose = true
+    elseif a == "--no-run-if-empty" then optNoRunIfEmpty = true
+    elseif a == "--eof" then
+        i = i + 1
+        if not args[i] then stderr("xargs: option '--eof' requires an argument\n"); return 1 end
+        eofStr = args[i]
+    elseif a:sub(1, 6) == "--eof=" then eofStr = a:sub(7)
+    elseif a == "--replace" then setReplace("{}")
+    elseif a:sub(1, 10) == "--replace=" then setReplace(a:sub(11))
+    elseif a == "--max-args" then
+        i = i + 1
+        local n = optNum("-n", args[i]); if not n then return 1 end
+        setLimit("-n", n)
+    elseif a:sub(1, 11) == "--max-args=" then
+        local n = optNum("-n", a:sub(12)); if not n then return 1 end
+        setLimit("-n", n)
+    elseif a == "--max-lines" then
+        i = i + 1
+        local n = optNum("-L", args[i]); if not n then return 1 end
+        setLimit("-L", n)
+    elseif a:sub(1, 12) == "--max-lines=" then
+        local n = optNum("-L", a:sub(13)); if not n then return 1 end
+        setLimit("-L", n)
+    elseif a == "--max-chars" then
+        i = i + 1
+        local n = optNum("-s", args[i]); if not n then return 1 end
+        maxChars = n
+    elseif a:sub(1, 12) == "--max-chars=" then
+        local n = optNum("-s", a:sub(13)); if not n then return 1 end
+        maxChars = n
+    elseif a:sub(1, 2) == "--" then
+        stderr("xargs: unrecognized option '" .. a .. "'\n")
+        return 1
+    elseif a:sub(1, 1) == "-" and #a > 1 then
+        local k = 2
+        while k <= #a do
+            local c = a:sub(k, k)
+            local val = a:sub(k + 1)
+            local function take()
+                if val ~= "" then k = #a; return val end
+                i = i + 1
+                return args[i]
+            end
+            if c == "0" then optNull = true
+            elseif c == "t" then optVerbose = true
+            elseif c == "x" then optExit = true
+            elseif c == "p" then optInteractive = true; optVerbose = true
+            elseif c == "r" then optNoRunIfEmpty = true
+            elseif c == "E" then
+                local v = take()
+                if v == nil then stderr("xargs: option requires an argument -- 'E'\n"); return 1 end
+                eofStr = v
+            elseif c == "I" then setReplace(take() or "{}")
+            elseif c == "L" or c == "l" then
+                local n = optNum("-L", take()); if not n then return 1 end
+                setLimit("-L", n)
+            elseif c == "n" then
+                local n = optNum("-n", take()); if not n then return 1 end
+                setLimit("-n", n)
+            elseif c == "s" then
+                local n = optNum("-s", take()); if not n then return 1 end
+                maxChars = n
+            else
+                stderr("xargs: invalid option -- '" .. c .. "'\n")
+                return 1
+            end
+            k = k + 1
+        end
+    else
+        cmd = a
+    end
+    i = i + 1
+end
+
+if optNull and eofStr then
+    -- GNU 在实测中这条警告后面会多打一个空行, 这里照抄(便于与宿主逐字节对照)。
+    warn("the -E option has no effect if -0 or -d is used.\n")
+    eofStr = nil
+end
+cmd = cmd or "echo"
+
+-- ---------------------------------------------------------------
+-- 读输入
+-- ---------------------------------------------------------------
+--- 把 stdin 整个读进来(管道/文件有 readAll; tty 句柄只有 readLine —— 那就逐行拼)。
+--- -0 模式下逐行回退不补换行: 否则 NUL 分隔的最后一个参数会多一个换行。
+local function readInput()
+    local h = io.stdin()
+    if not h then return "" end
+    if h.readAll then
+        return h.readAll() or ""
+    end
+    local lines = {}
+    while true do
+        local l = h.readLine()
+        if l == nil then break end
+        lines[#lines + 1] = l
+    end
+    return table.concat(lines, optNull and "" or "\n")
+end
+
+local text = readInput()
+
+-- ---------------------------------------------------------------
+-- 切分参数
+-- ---------------------------------------------------------------
+--- 返回 { value = 参数, line = 逻辑行号 } 列表; 失败返回 nil, 原因。
+local function splitDefault(s)
+    local out = {}
+    local i, n = 1, #s
+    local line = 1
+    local cur, hasCur = {}, false
+    local function push()
+        out[#out + 1] = { value = table.concat(cur), line = line }
+        cur, hasCur = {}, false
+    end
+    while i <= n do
+        local c = s:sub(i, i)
+        if c == "'" then
+            hasCur = true
+            i = i + 1
+            while true do
+                local d = s:sub(i, i)
+                if d == "" or d == "\n" then return out, "unmatched single quote" end
+                if d == "'" then i = i + 1; break end
+                cur[#cur + 1] = d
+                i = i + 1
+            end
+        elseif c == '"' then
+            hasCur = true
+            i = i + 1
+            while true do
+                local d = s:sub(i, i)
+                if d == "" or d == "\n" then return out, "unmatched double quote" end
+                if d == '"' then i = i + 1; break end
+                -- 双引号内**没有任何转义**: 反斜杠也是字面字符(GNU 实测 —— `"b\"c"` 会因此
+                -- 被判成 unmatched double quote, 而 `"b\tc"` 得到的就是 b\tc)。
+                cur[#cur + 1] = d
+                i = i + 1
+            end
+        elseif c == "\\" then
+            local nx = s:sub(i + 1, i + 1)
+            if nx == "" then
+                hasCur = true
+                cur[#cur + 1] = "\\"
+                i = i + 1
+            else
+                hasCur = true
+                cur[#cur + 1] = nx
+                i = i + 2
+            end
+        elseif c == " " or c == "\t" or c == "\n" then
+            if hasCur then push() end
+            if c == "\n" then
+                -- 行尾是空白 -> 逻辑上续到下一行(POSIX 的 trailing blank continuation)
+                local prev = s:sub(i - 1, i - 1)
+                if prev ~= " " and prev ~= "\t" then line = line + 1 end
+            end
+            i = i + 1
+        else
+            hasCur = true
+            cur[#cur + 1] = c
+            i = i + 1
+        end
+    end
+    if hasCur then push() end
+    return out
+end
+
+--- -0: 按 NUL 切, 不做任何引号/反斜杠处理。
+local function splitNull(s)
+    local out, cur = {}, {}
+    for i = 1, #s do
+        local c = s:sub(i, i)
+        if c == string.char(0) then
+            out[#out + 1] = { value = table.concat(cur), line = #out + 1 }
+            cur = {}
+        else
+            cur[#cur + 1] = c
+        end
+    end
+    if #cur > 0 then out[#out + 1] = { value = table.concat(cur), line = #out + 1 } end
+    return out
+end
+
+--- -I: 每个非空行是一个"参数"(整体替换), 不做进一步切分。
+local function splitLines(s)
+    local out = {}
+    for line in (s .. "\n"):gmatch("(.-)\n") do
+        if line ~= "" then out[#out + 1] = { value = line, line = #out + 1 } end
+    end
+    return out
+end
+
+local items, serr
+if replaceStr then
+    items = splitLines(text)
+elseif optNull then
+    items = splitNull(text)
+else
+    items, serr = splitDefault(text)
+end
+-- 引号不配对的诊断 + 已解析出的参数照常执行(GNU 实测: 先把读到的参数跑掉, 再以 1 退出)。
+-- 诊断先打: 宿主的 stderr 是无缓冲的, 顺序上也是先看到诊断。
+local parseErr = nil
+if serr then
+    parseErr = serr
+    stderr("xargs: " .. serr .. "; by default quotes are special to xargs unless you use the -0 option\n")
+end
+
+-- -E: 遇到该参数即停止(它自身及其后的参数都不传)。
+if eofStr then
+    local cut
+    for k, it in ipairs(items) do
+        if it.value == eofStr then cut = k; break end
+    end
+    if cut then
+        for k = #items, cut, -1 do items[k] = nil end
+    end
+end
+
+if replaceStr then maxLines = maxLines or 1 end
+
+-- ---------------------------------------------------------------
+-- 执行
+-- ---------------------------------------------------------------
+local exitStatus = 0
+
+--- 记录一个 xargs 退出码(取"最严重"的那个: 127 > 126 > 125 > 124 > 123)。
+local function worse(v)
+    if v > exitStatus then exitStatus = v end
+end
+
+--- 子命令的退出码 -> xargs 的退出码(POSIX: 1..125 -> 123; 255 -> 124; 信号 -> 125)。
+local function recordChild(code)
+    if code < 0 then
+        worse(125)
+    elseif code == 255 then
+        worse(124)
+    elseif code ~= 0 then
+        worse(123)
+    end
+    return code
+end
+
+--- 参数在 -t 回显里的引号形式(GNU: 含特殊字符的参数用单引号包起来)。
+local function quoteArg(a)
+    if a ~= "" and not a:find("[^%w%._/:=@%%+%,%-]") then return a end
+    return "'" .. a:gsub("'", "'\\''") .. "'"
+end
+
+local function showCommand(argv)
+    local parts = {}
+    for k, a in ipairs(argv) do parts[k] = quoteArg(a) end
+    return table.concat(parts, " ")
+end
+
+--- 询问确认(-p): 从 stdin 读一行, y/Y 开头才执行。
+local function askConfirm(argv)
+    local h = io.stdin()
+    local s = showCommand(argv) .. "?..."
+    stderr(s)
+    local ans = h and h.readLine and h.readLine() or nil
+    if ans == nil then
+        stderr("\n")
+        return false
+    end
+    return ans:sub(1, 1) == "y" or ans:sub(1, 1) == "Y"
+end
+
+--- 运行一条命令行。返回 false 表示必须立即停止(exec 失败/255/被信号杀死)。
+local function runOne(argv)
+    if optVerbose then stderr(showCommand(argv) .. "\n") end
+    -- stdio 显式传本进程的 stdin/stdout(内核里与继承等价; 宿主测试台不继承父进程 stdio)。
+    local stdio = { output = io.stdout() }
+    if io.stdin() then stdio.input = io.stdin() end
+    local pid, err = syscalls["proc.exec"](argv[1], { unpack(argv, 2) }, { cwd = cwd, stdio = stdio })
+    if not pid then
+        -- 命令找不到 -> 127; 找到但无法执行 -> 126(POSIX)。
+        local reason = tostring(err)
+        local code = 127
+        if not reason:find("command not found") then code = 126 end
+        if reason:find("command not found") then reason = "No such file or directory"
+        elseif reason:find("permission denied") then reason = "Permission denied" end
+        -- 内核的错误串本身带命令名("cmd: ..."), 去掉以免重复打印。
+        if reason:sub(1, #argv[1] + 2) == argv[1] .. ": " then
+            reason = reason:sub(#argv[1] + 3)
+        end
+        stderr("xargs: " .. argv[1] .. ": " .. reason .. "\n")
+        worse(code)
+        return false
+    end
+    local code = syscalls["proc.wait"](pid)
+    if code < 0 then
+        stderr("xargs: " .. argv[1] .. ": terminated by signal " .. tostring(-code) .. "\n")
+    elseif code == 255 then
+        stderr("xargs: " .. argv[1] .. ": exited with status 255; aborting\n")
+    end
+    recordChild(code)
+    return not (code == 255)
+end
+
+--- 固定开销: 命令名 + 初始参数, 每个参数记为 len+1(GNU 的估算方式)。
+local baseCost = #cmd + 1
+for _, a in ipairs(initial) do baseCost = baseCost + #a + 1 end
+
+--- 组装 argv(把 batch 追加在命令与初始参数之后)。
+local function buildArgv(batch)
+    local argv = { cmd }
+    for k, a in ipairs(initial) do argv[#argv + 1] = a end
+    for _, a in ipairs(batch) do argv[#argv + 1] = a end
+    return argv
+end
+
+local stop = false
+if replaceStr then
+    -- -I: 每行一条命令行, 整行替换初始参数(含命令名)里出现的 REPLSTR。
+    for _, it in ipairs(items) do
+        local argv = {}
+        for _, a in ipairs(buildArgv({})) do
+            argv[#argv + 1] = a:gsub(replaceStr:gsub("%p", "%%%0"), (it.value:gsub("%%", "%%%%")))
+        end
+        local cost = 0
+        for _, a in ipairs(argv) do cost = cost + #a + 1 end
+        if cost > maxChars then
+            stderr("xargs: argument line too long\n")
+            return 1
+        end
+        if optInteractive and not askConfirm(argv) then
+            -- 用户拒绝: 跳过这一条(GNU 亦如此, 不算错误)。
+        elseif not runOne(argv) then
+            stop = true
+        end
+        if stop then break end
+    end
+else
+    -- 分批: 受 -n(参数个数)/-L(逻辑行数)/-s(字节) 限制。
+    local limited = (maxArgs ~= nil) or (maxLines ~= nil)
+    local batch, cost, firstLine = {}, baseCost, nil
+    local function flush()
+        if #batch == 0 then return true end
+        local argv = buildArgv(batch)
+        batch, cost, firstLine = {}, baseCost, nil
+        if optInteractive and not askConfirm(argv) then return true end
+        return runOne(argv)
+    end
+
+    for _, it in ipairs(items) do
+        local add = #it.value + 1
+        if #batch > 0 then
+            local countFull = (maxArgs ~= nil and #batch >= maxArgs)
+            local lineFull = (maxLines ~= nil and (it.line - firstLine + 1) > maxLines)
+            if countFull or lineFull then
+                if not flush() then stop = true; break end
+            elseif cost + add > maxChars then
+                -- -x: 若因 -s 限制而凑不满 -n/-L 要求的批次, 直接报错(POSIX/GNU 实测)。
+                if optExit and limited then
+                    stderr("xargs: argument list too long\n")
+                    return 1
+                end
+                if not flush() then stop = true; break end
+            end
+        end
+        if #batch == 0 then firstLine = it.line; cost = baseCost end
+        if cost + add > maxChars and #batch == 0 then
+            -- 单个参数就超限: 无论有没有 -x 都是错误(GNU 报 argument line too long)。
+            stderr(optExit and "xargs: argument list too long\n" or "xargs: argument line too long\n")
+            return 1
+        end
+        batch[#batch + 1] = it.value
+        cost = cost + add
+    end
+    if not stop then flush() end
+end
+
+-- 输入为空且没给 -r: POSIX 要求仍执行一次(echo 没有参数就只打一个空行)。
+if not stop and #items == 0 and not optNoRunIfEmpty and not replaceStr then
+    local argv = buildArgv({})
+    if not (optInteractive and not askConfirm(argv)) then runOne(argv) end
+end
+
+if parseErr then return 1 end
+if exitStatus ~= 0 then return exitStatus end

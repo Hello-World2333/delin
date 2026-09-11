@@ -1,0 +1,249 @@
+-- Delin ln: 创建硬链接/符号链接 (POSIX ln(1) + GNU 常用项)。
+-- 用法:
+--   ln [OPTION]... TARGET LINKNAME
+--   ln [OPTION]... TARGET... DIRECTORY
+--   ln [OPTION]... TARGET                 (在 cwd 下按 TARGET 的 basename 建链接)
+-- 选项:
+--   -s, --symbolic            建符号链接(缺省是硬链接)
+--   -f, --force               目标已存在时先删除再建
+--   -n, --no-dereference      LINKNAME 是"指向目录的符号链接"时把它当普通文件, 不放进那个目录
+--   -T, --no-target-directory 永远把最后的操作数当链接名, 不当作目录
+--   -v, --verbose             每建一个链接打印 ' 链接名' -> '目标' (GNU 格式)
+--   --                        结束选项
+-- 语义要点:
+--   - 硬链接走 fs.link: 与 Linux link(2) 一致 —— **不跟随** TARGET 最后一段的符号链接,
+--     LINKNAME 必须不存在; 跨文件系统失败("cross-filesystem hard link is not allowed")。
+--     TARGET 必须存在(GNU: "failed to access 'TARGET': No such file or directory"),
+--     且不能是目录(GNU: "TARGET: hard link not allowed for directory")。
+--   - 符号链接走 fs.symlink: TARGET **原样保存, 不做任何路径解析** —— `ln -s a/b c` 存的就是字面
+--     "a/b", 因此相对目标按"链接所在目录"解释(与 Linux 相同)。-s 时 TARGET 允许不存在(悬空链接)。
+--   - 只有 LINKNAME 的最后一段不跟随链接: 删 -f 覆盖、建链接都作用在链接本身而不是它指向的文件
+--     (内核 fs.delete/symlink 的最后一段不跟随)。
+--   - 目标目录判定: 缺省用 fs.isDir(跟随符号链接); -n 时用 fs.lstat 且只认真正的目录;
+--     -T 时根本不判定(总是链接名)。
+--   - "同一文件" 检查: TARGET 与 LINKNAME 是同一个 inode(ino) 时按 GNU 报 same file。
+-- 已知偏离:
+--   - 不支持 -L/-P/-b/-S/-i/-r/-t/--backup: 未实现, 出现即报错(invalid option)。
+--   - 诊断文本按本任务书给的格式(硬链接失败带 " => 'TARGET'"):
+--       ln: failed to create hard link 'b' => 'a': File exists
+--       ln: failed to create symbolic link 'b': File exists
+--     宿主 coreutils 9.7 的**实测**是: 硬链接失败**不带** " => 'a'"(只有 "failed to create hard
+--     link 'b': File exists"), 而 -v 的**硬**链接用 " => "("'b' => 'a'")、符号链接才用 " -> "。
+--     本工具一律按任务书: 错误消息带 " => 'TARGET'", -v 一律 " -> "。要改回 GNU 实测文本
+--     只需动 failPrefix 与 createOne 里 -v 那一行。
+--   - 目录的硬链接被拒(与 Linux 一致), 报 GNU 的 "hard link not allowed for directory"。
+--   - 诊断信息用英文(与本项目其他工具一致)。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+--- 取不跟随符号链接的属性; 路径(最后一段)不存在时返回 nil。
+--- fs.exists 复核一次是因为宿主测试台的 fs.lstat 桩对不存在的路径也会给出一张表(真机上返回 nil);
+--- 只认 kind == "symlink" 的表, 于是悬空链接(存在但目标不存在)仍被算作"存在"。
+local function lstat(p)
+    local a = fs.lstat(p)
+    if not a then return nil end
+    if a.kind == "symlink" then return a end
+    if fs.exists(p) then return a end
+    return nil
+end
+
+local function basename(p)
+    p = (type(p) == "string" and p) or ""
+    p = p:gsub("/+$", "")
+    return (p:match("([^/]+)$")) or p
+end
+
+-- ---------------------------------------------------------------
+-- 选项解析
+-- ---------------------------------------------------------------
+local optSym, optForce, optNoDeref, optTargetDir, optVerbose = false, false, false, false, false
+local operands = {}
+local noMoreOpts = false
+
+local function setShort(ch)
+    if ch == "s" then optSym = true
+    elseif ch == "f" then optForce = true
+    elseif ch == "n" then optNoDeref = true
+    elseif ch == "T" then optTargetDir = true
+    elseif ch == "v" then optVerbose = true
+    else stderr("ln: invalid option -- '" .. ch .. "'\n"); return false end
+    return true
+end
+
+for _, a in ipairs(args) do
+    if noMoreOpts then
+        operands[#operands + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "--symbolic" then optSym = true
+    elseif a == "--force" then optForce = true
+    elseif a == "--no-dereference" then optNoDeref = true
+    elseif a == "--no-target-directory" then optTargetDir = true
+    elseif a == "--verbose" then optVerbose = true
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        for k = 2, #a do if not setShort(a:sub(k, k)) then return 1 end end
+    else
+        operands[#operands + 1] = a
+    end
+end
+
+if #operands == 0 then
+    stderr("ln: missing file operand\n")
+    return 1
+end
+
+-- ---------------------------------------------------------------
+-- 目标目录判定 + 建立 (TARGET, LINKNAME) 任务表
+-- ---------------------------------------------------------------
+local linkOf = {} -- 每项 { target = 原始操作数, link = 绝对链接路径, display = 诊断里显示的链接名 }
+
+local function joinDisplay(dir, name)
+    dir = dir:gsub("/+$", "")
+    if dir == "" then return "/" .. name end
+    return dir .. "/" .. name
+end
+
+local destIsDir = false
+local destDirRaw = nil
+if #operands == 1 then
+    -- GNU: 单个操作数 = 在 cwd 下建同名链接(诊断里显示 "./name")。
+    destIsDir = true
+    destDirRaw = "."
+    linkOf[1] = { target = operands[1], link = resolve(basename(operands[1])),
+                  display = joinDisplay(".", basename(operands[1])) }
+else
+    local last = operands[#operands]
+    if not optTargetDir then
+        if optNoDeref then
+            local a = lstat(resolve(last))
+            destIsDir = (a ~= nil) and (a.isDir == true) and (a.kind ~= "symlink")
+        else
+            destIsDir = fs.isDir(resolve(last)) and true or false
+        end
+    end
+    if destIsDir then
+        destDirRaw = last
+        for i = 1, #operands - 1 do
+            local t = operands[i]
+            local b = basename(t)
+            linkOf[#linkOf + 1] = { target = t, link = resolve(joinDisplay(last, b)),
+                                    display = joinDisplay(last, b) }
+        end
+    else
+        if #operands > 2 then
+            -- 多目标 + 末操作数不是目录: GNU 只报一次错并放弃整次调用(什么都不建)。
+            local p = resolve(last)
+            if fs.exists(p) then
+                stderr("ln: target '" .. last .. "' is not a directory\n")
+            else
+                stderr("ln: target '" .. last .. "': No such file or directory\n")
+            end
+            return 1
+        end
+        linkOf[1] = { target = operands[1], link = resolve(last), display = last }
+    end
+end
+
+-- ---------------------------------------------------------------
+-- 建链接
+-- ---------------------------------------------------------------
+local function failPrefix(targetRaw, linkRaw)
+    if optSym then
+        return "ln: failed to create symbolic link '" .. linkRaw .. "': "
+    end
+    return "ln: failed to create hard link '" .. linkRaw .. "' => '" .. targetRaw .. "': "
+end
+
+--- 同一文件判定: ino 相同(内核 ext2 给 ino; CC 原生 fs 没有, 退化成字面路径比较)。
+local function sameFile(a, b)
+    local la, lb = lstat(a), lstat(b)
+    if la and lb and la.ino and lb.ino then return la.ino == lb.ino end
+    return a == b
+end
+
+local function createOne(job)
+    local targetRaw, linkRaw = job.target, job.display
+    local target, link = resolve(targetRaw), job.link
+
+    if not optSym then
+        if not (fs.exists(target) or lstat(target)) then
+            stderr("ln: failed to access '" .. targetRaw .. "': No such file or directory\n")
+            return false
+        end
+        local ta = lstat(target)
+        if ta and ta.isDir then
+            stderr("ln: " .. targetRaw .. ": hard link not allowed for directory\n")
+            return false
+        end
+    end
+
+    local la = lstat(link)
+    if la then
+        if not optSym and sameFile(target, link) then
+            stderr("ln: '" .. targetRaw .. "' and '" .. linkRaw .. "' are the same file\n")
+            return false
+        end
+        if not optForce then
+            stderr(failPrefix(targetRaw, linkRaw) .. "File exists\n")
+            return false
+        end
+        if la.isDir and la.kind ~= "symlink" then
+            stderr("ln: cannot overwrite directory '" .. linkRaw .. "' with non-directory\n")
+            return false
+        end
+        local dok, derr = fs.delete(link)
+        if not dok then
+            stderr("ln: cannot remove '" .. linkRaw .. "': " .. tostring(derr) .. "\n")
+            return false
+        end
+    end
+
+    -- 父目录必须存在(GNU: "failed to create ...: No such file or directory")。
+    -- 内核返回的错误串不带 errno 语义, 这里自己判一次, 好让诊断与 GNU 一致。
+    local parent = link:match("^(.*)/[^/]*$") or "/"
+    if parent == "" then parent = "/" end
+    local pa = lstat(parent)
+    if not pa then
+        stderr(failPrefix(targetRaw, linkRaw) .. "No such file or directory\n")
+        return false
+    end
+    if not fs.isDir(parent) then
+        stderr(failPrefix(targetRaw, linkRaw) .. "Not a directory\n")
+        return false
+    end
+
+    local ok, err
+    if optSym then
+        ok, err = fs.symlink(targetRaw, link) -- target 原样保存(不 resolve)
+    else
+        ok, err = fs.link(target, link)
+    end
+    if not ok then
+        stderr(failPrefix(targetRaw, linkRaw) .. tostring(err) .. "\n")
+        return false
+    end
+    if optVerbose then
+        io.write("'" .. linkRaw .. "' -> '" .. targetRaw .. "'\n")
+    end
+    return true
+end
+
+local rc = 0
+for _, job in ipairs(linkOf) do
+    if not createOne(job) then rc = 1 end
+end
+return rc

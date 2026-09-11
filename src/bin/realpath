@@ -1,0 +1,220 @@
+-- Delin realpath: 把路径规范化成绝对路径(逐段展开符号链接) (POSIX realpath(1) + GNU 子集)。
+-- 用法: realpath [OPTION]... FILE...
+-- 选项:
+--   -e, --canonicalize-existing  **所有**段都必须存在, 否则报错(退出 1)
+--   -m, --canonicalize-missing   只做纯词法规范化(不要求存在, 也不展开符号链接)
+--   -L, --logical                先按字面消解 ".." 再展开符号链接
+--   -P, --physical               展开符号链接时遇到 ".." 就按展开后的位置回退(GNU 缺省)
+--       --relative-to=DIR        输出相对于 DIR 的路径
+--   --                           结束选项
+-- 缺省(既不给 -e 也不给 -m): **除最后一段外**每段都必须存在(`realpath nosuch` 成功,
+-- `realpath nosuch/deep` 报 No such file or directory)。
+-- 规范化规则: 去掉 "."、消解 ".."(到根为止)、折叠多余 "/"; 符号链接**逐段展开** ——
+-- 对每段用 fs.lstat 看 kind == "symlink", 是就用 fs.readlink 取目标并把它 splice 回待处理段
+-- (目标以 "/" 开头则从头开始, 否则相对链接所在目录), 最多 40 跳, 超了报 ELOOP
+-- ("Too many levels of symbolic links")。
+-- 已知偏离:
+--   - `-m` 是**纯词法**的: 不展开符号链接(GNU 的 -m 仍会跟随已存在的链接)。按任务书简化。
+--   - `-P`/`-L` 按 GNU 语义实现: -P 是缺省(展开链接, ".." 在展开后的位置回退),
+--     -L 先把 ".." 按字面消解再展开链接。任务书里"-P 时不做链接展开"与 GNU 不符, 这里跟 GNU。
+--     (本工具没有"不展开链接"的模式: 那是 -m 之外的另一种语义, GNU 也没有。)
+--   - 不实现 -q/--quiet, -s/--strip, -z/--zero, --no-symlinks: 未实现, 出现即报错。
+--   - 空操作数是错误(GNU 同样报 No such file or directory)。
+--   - 诊断信息用英文(与本项目其他工具一致)。
+local args = args or {}
+-- 相对路径在 canonPath 里直接拼 cwd(wc 顶部那段 resolve 的等价物)——
+-- 这里要的是"逐段处理原始路径", 所以拼接必须发生在规范化之前。
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+-- ---------------------------------------------------------------
+-- 路径规范化
+-- ---------------------------------------------------------------
+local MAX_SYMLINKS = 40
+
+local function splitSegs(p)
+    local out = {}
+    for s in p:gmatch("[^/]+") do out[#out + 1] = s end
+    return out
+end
+
+--- 取不跟随符号链接的属性; 路径(最后一段)不存在时返回 nil。
+--- fs.exists 复核一次: 宿主测试台的 fs.lstat 桩对不存在的路径也会给出一张表(真机返回 nil);
+--- 只把 kind == "symlink" 的表当作链接, 于是悬空链接(链接本身存在)仍算存在。
+local function lstat(p)
+    local a = fs.lstat(p)
+    if not a then return nil end
+    if a.kind == "symlink" then return a end
+    if fs.exists(p) then return a end
+    return nil
+end
+
+--- -L: 先把 "." 与 ".." 按字面消解掉(在展开任何符号链接之前)。
+local function lexicalize(p)
+    local out = {}
+    for s in p:gmatch("[^/]+") do
+        if s == "." then -- 丢掉
+        elseif s == ".." then
+            if #out > 0 then out[#out] = nil end
+        else
+            out[#out + 1] = s
+        end
+    end
+    if #out == 0 then return "/" end
+    return "/" .. table.concat(out, "/")
+end
+
+--- 规范化一个路径。
+---@param input string 操作数(相对路径按本进程 cwd 展开)
+---@param mode string "existing"(-e) | "allbutlast"(缺省/-f) | "missing"(-m)
+---@param logical boolean -L
+---@return string|nil 绝对路径, string|nil 失败原因
+local function canonPath(input, mode, logical)
+    if input == "" then return nil, "No such file or directory" end
+    local abs
+    if input:sub(1, 1) == "/" then
+        abs = input
+    else
+        local base = (cwd == "/") and "" or cwd
+        abs = base .. "/" .. input
+    end
+    if logical then abs = lexicalize(abs) end
+
+    local segs = splitSegs(abs)
+    local out = {}          -- 已确定的前缀段
+    local hops = 0          -- 符号链接跳数
+    local missingFrom = nil -- 第一个不存在的段在 out 里的位置
+    local i = 1
+    while i <= #segs do
+        local seg = segs[i]
+        if seg == "." then
+            i = i + 1
+        elseif seg == ".." then
+            if #out > 0 then out[#out] = nil end
+            i = i + 1
+        else
+            local cur = (#out == 0) and "/" or ("/" .. table.concat(out, "/") .. "/")
+            local path = cur .. seg
+            -- -m 是纯词法的: 一次 lstat 都不做(见文件头的偏离说明)。
+            -- 注意别写成 `(mode == "missing") and nil or lstat(path)`: true and nil 仍是 nil,
+            -- 而 nil or x 会取 x —— 那样 -m 反而会去跟随符号链接。
+            local a
+            if mode ~= "missing" then a = lstat(path) end
+            if a and a.kind == "symlink" then
+                local tgt, terr = fs.readlink(path)
+                if not tgt then
+                    return nil, "cannot read symbolic link '" .. path .. "': " .. tostring(terr)
+                end
+                hops = hops + 1
+                if hops > MAX_SYMLINKS then return nil, "Too many levels of symbolic links" end
+                if tgt:sub(1, 1) == "/" then out = {}; missingFrom = nil end
+                local tsegs = splitSegs(tgt)
+                table.remove(segs, i)
+                for k = #tsegs, 1, -1 do table.insert(segs, i, tsegs[k]) end
+                -- 不推进 i: 下一轮处理 splice 进来的目标段。
+            elseif a then
+                out[#out + 1] = seg
+                i = i + 1
+            else
+                if not missingFrom then missingFrom = #out + 1 end
+                out[#out + 1] = seg
+                i = i + 1
+            end
+        end
+    end
+
+    if mode ~= "missing" and missingFrom then
+        -- -e: 任何一段缺失都错; 缺省: 只允许**最后一段**缺失。
+        if mode == "existing" or #out > missingFrom then
+            return nil, "No such file or directory"
+        end
+    end
+    if #out == 0 then return "/" end
+    return "/" .. table.concat(out, "/")
+end
+
+--- --relative-to: 取 target 相对 base 的路径(两者都已规范化)。
+local function relativize(target, base)
+    local ts, bs = splitSegs(target), splitSegs(base)
+    local n = 0
+    while n < #ts and n < #bs and ts[n + 1] == bs[n + 1] do n = n + 1 end
+    local parts = {}
+    for _ = n + 1, #bs do parts[#parts + 1] = ".." end
+    for k = n + 1, #ts do parts[#parts + 1] = ts[k] end
+    if #parts == 0 then return "." end
+    return table.concat(parts, "/")
+end
+
+-- ---------------------------------------------------------------
+-- 选项解析
+-- ---------------------------------------------------------------
+local mode = "allbutlast"
+local logical = false -- GNU 缺省是 -P(物理展开)
+local relTo = nil
+local files = {}
+local noMoreOpts = false
+
+local function setShort(ch)
+    if ch == "e" then mode = "existing"
+    elseif ch == "m" then mode = "missing"
+    elseif ch == "L" then logical = true
+    elseif ch == "P" then logical = false
+    else stderr("realpath: invalid option -- '" .. ch .. "'\n"); return false end
+    return true
+end
+
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if noMoreOpts then
+        files[#files + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "--canonicalize-existing" then mode = "existing"
+    elseif a == "--canonicalize-missing" then mode = "missing"
+    elseif a == "--logical" then logical = true
+    elseif a == "--physical" then logical = false
+    elseif a == "--relative-to" then
+        i = i + 1
+        if not args[i] then stderr("realpath: option '--relative-to' requires an argument\n"); return 1 end
+        relTo = args[i]
+    elseif a:sub(1, 14) == "--relative-to=" then
+        relTo = a:sub(15)
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        for k = 2, #a do if not setShort(a:sub(k, k)) then return 1 end end
+    else
+        files[#files + 1] = a
+    end
+    i = i + 1
+end
+
+if #files == 0 then
+    stderr("realpath: missing operand\n")
+    return 1
+end
+
+local relBase = nil
+if relTo ~= nil then
+    local b, berr = canonPath(relTo, mode, logical)
+    if not b then
+        stderr("realpath: " .. relTo .. ": " .. tostring(berr) .. "\n")
+        return 1
+    end
+    relBase = b
+end
+
+local rc = 0
+for _, f in ipairs(files) do
+    local p, err = canonPath(f, mode, logical)
+    if not p then
+        stderr("realpath: " .. f .. ": " .. tostring(err) .. "\n")
+        rc = 1
+    else
+        if relBase then p = relativize(p, relBase) end
+        io.write(p .. "\n")
+    end
+end
+return rc

@@ -1,0 +1,190 @@
+-- Delin readlink: 打印符号链接的目标 (POSIX readlink(1) + GNU 扩展)。
+-- 用法: readlink [OPTION]... FILE...
+-- 选项:
+--   -f, --canonicalize           规范化(逐段展开符号链接), **除最后一段外**每段必须存在
+--   -e, --canonicalize-existing  规范化, **所有**段都必须存在, 否则报错
+--   -m, --canonicalize-missing   只做纯词法规范化(不要求存在, 也不展开符号链接)
+--   -n, --no-newline             不输出结尾换行(多个操作数时 GNU 会忽略它并警告)
+--   -z, --zero                   输出用 NUL 而不是换行结尾
+--   -v, --verbose                对非链接/失败也打印诊断(缺省静默, 但退出码仍非 0)
+--   --                           结束选项
+-- 缺省(无 -f/-e/-m): 对每个 FILE 打印 fs.readlink 的结果; **不是符号链接就静默跳过**,
+-- 最终退出 1(POSIX: 不是链接不打印、退出码非 0)。多操作数时部分成功也退 1。
+-- -f/-e/-m 与 realpath 用同一套规范化逻辑与语义(逐段 fs.lstat + fs.readlink 展开, 40 跳上限,
+-- 超了报 ELOOP)。诊断消息只在 -v 或规范化失败时打印(与非规范化模式一致)。
+-- 已知偏离:
+--   - `-m` 是**纯词法**的(不展开符号链接), 见 realpath 的同一条说明。
+--   - 不实现 -q/--quiet, -s/--strip: 未实现, 出现即报错。
+--   - 非链接的错误文本用 Linux 的 "Invalid argument"/"No such file or directory"(与 GNU 一致)。
+--   - 诊断信息用英文(与本项目其他工具一致)。
+local args = args or {}
+-- 相对路径在 canonPath 里直接拼 cwd(wc 顶部那段 resolve 的等价物)。
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+-- ---------------------------------------------------------------
+-- 路径规范化(与 /bin/realpath 同一套实现思路与语义)
+-- ---------------------------------------------------------------
+local MAX_SYMLINKS = 40
+
+local function splitSegs(p)
+    local out = {}
+    for s in p:gmatch("[^/]+") do out[#out + 1] = s end
+    return out
+end
+
+--- 取不跟随符号链接的属性; 路径(最后一段)不存在时返回 nil。
+--- fs.exists 复核一次: 宿主测试台的 fs.lstat 桩对不存在的路径也会给出一张表(真机返回 nil);
+--- 只把 kind == "symlink" 的表当作链接, 于是悬空链接(链接本身存在)仍算存在。
+local function lstat(p)
+    local a = fs.lstat(p)
+    if not a then return nil end
+    if a.kind == "symlink" then return a end
+    if fs.exists(p) then return a end
+    return nil
+end
+
+--- 规范化一个路径。mode: "existing"(-e) | "allbutlast"(-f) | "missing"(-m)。
+---@return string|nil 绝对路径, string|nil 失败原因
+local function canonPath(input, mode)
+    if input == "" then return nil, "No such file or directory" end
+    local abs
+    if input:sub(1, 1) == "/" then
+        abs = input
+    else
+        local base = (cwd == "/") and "" or cwd
+        abs = base .. "/" .. input
+    end
+
+    local segs = splitSegs(abs)
+    local out = {}
+    local hops = 0
+    local missingFrom = nil
+    local i = 1
+    while i <= #segs do
+        local seg = segs[i]
+        if seg == "." then
+            i = i + 1
+        elseif seg == ".." then
+            if #out > 0 then out[#out] = nil end
+            i = i + 1
+        else
+            local cur = (#out == 0) and "/" or ("/" .. table.concat(out, "/") .. "/")
+            local path = cur .. seg
+            -- -m 是纯词法的: 一次 lstat 都不做(见文件头的偏离说明)。
+            -- 注意别写成 `(mode == "missing") and nil or lstat(path)`: true and nil 仍是 nil,
+            -- 而 nil or x 会取 x —— 那样 -m 反而会去跟随符号链接。
+            local a
+            if mode ~= "missing" then a = lstat(path) end
+            if a and a.kind == "symlink" then
+                local tgt, terr = fs.readlink(path)
+                if not tgt then
+                    return nil, "cannot read symbolic link '" .. path .. "': " .. tostring(terr)
+                end
+                hops = hops + 1
+                if hops > MAX_SYMLINKS then return nil, "Too many levels of symbolic links" end
+                if tgt:sub(1, 1) == "/" then out = {}; missingFrom = nil end
+                local tsegs = splitSegs(tgt)
+                table.remove(segs, i)
+                for k = #tsegs, 1, -1 do table.insert(segs, i, tsegs[k]) end
+            elseif a then
+                out[#out + 1] = seg
+                i = i + 1
+            else
+                if not missingFrom then missingFrom = #out + 1 end
+                out[#out + 1] = seg
+                i = i + 1
+            end
+        end
+    end
+
+    if mode ~= "missing" and missingFrom then
+        if mode == "existing" or #out > missingFrom then
+            return nil, "No such file or directory"
+        end
+    end
+    if #out == 0 then return "/" end
+    return "/" .. table.concat(out, "/")
+end
+
+-- ---------------------------------------------------------------
+-- 选项解析
+-- ---------------------------------------------------------------
+local mode = nil -- nil = 直接读链接(缺省)
+local noNewline, zero, verbose = false, false, false
+local files = {}
+local noMoreOpts = false
+
+local function setShort(ch)
+    if ch == "f" then mode = "allbutlast"
+    elseif ch == "e" then mode = "existing"
+    elseif ch == "m" then mode = "missing"
+    elseif ch == "n" then noNewline = true
+    elseif ch == "z" then zero = true
+    elseif ch == "v" then verbose = true
+    else stderr("readlink: invalid option -- '" .. ch .. "'\n"); return false end
+    return true
+end
+
+for _, a in ipairs(args) do
+    if noMoreOpts then
+        files[#files + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "--canonicalize" then mode = "allbutlast"
+    elseif a == "--canonicalize-existing" then mode = "existing"
+    elseif a == "--canonicalize-missing" then mode = "missing"
+    elseif a == "--no-newline" then noNewline = true
+    elseif a == "--zero" then zero = true
+    elseif a == "--verbose" then verbose = true
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        for k = 2, #a do if not setShort(a:sub(k, k)) then return 1 end end
+    else
+        files[#files + 1] = a
+    end
+end
+
+if #files == 0 then
+    stderr("readlink: missing operand\n")
+    return 1
+end
+
+-- GNU: -n 与多个操作数共存时忽略 -n 并警告(否则输出会粘成一行)。
+if noNewline and #files > 1 then
+    stderr("readlink: ignoring --no-newline with multiple arguments\n")
+    noNewline = false
+end
+local delim = zero and string.char(0) or (noNewline and "" or "\n")
+
+local rc = 0
+for _, f in ipairs(files) do
+    if mode then
+        local p, err = canonPath(f, mode)
+        if not p then
+            if verbose then stderr("readlink: " .. f .. ": " .. tostring(err) .. "\n") end
+            rc = 1
+        else
+            io.write(p .. delim)
+        end
+    else
+        local p = (f:sub(1, 1) == "/") and f:gsub("/+$", "") or
+            (((cwd == "/") and "" or cwd) .. "/" .. f):gsub("/+", "/")
+        local tgt, terr = fs.readlink(p)
+        if tgt then
+            io.write(tgt .. delim)
+        else
+            if verbose then
+                if lstat(p) then
+                    stderr("readlink: " .. f .. ": Invalid argument\n")
+                else
+                    stderr("readlink: " .. f .. ": No such file or directory\n")
+                end
+            end
+            rc = 1
+        end
+    end
+end
+return rc

@@ -1,0 +1,96 @@
+-- Delin echo: 输出参数 (POSIX echo(1) + bash/XSI 风格的 -n/-e/-E)。
+-- 用法: echo [-neE] [--] [ARG]...
+-- 选项:
+--   -n   不在末尾输出换行
+--   -e   解释反斜杠转义: \\ \a \b \c \e \f \n \r \t \v \0nnn(1-3 位八进制) \xHH
+--        (\c = 停止输出且不再输出换行; 未知转义原样保留)
+--   -E   关闭转义解释(缺省行为)
+--   --   结束选项(后面的 -n 之类按字面输出)
+-- 语义: **与 sh 的 echo 内建逐字节一致**(同一套 -n/-e/-E 解析与同一张转义表)。缺省不解释转义
+--       (同 bash; 与 XSI 的"缺省解释"不同, 这是本项目的既有约定, 见 for-ai.md)。
+-- 为什么还要有一个 /bin/echo: echo 是 shell 内建, 但 POSIX 也把它列在**强制命令**里, 而且
+-- 很多工具是"exec 一个 echo"的 —— `xargs` 不带 COMMAND 时缺省就是 echo、`nohup echo`、
+-- `find -exec echo` 等等。这些路径不经过 shell, 找不到 /bin/echo 就会 127 command not found
+-- (真机验证时 `printf 'a b c\n' | xargs` 就是这么失败的)。
+local args = args or {}
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+local ECHO_ESC = {
+    a = "\a", b = "\b", e = "\27", E = "\27", f = "\f",
+    n = "\n", r = "\r", t = "\t", v = "\v", ["\\"] = "\\",
+}
+
+--- 解释 -e 转义。返回 (文本, 是否继续输出换行)。
+local function echoEscapes(s)
+    local out, i, n = {}, 1, #s
+    while i <= n do
+        local c = s:sub(i, i)
+        if c ~= "\\" then
+            out[#out + 1] = c
+            i = i + 1
+        else
+            local d = s:sub(i + 1, i + 1)
+            if d == "" then
+                out[#out + 1] = "\\"
+                i = i + 1
+            elseif d == "c" then
+                return table.concat(out), false
+            elseif d == "0" then
+                local oct = s:match("^[0-7][0-7]?[0-7]?", i + 2) or ""
+                out[#out + 1] = string.char((tonumber(oct, 8) or 0) % 256)
+                i = i + 2 + #oct
+            elseif d == "x" then
+                local hex = s:match("^%x%x", i + 2)
+                if hex then
+                    out[#out + 1] = string.char(tonumber(hex, 16))
+                    i = i + 4
+                else
+                    out[#out + 1] = "\\x"
+                    i = i + 2
+                end
+            elseif ECHO_ESC[d] then
+                out[#out + 1] = ECHO_ESC[d]
+                i = i + 2
+            else
+                out[#out + 1] = "\\" .. d
+                i = i + 2
+            end
+        end
+    end
+    return table.concat(out), true
+end
+
+local i, newline, escapes = 1, true, false
+while i <= #args do
+    local a = args[i]
+    if a == "--" then i = i + 1; break end
+    if not a:match("^%-[neE]+$") then break end
+    for k = 2, #a do
+        local ch = a:sub(k, k)
+        if ch == "n" then newline = false
+        elseif ch == "e" then escapes = true
+        else escapes = false end -- -E
+    end
+    i = i + 1
+end
+local parts = {}
+for k = i, #args do parts[#parts + 1] = args[k] end
+local s = table.concat(parts, " ")
+if escapes then
+    local cont
+    s, cont = echoEscapes(s)
+    newline = newline and cont
+end
+
+-- POSIX echo: 写失败必须报错并给非 0 退出码(否则 `echo x > /sys/...` 的失败会被静默吞掉)。
+local w = io.stdout()
+if w and w.write then
+    local okw, werr = w:write(s .. (newline and "\n" or ""))
+    if okw == nil and werr ~= nil then
+        stderr("echo: write error: " .. tostring(werr) .. "\n")
+        return 1
+    end
+end

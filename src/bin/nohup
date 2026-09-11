@@ -1,0 +1,133 @@
+-- Delin nohup: 让命令免疫 SIGHUP 并(必要时)把输出转到 nohup.out (POSIX nohup(1))。
+-- 用法: nohup COMMAND [ARG...]
+-- 选项: 无。`--` 结束选项(之后第一个操作数仍是 COMMAND)。
+-- 语义要点:
+--   - 用 syscalls["proc.exec"](cmd, argv, { sigIgnore = { [1] = true }, ... }) 起子进程:
+--     被忽略的信号**跨 spawn 继承**(内核 process.spawn 的语义), 于是子命令对 SIGHUP 免疫。
+--   - stdout 是终端时(io.stdout().isTTY == true): 输出**追加**写 nohup.out —— 先试当前目录,
+--     不可写(打不开)再试 $HOME/nohup.out; 并向 stderr 打
+--     "nohup: ignoring input and appending output to 'nohup.out'"。
+--     Delin 的 stderr 就是进程的 stdout(io.stderr() 与 io.stdout() 同一个句柄), 所以
+--     "stderr 是终端时也重定向到同一文件" 是同一件事: 重定向 output 即同时覆盖两者。
+--   - stdin 是终端时重定向到 /dev/null(POSIX: 后台命令不该再读终端)。
+--   - stdout 不是终端时什么都不改: 输出继承父进程(管道/文件重定向由调用者负责)。
+--   - 退出码(POSIX): 命令找不到 -> 127; 找到但无法执行 -> 126; 否则 = 命令的退出码;
+--     命令被信号杀死 -> 128 + 信号号; nohup 自己失败(缺操作数/开不了 nohup.out) -> 125(GNU)。
+-- 已知偏离:
+--   - 没有 -v/--version 一类选项(与本项目其他工具一致)。
+--   - 不 fork 到后台: Delin 没有 fork(进程是协程), nohup 与 sh 一样**在前台等**子命令结束
+--     再把它的退出码返回(想要后台请用 `nohup cmd &`, 由 sh 负责作业控制)。
+--   - nohup.out 的句柄在子命令退出后由本进程 flush 一次(内核句柄是带缓冲的, 不 flush 的话
+--     子进程写的内容可能还留在父进程打开的句柄里 —— Linux 上不存在这个问题)。
+--   - 诊断信息用英文(与本项目其他工具一致)。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+-- 选项只在最前面(GNU 用 getopt "+"): 第一个非选项就是 COMMAND,
+-- 它之后的参数**一律**原样传给 COMMAND(`nohup sh -c 'exit 3'` 里的 -c 不能被当成 nohup 的选项)。
+local operands = {}
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if a == "--" then
+        i = i + 1
+        for k = i, #args do operands[#operands + 1] = args[k] end
+        break
+    elseif a:sub(1, 1) == "-" and a ~= "-" and #a > 1 then
+        stderr("nohup: invalid option -- '" .. a:sub(2, 2) .. "'\n")
+        return 125
+    else
+        for k = i, #args do operands[#operands + 1] = args[k] end
+        break
+    end
+end
+
+if #operands == 0 then
+    stderr("nohup: missing operand\n")
+    return 125
+end
+
+local cmd = operands[1]
+local argv = {}
+for k = 2, #operands do argv[#argv + 1] = operands[k] end
+
+-- ---------------------------------------------------------------
+-- stdio: stdout 是终端 -> 追加 nohup.out; stdin 是终端 -> /dev/null
+-- ---------------------------------------------------------------
+local stdout = io.stdout()
+local stdin = io.stdin()
+local stdio = nil
+local outHandle = nil
+
+if stdout and stdout.isTTY == true then
+    -- POSIX: 先试当前目录的 nohup.out, 不行再试 $HOME/nohup.out。
+    -- 第一次尝试用 pcall 包住: 有的 fs 层(以及宿主测试台)用**抛异常**而不是返回 nil 表示
+    -- "开不了", 不包的话 $HOME 这条兜底路径永远不会被走到。两次都失败照样报错退出 125,
+    -- 错误没有被吞掉。
+    local file = "nohup.out"
+    local ok, h = pcall(fs.open, resolve("nohup.out"), "a")
+    if not ok or not h then
+        local home = getenv("HOME") or "/root"
+        local p = resolve(home) .. "/nohup.out"
+        local f, err = fs.open(p, "a")
+        if not f then
+            stderr("nohup: failed to open '" .. p .. "': " .. tostring(err) .. "\n")
+            return 125
+        end
+        file, h = p, f
+    end
+    outHandle = h
+    stdio = { output = h }
+    stderr("nohup: ignoring input and appending output to '" .. file .. "'\n")
+end
+
+if stdin and stdin.isTTY == true then
+    local nul = fs.open("/dev/null", "r")
+    if not nul then
+        stderr("nohup: cannot open '/dev/null'\n")
+        return 125
+    end
+    stdio = stdio or {}
+    stdio.input = nul
+end
+
+-- ---------------------------------------------------------------
+-- 起子进程并等待
+-- ---------------------------------------------------------------
+local opts = { cwd = cwd, env = env, sigIgnore = { [1] = true } }
+if stdio then opts.stdio = stdio end
+
+local pid, err = syscalls["proc.exec"](cmd, argv, opts)
+if not pid then
+    -- 命令找不到 -> 127; 找到但无法执行(x 位/读不了源码) -> 126。
+    local code = 126
+    local reason = tostring(err)
+    if reason:find("command not found") then
+        code = 127
+        reason = "No such file or directory"
+    elseif reason:find("permission denied") then
+        reason = "Permission denied"
+    end
+    stderr("nohup: failed to run command '" .. cmd .. "': " .. reason .. "\n")
+    return code
+end
+
+local code = syscalls["proc.wait"](pid)
+-- 内核句柄带缓冲: 子进程写进 nohup.out 的内容要由本进程 flush 一次才落盘。
+if outHandle and outHandle.flush then outHandle:flush() end
+if code < 0 then return 128 + (-code) end
+return code

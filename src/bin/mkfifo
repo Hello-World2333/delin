@@ -1,0 +1,162 @@
+-- Delin mkfifo: 建命名管道(FIFO) (POSIX mkfifo(1) + GNU 子集)。
+-- 用法: mkfifo [OPTION]... NAME...
+-- 选项:
+--   -m, --mode=MODE   权限位(八进制如 644/0644, 或符号模式如 u=rw,go=)；缺省 0666(再被 umask 收窄)。
+--   --                结束选项
+-- 语义要点:
+--   - 缺省权限由**内核**在建节点时应用 umask(见 kernel/ext2.lua 的 applyUmask), 工具不自己收窄 ——
+--     否则 umask 会被叠两次, 用户拿到的权限比要的更紧。
+--   - 给了 -m 时, 与 GNU 一样是"先建、再 chmod": 显式 mode **不受 umask 影响**
+--     (`mkfifo -m 777 p` 在 Linux 上就是 0777)。所以这里的做法是 mkfifo(p) 之后 chmod(p, mode)。
+--   - 只支持 ext2:CC 原生文件系统没有特殊文件类型, 内核报 "named pipes are not supported",
+--     本工具原样转述(fail-fast, 不静默降级成普通文件 —— 那会让 `cat fifo` 直接读到 EOF)。
+-- 已知偏离: 不实现 --help/--version(与本项目其他工具一致); 诊断信息用英文。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+--- 解析八进制权限(接受 644 / 0644 / 00644)。
+local function parseOctal(s)
+    if not s:match("^[0-7]+$") then return nil end
+    local n = tonumber(s, 8)
+    if not n or n > tonumber("7777", 8) then return nil end
+    return n
+end
+
+local function bitSet(v, b) return math.floor(v / (2 ^ b)) % 2 == 1 end
+local function setBit(v, b, on)
+    local bit = 2 ^ b
+    if on then return bitSet(v, b) and v or (v + bit) end
+    return bitSet(v, b) and (v - bit) or v
+end
+
+--- 在基准权限 base(低 9 位)上应用符号模式(POSIX chmod 的 [ugoa]*[+-=][rwxXst]* 子集)。
+--- 语法错返回 nil。多个子句按逗号分隔, 依次累积。
+--- 注意与 POSIX 的一处差异: 省略 who 在 POSIX 里等价于 "a" 但**还要受 umask 影响**;
+--- 这里按纯 "a" 处理 —— umask 由内核在 create 那一层统一应用, 本工具再叠一次就成两遍了。
+local function applySymbolic(base, spec)
+    local cur = base % 512
+    for clause in spec:gmatch("[^,]+") do
+        local who, op, perms = clause:match("^([ugoa]*)([-+=])([rwxXstugo]*)$")
+        if not who or perms == "" then return nil end
+        if who == "" then who = "a" end
+        -- perms 里每个字符对应组内的一个位号(r=2, w=1, x=0); s/t 在 FIFO 上无意义, 接受并忽略。
+        local ops = {}
+        for i = 1, #perms do
+            local c = perms:sub(i, i)
+            if c == "r" then ops[#ops + 1] = 2
+            elseif c == "w" then ops[#ops + 1] = 1
+            elseif c == "x" or c == "X" then ops[#ops + 1] = 0
+            elseif c == "s" or c == "t" then -- 忽略
+            else return nil end
+        end
+        -- 受影响的用户组: u 偏移 6 位, g 偏移 3 位, o 偏移 0 位
+        local groups = {}
+        if who:find("u") then groups[#groups + 1] = 6 end
+        if who:find("g") then groups[#groups + 1] = 3 end
+        if who:find("o") then groups[#groups + 1] = 0 end
+        if #groups == 0 then return nil end
+        for _, shift in ipairs(groups) do
+            if op == "=" then
+                for _, b in ipairs({ 2, 1, 0 }) do cur = setBit(cur, shift + b, false) end
+            end
+            for _, b in ipairs(ops) do
+                cur = setBit(cur, shift + b, op ~= "-")
+            end
+        end
+    end
+    return cur
+end
+
+local modeSpec = nil
+local names = {}
+local i = 1
+local noMoreOpts = false
+while i <= #args do
+    local a = args[i]
+    if noMoreOpts then
+        names[#names + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "--mode" then
+        i = i + 1
+        if not args[i] then stderr("mkfifo: option '--mode' requires an argument\n"); return 1 end
+        modeSpec = args[i]
+    elseif a:sub(1, 8) == "--mode=" then
+        modeSpec = a:sub(9)
+    elseif a:sub(1, 1) == "-" and a ~= "-" and #a > 1 then
+        local k = 2
+        while k <= #a do
+            local ch = a:sub(k, k)
+            if ch == "m" then
+                if k < #a then
+                    modeSpec = a:sub(k + 1)
+                    k = #a
+                else
+                    i = i + 1
+                    if not args[i] then stderr("mkfifo: option requires an argument -- 'm'\n"); return 1 end
+                    modeSpec = args[i]
+                end
+            else
+                stderr("mkfifo: invalid option -- '" .. ch .. "'\n")
+                return 1
+            end
+            k = k + 1
+        end
+    else
+        names[#names + 1] = a
+    end
+    i = i + 1
+end
+
+if #names == 0 then
+    stderr("mkfifo: missing operand\n")
+    return 1
+end
+
+local mode = nil
+if modeSpec ~= nil then
+    mode = parseOctal(modeSpec)
+    if mode == nil then
+        mode = applySymbolic(tonumber("666", 8), modeSpec)
+        if mode == nil then
+            stderr("mkfifo: invalid mode: '" .. modeSpec .. "'\n")
+            return 1
+        end
+    end
+end
+
+local rc = 0
+for _, name in ipairs(names) do
+    local p = resolve(name)
+    if fs.exists(p) then
+        stderr("mkfifo: cannot create fifo '" .. name .. "': File exists\n")
+        rc = 1
+    else
+        local ok, err = fs.mkfifo(p)
+        if not ok then
+            stderr("mkfifo: cannot create fifo '" .. name .. "': " .. tostring(err) .. "\n")
+            rc = 1
+        elseif mode ~= nil then
+            local cok, cerr = fs.chmod(p, mode)
+            if not cok then
+                stderr("mkfifo: cannot set mode of '" .. name .. "': " .. tostring(cerr) .. "\n")
+                rc = 1
+            end
+        end
+    end
+end
+return rc
