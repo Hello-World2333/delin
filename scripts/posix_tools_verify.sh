@@ -133,6 +133,19 @@ if have tee; then
     echo "tee rc=$?" >> $LOG
     file_eq tee_file "$T/tee.out" "$T/tee.in"
     file_eq tee_stdout "$T/tee.stdout" "$T/tee.in"
+    # stdout 是**管道**时必须也拿到同一份数据。老代码用点号调用 stdout 句柄
+    # (管道句柄是 `write(_, s)`), 数据丢在 self 上 -> 下游读到 0 字节。
+    wc -l < "$T/tee.in" > "$T/tee.in.wc"
+    cat "$T/tee.in" | tee "$T/tee.pipe" | wc -l > "$T/tee.pipe.wc"
+    file_eq tee_pipe_stdout "$T/tee.pipe.wc" "$T/tee.in.wc"
+    file_eq tee_pipe_file "$T/tee.pipe" "$T/tee.in"
+    # stdout 是**终端**时必须真的落屏 —— 屏幕读不回来, 由 lua 探针用光标位置观测
+    if [ -f /root/tee_verify.lua ]; then
+        /bin/lua /root/tee_verify.lua >> $LOG
+        echo "tee-probe rc=$?" >> $LOG
+    else
+        echo "SKIP: /root/tee_verify.lua not deployed" >> $LOG
+    fi
 fi
 if have rmdir;    then mkdir "$T/nodir"; cmd_chk rmdir rmdir "$T/nodir"; fi
 if have du;       then cmd_chk du du -s "$T"; fi

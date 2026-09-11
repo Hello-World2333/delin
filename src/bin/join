@@ -192,7 +192,7 @@ local function makeSource(name)
     local lineno, prevKey = 0, nil
     local src = { name = name, h = h }
     function src.next()
-        local l = h.readLine()
+        local l = h:readLine()
         if l == nil then return nil end
         lineno = lineno + 1
         local fields = splitFields(l)
@@ -315,5 +315,5 @@ while r2 ~= nil do
     r2 = s2.next()
 end
 flush()
-s1.close()
-s2.close()
+s1:close()
+s2:close()

@@ -97,7 +97,7 @@ local function makeSource(name)
         name = name,
         read = function()
             if done then return nil end
-            local l = h.readLine()
+            local l = h:readLine()
             if l == nil then done = true; return nil end
             if prev and l < prev then disorder = true end
             prev = l
@@ -130,18 +130,18 @@ local function disordered(n)
     return nil
 end
 
-local a, b = s1.read(), s2.read()
+local a, b = s1:read(), s2:read()
 while a ~= nil and b ~= nil do
     if a < b then
         if not hide1 then out[#out + 1] = a .. "\n" end
-        a = s1.read()
+        a = s1:read()
     elseif a > b then
         if not hide2 then out[#out + 1] = prefix2 .. b .. "\n" end
-        b = s2.read()
+        b = s2:read()
     else
         if not hide3 then out[#out + 1] = prefix3 .. a .. "\n" end
-        a = s1.read()
-        b = s2.read()
+        a = s1:read()
+        b = s2:read()
     end
     if #out > 256 then flush() end
     if s1.disorder() then local r = disordered(1); if r then flush(); return r end end
@@ -149,17 +149,17 @@ while a ~= nil and b ~= nil do
 end
 while a ~= nil do
     if not hide1 then out[#out + 1] = a .. "\n" end
-    a = s1.read()
+    a = s1:read()
     if #out > 256 then flush() end
 end
 while b ~= nil do
     if not hide2 then out[#out + 1] = prefix2 .. b .. "\n" end
-    b = s2.read()
+    b = s2:read()
     if #out > 256 then flush() end
 end
 flush()
-s1.close()
-s2.close()
+s1:close()
+s2:close()
 if disorderFile then
     stderr("comm: input is not in sorted order\n")
     return 1

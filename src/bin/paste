@@ -142,7 +142,7 @@ local function serialFile(name)
     local first = true
     local buf = {}
     while true do
-        local l = h.readLine()
+        local l = h:readLine()
         if l == nil then break end
         if first then buf[#buf + 1] = l; first = false
         else buf[#buf + 1] = nextDelim(); buf[#buf + 1] = l end
@@ -171,7 +171,7 @@ local done = false
 while not done do
     local cells, any = {}, false
     for idx = 1, #handles do
-        local l = handles[idx].readLine()
+        local l = handles[idx]:readLine()
         if l == nil then cells[idx] = nil else cells[idx] = l; any = true end
     end
     if not any then done = true else

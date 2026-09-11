@@ -22,7 +22,18 @@ for _, d in ipairs({ "/", "/var", "/var/tmp", "/tmp" }) do
 end
 
 local BASE = "/var/tmp/posixk"
-pcall(function() fs.delete(BASE) end)
+-- 先删内容再删目录: 内核的 fs.delete **不拦非空目录**, 直接删会留下未连接 inode, 真机跑完
+-- e2fsck 会报 "Unattached inode"(实测踩过 —— 之前这里就是直接 fs.delete(BASE))。
+local function rmTree(p)
+    -- 用 lstat: isDir/attributes 会跟着符号链接走, 而自检里故意造了成环的链接, 那样会直接
+    -- 报 "too many levels of symbolic links" 把清理本身搞崩(实测踩过)。
+    local a = fs.lstat(p)
+    if a and a.isDir then
+        for _, n in ipairs(fs.list(p) or {}) do rmTree(p .. "/" .. n) end
+    end
+    pcall(fs.delete, p)
+end
+rmTree(BASE)
 assert(fs.makeDir(BASE), "cannot create " .. BASE)
 
 -- ---------- 符号链接 ----------
@@ -130,6 +141,6 @@ eq(fs.lstat(BASE .. "/pipe").size, 0, "mkfifo: FIFO 没有文件内容")
 eq(fs.isFifo(BASE .. "/pipe"), true, "fs.isFifo: 认得出管道")
 eq(fs.isFifo(BASE .. "/umaskfile"), false, "fs.isFifo: 普通文件不是管道")
 
-pcall(function() fs.delete(BASE) end)
+rmTree(BASE)
 io.write(string.format("\nposix_kernel: %d passed, %d failed\n", pass, fail))
 return fail == 0 and 0 or 1

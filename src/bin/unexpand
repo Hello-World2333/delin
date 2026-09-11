@@ -190,7 +190,7 @@ for _, f in ipairs(files) do
         end
     end
     while true do
-        local line = h.readLine()
+        local line = h:readLine()
         if line == nil then break end
         unexpandLine(line)
         if #buf >= 512 then flush() end

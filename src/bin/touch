@@ -79,7 +79,7 @@ for _, fp in ipairs(rest) do
         else
             local ok, err = pcall(function()
                 local f = fs.open(p, "w")
-                if f then f.close() end
+                if f then f:close() end
             end)
             if not ok then
                 stderr("touch: " .. fp .. ": " .. tostring(err) .. "\n")

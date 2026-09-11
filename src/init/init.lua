@@ -115,8 +115,8 @@ local function rescue(reason)
         log("FATAL: /bin/login not found, no rescue shell")
         return
     end
-    local src = f.readAll()
-    f.close()
+    local src = f:readAll()
+    f:close()
     for _, tn in ipairs(syscalls["tty.list"]()) do
         local lpid = spawn(src, "login", 0, 0, { [0] = "/bin/login", tn })
         log("rescue: login on " .. tn .. " pid=" .. tostring(lpid))

@@ -120,10 +120,10 @@ local content = ""
 do
     local parts = {}
     if h.readAll then
-        parts[1] = h.readAll() or ""
+        parts[1] = h:readAll() or ""
     else
         while true do
-            local l = h.readLine()
+            local l = h:readLine()
             if l == nil then break end
             parts[#parts + 1] = l .. "\n"
         end

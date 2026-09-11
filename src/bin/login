@@ -34,7 +34,7 @@ local function readBin(p)
     end
     local f = fs.open(p, "r")
     if not f then return nil end
-    local s = f.readAll(); f.close()
+    local s = f:readAll(); f:close()
     return s
 end
 

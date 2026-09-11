@@ -88,8 +88,8 @@ end
 local function readConf(path)
     local f = fs.open(path, "r")
     if not f then return nil, path .. ": cannot open" end
-    local text = f.readAll()
-    f.close()
+    local text = f:readAll()
+    f:close()
     local rules = {}
     local lineno = 0
     for raw in (text .. "\n"):gmatch("([^\n]*)\n") do
@@ -219,8 +219,8 @@ local klogBoot = syscalls["klog.stats"]().boot
 do
     local cf = fs.open(cursorPath, "r")
     if cf then
-        local seq, boot = (cf.readLine() or ""):match("^(%d+)%s*(%d*)")
-        cf.close()
+        local seq, boot = (cf:readLine() or ""):match("^(%d+)%s*(%d*)")
+        cf:close()
         seq, boot = tonumber(seq), tonumber(boot)
         local st = syscalls["klog.stats"]()
         if seq and boot and boot == st.boot and seq >= st.first and seq <= st.next then

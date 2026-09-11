@@ -95,9 +95,9 @@ local function cksumStream(h)
     local pending = nil
     while true do
         local chunk
-        if h.read then chunk = h.read(65536) end
+        if h.read then chunk = h:read(65536) end
         if type(chunk) ~= "string" or chunk == "" then
-            local l = h.readLine()
+            local l = h:readLine()
             if l == nil then break end
             chunk = l .. "\n"
         end

@@ -108,7 +108,7 @@ for _, f in ipairs(files) do
         inHandle = fh
     end
     while not _interrupted do
-        local line = inHandle.readLine()
+        local line = inHandle:readLine()
         if line == nil then break end
         out:write(line .. "\n")
         yieldCheck(#line + 1)

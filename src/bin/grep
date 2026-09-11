@@ -231,7 +231,7 @@ local function search(fh, label)
     local count = 0
     local n = 0
     while true do
-        local line = fh.readLine()
+        local line = fh:readLine()
         if line == nil then break end
         n = n + 1
         local hay = ci and line:lower() or line
@@ -296,7 +296,7 @@ else
                     if doCount then io.write("0\n") end
                 else
                     processOne(p, fh)
-                    fh.close()
+                    fh:close()
                 end
             end
         end

@@ -72,15 +72,15 @@ while i <= #args do
         local sp = resolve(args[i])
         local fh, ferr = fs.open(sp, "r")
         if not fh then stderr("sed: can't read " .. sp .. ": " .. ioeMsg(ferr) .. "\n"); return end
-        scripts[#scripts + 1] = fh.readAll()
-        fh.close()
+        scripts[#scripts + 1] = fh:readAll()
+        fh:close()
         seenScriptOpt = true
     elseif a:match("^%-%-file=(.*)$") then
         local sp = resolve(a:match("^%-%-file=(.*)$"))
         local fh, ferr = fs.open(sp, "r")
         if not fh then stderr("sed: can't read " .. sp .. ": " .. ioeMsg(ferr) .. "\n"); return end
-        scripts[#scripts + 1] = fh.readAll()
-        fh.close()
+        scripts[#scripts + 1] = fh:readAll()
+        fh:close()
         seenScriptOpt = true
     elseif a == "-i" or a == "--in-place" then
         inplace = true; inSuffix = nil
@@ -514,14 +514,14 @@ end
 local curOut -- nil => stdout; 否则为写入的文件句柄
 local function wline(s)
     local out = (s or "") .. "\n"
-    if curOut then curOut.write(out) else io.write(out) end
+    if curOut then curOut:write(out) else io.write(out) end
     yieldCheck(#out)
 end
 
 local function readAllLines(handle)
     local lines = {}
     while true do
-        local l = handle.readLine()
+        local l = handle:readLine()
         if l == nil then break end
         lines[#lines + 1] = l
     end
@@ -611,7 +611,7 @@ local function runOne(lines, absPath)
         curOut = nil
     end
     local quit, quitCode = process(lines, absPath)
-    if outH then outH.close() end
+    if outH then outH:close() end
     return quit, quitCode
 end
 
@@ -630,12 +630,12 @@ else
                 stderr("sed: " .. sourceName(abs) .. ": " .. ioeMsg(e) .. "\n"); return
             end
             local lines = readAllLines(fh)
-            fh.close()
+            fh:close()
             if inSuffix then
                 local bak = abs .. inSuffix
                 local bh = assert(fs.open(bak, "w"))
-                for _, l in ipairs(lines) do bh.write(l .. "\n") end
-                bh.close()
+                for _, l in ipairs(lines) do bh:write(l .. "\n") end
+                bh:close()
             end
             local q = runOne(lines, abs)
             if q then return end
@@ -648,7 +648,7 @@ else
                 stderr("sed: " .. sourceName(abs) .. ": " .. ioeMsg(e) .. "\n"); return
             end
             local lines = readAllLines(fh)
-            fh.close()
+            fh:close()
             local q = nil
             curOut = nil
             q = process(lines, abs)
@@ -664,7 +664,7 @@ else
                 stderr("sed: " .. sourceName(abs) .. ": " .. ioeMsg(e) .. "\n"); return
             end
             for _, l in ipairs(readAllLines(fh)) do all[#all + 1] = l end
-            fh.close()
+            fh:close()
         end
         curOut = nil
         process(all, nil)

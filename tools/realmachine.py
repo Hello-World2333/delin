@@ -235,7 +235,8 @@ def main():
     #      内核那部分用 /bin/lua 跑 —— 见 scripts/posix_kernel_verify.lua 的头注释: 这里要验的是
     #      **内核语义本身**, 不该依赖某个工具的包装(而且部分能力当时还没有命令行入口)。
     for src, dst in (("scripts/posix_tools_verify.sh", "/root/posix_tools_verify.sh"),
-                     ("scripts/posix_kernel_verify.lua", "/root/posix_kernel_verify.lua")):
+                     ("scripts/posix_kernel_verify.lua", "/root/posix_kernel_verify.lua"),
+                     ("scripts/tee_verify.lua", "/root/tee_verify.lua")):
         df_write(out, os.path.join(REPO, src), dst)
         df(out, "set_inode_field %s mode 0100755" % dst)
     unit_posix = os.path.join(work, "posix-verify.service")

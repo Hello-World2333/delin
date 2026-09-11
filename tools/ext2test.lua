@@ -141,6 +141,25 @@ eq(ext2.lookup(fs, "/d/sub"), nil, "子目录条目已删除")
 local freed = ext2.readInode(fs, subIno)
 eq(freed.links, 0, "删除的空目录 inode 已回收(links=0)")
 
+-- 删**非空**目录必须被拒绝(POSIX rmdir / ENOTEMPTY)。曾经的 bug: ext2.delete 不检查就合并掉
+-- 目录条目, 子 inode 仍被占用却没有任何目录项指向它们 —— 真机 e2fsck 报
+-- "Unconnected directory inode" + "Unattached inode"(数据静默丢失); 用户态不能靠 rmdir 自己
+-- 先判空来兜, 直接调 fs.delete 的地方(真机自检脚本就是)照样弄坏盘。
+do
+    assert(ext2.create(fs, "/d", "ne", T_DIR + 493))
+    assert(ext2.create(fs, "/d/ne", "inner", T_REG + 420))
+    local okd, derr = ext2.delete(fs, "/d", "ne")
+    eq(okd, nil, "删非空目录被拒绝")
+    eq(derr, "directory not empty", "删非空目录的报错是 directory not empty")
+    ok(ext2.lookup(fs, "/d/ne") ~= nil, "被拒绝后目录条目还在")
+    ok(ext2.lookup(fs, "/d/ne/inner") ~= nil, "被拒绝后目录里的文件还在")
+    eq(ext2.lookup(fs, "/d").links, 3, "被拒绝后父目录 links 不变")
+    -- 清空之后就能删(rm -r 的正常路径)
+    assert(ext2.delete(fs, "/d/ne", "inner"))
+    assert(ext2.delete(fs, "/d", "ne"))
+    eq(ext2.lookup(fs, "/d").links, 2, "清空后删目录成功, links 回落")
+end
+
 -- 写文件 + 读回(句柄路径)
 local h = assert(ext2.backend(fs).open("/d/f1", "w"))
 h:write("hello ext2\n")

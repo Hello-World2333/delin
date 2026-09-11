@@ -104,8 +104,8 @@ end
 local function readConf(path)
     local f = fs.open(path, "r")
     if not f then return nil, path .. ": cannot open" end
-    local text = f.readAll()
-    f.close()
+    local text = f:readAll()
+    f:close()
     local defaults = { rotate = 1, size = nil, daily = false, weekly = false, monthly = false,
                        notifempty = false, missingok = false, create = { mode = 0x1A4 } }
     local entries, cur = {}, nil
@@ -144,8 +144,8 @@ end
 local function readAllFile(path)
     local f = fs.open(path, "r")
     if not f then return nil end
-    local s = f.readAll()
-    f.close()
+    local s = f:readAll()
+    f:close()
     return s
 end
 
@@ -251,8 +251,8 @@ end
 if not debug then
     local pf = fs.open("/run/syslogd.pid", "r")
     if pf then
-        local line = pf.readLine()
-        pf.close()
+        local line = pf:readLine()
+        pf:close()
         local spid = tonumber((line or ""):match("^%s*(%d+)"))
         if spid then
             local ok, kerr = syscalls["signal.kill"](spid, 1) -- SIGHUP

@@ -677,11 +677,11 @@ local function loadSide(path, missing)
         -- 整块读能得到精确的"末行有没有换行符"; 逐行读是测试台兼容路径(补回换行, 与 wc 同款)。
         local content
         if h.readAll then
-            content = h.readAll() or ""
+            content = h:readAll() or ""
         else
             local parts = {}
             while true do
-                local l = h.readLine()
+                local l = h:readLine()
                 if l == nil then break end
                 parts[#parts + 1] = l
             end
@@ -695,8 +695,8 @@ local function loadSide(path, missing)
         stderr("diff: " .. path .. ": " .. ioeMsg(err) .. "\n")
         return nil
     end
-    local content = f.readAll() or ""
-    f.close()
+    local content = f:readAll() or ""
+    f:close()
     local lines, noEol = splitLines(content)
     local attrs = fs.attributes(path) or {}
     return { lines = lines, noEol = noEol, content = content, mtime = attrs.mtime or 0 }

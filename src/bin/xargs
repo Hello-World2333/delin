@@ -177,11 +177,11 @@ local function readInput()
     local h = io.stdin()
     if not h then return "" end
     if h.readAll then
-        return h.readAll() or ""
+        return h:readAll() or ""
     end
     local lines = {}
     while true do
-        local l = h.readLine()
+        local l = h:readLine()
         if l == nil then break end
         lines[#lines + 1] = l
     end
@@ -349,7 +349,7 @@ local function askConfirm(argv)
     local h = io.stdin()
     local s = showCommand(argv) .. "?..."
     stderr(s)
-    local ans = h and h.readLine and h.readLine() or nil
+    local ans = h and h.readLine and h:readLine() or nil
     if ans == nil then
         stderr("\n")
         return false

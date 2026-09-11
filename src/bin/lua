@@ -92,8 +92,8 @@ end
 local function readFile(path)
     local f, oerr = fs.open(resolve(path), "r")
     if not f then return nil, oerr or "cannot open" end
-    local src = f.readAll()
-    f.close()
+    local src = f:readAll()
+    f:close()
     return stripShebang(src)
 end
 

@@ -267,6 +267,15 @@ CC 原生文件系统没有这些概念、`ext2` 驱动里有 inode 类型却没
 所以：读句柄实现精确的 `set`/`cur`/`end`；写句柄只能**向前** seek（用 0 填充缓冲区，逻辑内容与稀疏
 文件一致），**向后 seek 明确报错而不是假装成功** —— 静默返回 0 会让 `dd` 悄悄写错位置。
 
+#### 删非空目录必须失败（POSIX rmdir / ENOTEMPTY）
+
+`fs.delete` 只删**空**目录/文件：`ext2.delete` 先看目标目录里有没有非 `.`/`..` 的条目，有就返回
+`directory not empty`。曾经的 bug: 不检查就直接把目录条目合并掉 —— 子 inode 仍被占用却没有任何
+目录项指向它们，真机跑完 `e2fsck` 报 `Unconnected directory inode` + `Unattached inode`(数据静默
+丢失)。宿主用真实 ext2 驱动即可复现(`tools/ext2test.lua` 里锁住了这条)。
+**用户态不要靠"自己先判空"兜底**: 直接调 `fs.delete` 的地方(真机自检脚本就是)照样会弄坏盘 ——
+`rmdir` 保留自己的判空只是为了给出 POSIX 那套措辞; `rm -r` 是递归删干净再删目录(正常路径)。
+
 **用户**：`/etc/passwd` `name:x:uid:gid:fullname:home:shell`、`/etc/shadow` `name:salt$hash`、
 `/etc/group`；`login` 提示用户名/密码（隐藏回显），验证通过后按该用户 `uid/gid` 起 `sh`。
 用户管理命令（`passwd`/`useradd`/…）与内核 `user.*` 写 syscall 见下文「用户管理」。
@@ -489,7 +498,7 @@ PID 1 现在是**用户态服务管理器**（`src/init/unit.lua` 单元解析 +
 用户态 `/dev/log`、`syslogd` 按 `/etc/syslog.conf` 写 `/var/log/*`（SIGHUP 重开、游标续读不重放）、
 `logrotate` + `logrotate.timer` 轮转、`logger`/`dmesg`。`/etc/fstab` 由 init 生成 mount 单元
 （`local-fs.target`），`mount -a` 复用同一解析器。init 里的自检代码已全部删除，验证改为
-宿主测试台 `tools/hosttest.lua`（503 项）与真机脚本 `tools/realmachine.py` +
+宿主测试台 `tools/hosttest.lua`（512 项）与真机脚本 `tools/realmachine.py` +
 `scripts/realmachine_verify.sh`。
 
 `src/bin/sh` 已升级为 POSIX 核心子集（变量/引号/if/for/while/case/函数/test/[ ]/&&/|| /文件重定向/管道
@@ -504,7 +513,7 @@ UUID 用磁盘 ID 模拟，磁盘不随启动自动挂载（改由 `/etc/fstab` 
 终端侧：tty 层解释 ANSI 转义（SGR 16 色/ED-EL 清屏/CUP 定位/光标显隐与保存恢复，见上文
 「终端（ANSI / `$TERM=linux`）」），`$TERM=linux` 随环境导出，`echo` 支持 `-n`/`-e`，新增 `/bin/clear`，
 `login` 每次提示前清屏。
-`scripts/posix_test.sh`（122 项）与 `scripts/jobctl_test.sh` 在宿主与 Delin 上各跑一次逐项比对，
+`scripts/posix_test.sh`(125 项)与 `scripts/jobctl_test.sh` 在宿主与 Delin 上各跑一次逐项比对，
 `scripts/sysinfo.sh` 演示实用用法。
 
 打印机经 `ccprinter` 模块抽象成 `/dev/lpN` 字符设备（`cat f > /dev/lp0` / `lp f` 即打印，折行与
@@ -678,12 +687,25 @@ sysfs 也从 display 专用泛化成 class 注册表（模块用 `kapi.registerS
   两条路径必须给上层同一套语义，所以 `vfs.real()` 的 `open` 会把 CC 原生句柄包一层
   `wrapCCHandle`（见 `src/kernel/vfs.lua`），**两种调用风格都接受** ——
   于是内核里既有的点号调用（`f.readAll()`）与用户态工具的冒号调用都能用。
+- **反过来不成立：tty/fb 设备句柄只吃冒号**，而且点号调用是**静默写空串**（`write(self, s)` 收到
+  `self=数据, s=nil`，`tostring(nil or "")` 就是空串，返回值也不为 nil，一声不响）。
+  管道句柄 `write(_, s)` 同样把点号调用里的数据丢进 `_` —— 也是静默丢。
+  `tee` 就栽在这上面（写成了 `out.write(chunk)`）：FILE 目标（ext2 句柄两种风格都收）照写，
+  stdout 却什么都没有 —— 交互式终端里 `tee f` 屏幕上不出现任何东西，管道里下游读到 0 字节。
+  教训两条：① 工具写句柄一律冒号（`h:write` / `h:read` / `h:readLine`），点号只留给 CC 原生句柄，
+  而它已经被 `wrapCCHandle` 桥过一层（`tee` 之后按这条把 `cp`/`mv`/`sed`/`ed`/`patch`/`split`/`sort`/
+  `comm`/`join`/`paste`/`head`/`tail`/`wc`/`diff`/`cksum`/`file`/`strings`/`xargs`/`sh` 等全部点号调用
+  清掉了）；② 测试台的 stdout/stdin 桩必须照真机句柄建
+  （`tools/hosttest.lua` 的 `runTool` outHandle、`tools/harness.lua` 的顶层 stdout 桩都是
+  冒号 + `s or ""`），否则这类 bug 只有真机上才露头。真机回归见 `scripts/tee_verify.lua`：
+  终端那一路用 tty 句柄的**光标位置**当观测点（CC 没有屏幕读回 API），并带一个"点号调用光标
+  一动不动"的控制组，保证这套观测法本身是有效的。
 
 ## 构建
 
 ```bash
 lua5.1 tools/build.lua             # 构建 dist/: 压缩内核/DLUB/BIOS/工具/模块/配置 + manifest
-lua5.1 tools/build.lua --check     # 构建 + 压缩等价性门禁(hosttest 503 项 + 7 个自检脚本差分)
+lua5.1 tools/build.lua --check     # 构建 + 压缩等价性门禁(hosttest 512 项 + 7 个自检脚本差分)
 lua5.1 tools/build.lua --release   # 构建 + 生成 dist/release/<版本>/ 发布树(安装布局的 payload)
 sh tools/serve.sh                  # 开发期: 把发布树挂在 10568 端口(游戏侧 wget 安装用)
 ```
@@ -846,7 +868,7 @@ key/char 事件**来驱动向导。喂按键的时机靠 `wait` 盯 `/delin-inst
 验证：
 
 ```bash
-lua5.1 tools/hosttest.lua        # 宿主测试: init 引擎/fstab/syslogd/logrotate/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone (503 项)
+lua5.1 tools/hosttest.lua        # 宿主测试: init 引擎/fstab/syslogd/logrotate/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone (512 项)
 DELIN_REPO=<压缩后的源码树> lua5.1 tools/hosttest.lua         # 压缩器等价性: 同一套测试跑在压缩产物上
 DELIN_SRCBIN=<压缩后的 bin> lua5.1 tools/harness.lua /bin/sh # 同上, 工具级差分比对
 lua5.4 tools/hosttest.lua        # 同上用 5.4 跑一遍(CC 是 5.2 语义, 不能只在 5.1 上验;
@@ -975,7 +997,7 @@ src/modules/*.ko           内核模块: ccdisk(ccdisk fstype) ccmonitor(CC 显�
                            void(Void 全息驱动)
 src/modules/modules.alias  驱动别名(modprobe 风格): tm_gpu->tom hologram->void monitor->ccmonitor printer->ccprinter
 src/modules/manifest       默认装载模块清单: demo ext2 ccdisk redstone
-scripts/posix_test.sh      可移植 POSIX 自检(host 与 Delin 各跑一次比对, 122 项全过)
+scripts/posix_test.sh      可移植 POSIX 自检(host 与 Delin 各跑一次比对, 125 项全过)
 scripts/jobctl_test.sh     作业控制自检(& / $! / jobs / fg / bg / wait / kill %job, host 与真机各跑一次)
 scripts/sysinfo.sh         实用小工具: 系统信息(变量/函数/for/case/if/重定向/工具)
 scripts/proc_test.sh       /proc + ps/pgrep/pkill/killall 自检(host harness 与真机各跑一次比对, 41 项)
@@ -992,6 +1014,11 @@ scripts/lua_repl_test.sh   /bin/lua 交互式 REPL 自检(宿主专用: 测试�
 scripts/redstone_verify.lua  真机交叉核对: /sys/class/redstone/* 与 CC 原始 redstone API 逐项一致
                            (写 /var/log/redstone_verify.log; 由 realmachine_verify.sh 调用)
 scripts/realmachine_verify.sh  真机验证脚本(由 verify.service 以 oneshot 运行, 结果写 /var/log/verify.log)
+scripts/posix_tools_verify.sh  真机 POSIX 工具自检(由 posix-verify.service 运行, 写 /var/log/posix_verify.log;
+                           工具这一层用 sh, 需要直接看内核句柄/管道的用 /bin/lua)
+scripts/posix_kernel_verify.lua  真机: 符号链接/硬链接/FIFO/umask/seek 的内核语义(上面那份用 /bin/lua 调)
+scripts/tee_verify.lua     真机: tee 的 stdout 契约 —— stdout 是终端句柄(用光标位置观测)/管道/文件时
+                           stdin 都必须真的写出去; 带"点号调用光标一动不动"的控制组(见 for-ai 的设计要点)
 scripts/printer_probe.lua  真机探测 CC printer 原始 API 语义(页尺寸/写不折行/开页扣纸墨), 写 /var/log/printer_probe.log
 scripts/printer_verify.sh  真机验证 ccprinter 模块(/dev/lp0 + /sys/class/printer, 会实际打印), 写 /var/log/printer_verify.log
 tools/bundle.lua           拼装 bundle: src/ -> 单文件内核/DLUB(init 多文件拼成一个 chunk);
@@ -1027,7 +1054,7 @@ tools/harness.lua          host 测试台: 用真实 Delin 工具源码在宿主
                            + 桩 printer(/dev/lp0) + 桩 redstone API(加载真实 redstone.ko)
                            + 桩进程表(ps/pgrep/pkill/killall);
                            进程环境用内核同一份白名单(src/kernel/procenv.lua), 不放宽)
-tools/hosttest.lua         宿主测试: init 单元引擎/fstab 生成/syslogd 规则/logrotate 轮转/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone(503 项)
+tools/hosttest.lua         宿主测试: init 单元引擎/fstab 生成/syslogd 规则/logrotate 轮转/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone(512 项)
 tools/installertest.lua    安装器宿主回归: 假 CraftOS(fs/term/os/http/disk/peripheral + 脚本化事件队列)
                            + 假终端格子(含 fg/bg), 用 loadfile 跑 dist/install.lua, 按键序列驱动向导
                            并断言落盘文件/镜像/日志; 失败时 dump 每一屏(含反色行标记)

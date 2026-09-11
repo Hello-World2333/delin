@@ -449,10 +449,10 @@ local function readAllLines(name)
     local lines = {}
     if opt.z then
         local content
-        if h.readAll then content = h.readAll() or ""
+        if h.readAll then content = h:readAll() or ""
         else
             local t = {}
-            while true do local l = h.readLine(); if l == nil then break end; t[#t + 1] = l end
+            while true do local l = h:readLine(); if l == nil then break end; t[#t + 1] = l end
             content = table.concat(t, "\n")
         end
         local pos, n = 1, #content
@@ -464,7 +464,7 @@ local function readAllLines(name)
         end
     else
         while true do
-            local l = h.readLine()
+            local l = h:readLine()
             if l == nil then break end
             lines[#lines + 1] = l
         end

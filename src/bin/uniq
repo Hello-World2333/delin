@@ -123,14 +123,14 @@ end
 
 -- 输入记录迭代器: 缺省逐行 readLine(流式); -z 按 NUL 切(需要 readAll)。
 local function lineReader(fh)
-    return function() return fh.readLine() end
+    return function() return fh:readLine() end
 end
 local function nulReader(fh)
     if not fh.readAll then
         stderr("uniq: -z 需要 readAll 句柄(宿主测试台的 stdin 不支持)\n")
         return nil
     end
-    local content = fh.readAll() or ""
+    local content = fh:readAll() or ""
     local pos, n = 1, #content
     return function()
         if pos > n then return nil end

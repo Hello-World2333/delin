@@ -468,7 +468,7 @@ end
 local function readSample(h)
     local parts, total = {}, 0
     while total < MAXSAMPLE do
-        local chunk = h.read(MAXSAMPLE - total)
+        local chunk = h:read(MAXSAMPLE - total)
         if not chunk or chunk == "" then break end
         parts[#parts + 1] = chunk
         total = total + #chunk
@@ -485,7 +485,7 @@ local function readStdinSample()
     if s == "" and h.readLine then
         local lines = {}
         while true do
-            local l = h.readLine()
+            local l = h:readLine()
             if l == nil then break end
             lines[#lines + 1] = l
         end
@@ -554,7 +554,7 @@ for _, raw in ipairs(files) do
                     failed = true
                 else
                     local s = readSample(h)
-                    h.close()
+                    h:close()
                     rec = contentRecord(s, size > #s)
                 end
             end

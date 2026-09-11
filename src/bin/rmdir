@@ -5,8 +5,8 @@
 --       --ignore-fail-on-non-empty 只看"目录非空"这一类失败, 不报错也不影响退出码
 --   -v, --verbose                  每删一个目录打印 "rmdir: removing directory, 'X'"
 --   --                             结束选项
--- 语义: 只用 fs.delete 删空目录是不可靠的(本内核的 fs.delete 不拦非空目录), 所以先
---   fs.isDir + fs.list 自己判空, 非空直接报 "Directory not empty"。
+-- 语义: 删之前自己先判空 —— 内核的 fs.delete 现在也会拒绝非空目录(POSIX ENOTEMPTY), 但那是
+--   抛错; 这里先判空能给出 POSIX 那套措辞, 也能让 --ignore-fail-on-non-empty 不必去猜错误串。
 --   -p 的"向上"只到操作数自己的第一个目录段为止(GNU 语义: 不会顺着 cwd 一路删上去)。
 --   多个操作数时逐个处理, 任一失败最终退出码为 1(其余操作数照常处理)。
 -- 已知偏离: 不实现 --help/--version; 诊断信息用英文(POSIX 措辞)。

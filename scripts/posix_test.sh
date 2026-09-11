@@ -317,6 +317,24 @@ cat "$T/p1.txt" | grep beta | wc -l > "$T/p3.txt"
 grep "^1$" "$T/p3.txt" > "$T/p31.txt"
 chk pipe_3stage [ -s "$T/p31.txt" ]
 
+# tee: FILE 与 stdout 都要拿到同一份 stdin。
+# 关键: **stdout 不重定向** —— 这样 tee 的 stdout 就是测试台的顶层句柄(内核里是 tty/console
+# 句柄, 只吃冒号调用)。写成 `out.write(chunk)` 会静默写空串: FILE 照写、屏幕上什么都没有;
+# 上面那两行 "tee-1/tee-2" 少了, 差分对比立刻就能看出来。
+# 曾经的真机 bug: 交互式终端下 `tee f` 屏幕上什么也不出现(见 src/bin/tee 的头注释)。
+echo "tee-1" > "$T/tee.in"
+echo "tee-2" >> "$T/tee.in"
+tee "$T/tee.out" < "$T/tee.in"
+cmp -s "$T/tee.out" "$T/tee.in"; chk tee_file
+# -a 追加: 内容 = 原内容 + 追加内容
+tee -a "$T/tee.out" < "$T/tee.in"
+cat "$T/tee.in" "$T/tee.in" > "$T/tee.want"
+cmp -s "$T/tee.out" "$T/tee.want"; chk tee_append
+# 无 FILE 操作数 = stdin->stdout 直通
+cat "$T/p1.txt" | tee | wc -l > "$T/tee.nf"
+grep "^2$" "$T/tee.nf" > "$T/tee.nf1"
+chk tee_no_file [ -s "$T/tee.nf1" ]
+
 # ---------------------------------------------------------------
 # 5d. 多行命令: 行续接(`\` + 换行) 与跨行结构
 # ---------------------------------------------------------------

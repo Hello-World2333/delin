@@ -195,10 +195,10 @@ local function makeExactReader(fh)
                 local r = buf; buf = ""; return r
             end
             local c
-            if fh.read then c = fh.read(65536) end
+            if fh.read then c = fh:read(65536) end
             if type(c) ~= "string" or c == "" then
                 if buf == "" then
-                    local l = fh.readLine()
+                    local l = fh:readLine()
                     if l == nil then eof = true; return nil end
                     return l .. "\n"
                 end
@@ -214,10 +214,10 @@ if bytesPer then
     local remaining = bytesPer
     while true do
         local chunk
-        if h.read then chunk = h.read(remaining) end
+        if h.read then chunk = h:read(remaining) end
         if type(chunk) ~= "string" or chunk == "" then
             -- 无字节读取能力: 退化为逐行。
-            local l = h.readLine()
+            local l = h:readLine()
             if l == nil then break end
             chunk = l .. "\n"
         end

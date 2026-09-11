@@ -581,8 +581,12 @@ do
     local function runTool(env, path, argv, opts)
         opts = opts or {}
         local outbuf = {}
+        -- stdout 句柄**照抄内核 tty 句柄的调用约定**(src/kernel/tty.lua): write 吃冒号、参数缺省
+        -- 当空串。工具里写成 `h.write(chunk)` 时 chunk 落到 self 上、s 是 nil, 于是静默写空串 ——
+        -- 与真机终端上的表现完全一致(tee 曾经就是这样: 文件写了, 屏幕上什么都没有)。
+        -- 别把它改成"点号冒号都收": 那样这类 bug 就只能在真机上才露头了。
         local outHandle = {
-            write = function(_, s) outbuf[#outbuf + 1] = tostring(s); return #s end,
+            write = function(self, s) s = tostring(s or ""); outbuf[#outbuf + 1] = s; return #s end,
             writeLine = function(self, s) return self:write(tostring(s or "") .. "\n") end,
             flush = function() return true end,
         }
@@ -737,6 +741,50 @@ missingok
     eq(na.rc, 3, "systemctl: 非活动 -> 3")
     local st = runTool(env4, REPO .. "/src/bin/systemctl", { "start", "getty@tty0.service" })
     eq(st.rc, 0, "systemctl: start 成功")
+
+    -- F7. tee: stdin -> stdout(tty 句柄) + FILE
+    --     回归: tee 曾用 `out.write(chunk)` 点号调用 stdout 句柄 —— tty 句柄是
+    --     `write(self, s)`, 于是 chunk 落到 self 上、s 是 nil, **静默写空串**: FILE(ext2 句柄,
+    --     点号也能用)照写, 屏幕上什么都不出现。上面 runTool 的 outHandle 就是照 tty 建的,
+    --     所以这条用例在宿主上就能挡住它(以前是真机交互式终端下才看得见的 bug)。
+    local function inHandle(s) -- 管道/文件式的 stdin: 有 readAll + read(n), 吃冒号
+        local pos = 1
+        local h
+        h = {
+            read = function(_, n)
+                if pos > #s then return nil end
+                local r = s:sub(pos, pos + (n or 1) - 1)
+                pos = pos + #r
+                return r
+            end,
+            readAll = function()
+                local r = s:sub(pos); pos = #s + 1
+                return r ~= "" and r or nil
+            end,
+            readLine = function()
+                if pos > #s then return nil end
+                local nl = s:find("\n", pos, true)
+                if not nl then local r = s:sub(pos); pos = #s + 1; return r end
+                local r = s:sub(pos, nl - 1); pos = nl + 1
+                return r
+            end,
+        }
+        return h
+    end
+    local teeIn = "tee line 1\ntee line 2\n"
+    local tp = runTool(env3, REPO .. "/src/bin/tee", { "/tmp/tee.out" }, { input = inHandle(teeIn) })
+    eq(tp.rc, 0, "tee: 退出码 0")
+    eq(tp.out, teeIn, "tee: stdin 写到 stdout")
+    eq(readFile(ROOT .. "/tmp/tee.out"), teeIn, "tee: stdin 写进 FILE")
+    local ta = runTool(env3, REPO .. "/src/bin/tee", { "-a", "/tmp/tee.out" }, { input = inHandle("third\n") })
+    eq(ta.out, "third\n", "tee -a: stdin 写到 stdout")
+    eq(readFile(ROOT .. "/tmp/tee.out"), teeIn .. "third\n", "tee -a: 追加到 FILE")
+    -- 多个 FILE: 每个都要拿到同一份数据; 打不开的那个只报错、不影响其它目标与 stdout
+    local tm = runTool(env3, REPO .. "/src/bin/tee", { "/tmp/tee.a", "/tmp/tee.b" }, { input = inHandle("x\n") })
+    eq(tm.rc, 0, "tee 多文件: 退出码 0")
+    eq(tm.out, "x\n", "tee 多文件: stdout 仍有数据")
+    eq(readFile(ROOT .. "/tmp/tee.a"), "x\n", "tee 多文件: 第 1 个 FILE")
+    eq(readFile(ROOT .. "/tmp/tee.b"), "x\n", "tee 多文件: 第 2 个 FILE")
 end
 
 -- ===============================================================

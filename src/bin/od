@@ -430,10 +430,10 @@ local function readSome(n)
             curH = h
         end
         local chunk
-        if curH.read then chunk = curH.read(n) end
+        if curH.read then chunk = curH:read(n) end
         if type(chunk) ~= "string" or chunk == "" then
             -- 无字节读取能力的句柄(宿主测试台 stdin): 逐行 + 换行。
-            local l = curH.readLine()
+            local l = curH:readLine()
             if l == nil then
                 if files[fileIdx - 1] ~= "-" then pcall(function() curH:close() end) end
                 curH = nil

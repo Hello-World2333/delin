@@ -101,7 +101,7 @@ end
 local function emitLines(fh)
     local lines = {}
     while true do
-        local line = fh.readLine()
+        local line = fh:readLine()
         if line == nil then break end
         lines[#lines + 1] = line
     end
@@ -114,13 +114,13 @@ end
 
 local function emitBytes(fh)
     if fh.readAll then
-        local s = fh.readAll() or ""
+        local s = fh:readAll() or ""
         io.write((n == 0) and "" or s:sub(-n))
         return
     end
     local buf = {}
     while true do
-        local line = fh.readLine()
+        local line = fh:readLine()
         if line == nil then break end
         buf[#buf + 1] = line
     end
@@ -146,6 +146,6 @@ for idx, raw in ipairs(files) do
         end
         header(raw)
         emit(f)
-        f.close()
+        f:close()
     end
 end

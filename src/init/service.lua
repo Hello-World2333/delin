@@ -26,8 +26,8 @@ local function log(...) svc.log(...) end
 local function readFile(path)
     local f = fs.open(path, "r")
     if not f then return nil end
-    local s = f.readAll()
-    f.close()
+    local s = f:readAll()
+    f:close()
     return s
 end
 
@@ -618,7 +618,7 @@ function svc.enable(name)
         if not fs.exists(dir) then fs.makeDir(dir) end
         local f = fs.open(markerPath(name, target), "w")
         if not f then return nil, "cannot create " .. markerPath(name, target) end
-        f.close()
+        f:close()
         svc.addDep(target, name, false)
         log("[init] enabled " .. name .. " -> " .. target)
     end

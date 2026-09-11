@@ -13,6 +13,11 @@
 -- 读法: 真机的管道/终端句柄支持 read(n), 按 4096 字节块流式读; 宿主测试台的 stdin 桩
 --   只实现了 readLine(见 tools/harness.lua), 那种情况下退回逐行读并补回换行(与 cat 一致)——
 --   代价是"末行没有换行符"的输入会被补一个换行(真机上不会)。
+-- 句柄一律**冒号调用**: Delin 自己的句柄(tty/fb 设备、ext2、管道)是普通 Lua 表, 方法吃冒号;
+--   唯一只吃点号的是 CC 原生文件句柄, 内核已用 wrapCCHandle 桥成两种都收(见 kernel/vfs.lua)。
+--   曾经的 bug: 这里写成 `out.write(chunk)` —— 对 tty 句柄 `write(self, s)` 来说 chunk 落到了
+--   self 上、s 是 nil, 于是**静默写空串**: 文件(FILE 目标是 ext2 句柄, 点号也能用)照写,
+--   屏幕上却什么都不出现。诊断只在真机交互式终端下才看得见, 宿主测试台的句柄点号冒号都收。
 -- 已知偏离: 不实现 --output-error/-p; 不实现 --help/--version。
 -- 让出调度器: 防止长输出/长计算饿死事件循环(CC 的 ~7s no-yield 限制)。
 -- 时间片式: 每累计 ~50ms CPU 时间让出一次, 不按字节让出 —— HSE 已改拉模式(waitNextTick),
@@ -125,11 +130,11 @@ local function writeAll(chunk)
     local i = 1
     while i <= #targets do
         local t = targets[i]
-        local ok, err = t.h.write(chunk)
+        local ok, err = t.h:write(chunk)
         if not ok then
             stderr("tee: " .. t.name .. ": " .. tostring(err or "write failed") .. "\n")
             status = 1
-            t.h.close()
+            t.h:close()
             table.remove(targets, i)
         else
             i = i + 1
@@ -144,15 +149,15 @@ local chunked = stdin.readAll ~= nil
 while true do
     local chunk
     if chunked then
-        chunk = stdin.read(4096)
+        chunk = stdin:read(4096)
     else
-        local line = stdin.readLine()
+        local line = stdin:readLine()
         if line ~= nil then chunk = line .. "\n" end
     end
     if chunk == nil then break end
     -- 注意: 逐行模式下 "" 是一整行空行(tty 的 readLine 剥掉了换行), 不是 EOF —— 只有 nil 才是。
     if not stdoutDead then
-        local ok, err = out.write(chunk)
+        local ok, err = out:write(chunk)
         if not ok then
             -- 对端已关(内核管道写端返回 "broken pipe"): 只报一次, 之后不再写 stdout,
             -- 但 FILE 照常继续写(POSIX 允许, 退出码非 0)。
@@ -166,9 +171,9 @@ while true do
 end
 
 for _, t in ipairs(targets) do
-    t.h.flush()
-    t.h.close()
+    t.h:flush()
+    t.h:close()
 end
-if out then out.flush() end
+if out then out:flush() end
 
 return status

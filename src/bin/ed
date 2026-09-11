@@ -319,8 +319,8 @@ end
 local function readText(path)
     local fh, err = fs.open(resolve(path), "r")
     if not fh then return nil, err end
-    local text = fh.readAll()
-    fh.close()
+    local text = fh:readAll()
+    fh:close()
     return text or ""
 end
 
@@ -334,11 +334,11 @@ local function shScript(cmd)
     local path = "/tmp/ed" .. pid .. ".sh"
     local fh = fs.open(path, "w")
     if not fh then ederror("cannot open " .. path) end
-    fh.write(cmd .. "\n")
-    fh.close()
+    fh:write(cmd .. "\n")
+    fh:close()
     local shf = fs.open("/bin/sh", "r")
     if not shf then ederror("cannot execute shell") end
-    local src = shf.readAll(); shf.close()
+    local src = shf:readAll(); shf:close()
     return path, src
 end
 
@@ -544,11 +544,11 @@ execLine = function(line)
             local path, src = shScript(cmd)
             local child = spawn(src, "sh", nil, nil, { [0] = "/bin/sh", path },
                 { input = fs.open(path, "r"), output = pw })
-            if not child then fs.delete(path); pw.close(); pr.close(); ederror("cannot execute shell") end
+            if not child then fs.delete(path); pw:close(); pr:close(); ederror("cannot execute shell") end
             -- 不关自持写端引用: 子进程退出时内核 onExit 关闭其 stdio(output=本写端),
             -- writers 归零后读端才见 EOF; 过早 close 会让 readAll 立即 EOF。
-            text = pr.readAll() or ""
-            pr.close()
+            text = pr:readAll() or ""
+            pr:close()
             fs.delete(path)
         else
             text = readText(nm) or ederror("cannot open input file")
@@ -681,17 +681,17 @@ execLine = function(line)
             local path, src = shScript(cmd)
             local child = spawn(src, "sh", nil, nil, { [0] = "/bin/sh", path },
                 { input = pr, output = stdout })
-            if not child then fs.delete(path); pr.close(); pw.close(); ederror("cannot execute shell") end
+            if not child then fs.delete(path); pr:close(); pw:close(); ederror("cannot execute shell") end
             local wok = pw:write(text)
-            pw.close()
+            pw:close()
             if not wok then ederror("broken pipe") end
             syscalls["proc.wait"](child)
             fs.delete(path)
         else
             local fh = fs.open(resolve(nm), (c == "W") and "a" or "w")
             if not fh then ederror("cannot open output file") end
-            fh.write(text)
-            fh.close()
+            fh:write(text)
+            fh:close()
         end
         dirty = false
         if not suppressCounts then out(#text .. "\n") end

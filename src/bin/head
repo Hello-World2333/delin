@@ -101,7 +101,7 @@ end
 local function emitLines(fh)
     local c = 0
     while c < n do
-        local line = fh.readLine()
+        local line = fh:readLine()
         if line == nil then break end
         io.write(line .. "\n")
         c = c + 1
@@ -113,7 +113,7 @@ local function emitBytes(fh)
     if fh and fh.read then
         local hadData = false
         while remaining > 0 do
-            local chunk = fh.read(remaining)
+            local chunk = fh:read(remaining)
             if not chunk or chunk == "" then break end
             hadData = true
             io.write(chunk)
@@ -124,7 +124,7 @@ local function emitBytes(fh)
     -- 生数据读取不可用(如 stdin): 逐行缓冲后截取前 n 字节。
     local buf = {}
     while true do
-        local line = fh.readLine()
+        local line = fh:readLine()
         if line == nil then break end
         buf[#buf + 1] = line
     end
@@ -150,6 +150,6 @@ for idx, raw in ipairs(files) do
         end
         header(raw)
         emit(f)
-        f.close()
+        f:close()
     end
 end

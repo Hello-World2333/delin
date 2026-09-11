@@ -17,8 +17,8 @@ end
 local function readFile(path)
     local h = fs.open(path, "r")
     if not h then return nil end
-    local c = h.readAll()
-    h.close()
+    local c = h:readAll()
+    h:close()
     return c
 end
 

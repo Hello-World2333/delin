@@ -120,11 +120,11 @@ local function foldStream(h)
         parts, n, lastBlank, column = {}, 0, 0, 0
     end
     while true do
-        local chunk = h.read and h.read(4096)
+        local chunk = h.read and h:read(4096)
         if type(chunk) ~= "string" or chunk == "" then chunk = nil end
         if not chunk then
             -- 无 read 的句柄(宿主测试台的 stdin): 退化为逐行读取, 每行补回换行。
-            local l = h.readLine()
+            local l = h:readLine()
             if l == nil then break end
             chunk = l .. "\n"
         end

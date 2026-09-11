@@ -761,9 +761,18 @@ function ext2.delete(fs, dirPath, name)
     if not parent or parent.type ~= T_DIR then return nil, "parent not a dir" end
     local entry = findDirEntry(fs, parent, name)
     if not entry then return nil, "no such entry" end
+    local child = ext2.readInode(fs, entry.ino)
+    -- POSIX rmdir 语义: **非空目录必须拒绝**(ENOTEMPTY), 而不是把目录条目摘掉就算了。
+    -- 曾经的 bug: 不检查就直接合并掉条目, 于是子 inode 仍被占用、却没有任何目录项指向它们 ——
+    -- 真机跑完 e2fsck 报 "Unconnected directory inode" + "Unattached inode", 数据静默丢失。
+    -- 工具侧不能靠"自己先判空"来兜: 直接调 fs.delete 的地方(真机自检脚本就是)一样会弄坏盘。
+    if child and child.type == T_DIR then
+        for _, e in ipairs(ext2.readDir(fs, child) or {}) do
+            if e.name ~= "." and e.name ~= ".." then return nil, "directory not empty" end
+        end
+    end
     local ok, err = ext2.removeDirEntry(fs, parent, name)
     if not ok then return nil, err end
-    local child = ext2.readInode(fs, entry.ino)
     if child then
         child.links = math.max(0, child.links - 1)
         -- 目录的 links 含 "." 与 "..": 删空目录后剩 1 即应回收, 否则会漏一个未连接 inode。

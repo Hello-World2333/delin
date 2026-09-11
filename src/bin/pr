@@ -312,7 +312,7 @@ local function makeReader(h)
     local pending = nil
     return function()
         if pending ~= nil then local p = pending; pending = nil; return p end
-        return h.readLine()
+        return h:readLine()
     end, function(l) pending = l end
 end
 

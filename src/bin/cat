@@ -112,7 +112,7 @@ local nLine, nNb, blankRun = 0, 0, 0
 
 local function emit(fh)
     while not _interrupted do
-        local line = fh.readLine()
+        local line = fh:readLine()
         if line == nil then break end
         nLine = nLine + 1
         local isBlank = (line == "")
@@ -160,7 +160,7 @@ local function catFile(p)
         return false
     end
     emit(f)
-    f.close()
+    f:close()
     return true
 end
 

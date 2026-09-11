@@ -198,7 +198,7 @@ local function makeReader(h)
     local pending = nil
     local function readChunk(n)
         if useChunks then
-            local c = h.read(n)
+            local c = h:read(n)
             if type(c) == "string" then
                 if c == "" then return nil end
                 return c
@@ -206,7 +206,7 @@ local function makeReader(h)
             useChunks = false
         end
         if pending then local p = pending; pending = nil; return p end
-        local l = h.readLine()
+        local l = h:readLine()
         if l == nil then return nil end
         return l .. "\n"
     end
@@ -239,7 +239,7 @@ end
 local function skipBytes(h, r, n, name)
     if n == 0 then return true end
     if h.seek then
-        local ok = h.seek("set", n)
+        local ok = h:seek("set", n)
         if ok then return true end
     end
     local left = n

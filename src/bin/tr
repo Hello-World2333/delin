@@ -259,14 +259,14 @@ local function makeReader(h)
     local useChunks = true
     local function readChunk()
         if useChunks then
-            local c = h.read(4096)
+            local c = h:read(4096)
             if type(c) == "string" then
                 if c == "" then return nil end
                 return c
             end
             useChunks = false
         end
-        local l = h.readLine()
+        local l = h:readLine()
         if l == nil then return nil end
         return l .. "\n"
     end

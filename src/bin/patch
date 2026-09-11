@@ -185,7 +185,7 @@ local function readWhole(path)
     if path == nil or path == "-" then
         local h = io.stdin()
         if not h then error("patch: standard input is not available") end
-        return h.readAll() or ""
+        return h:readAll() or ""
     end
     local p = resolve(path)
     local f, err = fs.open(p, "r")
@@ -193,8 +193,8 @@ local function readWhole(path)
         stderr("patch: " .. p .. ": " .. ioeMsg(err) .. "\n")
         return nil
     end
-    local s = f.readAll() or ""
-    f.close()
+    local s = f:readAll() or ""
+    f:close()
     return s
 end
 
@@ -546,8 +546,8 @@ end
 local function loadRecords(path)
     local f, err = fs.open(path, "r")
     if not f then return nil, err end
-    local content = f.readAll() or ""
-    f.close()
+    local content = f:readAll() or ""
+    f:close()
     return splitRecords(content)
 end
 
@@ -642,9 +642,9 @@ local function writeRecords(path, recs)
         return false
     end
     for _, r in ipairs(recs) do
-        f.write(r.t .. (r.eol and "\n" or ""))
+        f:write(r.t .. (r.eol and "\n" or ""))
     end
-    f.close()
+    f:close()
     return true
 end
 
@@ -655,12 +655,12 @@ local function writeRej(path, sec, idxs)
         stderr("patch: " .. path .. ".rej: cannot write rejects\n")
         return 1
     end
-    if sec.oldName then h.write("--- " .. sec.oldName .. "\n") end
-    if sec.newName then h.write("+++ " .. sec.newName .. "\n") end
+    if sec.oldName then h:write("--- " .. sec.oldName .. "\n") end
+    if sec.newName then h:write("+++ " .. sec.newName .. "\n") end
     for _, hi in ipairs(idxs) do
-        for _, raw in ipairs(sec.hunks[hi].raw) do h.write(raw .. "\n") end
+        for _, raw in ipairs(sec.hunks[hi].raw) do h:write(raw .. "\n") end
     end
-    h.close()
+    h:close()
 end
 
 --- 找一个 section 要打的文件。

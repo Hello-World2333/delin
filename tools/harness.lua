@@ -1056,7 +1056,12 @@ inputHandle.readLine = function()
     stdinPos = nl + 1
     return line
 end
-inputHandle.read = function(fmt)
+-- read 同时收点号与冒号: 内核里所有 stdin 句柄(管道/文件/tty)都是普通 Lua 表, 方法吃冒号,
+-- 工具一律写 `h:read(n)`。桩只认点号的话, 按内核写法写的工具(tee)在测试台上会把 4096 当成
+-- self 传进来 -> tonumber(table)=nil -> 返回空串 -> 无限循环挂死(已经踩过一次)。
+local function readFmt(a, b) return (a == inputHandle) and b or a end
+inputHandle.read = function(a, b)
+    local fmt = readFmt(a, b)
     if stdinPos > #stdinData then return nil end
     if fmt == nil or fmt == "*l" or fmt == "l" then return inputHandle.readLine() end
     if fmt == "*a" or fmt == "a" then
@@ -1078,6 +1083,18 @@ end
 inputHandle.readAll = function() return inputHandle.read("*a") end
 
 local outputHandle = Handle.new(io.stdout, "<stdout>")
+-- 顶层 stdout = 内核的**终端句柄**, 所以照 src/kernel/tty.lua 的约定来: write 吃冒号, 参数缺省
+-- 当空串。工具里写成 `h.write(chunk)` 时 chunk 落到 self 上、s 是 nil, 于是静默写空串 ——
+-- 与真机终端上的表现完全一致(tee 曾经就这样: FILE 写了, 屏幕上什么都没有)。
+-- 别改回"点号冒号都收": 那样这一类 bug 就只有真机上才露头了(文件句柄两种都收是另一回事,
+-- 见 kernel/vfs.lua 的 wrapCCHandle)。
+outputHandle.write = function(self, s)
+    s = tostring(s or "")
+    io.stdout:write(s)
+    io.stdout:flush()
+    return #s
+end
+outputHandle.writeLine = function(self, s) return outputHandle:write(tostring(s or "") .. "\n") end
 
 curStdio = { input = inputHandle, output = outputHandle }
 

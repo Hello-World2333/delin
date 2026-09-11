@@ -1120,8 +1120,8 @@ builtins["."] = function(args)
     if not path then errln("sh: .: " .. file .. ": not found"); lastExit = 1; return end
     local h = fs.open(path, "r")
     if not h then errln("sh: .: " .. path .. ": cannot open"); lastExit = 1; return end
-    local src = (h.readAll and h.readAll()) or ""
-    h.close()
+    local src = (h.readAll and h:readAll()) or ""
+    h:close()
     local saveArgs = posArgs
     if #args > 1 then
         local a = {}
@@ -1937,8 +1937,8 @@ end
 local function firstLine(path)
     local f = fs.open(path, "r")
     if not f then return nil end
-    local line = (f.readLine and f.readLine()) or ""
-    f.close()
+    local line = (f.readLine and f:readLine()) or ""
+    f:close()
     return line
 end
 
@@ -1977,7 +1977,7 @@ spawnChild = function(cmd, argv, stdio)
         if not fs.canExecute(interpPath) then return nil, "shebang interpreter not executable: " .. prog end
         f = fs.open(interpPath, "r")
         if not f then return nil, "permission denied" end
-        src = f.readAll(); f.close()
+        src = f:readAll(); f:close()
         cargv = { [0] = interpPath }
         local n = 1
         if iarg and iarg ~= "" then cargv[n] = iarg; n = n + 1 end
@@ -1989,7 +1989,7 @@ spawnChild = function(cmd, argv, stdio)
     end
     f = fs.open(path, "r")
     if not f then return nil, "permission denied" end
-    src = f.readAll(); f.close()
+    src = f:readAll(); f:close()
     cargv = { [0] = path }
     for i = 1, #argv do cargv[i] = argv[i] end
     local child, cerr = spawn(src, cmd, nil, nil, cargv, sopts)
@@ -2522,8 +2522,8 @@ local hostname = "delin"
 do
     local f = fs.open("/etc/hostname", "r")
     if f then
-        local l = (f.readLine and f.readLine()) or ""
-        f.close()
+        local l = (f.readLine and f:readLine()) or ""
+        f:close()
         l = l:gsub("^%s+", ""):gsub("%s+$", "")
         if l ~= "" then hostname = l end
     end
@@ -2597,8 +2597,8 @@ else
     elseif scriptPath then
         local f = fs.open(scriptPath, "r")
         if f then
-            src = (f.readAll and f.readAll()) or ""
-            f.close()
+            src = (f.readAll and f:readAll()) or ""
+            f:close()
         else
             errln("sh: " .. scriptPath .. ": cannot open")
             return 1

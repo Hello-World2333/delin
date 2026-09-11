@@ -87,14 +87,14 @@ local function copyFile(src, dst)
     local inF, ierr = fs.open(src, "r")
     if not inF then return nil, (ierr or ("cannot open " .. src)) end
     local outF, oerr = fs.open(dst, "w")
-    if not outF then inF.close(); return nil, (oerr or ("cannot write " .. dst)) end
+    if not outF then inF:close(); return nil, (oerr or ("cannot write " .. dst)) end
     while true do
-        local chunk = inF.read(4096)
+        local chunk = inF:read(4096)
         if not chunk or chunk == "" then break end
-        outF.write(chunk)
+        outF:write(chunk)
     end
-    inF.close()
-    outF.close()
+    inF:close()
+    outF:close()
     return true
 end
 
