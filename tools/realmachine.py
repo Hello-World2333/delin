@@ -230,6 +230,22 @@ def main():
             df_write(out, unit_pv, "/lib/systemd/system/printer-verify.service")
             df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/printer-verify.service")
 
+    # 3f2) posix-verify.service: POSIX 命令补齐后的自检(新工具 + sh 新内建 + 内核新能力:
+    #      符号链接/硬链接/命名管道/umask/seek) -> /var/log/posix_verify.log
+    #      内核那部分用 /bin/lua 跑 —— 见 scripts/posix_kernel_verify.lua 的头注释: 这里要验的是
+    #      **内核语义本身**, 不该依赖某个工具的包装(而且部分能力当时还没有命令行入口)。
+    for src, dst in (("scripts/posix_tools_verify.sh", "/root/posix_tools_verify.sh"),
+                     ("scripts/posix_kernel_verify.lua", "/root/posix_kernel_verify.lua")):
+        df_write(out, os.path.join(REPO, src), dst)
+        df(out, "set_inode_field %s mode 0100755" % dst)
+    unit_posix = os.path.join(work, "posix-verify.service")
+    with open(unit_posix, "w") as f:
+        f.write("[Unit]\nDescription=Real-machine POSIX tools verification\nAfter=syslogd.service\n\n"
+                "[Service]\nType=oneshot\nExecStart=/bin/sh /root/posix_tools_verify.sh\n\n"
+                "[Install]\nWantedBy=multi-user.target\n")
+    df_write(out, unit_posix, "/lib/systemd/system/posix-verify.service")
+    df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/posix-verify.service")
+
     # 3g) 门禁: 注入后镜像仍必须干净, 不把坏镜像带上真机
     p = subprocess.run([FSCK, "-fn", out], capture_output=True, text=True)
     if p.returncode != 0:
@@ -354,7 +370,7 @@ def reboot_and_collect(printer=False):
     if "=== verify done ===" not in fresh:
         raise RuntimeError("失效验证: verify.log 变了但没有跑完(缺 '=== verify done ==='):\n" + fresh[-2000:])
     print("   boot guard ok: 磁盘根已引导, verify.log 是本轮写的")
-    logs = ["/var/log/verify.log", "/var/log/sh_verify.log", "/var/log/messages", "/var/log/messages.1",
+    logs = ["/var/log/verify.log", "/var/log/sh_verify.log", "/var/log/posix_verify.log", "/var/log/messages", "/var/log/messages.1",
             "/var/log/secure", "/var/log/kern.log", "/var/log/redstone_verify.log", "/delin.log"]
     if printer:
         logs += ["/var/log/printer_probe.log", "/var/log/printer_verify.log"]

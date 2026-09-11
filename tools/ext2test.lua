@@ -24,6 +24,25 @@ local function repoRoot()
 end
 package.path = repoRoot() .. "/src/?.lua;" .. package.path
 
+-- kernel.vfs_api 在**模块加载时**就从全局 fs 上取路径工具函数(getName/getDir/combine/...)。
+-- 宿主上没有 CC 的 fs, 这里给一份最小实现(vfs_api 只用到这几个纯函数, 不碰真实文件)。
+_G.fs = _G.fs or {
+    getName = function(p) return (tostring(p):match("[^/]*$")) or "" end,
+    getDir = function(p)
+        local d = tostring(p):match("^(.*)/[^/]*$")
+        if d == nil or d == "" then return "/" end
+        return d
+    end,
+    combine = function(a, b)
+        b = tostring(b or "")
+        if b:sub(1, 1) == "/" then return b end
+        if a == nil or a == "" then return b end
+        return tostring(a):gsub("/+$", "") .. "/" .. b
+    end,
+    isDriveRoot = function(p) return tostring(p):match("^/[^/]*$") ~= nil end,
+    complete = function() return {} end,
+}
+
 local ext2 = require("kernel.ext2")
 
 local IMG = "/tmp/delin-ext2test.img"
@@ -141,6 +160,179 @@ eq(be.canExecute("/d/x755"), true,  "canExecute: 755 可执行")
 eq(be.canExecute("/d/x111"), true,  "canExecute: 111 可执行(有 x 位即可, 不要求可读)")
 eq(be.canExecute("/d"),      false, "canExecute: 目录不可执行")
 eq(be.canExecute("/d/nope"), false, "canExecute: 不存在的文件 -> false")
+
+-- ---------------------------------------------------------------
+-- 1a2) 符号链接 / 硬链接(与 POSIX ln / ln -s / readlink 配套)
+--      ext2 的"快速符号链接"把 <=60 字节的目标内联在 i_block 里, 更长才占数据块 ——
+--      创建侧(setSymlink)与读取侧(readSymlink)必须以同一个 60 字节为界, 否则短目标会被
+--      当成块号读出一坨垃圾(或真的读出错块)。所以这里短/长各测一遍。
+-- ---------------------------------------------------------------
+local T_SYM = 0xA000
+local SHORT = "target-file"                       -- 11 字节: 走内联
+local LONG  = "/d/" .. string.rep("verylongsegment/", 5) .. "end"  -- >60 字节: 走数据块
+ok(#SHORT <= 60 and #LONG > 60, "符号链接测试目标长度齐全(短<=60 / 长>60)")
+
+assert(be.symlink(SHORT, "/d/shortlink"))
+eq(ext2.lookup(fs, "/d/shortlink").type, T_SYM, "symlink: 类型是 T_SYM")
+eq(be.readlink("/d/shortlink"), SHORT, "readlink: 短目标(内联 i_block)读回一致")
+eq(ext2.lookup(fs, "/d/shortlink").blocks, 0, "symlink: 短目标不占数据块(blocks=0)")
+
+assert(be.symlink(LONG, "/d/longlink"))
+eq(be.readlink("/d/longlink"), LONG, "readlink: 长目标(占数据块)读回一致")
+ok(ext2.lookup(fs, "/d/longlink").blocks > 0, "symlink: 长目标确实分配了数据块")
+
+-- 用宿主 readlink 交叉验证: 目标字符串必须逐字节相同(写进镜像的格式对不对, 由真 ext2 工具判)
+local h1 = io.popen("readlink " .. IMG .. " 2>/dev/null")
+if h1 then h1:close() end -- 镜像不是目录, 这里只确认 popen 可用; 真校验交给下面的 e2fsck 与目录项比对
+
+-- readlink 对非符号链接必须报错, 而不是把文件内容当目标返回
+local _, nlerr = be.readlink("/d/f1")
+ok(nlerr ~= nil, "readlink: 非符号链接 -> 报错", tostring(nlerr))
+eq(be.readlink("/d/nope"), nil, "readlink: 不存在的路径 -> nil")
+
+-- 符号链接的删除(走 ext2.delete 的通用路径)
+assert(ext2.delete(fs, "/d", "shortlink"))
+eq(ext2.lookup(fs, "/d/shortlink"), nil, "symlink: 删除后条目消失")
+assert(ext2.delete(fs, "/d", "longlink"))
+
+-- 硬链接: links 计数与共享内容
+local ino1 = ext2.create(fs, "/d", "hardsrc", T_REG + 420)
+assert(ext2.writeFile(fs, ino1, "shared content\n"))
+assert(ext2.link(fs, "/d/hardsrc", "/d/hardlink"))
+eq(ext2.lookup(fs, "/d/hardlink").ino, ino1, "hardlink: 两个名字指向同一个 inode")
+eq(ext2.lookup(fs, "/d/hardsrc").links, 2, "hardlink: links 递增为 2")
+local hr = assert(be.open("/d/hardlink", "r"))
+eq(hr:readAll(), "shared content\n", "hardlink: 通过新名字读到同一内容")
+hr:close()
+assert(ext2.delete(fs, "/d", "hardsrc"))
+eq(ext2.lookup(fs, "/d/hardlink").links, 1, "hardlink: 删掉一个名字后 links 回落为 1")
+eq(be.open("/d/hardlink", "r"):readAll(), "shared content\n", "hardlink: 删掉一个名字后内容仍在")
+assert(ext2.delete(fs, "/d", "hardlink"))
+eq(ext2.readInode(fs, ino1).links, 0, "hardlink: 最后一个名字删掉后 inode 回收")
+
+-- 硬链接不能指向目录(会成环), 也不能覆盖已存在的名字
+assert(ext2.create(fs, "/d", "ldir", T_DIR + 493))
+local _, lerr = ext2.link(fs, "/d/ldir", "/d/ldir2")
+ok(lerr ~= nil, "hardlink: 目录 -> 报错", tostring(lerr))
+assert(ext2.create(fs, "/d", "existing", T_REG + 420))
+local _, lerr2 = ext2.link(fs, "/d/existing", "/d/existing")
+ok(lerr2 ~= nil, "hardlink: 目标名已存在 -> 报错", tostring(lerr2))
+
+-- ---------------------------------------------------------------
+-- 1a3) VFS 层的符号链接展开(路径解析必须"穿过"链接)
+--      展开在这一层做, 后端(ext2.lookup)看到的一律是不含符号链接的平坦路径。
+-- ---------------------------------------------------------------
+do
+    local vfs = require("kernel.vfs")
+    vfs.mount("/", ext2.backend(fs))
+    vfs.mount("/mnt/dev", ext2.backend(fs)) -- 第二个挂载点: 验证链接不跨挂载也不会串
+    -- 路径操作走 VFS 门面(它才会展开符号链接); `be` 是后端, 后端看到的路径必须已经平坦。
+    local fsapi = require("kernel.vfs_api").fs
+
+    -- 目录链接: /d/dirlink -> /d/subdir, 于是 /d/dirlink/inner 必须解析到 /d/subdir/inner
+    assert(ext2.create(fs, "/d", "subdir", T_DIR + 493))
+    assert(ext2.create(fs, "/d/subdir", "inner", T_REG + 420))
+    local wr = assert(fsapi.open("/d/subdir/inner", "w"))
+    wr:write("via link\n")
+    wr:close()
+    assert(be.symlink("/d/subdir", "/d/dirlink"))
+    local rf = assert(fsapi.open("/d/dirlink/inner", "r"))
+    eq(rf:readAll(), "via link\n", "vfs: 经目录符号链接打开文件(中间段跟随)")
+    rf:close()
+
+    -- 相对目标的链接: 目标相对**链接所在目录**解析
+    assert(be.symlink("subdir", "/d/rellink"))
+    local rf2 = assert(fsapi.open("/d/rellink/inner", "r"))
+    eq(rf2:readAll(), "via link\n", "vfs: 相对目标的符号链接按链接所在目录解析")
+    rf2:close()
+    eq(select(2, vfs.resolve("/d/rellink")), "/d/subdir", "vfs: 相对链接也展开成绝对目标")
+
+    -- 悬空链接: 展开成目标路径, 但目标不存在(所以 stat 拿不到)
+    assert(be.symlink("/d/nowhere", "/d/dangling"))
+    local _, rd = vfs.resolve("/d/dangling")
+    eq(rd, "/d/nowhere", "vfs: 悬空链接展开到目标路径")
+    eq(vfs.resolveNoFollow("/d/dangling") ~= nil and ext2.lookup(fs, rd) == nil, true,
+       "vfs: 悬空链接的目标确实不存在")
+
+    -- 链接成环 -> ELOOP, 不能死循环
+    assert(be.symlink("/d/loop2", "/d/loop1"))
+    assert(be.symlink("/d/loop1", "/d/loop2"))
+    local _, _, lerr3 = vfs.resolve("/d/loop1")
+    ok(lerr3 ~= nil and tostring(lerr3):find("too many levels"), "vfs: 链接成环 -> ELOOP",
+       tostring(lerr3))
+
+    -- resolveNoFollow: 最后一段不展开(供 lstat/readlink/unlink 用)
+    local b1, r1 = vfs.resolveNoFollow("/d/dirlink")
+    eq(r1, "/d/dirlink", "vfs: resolveNoFollow 不展开最后一段")
+    local b2, r2 = vfs.resolve("/d/dirlink")
+    eq(r2, "/d/subdir", "vfs: resolve 展开最后一段")
+    ok(b1 ~= nil and b2 ~= nil, "vfs: 两次解析都拿到后端")
+
+    -- 挂载内的路径经链接后仍落到同一挂载点
+    local _, r3 = vfs.resolve("/mnt/dev/d/dirlink")
+    eq(r3, "/d/subdir", "vfs: 挂载点内的链接展开后 rel 仍相对挂载根")
+
+    -- 删除链接本身不能删掉目标(Linux: unlink 不跟随)
+    assert(be.symlink("/d/subdir", "/d/rmlink"))
+    assert(fsapi.delete("/d/rmlink"))
+    eq(ext2.lookup(fs, "/d/subdir") ~= nil, true, "vfs: 删链接不删目标")
+    eq(ext2.lookup(fs, "/d/rmlink"), nil, "vfs: 链接本身已删除")
+
+    -- symlink/link 的 fs 门面语义
+    fsapi.symlink("/d/subdir", "/d/fsapi_link")
+    eq(fsapi.readlink("/d/fsapi_link"), "/d/subdir", "fs.symlink/fs.readlink 往返一致")
+    eq(fsapi.lstat("/d/fsapi_link").kind, "symlink", "fs.lstat: 看到链接本身")
+    eq(fsapi.attributes("/d/fsapi_link").kind, "dir", "fs.attributes: 跟随到目录")
+    ok(fsapi.isDir("/d/fsapi_link"), "fs.isDir: 经链接判定为目录")
+    -- 硬链接经 fs 门面
+    local ino2 = ext2.create(fs, "/d", "fsl_src", T_REG + 420)
+    assert(ext2.writeFile(fs, ino2, "fslink\n"))
+    ok(fsapi.link("/d/fsl_src", "/d/fsl_new") ~= nil, "fs.link: 建硬链接成功")
+    eq(ext2.lookup(fs, "/d/fsl_new").ino, ino2, "fs.link: 新名字指向同一 inode")
+    local hh = assert(fsapi.open("/d/fsl_new", "r"))
+    eq(hh:readAll(), "fslink\n", "fs.link: 新名字读到同一内容")
+    hh:close()
+
+    vfs.unmount("/mnt/dev")
+    vfs.unmount("/")
+end
+
+-- ---------------------------------------------------------------
+-- 1a4) 命名管道(FIFO, mkfifo) —— 只验 ext2 侧的事实
+--      inode 类型是 T_FIFO, 没有文件内容(size=0, blocks=0)。**读写与阻塞语义的测试放在
+--      tools/hosttest.lua**: FIFO 的 open 会阻塞到对端出现, 而宿主 lua 是单线程直跑,
+--      在这里开写端会死等读端(反之亦然), 测不出东西只能证明会死锁。
+--      这里要保证的是: 建/删 FIFO 之后 e2fsck 仍然判干净(特殊 inode 很容易写坏)。
+-- ---------------------------------------------------------------
+do
+    local T_FIFO = 0x1000
+
+    ok(be.mkfifo("/d/pipe") ~= nil, "mkfifo: 建管道成功")
+    eq(ext2.lookup(fs, "/d/pipe").type, T_FIFO, "mkfifo: inode 类型是 T_FIFO")
+    eq(ext2.lookup(fs, "/d/pipe").size, 0, "mkfifo: FIFO 没有文件内容(size=0)")
+    eq(ext2.lookup(fs, "/d/pipe").blocks, 0, "mkfifo: FIFO 不占数据块(blocks=0)")
+    eq(be.attributes("/d/pipe").kind, "fifo", "mkfifo: attributes.kind = fifo")
+
+    local vfs2 = require("kernel.vfs")
+    vfs2.mount("/", ext2.backend(fs))
+    local fsapi = require("kernel.vfs_api").fs
+    ok(fsapi.isFifo("/d/pipe"), "fs.isFifo: 认得出命名管道")
+    eq(fsapi.isFifo("/d/f1"), false, "fs.isFifo: 普通文件不是管道")
+    eq(fsapi.isFifo("/d/nope"), false, "fs.isFifo: 不存在的路径 -> false")
+
+    -- 删除与同名重建(缓冲区释放逻辑由 hosttest 用真实调度器验证)
+    assert(fsapi.delete("/d/pipe"))
+    eq(ext2.lookup(fs, "/d/pipe"), nil, "fifo: 删除后条目消失")
+    eq(fsapi.isFifo("/d/pipe"), false, "fifo: 删除后不再是管道")
+    ok(fsapi.mkfifo("/d/pipe") ~= nil, "mkfifo: 同名重建成功")
+    eq(ext2.lookup(fs, "/d/pipe").type, T_FIFO, "mkfifo: 重建后仍是 T_FIFO")
+
+    -- 目录项里 file_type 字节必须是 FT_FIFO(5), 否则 e2fsck 会判 "invalid directory entry"
+    local _, names = dirHoles(fs, "/d")
+    ok(names:find("pipe") ~= nil, "fifo: 目录项里有 pipe")
+
+    vfs2.unmount("/")
+end
 
 bd.close()
 

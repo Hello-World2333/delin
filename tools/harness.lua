@@ -5,7 +5,9 @@
 --   如: printf 'echo hi\n' | lua5.1 tools/harness.lua /bin/sh
 -- ROOT 会先重建并填充 ROOT/bin(=src/bin), /etc, /home, /root 与示例文件。
 
-local ROOT = "/tmp/delinhost"
+-- 测试根目录(所有 "/" 路径映射到它下面)。默认 /tmp/delinhost; 并行跑多份 harness 时
+-- 用 DELIN_HARNESS_ROOT 各给一个独立的根, 否则会互相 rm -rf 掉对方的树。
+local ROOT = os.getenv("DELIN_HARNESS_ROOT") or "/tmp/delinhost"
 
 -- Lua 5.2+ 没有 loadstring/setfenv; 用 load + 改 _ENV upvalue 顶上, 这样同一套测试
 -- 也能在 lua5.4 下跑 (CC 的 Lua 是 5.2 语义 —— 压缩器等改动必须在 5.2 语义下也验一遍)。
@@ -97,6 +99,67 @@ function F.getSize(p)
     local r = tonumber(st:read("*a")); st:close()
     return r or 0
 end
+-- 补齐内核 vfs_api 里 fs 门面的其余方法。测试台与内核的 fs 面必须**同名同语义**,
+-- 否则工具在宿主上跑得过、真机才炸(这正是这台机器的存在意义)。
+function F.getName(p) return norm(p):match("[^/]*$") or "" end
+function F.getDir(p)
+    local n = norm(p)
+    local d = n:match("^(.*)/[^/]*$")
+    if d == nil or d == "" then return "/" end
+    return d
+end
+function F.combine(a, b)
+    b = tostring(b or "")
+    if b:sub(1, 1) == "/" then return b end
+    if a == nil or a == "" then return b end
+    return norm(a .. "/" .. b)
+end
+function F.isDriveRoot(p) return norm(p):match("^/[^/]*$") ~= nil end
+function F.complete(p, opts)
+    -- 与 CC fs.complete 同形的补全: 返回 { name..., "/" 结尾表示目录前缀 }。
+    local n = norm(p or "")
+    local dir, frag = n:match("^(.*)/([^/]*)$")
+    if not dir then dir, frag = "", n end
+    local h = host(dir == "" and "/" or dir)
+    local out = {}
+    local f = io.popen("ls -Ap -- " .. h .. " 2>/dev/null")
+    if f then
+        for line in f:lines() do
+            if line:sub(1, #frag) == frag then out[#out + 1] = line end
+        end
+        f:close()
+    end
+    table.sort(out)
+    return out
+end
+function F.isReadOnly(p)
+    local st = io.popen("[ -w " .. host(p) .. " ] && echo writable")
+    local r = st:read("*a"); st:close()
+    return r == "" -- 不可写即只读
+end
+function F.getDrive(p) return norm(p):match("^/([^/]*)") or "" end
+function F.getFreeSpace(p)
+    local st = io.popen("df -Pk -- " .. host(p) .. " 2>/dev/null | tail -n 1 | awk '{print $4}'")
+    local r = tonumber(st:read("*a")); st:close()
+    return (r or 0) * 1024
+end
+function F.getCapacity(p)
+    local st = io.popen("df -Pk -- " .. host(p) .. " 2>/dev/null | tail -n 1 | awk '{print $2}'")
+    local r = tonumber(st:read("*a")); st:close()
+    return (r or 0) * 1024
+end
+function F.find(p)
+    local list = {}
+    local function walk(cur)
+        for _, n in ipairs(F.list(cur)) do
+            local child = F.combine(cur, n)
+            if F.isDir(child) then walk(child) else list[#list + 1] = child end
+        end
+    end
+    walk(norm(p))
+    local i = 0
+    return function() i = i + 1; return list[i] end
+end
 function F.makeDir(p) os.execute("mkdir -p -- " .. host(p)); return true end
 function F.delete(p)
     if F.isDir(p) then os.execute("rm -rf -- " .. host(p)) else os.execute("rm -f -- " .. host(p)) end
@@ -108,10 +171,54 @@ end
 function F.move(a, b)
     os.execute("mv -- " .. host(a) .. " " .. host(b)); return true
 end
-function F.combine(a, b)
-    if b:sub(1, 1) == "/" then return norm(b) end
-    return norm(a .. "/" .. b)
+-- 符号链接 / 硬链接: 用宿主真实 ln/readlink, 使 ln/readlink/realpath/find 在宿主上可验证。
+local function shq(s) return "'" .. tostring(s):gsub("'", "'\\''") .. "'" end
+function F.symlink(target, linkpath)
+    -- target 是 **VFS 路径**; 以 "/" 开头时前缀测试根, 否则宿主解析这个绝对链接时会跑到真实 /,
+    -- 跟随就 ENOENT。readlink 再把它剥回去(见下), 于是工具看到的始终是 VFS 路径。
+    local t = target
+    if t:sub(1, 1) == "/" then t = ROOT .. t end
+    local r = os.execute("ln -s " .. shq(t) .. " " .. shq(host(linkpath)) .. " 2>/dev/null")
+    if r ~= true and r ~= 0 then return nil, "cannot create symbolic link" end
+    return true
 end
+function F.readlink(p)
+    local h = io.popen("readlink " .. shq(host(p)) .. " 2>/dev/null")
+    local r = h:read("*a"); h:close()
+    r = (r or ""):gsub("%s+$", "")
+    if r == "" then return nil, "not a symbolic link" end
+    if ROOT ~= "" and r:sub(1, #ROOT) == ROOT then r = r:sub(#ROOT + 1) end
+    return r
+end
+function F.link(a, b)
+    local r = os.execute("ln " .. shq(host(a)) .. " " .. shq(host(b)) .. " 2>/dev/null")
+    if r ~= true and r ~= 0 then return nil, "cannot create hard link" end
+    return true
+end
+--- 不跟随最后一段的 chown(内核 fs.lchown 的对应物): `chown -h`。
+function F.lchown(p, uid, gid)
+    local spec = ""
+    if uid ~= nil then spec = spec .. tostring(uid) end
+    if gid ~= nil then spec = spec .. ":" .. tostring(gid) end
+    if spec == "" then return true end
+    return os.execute("chown -h " .. spec .. " -- " .. shq(host(p)) .. " 2>/dev/null") ~= nil
+end
+--- 不跟随符号链接的 stat(内核 fs.lstat 的对应物)。
+function F.lstat(p)
+    local h = io.popen("test -L " .. shq(host(p)) .. " && echo l")
+    local isLink = h:read("*a"); h:close()
+    local a = F.attributes(p)
+    if not a then return nil end
+    if isLink ~= "" then
+        a.kind = "symlink"
+        a.isDir = false
+        a.size = #(F.readlink(p) or "")
+        return a
+    end
+    a.kind = a.isDir and "dir" or "file"
+    return a
+end
+
 function F.attributes(p)
     local n = norm(p)
     local sz = F.getSize(p)
@@ -169,6 +276,13 @@ local function mkHandle(file, name, isTTY)
     h.readAll   = m(function() return file:read("*a") end)
     h.getSize   = m(function() return 0 end)
     h.getDeviceName = m(function() return nil end)
+    -- seek: 与内核 vfs 包装的 CC 句柄同签名(whence="set"/"cur"/"end")。
+    h.seek = m(function(whence, off)
+        local p, err = file:seek(whence, off)
+        if p == nil then return nil, err end
+        return p
+    end)
+    h.isReadOnly = m(function() return false end)
     h.setEcho   = m(function() end)
     return h
 end
@@ -210,6 +324,8 @@ local NULL_HANDLE = {
     flush = function() return true end,
     close = function() return true end,
     getDeviceName = function() return nil end,
+    seek = function() return 0 end,
+    isReadOnly = function() return true end,
 }
 
 -- io.open 落在 F.open / fs.open
@@ -282,6 +398,8 @@ local function deliver(pid, sig)
     local p = procs[pid]
     if not p then return nil, "no such process: " .. tostring(pid) end
     if p.status == "dead" or p.status == "error" then return true end -- 已死: 无效果但不算错
+    -- SIG_IGN(沿内核语义): 被显式忽略的信号直接丢弃, 连停止/终止都不走。
+    if p.ignored and p.ignored[sig] then return true end
     if sig == 18 then -- SIGCONT
         if p.status == "stopped" then p.status = "running" end
         return true
@@ -315,6 +433,11 @@ syscalls["signal.install"] = function(sig, fn)
     local p = procs[curPid]
     if not p then return nil, "no current process" end
     p.handlers = p.handlers or {}
+    p.ignored = p.ignored or {}
+    -- "ignore"/"default" 与内核 process.setHandler 同一套语义("ignore" 还会跨 spawn 继承)。
+    if fn == "ignore" then p.handlers[sig] = nil; p.ignored[sig] = true; return true end
+    if fn == "default" then p.handlers[sig] = nil; p.ignored[sig] = nil; return true end
+    p.ignored[sig] = nil
     p.handlers[sig] = fn
     return true
 end
@@ -457,6 +580,15 @@ local function spawn(src, name, ppid, uid, gid, argv, opts)
     local sid = parent and parent.sid or 0
     procs[pid] = { pid = pid, ppid = ppid or 0, name = name, status = "running", exitCode = 0,
                    stdio = stdio, pgrp = pgrp, sid = sid, handlers = {}, envvars = envvars,
+                   -- umask 子进程继承父进程(与内核 process.spawn 一致), 缺省 022。
+                   umask = (parent and parent.umask) or tonumber("022", 8),
+                   -- 被忽略的信号同样继承(内核语义): nohup 的 SIG_IGN 要能传给子进程。
+                   ignored = (function()
+                       local t = {}
+                       if parent and parent.ignored then for s in pairs(parent.ignored) do t[s] = true end end
+                       if opts and opts.sigIgnore then for s in pairs(opts.sigIgnore) do t[s] = true end end
+                       return t
+                   end)(),
                    uid = uid or 0, gid = gid or 0, argv = argv or {},
                    cwd = (opts and opts.cwd) or "/" }
     running[#running + 1] = { pid = pid, co = coroutine.create(chunk) }
@@ -512,6 +644,20 @@ local function setupRoot()
                           "passwd","useradd","userdel","usermod","groupadd","groupdel","id","whoami","groups" }) do
         os.execute("cp -f " .. SRCBIN .. "/" .. f .. " " .. ROOT .. "/bin/" .. f)
         os.execute("chmod 755 " .. ROOT .. "/bin/" .. f)
+    end
+    -- 上面是手写白名单(历史遗留)。**再补全 src/bin 下的其余文件**: 维护两份清单必然会漏,
+    -- 漏了就在测试台上报 "cannot read /bin/<新工具>"(而真机上是好的), 白白浪费一轮排查。
+    do
+        local p = io.popen("ls -A " .. SRCBIN)
+        if p then
+            for f in p:lines() do
+                if not f:find("^%.") then
+                    os.execute("cp -f " .. SRCBIN .. "/" .. f .. " " .. ROOT .. "/bin/" .. f)
+                    os.execute("chmod 755 " .. ROOT .. "/bin/" .. f)
+                end
+            end
+            p:close()
+        end
     end
     -- 用户库: 格式与真机一致(哈希用内核同一份 user.hash 算, 所以 verify 是真判定)。
     local user = require("kernel.user")
@@ -633,6 +779,60 @@ function F.open(p, mode)
     return hostOpen(p, mode)
 end
 
+-- ---------------------------------------------------------------
+-- 命名管道(FIFO) 的测试台支持
+--   宿主上**不能**用真的 mkfifo: 真的 FIFO 阻塞的是整个 lua 进程, 测试台的协作式调度器
+--   根本转不动(对端永远没机会跑), 结果只能是死锁。所以这里用**内核同一份 kernel/fifo.lua**
+--   在进程内实现: 缓冲、阻塞 open、EOF、broken pipe 的语义与真机完全一致, 而阻塞走的是
+--   测试台的 os.sleep(= coroutine.yield), 于是 `cat fifo` 与 `echo x > fifo` 能真正并发跑起来。
+--   宿主侧只留一个占位文件, 好让 ls / fs.isFile 之类的路径行为保持自然。
+-- ---------------------------------------------------------------
+do
+    local fifoMod = require("kernel.fifo")
+    local fifoOwner = {}      -- 固定 owner: 测试台只有一个"文件系统"
+    local fifoPaths = {}      -- 归一化路径 -> true
+    local prevOpen, prevAttrs, prevLstat, prevDelete = F.open, F.attributes, F.lstat, F.delete
+
+    function F.mkfifo(p, mode)
+        p = norm(p)
+        if F.exists(p) then return nil, "file exists" end
+        local dir = p:match("^(.*)/[^/]*$")
+        if dir == nil or dir == "" then dir = "/" end
+        if not F.isDir(dir) then return nil, "parent not a dir" end
+        os.execute(": > " .. shq(host(p)))
+        fifoPaths[p] = true
+        return true
+    end
+    function F.isFifo(p) return fifoPaths[norm(p)] == true end
+    function F.open(p, mode)
+        if fifoPaths[norm(p)] then return fifoMod.open(fifoOwner, norm(p), mode or "r") end
+        return prevOpen(p, mode)
+    end
+    function F.attributes(p)
+        local a = prevAttrs(p)
+        if a and fifoPaths[norm(p)] then
+            a.kind, a.isDir, a.size = "fifo", false, 0
+        end
+        return a
+    end
+    function F.lstat(p)
+        local a = prevLstat(p)
+        if a and fifoPaths[norm(p)] then
+            a.kind, a.isDir, a.size = "fifo", false, 0
+        end
+        return a
+    end
+    function F.delete(p)
+        local n = norm(p)
+        local isFifo = fifoPaths[n] == true
+        if isFifo then
+            fifoPaths[n] = nil
+            fifoMod.forget(fifoOwner, n)
+        end
+        return prevDelete(p)
+    end
+end
+
 -- kernel.modules/vfs_api 装载时会抓全局 fs(与内核同一份源码); 宿主上没有 CC 的 fs,
 -- 用宿主门面顶上 —— 下面 setupRoot / user 库的 require 都会走到它。
 _G.fs = _G.fs or F
@@ -649,6 +849,79 @@ do
     -- user.registerSyscalls 写进的是**内核的** syscall 表(kernel.modules), 而工具拿到的是
     -- 测试台自己那张(proc/job/signal/... 的桩都在这儿) —— 把 user.* 并进来。
     for k, v in pairs(require("kernel.modules").syscalls()) do syscalls[k] = v end
+end
+
+-- ---------------------------------------------------------------
+-- proc.exec / umask.*: 与内核同一套语义, 但走测试台自己的 spawn 与 F
+--   (内核实现绑在 process.spawn 上, 而这里 process 是桩, 所以照着内核的语义另写一份;
+--    两边必须对得上, 否则 xargs/nohup/command 在宿主上跑得过、真机才炸)。
+-- ---------------------------------------------------------------
+syscalls["umask.get"] = function()
+    local p = curPid and procs[curPid]
+    return (p and p.umask) or tonumber("022", 8)
+end
+syscalls["umask.set"] = function(mask)
+    local p = curPid and procs[curPid]
+    if not p then return nil, "umask: no such process" end
+    if type(mask) ~= "number" or mask < 0 or mask > tonumber("777", 8) then
+        return nil, "umask: mask out of range (0..0777)"
+    end
+    local old = p.umask or tonumber("022", 8)
+    p.umask = math.floor(mask)
+    return old
+end
+
+do
+    local function findInPath(name, pathEnv)
+        if name:find("/", 1, true) then return name end
+        for dir in tostring(pathEnv or "/bin"):gmatch("[^:]+") do
+            local cand = (dir == "/" and "" or dir) .. "/" .. name
+            if F.exists(cand) then return cand end
+        end
+        return nil
+    end
+    local function parseShebang(line)
+        if line:sub(1, 2) ~= "#!" then return nil, nil end
+        local rest = line:sub(3):gsub("^[ \t]+", "")
+        local interp = rest:match("^(%S+)")
+        if not interp then return nil, nil end
+        return interp, rest:match("^%S+[ \t]+(.-)[ \t]*$")
+    end
+    syscalls["proc.exec"] = function(cmd, argv, opts)
+        opts = opts or {}
+        local me = curPid
+        local caller = me and procs[me]
+        local pathEnv = (caller and caller.envvars and caller.envvars.PATH) or "/bin"
+        local path = findInPath(cmd, pathEnv)
+        if not path then return nil, cmd .. ": command not found" end
+        if not F.canExecute(path) then return nil, path .. ": permission denied" end
+        local fh = F.open(path, "r")
+        if not fh then return nil, path .. ": cannot open" end
+        local src = fh:readAll(); fh:close()
+        local interp, iarg = parseShebang(src:match("^([^\n]*)") or "")
+        local childArgv = { [0] = path }
+        if interp then
+            local prog, arg = interp, iarg
+            if interp:match("[^/]+$") == "env" then
+                if not arg or arg == "" then return nil, "shebang: env without a program" end
+                prog = arg:match("^(%S+)")
+                arg = arg:match("^%S+%s+(.*)$")
+            end
+            local ipath = findInPath(prog, pathEnv)
+            if not ipath then return nil, "shebang interpreter not found: " .. prog end
+            local ih = F.open(ipath, "r")
+            if not ih then return nil, "shebang interpreter: cannot open " .. ipath end
+            local isrc = ih:readAll(); ih:close()
+            local n = 0
+            childArgv = { [0] = ipath }
+            if arg and arg ~= "" then n = 1; childArgv[n] = arg end
+            n = n + 1; childArgv[n] = path
+            for i = 1, #(argv or {}) do n = n + 1; childArgv[n] = argv[i] end
+            return spawn(isrc, ipath, me, opts.uid, opts.gid, childArgv, opts)
+        end
+        for i = 1, #(argv or {}) do childArgv[i] = argv[i] end
+        return spawn(src, path, me, opts.uid, opts.gid, childArgv, opts)
+    end
 end
 
 -- ---------------------------------------------------------------

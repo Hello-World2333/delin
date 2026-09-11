@@ -14,7 +14,7 @@
 
 | 路径 | 作用 |
 |---|---|
-| `/bin/` | 用户工具：`cat ls mkdir rm cp mv touch head tail wc grep sed ed kill ps pgrep pkill killall login sh lua clear sleep systemctl syslogd logrotate logger dmesg mount umount lp passwd useradd userdel usermod groupadd groupdel id whoami groups` |
+| `/bin/` | 用户工具（POSIX 强制命令已补齐，见「POSIX 命令覆盖」一节）：`basename cat chgrp chmod chown cksum clear cmp comm cp csplit cut dd df diff dirname du echo ed expand expr file find fold grep head id join kill killall ln ls mkdir mkfifo mount mv nohup od passwd paste patch pathchk pr printf ps readlink realpath rm rmdir sed sh sleep sort split strings tail tee touch tr umount unexpand uniq uudecode uuencode wc whoami xargs`；系统/服务类：`blkid dmesg logger login logrotate lp lsblk lua pgrep pkill syslogd systemctl`；用户管理：`groupadd groupdel groups useradd userdel usermod` |
 | `/dev/` | 设备文件：`/dev/ttyN`（字符终端）、`/dev/fbN`（像素帧缓冲）、`/dev/sdX`（磁盘，见下）、`/dev/lpN`（打印机字符设备，只写，见下）、`/dev/null`（读 EOF/写丢弃）、`/dev/console`（系统控制台 = 控制台 tty）、`/dev/kmsg`（内核 ring buffer 只读流）、`/dev/log`（用户态 syslog 输入） |
 | `/etc/` | 系统配置：`passwd` `shadow`（0600 root:root）`group`、`fstab`、`syslog.conf`、`logrotate.conf`、`systemd/system/`（管理员单元与 enable 标记） |
 | `/proc/` | 虚拟进程/系统信息 fs（procfs，内核提供，见下）：`/proc/<pid>/{cmdline,comm,cwd,stat,status}`、`/proc/self`、`/proc/{mounts,uptime,version}` |
@@ -222,6 +222,51 @@ Delin 一律按字典序解析。
 **root 也要文件至少有一个 `x` 位**（POSIX：root 绕过的是 `r`/`w` 检查，不绕过 `x`），否则 644 的
 脚本 `./script` 也能跑起来。CC 原生文件系统（`ccdisk`）没有权限位，其文件一律视为可执行。
 
+#### 符号链接、硬链接与命名管道（ext2）
+
+CC 原生文件系统没有这些概念、`ext2` 驱动里有 inode 类型却没出口，补齐 POSIX 命令时一起做了：
+
+- **符号链接**：`fs.symlink(target, linkpath)`（target **原样保存、不解析**）、`fs.readlink(path)`。
+  ext2 的"快速符号链接"把 ≤60 字节的目标**内联在 inode 的 i_block 区**、更长才占数据块 ——
+  创建侧(`ext2.setSymlink`)与读取侧(`readSymlink`)以同一个 60 字节为界（不一致会把目标字节当块号）。
+  **符号链接的权限恒为 0777 且不受 umask 影响**（Linux 语义；内核从不拿它做权限判定）。
+- **硬链接**：`fs.link(old, new)`（不跟随 `old` 最后一段，同 Linux `link(2)`；不允许指向目录）。
+- **路径解析穿链接**：展开在 **VFS 这一层**做（`vfs.resolve` → `expandLinks`），后端看到的永远是
+  "不含符号链接的平坦路径"，所以 `ext2.lookup` 根本不需要知道链接这回事。语义对齐 Linux：
+  中间段与最后一段都跟随、相对目标按**链接所在目录**解析、上限 40 跳后 ELOOP。
+  `vfs.resolveNoFollow`（= 不跟随最后一段）供 `lstat`/`readlink`/`unlink`/`symlink`/`link`/`mkdir`/`rename` 用
+  —— 用错会把 `rm link` 变成"删掉链接指向的文件"。
+  **已知偏离**：展开是纯字典序的，因此经符号链接目录的 `..` 与 Linux 不同（与 `normalize` 那条偏离同源）。
+- **`lstat` / `lchown`**：`fs.attributes` **跟随**（= `stat`）、`fs.lstat` **不跟随**（= `lstat`，
+  对链接本身返回 `kind="symlink"`）；`fs.lchown` 同理（`chown -h`/`chgrp -h`/递归遍历里的链接必须用它）。
+  `ls -l` 用 `fs.lstat`，所以能看到 `l` 类型字符与 `name@`。
+- **命名管道（FIFO）**：`fs.mkfifo(path[, mode])` + `src/kernel/fifo.lua`，与匿名管道（`kernel/pipe.lua`）
+  共用缓冲与协作式阻塞语义，区别是挂在 inode 上、可被**反复打开**（`cat fifo` 与 `echo x > fifo` 各自独立开合）。
+  `open` 按 POSIX **阻塞**：读端等到有写端、写端等到有读端。
+  **等待条件同时用三样东西，缺一样都会死锁或丢唤醒**（真机/测试台各踩过一次）：
+  ① 已挂上的对端；② **正在 open 的对端**（`pending*` —— 双方都只在等对方时必须有一个人先走）；
+  ③ 对端"挂上次数"的闩锁（`*Epoch`，进函数时记下 —— 防止"对端挂上、写完、关掉，自己才被调度到"的丢唤醒）。
+  配套地，`pipe.lua` 的 EOF/`broken pipe` 判据也把 `pending*` 算作"对端在场"（否则读端会在对端刚开始
+  open 时就读到 EOF）。FIFO 端句柄带 `.pipe` 标记，写进 stdio 时由 `process.onExit` 统一关闭。
+  **已知限制**：进程不 close 就被杀，端计数不回落（与匿名管道同一限制）。
+- **`/dev` 节点的 `kind`**：devtmpfs 的 `attributes` 必须给 `kind="device"` —— 工具靠它区分"文件"与
+  "设备节点"，漏了会让 `dd of=/dev/sda1` 走普通文件分支把整个分区镜像读进内存。
+
+#### umask
+
+内核持有**进程属性** `umask`（缺省 `0022`，随 spawn 继承），在**唯一的创建点**
+（`ext2.create` → `applyUmask`）统一应用到新建节点上，而不是让每个工具自己收窄：漏一个就多出几个
+"世界可写"的文件，而且工具往往先收窄一遍、内核再来一遍 —— 那就是叠了两次。
+`syscalls["umask.get"]/["umask.set"]` 供 shell 的 `umask` 内建读写；`-m` 显式指定权限的工具
+（`mkfifo -m`）按 GNU 的做法**先建、再 chmod**，使显式 mode 不受 umask 影响。
+**符号链接例外**（恒 0777，见上）。
+
+#### ext2 句柄的 seek
+
+读句柄本来是"整文件读进内存 + pos"，写句柄是"整表缓冲、close 时全量重写"。`dd` 需要 `skip`/`seek`，
+所以：读句柄实现精确的 `set`/`cur`/`end`；写句柄只能**向前** seek（用 0 填充缓冲区，逻辑内容与稀疏
+文件一致），**向后 seek 明确报错而不是假装成功** —— 静默返回 0 会让 `dd` 悄悄写错位置。
+
 **用户**：`/etc/passwd` `name:x:uid:gid:fullname:home:shell`、`/etc/shadow` `name:salt$hash`、
 `/etc/group`；`login` 提示用户名/密码（隐藏回显），验证通过后按该用户 `uid/gid` 起 `sh`。
 用户管理命令（`passwd`/`useradd`/…）与内核 `user.*` 写 syscall 见下文「用户管理」。
@@ -261,7 +306,15 @@ Delin 一律按字典序解析。
 `if/elif/else`、`for`、`while`、`case`、函数（位置参数）、`[ ]`/`test`（`=` `!=` `-n` `-z` `-eq/-ne/-lt/-le/-gt/-ge`
 `-e/-f/-d/-s/-x/-r/-w`、`!`）；`&&`/`||`/`;`；文件重定向（`>` `>>` `<`）；管道（`|`，每元素一个进程/内建，
 经内核 pipe 缓冲传递，`$?`=末元素退出码，生产端写满/消费端读空时让出调度器，broken pipe 中止写端）；内建
-`cd pwd echo read exit help jobs fg bg wait kill test [ true false : . set export unset break continue return shift`。
+`cd pwd echo read exit help jobs fg bg wait kill test [ true false : . set export unset break continue return shift alias unalias command getopts hash umask`；
+`time` 是 POSIX **保留字**（不是内建），只在管道首词位置识别（`time [-p] pipeline`），计时文本走 stderr，
+`real` 由 `os.epoch("utc")` 取差、`user` 由 `os.clock()` 取差、**`sys` 恒为 0**（无内核/用户态记账）。
+**别名**（`alias`）：POSIX 是在**解析期**做首词替换，Delin 改成**求值期**替换（认出首词是别名后把
+"别名体 + 其余已展开的词"重新解析执行）—— 日常用法（别名带参数/管道/重定向）一致，**已知偏离**：
+别名体里的位置参数展开时机不同，且不参与"词内"替换（`alias e=echo; e$x` 在 POSIX 里能展开，这里不能）。
+**`hash`** 维护命令路径缓存（`searchPath` 命中即不再走 PATH；**PATH 一变缓存整体作废**）。
+**`umask`** 读写进程的创建掩码（缺省 `0022`，随 spawn 继承给子进程），实际收窄由**内核在创建点**统一
+应用（见「umask」一节）。**`command`** 绕过函数/别名直接执行，`-v`/`-V` 查询，`-p` 用系统缺省 PATH。
 **启动变量**（可在 shell 里读写，`export` 后才传给子进程）：`PATH`（默认 `/bin`，命令查找用）、
 `HOME`、`USER`、`LOGNAME`、`SHELL`（后两者取自 `/etc/passwd`）、`TERM`（默认 `linux`，随环境导出）、
 `PPID`（内核给的父 pid）、
@@ -310,6 +363,32 @@ shebang 支持 `#!/bin/sh` / `#!/usr/bin/env sh` 等形式，env 特殊解释为
 自检脚本：`scripts/posix_test.sh`（POSIX 可移植子集，宿主与真机各跑一次比对）、
 `scripts/sh_builtin_test.sh`（内建/变量/选项自检，宿主用 harness 跑，真机由
 `scripts/sh_verify.sh` + `verify-sh.service` 跑并写 `/var/log/sh_verify.log`）。
+
+#### POSIX 命令覆盖与 `proc.exec`
+
+按 Wikipedia 的 [List of POSIX commands](https://en.wikipedia.org/wiki/List_of_POSIX_commands)
+（IEEE Std 1003.1-2024）逐条核对：**强制命令 110 条**，Delin 已实现其中绝大部分；完整对照表与分档
+清单在知识库里（`~/docs/posix/POSIX强制命令清单.md`、`~/docs/posix/Delin覆盖情况.md`）。
+仍有缺口的主要是**国际化/语言工具**（`locale`/`localedef`/`gettext` 系列、`m4`、`bc`、`ar`、`pax`）、
+`awk`、以及 CC 上没有意义的几项；终端类（`stty`/`tput`/`tabs`）在 16 色 ANSI 终端上只做了子集。
+**逐个命令的实测对照**（与宿主 GNU 逐字节比）由各工具自己的验收记录，不在这里重复。
+
+**`syscalls["proc.exec"](cmd, argv, opts)`**：按 PATH 查找并启动一个程序（`execvp` 的最小实现）——
+查 PATH、查 `x` 位、经 VFS 读源码、处理 shebang（含 `#!/usr/bin/env prog` 特判）。
+放在内核的理由：任何"我要起一个外部命令"的工具都得做同一件事，而 `spawn()` 只收**源码字符串**，
+每个工具抄一遍既冗长又容易抄漏。`opts` 透传给 `spawn`（`cwd`/`env`/`stdio`/`uid`/`gid`/`sigIgnore`），
+`argv[0]` 由内核填。**注意这是"起一个新进程"，不是 POSIX exec 的"替换当前进程映像"**（Delin 没有那个语义）。
+使用者：`xargs`、`nohup`、sh 的 `command` 内建。
+
+**被忽略的信号跨 spawn 继承**：`syscalls["signal.install"](sig, "ignore")` 置 `SIG_IGN`，该处置与
+Linux 的 exec 一样传给子进程（`process.setHandler` 认 `"ignore"`/`"default"`，`spawn` 合并父进程的
+`sig.ignored` 与 `opts.sigIgnore`）。`nohup` 就是靠这条让 COMMAND 免疫 SIGHUP 的。
+
+**错误路径的退出码**：工具里"出错"必须 `return 1`（内核把协程返回值当退出码，裸 `return` 就是 0）。
+历史上有 35 处 `stderr(...)` 后面跟裸 `return` 的写法会"报错却返回 0"，已统一修正；`cat` 按 POSIX
+在某个操作数失败时**继续处理其余操作数**、最终退出 1。另外共享模板里的 `ioeMsg` 曾先匹配 `"directory"`
+再兜底，而 `"No such file or directory"` 里本来就含 `directory` —— 于是"文件不存在"被报成
+"Is a directory"（31 个文件），已改为先判 ENOENT（且用小写比较，Lua pattern 区分大小写）。
 
 **已知偏离**：`grep`/`sed` 的正则用 **Lua pattern**（`%` 为转义符、`()` 为捕获）而非 POSIX ERE/BRE；
 替换区用 `&`=整串匹配、`\1..\9`=捕获组、`\n/\t`，不支持 BRE 风格 `\(...\)` 与模式内逆引用。
