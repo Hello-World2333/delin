@@ -2502,5 +2502,234 @@ do
     ok(random.uuid():match("^%x%x%x%x%x%x%x%x%-%x%x%x%x%-4") ~= nil, "random: uuid v4 前缀")
 end
 
+-- ===============================================================
+-- M. CEECC(CEE:CC) 台式机: kernel/platform.lua 探测 + modules/cee.ko 的
+--    /sys/class/power/supply 与 /sys/class/pin/pinN + devdisk 的引脚驱动器来源
+--    真机事实(台式 CEECC, 电脑 #6)锁在这里: 引脚没有端口时 cee 的 getAnalogOutput/getOutput
+--    报 "no signal port on pin N", 所以那三个端口属性必须只在有端口的引脚上存在;
+--    引脚上的外设同时出现在 CC 侧面平面上(实测 pin8 = 侧面 back), 于是设备枚举仍走侧面,
+--    只有存储按 CC 挂载路径补漏并去重。
+-- ===============================================================
+do
+    local vfs      = require("kernel.vfs")
+    local platform = require("kernel.platform")
+    local sysfs    = require("kernel.sysfs")
+
+    -- ---- cee 全局的桩: 3 个引脚。1 号空着; 2 号端口挂 drive; 3 号端口挂 modem。
+    local st = {
+        ports  = { [1] = { data = false, ports = 0, powered = false, type = nil },
+                   [2] = { data = true,  ports = 1, powered = true,  type = "drive" },
+                   [3] = { data = false, ports = 1, powered = true,  type = "modem" } },
+        analog = { [2] = 0, [3] = 0 },
+        calls  = {},
+        resets = 0,
+    }
+    local driveHandle = {
+        isDiskPresent = function() return true end,
+        getMountPath = function() return "disk7" end,
+        getDiskID    = function() return 41 end,
+        getDiskLabel = function() return "PIN-DISK" end,
+    }
+    local function requirePort(pin)
+        if st.ports[pin].ports == 0 then error("no signal port on pin " .. pin, 0) end
+    end
+    local ceeStub = {
+        getSignalCount    = function() return 3 end,
+        isDataPin         = function(p) return st.ports[p].data end,
+        getPortCount      = function(p) return st.ports[p].ports end,
+        isPortPowered     = function(p) return st.ports[p].powered end,
+        hasPeripheral     = function(p) return st.ports[p].type ~= nil end,
+        getPeripheralType = function(p) return st.ports[p].type end,
+        getPeripheral     = function(p) if p == 2 then return driveHandle end return nil end,
+        hasPower          = function() return true end,
+        getPowerVoltage   = function() return 299.98502276145973 end,
+        getSupplyCurrent  = function() return 0.33334997554213985 end,
+        getDeliveredPower = function() return 0 end,
+        getMaxPower       = function() return 500 end,
+        getPowerHeadroom  = function() return 500 end,
+        getSupplyState    = function() return "ok" end,
+        resetSupply       = function() st.resets = st.resets + 1 end,
+        getAnalog         = function(p) return st.analog[p] end,
+        getAnalogOutput   = function(p) requirePort(p); return st.analog[p] end,
+        getOutput         = function(p) requirePort(p); return st.analog[p] > 0 end,
+        setAnalog = function(p, v) st.calls[#st.calls + 1] = "setAnalog:" .. p .. ":" .. v; st.analog[p] = v end,
+        setOutput = function(p, on)
+            st.calls[#st.calls + 1] = "setOutput:" .. p .. ":" .. tostring(on)
+            st.analog[p] = on and 15 or 0
+        end,
+    }
+
+    -- ---- platform: 探测与引脚快照
+    _G.cee = ceeStub
+    eq(platform.detect(), "cee", "platform: cee 全局存在 -> kind=cee")
+    local pins = platform.pins()
+    eq(#pins, 3, "platform: pins() 按 getSignalCount 列出全部引脚")
+    eq(pins[1].ports, 0, "platform: 空引脚的端口数")
+    eq(pins[2].ports, 1, "platform: 引脚 2 的端口数")
+    eq(pins[2].data, true, "platform: 引脚 2 上有 Peripheral Cable")
+    eq(pins[2].type, "drive", "platform: 引脚 2 的外设类型")
+    eq(pins[1].has, false, "platform: 空引脚 hasPeripheral=false")
+    local pinDrives = platform.pinDrives()
+    eq(#pinDrives, 1, "platform: 只有 drive 类型进 pinDrives")
+    eq(pinDrives[1].name, "pin2", "platform: 引脚驱动器用 pinN 命名")
+    ok(pinDrives[1].handle == driveHandle, "platform: pinDrives 给的是引脚上的句柄")
+
+    -- ---- cee.ko: 注册 sysfs 类并核对属性契约
+    local opsByName = {}
+    local registered = {}
+    local kapi = {
+        log = function() end,
+        registerSysfsClass   = function(n, ops) registered[#registered + 1] = n; opsByName[n] = ops; sysfs.registerClass(n, ops) end,
+        unregisterSysfsClass = function(n) sysfs.unregisterClass(n) end,
+    }
+    local src = assert(readFile(REPO .. "/src/modules/cee.ko"), "读不到 src/modules/cee.ko")
+    local env = setmetatable({ require = require }, { __index = _G })
+    local chunk
+    if _VERSION == "Lua 5.1" then
+        chunk = assert(loadstring(src, "cee"))
+        setfenv(chunk, env)
+    else
+        chunk = assert(load(src, "cee", "t", env))
+    end
+    local mod = chunk()
+    mod.init(kapi)
+    eq(table.concat(registered, ","), "power,pin", "cee.ko: 注册 power 与 pin 两个 sysfs 类")
+
+    local function openAttr(path, mode)
+        local b, r = vfs.resolve(path)
+        ok(b ~= nil, "cee.ko: 路径存在 " .. path)
+        if not b then return nil end
+        local fh, err = b.open(r, mode or "r")
+        ok(fh ~= nil, "cee.ko: 打开 " .. path, err)
+        return fh
+    end
+
+    -- power: 读全部落到 cee 的电力 API(字符串化跟着 tostring, 不另造格式)
+    eq(openAttr("/sys/class/power/supply/present").readAll(), "1", "cee.ko: hasPower -> present=1")
+    eq(openAttr("/sys/class/power/supply/max_power").readAll(), "500", "cee.ko: getMaxPower -> max_power")
+    eq(openAttr("/sys/class/power/supply/headroom").readAll(), "500", "cee.ko: getPowerHeadroom -> headroom")
+    eq(openAttr("/sys/class/power/supply/state").readAll(), "ok", "cee.ko: getSupplyState -> state")
+    eq(openAttr("/sys/class/power/supply/reset").readAll(), nil, "cee.ko: reset 是只写属性(读不到内容)")
+    local vh = openAttr("/sys/class/power/supply/voltage")
+    eq(vh.readAll(), tostring(299.98502276145973), "cee.ko: voltage 原样(字符串化跟着 tostring)")
+    eq(vh.readAll(), nil, "cee.ko: 属性读一次即 EOF")
+    eq(openAttr("/sys/class/power/supply/reset", "w"):write("1"), 1, "cee.ko: 写 reset=1")
+    eq(st.resets, 1, "cee.ko: reset 落到 resetSupply")
+    local rset, rerr = opsByName.power.set("supply", "reset", "0")
+    ok(rset == nil and tostring(rerr):find("invalid reset") ~= nil, "cee.ko: reset 只收 1")
+    eq(opsByName.power.writable("supply", "voltage"), false, "cee.ko: voltage 只读")
+    eq(opsByName.power.writable("supply", "reset"), true, "cee.ko: reset 可写")
+
+    -- pin: 条目名与属性清单(端口属性只在有端口时存在)
+    eq(table.concat(opsByName.pin.list(), ","), "pin1,pin2,pin3", "cee.ko: 引脚条目 pin1..pinN")
+    eq(table.concat(opsByName.pin.attrs("pin1"), ","), "data,ports,powered,peripheral,peripheral_type",
+       "cee.ko: 无端口引脚只有五个只读属性")
+    eq(table.concat(opsByName.pin.attrs("pin2"), ","),
+       "data,ports,powered,peripheral,peripheral_type,analog_in,analog_out,digital_out",
+       "cee.ko: 有端口引脚多三个端口属性")
+    eq(opsByName.pin.attrs("pin4"), nil, "cee.ko: 越界引脚没有条目")
+    eq(opsByName.pin.attrs("pinX"), nil, "cee.ko: 非引脚条目名不认")
+    local ab, ar = vfs.resolve("/sys/class/pin/pin1/analog_in")
+    ok(ab ~= nil and not ab.exists(ar), "cee.ko: 无端口引脚没有 analog_in 属性")
+    eq(openAttr("/sys/class/pin/pin2/peripheral").readAll(), "1", "cee.ko: hasPeripheral -> peripheral=1")
+    eq(openAttr("/sys/class/pin/pin2/peripheral_type").readAll(), "drive", "cee.ko: 引脚外设类型")
+    eq(openAttr("/sys/class/pin/pin1/peripheral_type").readAll(), nil, "cee.ko: 空引脚的外设类型读不到内容")
+    eq(openAttr("/sys/class/pin/pin3/data").readAll(), "0", "cee.ko: isDataPin -> data")
+
+    -- pin: 端口写入落到 setAnalog/setOutput, 越界 fail-fast 且不改状态
+    eq(openAttr("/sys/class/pin/pin2/analog_out", "w"):write("7"), 1, "cee.ko: 写 analog_out=7")
+    eq(st.analog[2], 7, "cee.ko: analog_out 落到 setAnalog(2,7)")
+    eq(openAttr("/sys/class/pin/pin2/analog_out").readAll(), "7", "cee.ko: analog_out 读回 getAnalogOutput")
+    local okW, errW = opsByName.pin.set("pin2", "analog_out", "16")
+    ok(okW == nil and tostring(errW):find("0..15") ~= nil, "cee.ko: analog_out 越界 fail-fast")
+    eq(st.analog[2], 7, "cee.ko: 越界写不改动端口状态")
+    ok(opsByName.pin.set("pin2", "analog_out", "0x3") == nil, "cee.ko: analog_out 不收十六进制")
+    eq(opsByName.pin.set("pin2", "digital_out", "1"), true, "cee.ko: 写 digital_out=1")
+    eq(st.analog[2], 15, "cee.ko: digital_out=1 等价 analog 15")
+    eq(opsByName.pin.get("pin2", "digital_out"), "1", "cee.ko: digital_out 读回 getOutput")
+    local okP, errP = opsByName.pin.set("pin1", "analog_out", "7")
+    ok(okP == nil and tostring(errP):find("no signal port") ~= nil, "cee.ko: 无端口引脚写 analog_out 报错")
+    eq(opsByName.pin.writable("pin1", "analog_out"), false, "cee.ko: 无端口引脚不可写")
+
+    -- CC 电脑: cee 全局不存在 -> kind=cc, 引脚为空, 模块什么都不注册
+    _G.cee = nil
+    eq(platform.detect(), "cc", "platform: 没有 cee 全局 -> kind=cc")
+    eq(#platform.pins(), 0, "platform: CC 电脑没有引脚")
+    eq(#platform.pinDrives(), 0, "platform: CC 电脑没有引脚驱动器")
+    local registered2 = {}
+    chunk().init({
+        log = function() end,
+        registerSysfsClass = function(n) registered2[#registered2 + 1] = n end,
+        unregisterSysfsClass = function() end,
+    })
+    eq(#registered2, 0, "cee.ko: CC 电脑上不注册任何 sysfs 类")
+
+    -- exit 注销两个类(热重载路径)
+    mod.exit()
+    local cb, cr = vfs.resolve("/sys/class")
+    local classNames = {}
+    for _, n in ipairs(cb.list(cr)) do classNames[n] = true end
+    ok(not classNames.power and not classNames.pin, "cee.ko: exit 注销 power/pin 两个类")
+
+    -- ---- devdisk: 引脚驱动器(去掉与侧面重复的, 去掉 fs 看不见的)
+    local function loadDevdisk(platStub)
+        local caps = { ["/"] = 1000000, ["disk"] = 128000, ["disk7"] = 100000000 }
+        local sideDrives = { left = { diskId = 0, mountPath = "disk", label = "BOOT" } }
+        local pinTable = {
+            { pin = 8, name = "pin8", handle = { isDiskPresent = function() return true end,
+                                                 getMountPath = function() return "disk" end,
+                                                 getDiskID = function() return 99 end,
+                                                 getDiskLabel = function() return "SAME-AS-SIDE" end } },
+            { pin = 9, name = "pin9", handle = { isDiskPresent = function() return true end,
+                                                 getMountPath = function() return "disk7" end,
+                                                 getDiskID = function() return 41 end,
+                                                 getDiskLabel = function() return "PIN-DISK" end } },
+            { pin = 7, name = "pin7", handle = { isDiskPresent = function() return true end,
+                                                 getMountPath = function() return "unseen" end,
+                                                 getDiskID = function() return 42 end,
+                                                 getDiskLabel = function() return nil end } },
+        }
+        local env = {
+            require = function(name)
+                if name == "kernel.platform" then return { pinDrives = function() return pinTable end } end
+                return require(name)
+            end,
+            fs = {
+                open = function() return nil end,
+                exists = function() return false end,
+                getSize = function() return nil end,
+                getCapacity = function(p) return caps[p] end,
+            },
+            disk = {
+                hasData = function(s) return sideDrives[s] ~= nil end,
+                getMountPath = function(s) return sideDrives[s] and sideDrives[s].mountPath end,
+                getID = function(s) return sideDrives[s] and sideDrives[s].diskId end,
+                getLabel = function(s) return sideDrives[s] and sideDrives[s].label end,
+            },
+            peripheral = { getNames = function() return { "left" } end },
+            os = { getComputerID = function() return 6 end, getComputerLabel = function() return nil end },
+            string = string, table = table, math = math, tostring = tostring, type = type,
+            ipairs = ipairs, pairs = pairs, error = error, pcall = pcall, select = select,
+        }
+        local s = assert(readFile(REPO .. "/src/kernel/devdisk.lua"), "读不到 src/kernel/devdisk.lua")
+        local c = assert(loadstring(s, "devdisk"))
+        setfenv(c, env)
+        local dd = c()
+        local byName = {}
+        for _, e in ipairs(dd.scan()) do byName[e.name] = e end
+        return byName
+    end
+
+    local dd = loadDevdisk()
+    eq(dd.sda.mountPath, "", "devdisk: 自带存储仍是 sda")
+    eq(dd.sdb.mountPath, "disk", "devdisk: 侧面驱动器是 sdb")
+    ok(dd.sdc ~= nil, "devdisk: 引脚上的驱动器补成 sdc")
+    eq(dd.sdc and dd.sdc.mountPath, "disk7", "devdisk: 引脚驱动器用它的 CC 挂载路径")
+    eq(dd.sdc and dd.sdc.uuid, "d41", "devdisk: 引脚驱动器 UUID = d<磁盘ID>")
+    eq(dd.sdc and dd.sdc.side, "pin9", "devdisk: 引脚驱动器的 side 记为 pinN")
+    eq(dd.sdd, nil, "devdisk: 与侧面同一个存储(同挂载路径)不重复造节点")
+    eq(dd.sde, nil, "devdisk: fs 看不见的挂载路径不造节点")
+end
+
 io.write(string.format("\n%d passed, %d failed\n", pass, fail))
 os.exit(fail == 0 and 0 or 1)

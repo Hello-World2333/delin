@@ -18,7 +18,7 @@
 | `/dev/` | 设备文件：`/dev/ttyN`（字符终端）、`/dev/fbN`（像素帧缓冲）、`/dev/sdX`（磁盘，见下）、`/dev/lpN`（打印机字符设备，只写，见下）、`/dev/null`（读 EOF/写丢弃）、`/dev/zero`（读 = 无限 NUL）、`/dev/random`、`/dev/urandom`（随机字节，见下）、`/dev/console`（系统控制台 = 控制台 tty）、`/dev/kmsg`（内核 ring buffer 只读流）、`/dev/log`（用户态 syslog 输入） |
 | `/etc/` | 系统配置：`passwd` `shadow`（0600 root:root）`group`、`fstab`、`syslog.conf`、`logrotate.conf`、`systemd/system/`（管理员单元与 enable 标记） |
 | `/proc/` | 虚拟进程/系统信息 fs（procfs，内核提供，见下）：`/proc/<pid>/{cmdline,comm,cwd,stat,status}`、`/proc/self`、`/proc/{mounts,uptime,version}`、`/proc/sys/kernel/random/{entropy_avail,poolsize,uuid}` |
-| `/sys/` | sysfs 挂载点（虚拟）：`/sys/class/<class>/<条目>/<属性>`，class 由内核/模块注册 —— `display`（每显示设备一项，`name/type/size` 只读，分辨率/位置/旋转/缩放 可读写）、`printer`（每打印设备一项，见下）与 `redstone`（每个红石面一项，见下）；属性文件是单行值，读一次即 EOF |
+| `/sys/` | sysfs 挂载点（虚拟）：`/sys/class/<class>/<条目>/<属性>`，class 由内核/模块注册 —— `display`（每显示设备一项，`name/type/size` 只读，分辨率/位置/旋转/缩放 可读写）、`printer`（每打印设备一项，见下）与 `redstone`（每个红石面一项，见下）、`power`（CEE:CC 的电力，见「CEE:CC 平台」）、`pin`（CEE:CC 的信号引脚与端口，见同节）；属性文件是单行值，读一次即 EOF |
 | `/lib/modules/<version>/` | 内核模块目录：`.ko` 模块 + 纯文本 `manifest` + `modules.alias` |
 | `/lib/systemd/system/` | 厂商单元文件（`.service` `.target` `.timer` `.mount`） |
 | `/run/` | 运行时状态（真实目录，非 tmpfs —— Delin 无 tmpfs）：pid 文件等 |
@@ -215,6 +215,75 @@ CC 的红石 API 是函数式的（`redstone.getInput(side)` / `redstone.setAnal
   并置退出码 1（见下文 `echo`），不会被静默吞掉。
 - **事件**：不提供阻塞读（没有 `/dev/kmsg` 那种语义），要等红石变化就轮询；
   事件驱动的程序直接用 CC 的 `redstone` API（`os.pullEvent("redstone")`）。
+
+### CEE:CC 平台（CEECC 台式机，`cee.ko`）
+
+CEE:CC（下称 CEECC）是服务器上的一个模组：它的电脑把整套 API 挂在**全局 `cee` 表**上（不是外设），
+在 CC 的三个平面（侧面外设 / `redstone` / 文件系统）之外多出**信号引脚**与**电力**两块。
+判据只有一条：`_G.cee` 存在且带 `getSignalCount` —— 见 `kernel/platform.lua`（`kind = "cc" | "cee"`）。
+
+CEECC 有两种机器：**机架式**（模块插在机架里，自带存储 4096 字节）与**台式**（自带存储与普通电脑同级）。
+机架式装不下 Delin（内核 208KB + 模块），**不在支持范围**：`platform.lua` 不为它做任何分支，
+BIOS/安装器也不拦 —— 容量不够时自然 fail-fast（`Out of space`）。
+
+真机实测（台式 CEECC，电脑 #6，`tools/ceecc_realmachine.py` 时读回）：
+
+| 项 | 实测 | 结论 |
+|---|---|---|
+| 平台 | `_G.cee`（71 个函数）；`peripheral`/`redstone`/`disk`/`rednet`/`http`/`gps` 全在 | 台式 CEECC ≈ 普通 CC 电脑 + 引脚 + 电力，**侧面平面照常工作** |
+| 自带存储 | `fs.getCapacity("/")` = **10,000,000**（普通电脑 1,000,000，机架式 4096） | CC-fs 根引导直接可用；`sda` 9.5M |
+| 侧面外设 | `back`=有线 modem（枢纽，下挂 27 个远端磁盘 `drive_0..26`）、`right`=drive、`left`=无线 modem | 现有 `peripheral.getNames()` / devdisk / 驱动**零改动**可用 |
+| 引脚 | **9 个**（机架式 3 个）；1 起编号；`pin8` 有端口：`isDataPin=true`、`getPortCount=1`、`isPortPowered=true`、类型 `modem` | 引脚数随机型，`getSignalCount()` 才是真源 |
+| 引脚外设 = 侧面外设 | 在 `wrap("back")` 上 `open(43)` 后 `cee.getPeripheral(8).isOpen(43)` 为真（反向亦然） | 同一个物理外设两种视图：**设备枚举仍走侧面平面**，引脚只做状态与端口 |
+| 无端口引脚 | `getAnalog`=0、`getInput`=false **不报错**；`getAnalogOutput`/`getOutput` 报 `no signal port on pin N` | 「有没有端口」只能看 `getPortCount>0`；没端口就不该有那三个属性文件 |
+| 数据引脚 | `setSignalVoltage(8,30)` 被拒（`cut the cable`），但 `setAnalog(8,7)` 可用 | 端口的红石 I/O 面与引脚的模拟信号线是两回事 |
+| 电力 | `hasPower`=1、电压≈300V、`getMaxPower`=**500W**、`headroom`=500、`state="ok"` | 台式自持馈电；`busInfo()`=nil、`isBusPowered()`=false |
+| 机架专用 API | `listHubs()`/`fabricPeers()` **直接报错**（`not a server module`），不是返回空表 | 机架总线 / Data Hub / fabric 一律不调 |
+| 性能 | 自检里 sysfs 段（约 130 次读写 + 每行 flush）在这台机器上要 **~60s** | 真机自检必须给够超时（见下） |
+
+`cee.ko`（manifest 常驻；非 CEECC 上 init 直接 no-op，不注册任何类）摊出两个 sysfs 类：
+
+| 路径 | 读 | 写 |
+|---|---|---|
+| `/sys/class/power/supply/present` | `0`/`1`（`hasPower`） | — |
+| `/sys/class/power/supply/voltage` `current` `power` `max_power` `headroom` `state` | `getPowerVoltage` / `getSupplyCurrent` / `getDeliveredPower` / `getMaxPower` / `getPowerHeadroom` / `getSupplyState` | — |
+| `/sys/class/power/supply/reset` | 只写属性（读不到内容） | `1` → `resetSupply`（清除跳闸） |
+| `/sys/class/pin/pinN/data` `ports` `powered` `peripheral` `peripheral_type` | `isDataPin` / `getPortCount` / `isPortPowered` / `hasPeripheral` / `getPeripheralType`（无外设时为空） | — |
+| `/sys/class/pin/pinN/analog_in` | `getAnalog`（端口 I/O 面的红石输入） | — |
+| `/sys/class/pin/pinN/analog_out` `digital_out` | `getAnalogOutput` / `getOutput` | `setAnalog`（0..15）/ `setOutput`（0\|1） |
+
+- **后三个属性只在有端口的引脚上存在**（`attrs(entry)` 按 `getPortCount>0` 决定）——真机上无端口引脚
+  调 `getAnalogOutput`/`getOutput` 会报 `no signal port on pin N`，属性文件因此也不该出现。
+- **写校验 fail-fast**：只收十进制整数且在范围内（`16`/`0x3`/`abc` 一律拒绝且不改状态），
+  `reset` 只收 `1`；越界引脚（`pin999`）与越界条目名都不存在。
+- **存储补漏**：`devdisk` 在侧面驱动器之外再捡一次**引脚上的 `drive`**（`platform.pinDrives()`），
+  按 CC 挂载路径去重（台式机上引脚外设通常也在侧面上，重复枚举会给同一块盘造两个设备节点），
+  并且 `fs.getCapacity(挂载路径)` 取不到就不造节点 —— 「能不能挂」就是设备节点的判据。
+- **`cee` 不进进程环境**：`kernel/procenv.lua` 的白名单里没有它，用户态一律走 sysfs / `/dev/sdX`。
+
+**电缆/枢纽设备是异步出现的**：`scheduler.setDiskHook` 原来只挂在 `disk`/`disk_eject` 上，
+而 modem 网络把远端外设挂进本机名字空间是**晚一拍**的（实测同一份装机两次冷启动，一次引导时看见
+28 个磁盘、另一次只看见本机那一个）。现在 `peripheral` / `peripheral_detach` 也接进同一个重扫钩子。
+
+#### 真机验证（电脑 #6）
+
+电脑 #3 留给普通 CC（`tools/realmachine.py`），CEECC 用**电脑 #6**：`tools/ceecc_realmachine.py`
+（先关机 → 打包 → 在自带存储上做一次干净的 CCFS 根安装 + 注入 `ceecc.service` → 开机 →
+引导门禁 → 读回 `/var/log/ceecc.log` → 逐项断言）。
+
+```bash
+python3 tools/ceecc_realmachine.py            # 装机 + 开机 + 验证(36 项)
+python3 tools/ceecc_realmachine.py --no-reboot
+```
+
+- **自检脚本是单进程 Lua**（`scripts/ceecc_verify.lua`，经 `/bin/lua` 跑），不是 `sh`：这个自检要读写
+  sysfs 上百次，`sh` 的每一次 `$(...)` 都是一次 spawn + 管道读，真机上跑不动（曾按 90 来个
+  子进程的量级被 60s 超时杀掉）。Lua 版**逐行 flush** 落盘，卡在哪一行看得见。
+- **`TimeoutStartSec=600` 不是装饰**：init 的默认 oneshot 超时是 60s，而这台机器上光 sysfs 那一段
+  就要 ~60s（`stage:` 行带 `t=...ms` 打点）——用默认值会把"跑得慢"报成"起不来"。
+- 装机时铺的是 **`dist/` 而不是 `dist/release/*/payload`**：后者只在 `--release` 时重建，
+  拿它装机第一次就把**上一轮的内核**装上去了（引导日志里没有 `platform=` 行才发现）。
+- 排障小抄：`ls` 对不存在的路径**退出码是 0**（只有错误消息），判断存在性要用 `cat`/`fs.open`。
 
 ### 用户管理（`passwd` / `useradd` / …）
 
@@ -745,6 +814,12 @@ sysfs 也从 display 专用泛化成 class 注册表（模块用 `kapi.registerS
 （`user.get` 也不回哈希，普通进程拿不到）。`scripts/user_test.sh`（125 项）在宿主 harness 与真机上
 各跑一次逐项比对，非 root 分支由 `scripts/user_helper.lua` 用内核 `spawn(uid)` 起普通用户进程验证。
 
+CEE:CC(CEECC)平台落地：`kernel/platform.lua` 认平台(`_G.cee`)、`modules/cee.ko` 摊出
+`/sys/class/power/supply`(电力)与 `/sys/class/pin/pinN`(引脚与端口)，引脚上的磁盘驱动器由 `devdisk`
+按 CC 挂载路径去重补进 `/dev/sdX`，电缆/枢纽设备的晚到由 `peripheral` 事件触发重扫。
+真机验证在**电脑 #6**（台式 CEECC，自带存储 10MB）：`tools/ceecc_realmachine.py` + `scripts/ceecc_verify.lua`，
+装机走 CCFS 根、36 项断言全绿；详见「CEE:CC 平台」一节。机架式（4096 字节存储）不在范围内。
+
 红石经 `redstone` 模块摊成 sysfs 属性文件 `/sys/class/redstone/<side>/{digital,analog,bundled}`
 （六个面恒定存在），`cat`/`echo` 即读写；读 = 该面输入、写 = 该面输出，
 写值严格校验（十进制整数 + 范围），非法写 fail-fast 且不改动输出状态。
@@ -1199,7 +1274,8 @@ src/kernel/klog.lua        内核日志: ring buffer + /dev/kmsg(带 cursor/seek
 src/kernel/fstab.lua       /etc/fstab 解析(fstab(5) 子集) + systemd 风格 mount 单元命名
 src/kernel/modules.lua     内核模块系统: .ko 解析(注释头)/依赖拓扑/装载/alias(use) + fstype 注册
 src/kernel/blockdev.lua    块设备层: 文件块设备(/parts/*.img, seek+read/write)
-src/kernel/devdisk.lua     存储设备抽象: 电脑自带存储/CC 磁盘 -> /dev/sdX 节点 + UUID(d<磁盘ID>/c<电脑ID>)
+src/kernel/platform.lua    平台层: CC / CEE:CC(CEECC) 探测 + 引脚快照 + 引脚上的磁盘驱动器(见"CEE:CC 平台")
+src/kernel/devdisk.lua     存储设备抽象: 电脑自带存储/CC 磁盘/引脚驱动器 -> /dev/sdX 节点 + UUID(d<磁盘ID>/c<电脑ID>)
                            + fstype 挂载/卸载 + mkfs/fsck 的入口(目标解析/拒绝挂载中的文件系统)
 src/kernel/ext2.lua        EXT2 读写: 超级块/inode(uid/gid/mode/硬链接/符号链接)/间接块/多块组
                            + mkfs(可调块大小/inode 数/保留块/卷标, 单块组) + fsck(五趟检查与修复)
@@ -1274,7 +1350,8 @@ src/modules/*.ko           内核模块: ccdisk(ccdisk fstype) ccmonitor(CC 显�
                            ext2(ext2 fstype) redstone(CC 红石 -> sysfs redstone 类) tom(Tom GPU 驱动)
                            void(Void 全息驱动)
 src/modules/modules.alias  驱动别名(modprobe 风格): tm_gpu->tom hologram->void monitor->ccmonitor printer->ccprinter
-src/modules/manifest       默认装载模块清单: ext2 ccdisk redstone
+src/modules/cee.ko         CEECC 平台驱动: /sys/class/power/supply(电力) + /sys/class/pin/pinN(引脚与端口)
+src/modules/manifest       默认装载模块清单: ext2 ccdisk redstone cee
 scripts/posix_test.sh      可移植 POSIX 自检(host 与 Delin 各跑一次比对, 128 项全过; 含 cat 字节保真)
 scripts/sh_expand_test.sh  sh 展开自检(通配符 * ? [ ]/命令替换 $( ) 与反引号/算术 $(( ));
                            host harness 与真机各跑一次比对, 期望值逐条对过 bash/dash;
@@ -1298,6 +1375,7 @@ scripts/lua_repl_test.sh   /bin/lua 交互式 REPL 自检(宿主专用: 测试�
 scripts/redstone_verify.lua  真机交叉核对: /sys/class/redstone/* 与 CC 原始 redstone API 逐项一致
                            (写 /var/log/redstone_verify.log; 由 realmachine_verify.sh 调用)
 scripts/realmachine_verify.sh  真机验证脚本(由 verify.service 以 oneshot 运行, 结果写 /var/log/verify.log)
+scripts/ceecc_verify.lua       CEECC 真机自检(单进程 Lua, 由 ceecc.service 运行, 结果写 /var/log/ceecc.log)
                            含 mkfs.ext2/fsck.ext2 段: 在电脑自带存储的 CC-fs 上现造 /parts/manifest +
                            /parts/scratch.img, 现场 mkfs -> 挂载写文件 -> fsck 判干净 -> 破坏块位图 ->
                            -n 报出(4) -> -y 修好(1) -> 再查干净(0); 镜像随后由宿主 e2fsck 复判
@@ -1355,6 +1433,7 @@ tools/ext2test.lua         宿主 ext2 回归: 真实镜像上跑目录增删(�
                            + fsck 的十种损坏/修复用例, 裁判一律是宿主 e2fsck -fn(235 项)
 tools/deploy.py            重建干净 ext2 根镜像(基镜像+内核/bin/单元/配置/标记), 属主按基镜像逐条写回;
                            基镜像损坏/rdump 漏文件/构建后 fsck 不过一律 fail-fast
+tools/ceecc_realmachine.py CEECC(电脑 #6)真机流程: 先关机->打包->CCFS 根安装+注入 ceecc.service->开机->逐项断言
 tools/realmachine.py       真机流程: 先关机->打包->部署->注入第二分区与 verify.service->fsck 门禁->
                            写磁盘 CC-fs 引导配置(/.boot + /dlub.cfg)->装盘并 md5 校验->开机->
                            引导门禁(verify.log 必须是本轮写的)->debugfs 取回日志->停机后再 fsck
