@@ -622,6 +622,16 @@ do
 
     local env3 = makeEnv()
     klog.registerSyscalls(env3.syscalls)
+    -- grep/find/... 走内核的正则引擎(用户态没有 require, 所以工具经 syscall 用它)
+    do
+        -- 直接注册 regex.compile(与内核 klog/regex 的注册方式同构)。
+        -- **不要**在这里 require("kernel.modules") 或 regex.registerSyscalls(): 那会把 kernel.sysfs
+        -- 一路带进来, 而 H 节要先塞 kernel.display 桩再 require sysfs —— 提前载入会让桩失效。
+        local regex = require("kernel.regex")
+        env3.syscalls["regex.compile"] = function(pat, flavor, opts)
+            return regex.compile(pat, flavor, opts)
+        end
+    end
     env3.syscalls["klog.stats"] = kmsgStats -- 宿主内存设备取代真实 ring buffer 的统计
     env3.handlers = {}
     env3.syscalls["signal.install"] = function(sig, fn) env3.handlers[sig] = fn; return true end
@@ -676,6 +686,84 @@ kern.*                     /var/log/kern.log
     local dm = runTool(env3, REPO .. "/src/bin/dmesg", {})
     ok(dm.out:find("second line", 1, true) ~= nil, "dmesg: 打印 /dev/kmsg", dm.out)
     ok(dm.out:find("0.002000", 1, true) ~= nil, "dmesg: 时间戳格式化", dm.out)
+
+    -- F4b. dmesg 的新选项(与 util-linux dmesg(1) 对齐): 时间格式 / 级别过滤 / 跟读 / 清空
+    do
+        local dT = runTool(env3, REPO .. "/src/bin/dmesg", { "-T" })
+        ok(dT.out:match("%[%a%a%a %a%a%a ") ~= nil, "dmesg -T: 人类可读时间戳", dT.out)
+        local dt = runTool(env3, REPO .. "/src/bin/dmesg", { "-t" })
+        -- 缺省格式的时间戳是 %5d.%06d(如 "0.002000"); -t 之后它必须消失
+        -- (消息正文自己也可能带方括号, 所以判据用 %06d 这个形式, 不用行首的 "[")
+        ok(dt.out:find("0.002000", 1, true) == nil and dt.out:find("second line", 1, true) ~= nil,
+            "dmesg -t: 不打印时间戳", dt.out)
+        local dx = runTool(env3, REPO .. "/src/bin/dmesg", { "-x" })
+        ok(dx.out:find("kern  :info  : ", 1, true) ~= nil, "dmesg -x: GNU 的 decode 前缀", dx.out)
+        local dl = runTool(env3, REPO .. "/src/bin/dmesg", { "-l", "err" })
+        eq(dl.out, "", "dmesg -l err: 过滤掉 info 级别")
+        local dk = runTool(env3, REPO .. "/src/bin/dmesg", { "-k" })
+        ok(dk.out:find("second line", 1, true) ~= nil, "dmesg -k: 内核消息保留")
+        local du = runTool(env3, REPO .. "/src/bin/dmesg", { "-u" })
+        eq(du.out, "", "dmesg -u: 只要用户态消息")
+        -- -w: 先冲掉现有缓冲再等新消息; 宿主测试台的 pump 上限就是"^C"
+        local dw = runTool(env3, REPO .. "/src/bin/dmesg", { "-w" }, { pumps = 3 })
+        ok(dw.out:find("second line", 1, true) ~= nil, "dmesg -w: 先打印现有缓冲", dw.out)
+        local dW = runTool(env3, REPO .. "/src/bin/dmesg", { "-W" }, { pumps = 3 })
+        eq(dW.out, "", "dmesg -W: 只跟新消息(现有缓冲不打印)")
+        eq(runTool(env3, REPO .. "/src/bin/dmesg", { "-C" }).rc, 0, "dmesg -C: 清空返回 0")
+        eq(runTool(env3, REPO .. "/src/bin/dmesg", { "-s", "64" }).rc, 2,
+            "dmesg: 未实现的选项 fail-fast 退出 2")
+        eq(runTool(env3, REPO .. "/src/bin/dmesg", { "--zz-bogus" }).rc, 1,
+            "dmesg: 未知选项退出 1(与 GNU 一致)")
+    end
+
+    -- F4c. head/tail 的 GNU 语义: -n +N / -n -N / 组合短选项 / -- 形式
+    do
+        writeFile(ROOT .. "/tmp/five", "a\nb\nc\nd\ne\n")
+        local function out1(tool, argv)
+            return runTool(env3, REPO .. "/src/bin/" .. tool, argv, { pumps = 10 }).out
+        end
+        eq(out1("tail", { "-n", "+2", "/tmp/five" }), "b\nc\nd\ne\n", "tail -n +2: 从第 2 行起")
+        eq(out1("tail", { "-n", "-2", "/tmp/five" }), "d\ne\n", "tail -n -2: 末 2 行")
+        eq(out1("tail", { "-c", "+3", "/tmp/five" }), "b\nc\nd\ne\n", "tail -c +3: 从第 3 字节起")
+        eq(out1("head", { "-n", "-2", "/tmp/five" }), "a\nb\nc\n", "head -n -2: 除末 2 行")
+        eq(out1("head", { "-c", "-3", "/tmp/five" }), "a\nb\nc\nd", "head -c -3: 除末 3 字节")
+        eq(out1("head", { "-n", "0", "/tmp/five" }), "", "head -n 0: 不输出")
+        eq(out1("head", { "--lines", "-2", "/tmp/five" }), "a\nb\nc\n", "head --lines -2: 空格形式")
+        eq(out1("head", { "-n5", "/tmp/five" }), "a\nb\nc\nd\ne\n", "head -n5: 粘连形式")
+    end
+
+    -- F4d. grep 的上下文/计数/上限(上下文分隔与 GNU 一致)
+    do
+        local function g(argv)
+            return runTool(env3, REPO .. "/src/bin/grep", argv, { pumps = 10 }).out
+        end
+        writeFile(ROOT .. "/tmp/ctx", "a\nb\nc\nb\na\n")
+        eq(g({ "-c", "b", "/tmp/ctx" }), "2\n", "grep -c: 只输出计数")
+        eq(g({ "-A1", "b", "/tmp/ctx" }), "b\nc\nb\na\n", "grep -A1: 后一行上下文")
+        eq(g({ "-B1", "b", "/tmp/ctx" }), "a\nb\nc\nb\n", "grep -B1: 前一行上下文")
+        eq(g({ "-C1", "c", "/tmp/ctx" }), "b\nc\nb\n", "grep -C1: 前后一行")
+        eq(g({ "-m1", "b", "/tmp/ctx" }), "b\n", "grep -m1: 每文件最多 1 条")
+        eq(g({ "-3", "b", "/tmp/ctx" }), "a\nb\nc\nb\na\n", "grep -3: 粘连形式 = -C3")
+    end
+
+    -- F4e. 未知/未实现选项的退出码(批次 0 的门禁: 不许静默返回 0)
+    do
+        local cases = {
+            { "ls", 2 }, { "cp", 1 }, { "mv", 1 }, { "wc", 1 }, { "chmod", 1 },
+            { "mkdir", 1 }, { "touch", 1 }, { "sort", 2 }, { "grep", 2 }, { "mount", 1 },
+            { "head", 1 }, { "tail", 1 }, { "umount", 1 }, { "cat", 1 },
+        }
+        for _, c in ipairs(cases) do
+            local r = runTool(env3, REPO .. "/src/bin/" .. c[1], { "--zz-bogus" }, { pumps = 6 })
+            eq(r.rc, c[2], c[1] .. ": 未知选项退出码(GNU = " .. c[2] .. ")")
+        end
+        -- umount -l/-f: 声称成功却什么都不做是最危险的 no-op, 现在 fail-fast
+        eq(runTool(env3, REPO .. "/src/bin/umount", { "-l", "/mnt/x" }, { pumps = 6 }).rc, 2,
+            "umount -l: 未实现 -> 退出 2")
+        -- mount -f: GNU 是 dry-run, 不能真的挂
+        local mf = runTool(env3, REPO .. "/src/bin/mount", { "-f", "/dev/sda1", "/mnt" }, { pumps = 6 })
+        eq(mf.out, "", "mount -f: dry-run 不打印也不真挂")
+    end
 
     -- F5. logrotate: 超过 size 才轮转, 保留 rotate 份, 轮转后 SIGHUP syslogd
     writeFile(ROOT .. "/etc/logrotate.conf", [[

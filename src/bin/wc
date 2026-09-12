@@ -55,8 +55,11 @@ for _, a in ipairs(args) do
     elseif a == "--bytes" then doC = true
     elseif a == "--chars" then doM = true
     elseif a == "--max-line-length" then doLmax = true
+    elseif a:sub(1, 2) == "--" then
+        stderr("wc: unrecognized option '" .. a .. "'\n")
+        return 1
     elseif a:sub(1, 1) == "-" and a ~= "-" then
-        for k = 2, #a do if not setShort(a:sub(k, k)) then return end end
+        for k = 2, #a do if not setShort(a:sub(k, k)) then return 1 end end
     else
         files[#files + 1] = a
     end

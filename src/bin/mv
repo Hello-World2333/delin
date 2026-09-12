@@ -45,8 +45,11 @@ for _, a in ipairs(args) do
     elseif a == "--force" then force = true
     elseif a == "--no-clobber" then noClobber = true
     elseif a == "--verbose" then verbose = true
+    elseif a:sub(1, 2) == "--" then
+        stderr("mv: unrecognized option '" .. a .. "'\n")
+        return 1
     elseif a:sub(1, 1) == "-" and a ~= "-" then
-        for k = 2, #a do if not setShort(a:sub(k, k)) then return end end
+        for k = 2, #a do if not setShort(a:sub(k, k)) then return 1 end end
     else
         srcs[#srcs + 1] = a
     end

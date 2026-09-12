@@ -4,20 +4,25 @@
 --   -E / --extended-regexp = **ERE**(扩展正则): . [ ] ^ $ * + ? {m,n} ( ) | ;
 --   -G / --basic-regexp    = 显式 BRE; -F / --fixed-strings = 模式按**字面**串;
 --   后出现的那个赢(GNU 语义)。引擎见 kernel/regex.lua(唯一真源)。
--- 选项:
---   -n, --line-number     显示行号
---   -i, --ignore-case     忽略大小写
---   -v, --invert-match    反转(打印不匹配行)
+-- 选择/输出:
 --   -e PAT, --regexp=PAT  指定匹配模式(可多次, OR); 此时无位置 PATTERN, 全部为 FILE
---   -w, --word-regexp     整词匹配
---   -x, --line-regexp     整行匹配
+--   -f FILE, --file=FILE  从文件读模式(每行一个; "-" = stdin)
+--   -i/-w/-x/-v           忽略大小写 / 整词 / 整行 / 反转
+--   -n, --line-number     显示行号
+--   -b, --byte-offset     显示行首字节偏移
 --   -c, --count           只打印每个文件匹配行数
---   -l, --files-with-matches 只打印含匹配行的文件名
---   -r/-R, --recursive    递归搜索目录
---   -q, --quiet           静默(有匹配即返回)
+--   -l, --files-with-matches / -L, --files-without-match
 --   -o, --only-matching   只打印匹配部分
+--   -m N, --max-count=N   每个文件最多 N 条匹配后停止
+--   -A N / -B N / -C N / -NUM   后/前/前后 N 行上下文(--group-separator / --no-group-separator)
 --   -H/-h, [--]with/--no-filename 文件名前缀开关
---   -s, --no-messages     抑制错误信息
+--   -r/-R, --recursive    递归搜索目录(-r 只跟随命令行上给的符号链接, -R 全部跟随; GNU 同此)
+--   --include=GLOB / --exclude=GLOB / --exclude-dir=GLOB / --exclude-from=FILE
+--   -I                    跳过含 NUL 的二进制文件; -a/--text 一律按文本处理
+--   -z, --zero-terminated 记录以 NUL 分隔而不是换行
+--   --color[=WHEN]        高亮(WHEN = always|never|auto, 缺省 auto; 认 GREP_COLORS)
+--   -q, --quiet           静默(有匹配即返回); -s, --no-messages 抑制错误信息
+--   --label=LABEL         stdin 在输出里显示成 LABEL
 -- 退出码(POSIX/GNU): 0 = 选中了行, 1 = 没有选中行, 2 = 出错(选项/模式/文件读不了)。
 -- 无 FILE 或 FILE 为 "-" 时读 stdin。
 -- 让出调度器: 防止长输出/长计算饿死事件循环(CC 的 ~7s no-yield 限制)。
@@ -58,15 +63,96 @@ local function ioeMsg(err)
     if err and err:find("directory") then return "Is a directory" end
     return "No such file or directory"
 end
+local function baseName(p) return (p:match("([^/]*)$")) or p end
 
+--- 通配符匹配(--include/--exclude; 与 shell 的路径名匹配同源: * ? [set] 与 \ 转义)。
+local function globMatch(pat, name)
+    local pi, ni = 1, 1
+    local starPi, starNi = nil, nil
+    while ni <= #name do
+        local pc = pat:sub(pi, pi)
+        if pc == "\\" then
+            if pat:sub(pi + 1, pi + 1) == name:sub(ni, ni) then pi, ni = pi + 2, ni + 1
+            else break end
+        elseif pc == "*" then
+            starPi, starNi = pi, ni
+            pi = pi + 1
+        elseif pc == "?" then
+            pi, ni = pi + 1, ni + 1
+        elseif pc == "[" then
+            local set = pat:match("^%[(!?)(%^?)(.-)%]", pi)
+            local negate, body
+            if not set then
+                -- 未闭合的 '[' 按字面字符
+                if name:sub(ni, ni) == "[" then pi, ni = pi + 1, ni + 1 else break end
+            else
+                local close = pat:find("]", pi + 1, true)
+                negate = (pat:sub(pi + 1, pi + 1) == "!")
+                body = pat:sub(pi + 1 + (negate and 1 or 0), close - 1)
+                local c = name:sub(ni, ni)
+                local hit = false
+                local bi = 1
+                while bi <= #body do
+                    if body:sub(bi + 1, bi + 1) == "-" and bi + 2 <= #body then
+                        if c >= body:sub(bi, bi) and c <= body:sub(bi + 2, bi + 2) then hit = true end
+                        bi = bi + 3
+                    else
+                        if c == body:sub(bi, bi) then hit = true end
+                        bi = bi + 1
+                    end
+                end
+                if hit ~= negate then pi, ni = close + 1, ni + 1 else break end
+            end
+        elseif pc == "" then
+            break
+        else
+            if pc == name:sub(ni, ni) then pi, ni = pi + 1, ni + 1 else break end
+        end
+        if ni > #name and pi > #pat then return true end
+        if ni > #name then
+            -- 剩下的模式必须全是 '*'
+            local rest = pat:sub(pi):gsub("%*", "")
+            if rest == "" then return true end
+        end
+        if starPi and ni <= #name then
+            -- 回溯
+            if pi > #pat or pat:sub(pi, pi) ~= "*" then
+                starNi = starNi + 1
+                ni = starNi
+                pi = starPi + 1
+            end
+        end
+    end
+    return pi > #pat
+end
+
+-- ---------------------------------------------------------------
+-- 选项
+-- ---------------------------------------------------------------
 local withNum, ci, invert, wordBoundary, wholeLine = false, false, false, false, false
-local doCount, doFiles, recursive, quiet, onlyMatch, withFilename, noFilename, noMessages = false, false, false, false, false, false, false, false
+local doCount, doFiles, doFilesWithout, recursive, followAll, quiet = false, false, false, false, false, false
+local onlyMatch, withFilename, noFilename, noMessages = false, false, false, false
+local maxCount, zeroTerm, byteOffset, ignoreBinary, forceText = nil, false, false, false, false
+local beforeCtx, afterCtx = 0, 0
+local groupSep = "--"
+local colorWhen, label = "never", nil
+local includes, excludes, excludeDirs = {}, {}, {}
 local flavor = "bre"         -- POSIX 默认方言 = BRE(GNU grep 同样)
 local fixed = false          -- -F: 模式按字面串
-local patternArgs = {}       -- 来自 -e / --regexp=
+local patternArgs = {}       -- 来自 -e / --regexp= 与 -f
+local patternFiles = {}      -- 来自 -f
 local rest = {}
 local noMoreOpts = false
 local optErr = nil
+local contextSet = false
+
+local function setColorWhen(v)
+    if v == "" or v == "auto" then colorWhen = "auto"
+    elseif v == "always" or v == "yes" or v == "force" then colorWhen = "always"
+    elseif v == "never" or v == "no" or v == "none" then colorWhen = "never"
+    else optErr = "invalid argument '" .. v .. "' for '--color'"; return false end
+    return true
+end
 
 local function setShort(ch)
     if ch == "n" then withNum = true
@@ -76,21 +162,33 @@ local function setShort(ch)
     elseif ch == "x" then wholeLine = true
     elseif ch == "c" then doCount = true
     elseif ch == "l" then doFiles = true
-    elseif ch == "r" or ch == "R" then recursive = true
+    elseif ch == "L" then doFilesWithout = true
+    elseif ch == "r" then recursive = true
+    elseif ch == "R" then recursive, followAll = true, true
     elseif ch == "q" then quiet = true
     elseif ch == "o" then onlyMatch = true
     elseif ch == "H" then withFilename = true
     elseif ch == "h" then noFilename = true
     elseif ch == "s" then noMessages = true
+    elseif ch == "I" then ignoreBinary = true
+    elseif ch == "a" then forceText = true
+    elseif ch == "b" then byteOffset = true
+    elseif ch == "z" then zeroTerm = true
     elseif ch == "E" then flavor, fixed = "ere", false
     elseif ch == "G" then flavor, fixed = "bre", false
     elseif ch == "F" then fixed = true
-    elseif ch == "e" then -- 需带参数, 由调用方消费
     else
         optErr = "invalid option -- '" .. ch .. "'"
         return false
     end
     return true
+end
+
+--- 取下一个 argv 作为本选项的参数(短选项粘连形式已由调用方切掉)。
+local function nextArg(at, opt)
+    local v = args[at + 1]
+    if not v then optErr = "option requires an argument -- '" .. opt .. "'" end
+    return v
 end
 
 local i = 1
@@ -107,38 +205,132 @@ while i <= #args do
     elseif a == "--line-regexp" then wholeLine = true
     elseif a == "--count" then doCount = true
     elseif a == "--files-with-matches" then doFiles = true
+    elseif a == "--files-without-match" then doFilesWithout = true
     elseif a == "--recursive" then recursive = true
+    elseif a == "--dereference-recursive" then recursive, followAll = true, true
     elseif a == "--quiet" or a == "--silent" then quiet = true
     elseif a == "--only-matching" then onlyMatch = true
     elseif a == "--with-filename" then withFilename = true
     elseif a == "--no-filename" then noFilename = true
     elseif a == "--no-messages" then noMessages = true
-    elseif a == "--extended-regexp" then flavor, fixed = "ere", false
-    elseif a == "--basic-regexp" then flavor, fixed = "bre", false
-    elseif a == "--fixed-strings" then fixed = true
+    elseif a == "--byte-offset" then byteOffset = true
+    elseif a == "--zero-terminated" then zeroTerm = true
+    elseif a == "--text" then forceText = true
+    elseif a == "--ignore-binary" then ignoreBinary = true
+    elseif a == "--no-group-separator" then groupSep = ""
+    elseif a:match("^%-%-group%-separator=") then groupSep = a:sub(19)
+    elseif a:match("^%-%-label=") then label = a:sub(9)
+    elseif a:match("^%-%-label$") then
+        local v = nextArg(i, "label"); if not v then break end
+        label = v; i = i + 1
+    elseif a == "--color" then
+        if not setColorWhen("auto") then break end
+    elseif a:match("^%-%-color=") then
+        if not setColorWhen(a:sub(9)) then break end
+    elseif a == "--colour" then
+        if not setColorWhen("auto") then break end
+    elseif a:match("^%-%-colour=") then
+        if not setColorWhen(a:sub(10)) then break end
+    elseif a:match("^%-%-max%-count=") then
+        maxCount = tonumber(a:sub(13))
+        if not maxCount then optErr = "invalid max count"; break end
+    elseif a == "--max-count" then
+        local v = nextArg(i, "max-count"); if not v then break end
+        maxCount = tonumber(v)
+        if not maxCount then optErr = "invalid max count"; break end
+        i = i + 1
+    elseif a:match("^%-%-after%-context=") then
+        afterCtx = tonumber(a:sub(17)) or 0; contextSet = true
+    elseif a == "--after-context" then
+        local v = nextArg(i, "after-context"); if not v then break end
+        afterCtx = tonumber(v) or 0; contextSet = true; i = i + 1
+    elseif a:match("^%-%-before%-context=") then
+        beforeCtx = tonumber(a:sub(18)) or 0; contextSet = true
+    elseif a == "--before-context" then
+        local v = nextArg(i, "before-context"); if not v then break end
+        beforeCtx = tonumber(v) or 0; contextSet = true; i = i + 1
+    elseif a:match("^%-%-context=") then
+        local v = tonumber(a:sub(11)) or 0
+        beforeCtx, afterCtx = v, v; contextSet = true
+    elseif a == "--context" then
+        local v = nextArg(i, "context"); if not v then break end
+        local nv = tonumber(v) or 0
+        beforeCtx, afterCtx = nv, nv; contextSet = true; i = i + 1
+    elseif a:match("^%-%-include=") then includes[#includes + 1] = a:sub(11)
+    elseif a:match("^%-%-exclude=") then excludes[#excludes + 1] = a:sub(11)
+    elseif a:match("^%-%-exclude%-dir=") then excludeDirs[#excludeDirs + 1] = a:sub(14)
+    elseif a == "--exclude-dir" then
+        local v = nextArg(i, "exclude-dir"); if not v then break end
+        excludeDirs[#excludeDirs + 1] = v; i = i + 1
+    elseif a == "--include" then
+        local v = nextArg(i, "include"); if not v then break end
+        includes[#includes + 1] = v; i = i + 1
+    elseif a == "--exclude" then
+        local v = nextArg(i, "exclude"); if not v then break end
+        excludes[#excludes + 1] = v; i = i + 1
     elseif a:match("^%-%-regexp=") then
         patternArgs[#patternArgs + 1] = a:sub(10)
+    elseif a == "--regexp" then
+        local v = nextArg(i, "regexp"); if not v then break end
+        patternArgs[#patternArgs + 1] = v; i = i + 1
+    elseif a:match("^%-%-file=") then
+        patternFiles[#patternFiles + 1] = a:sub(8)
+    elseif a == "--exclude-from" then
+        local v = nextArg(i, "exclude-from"); if not v then break end
+        local fh = fs.open(resolve(v), "r")
+        if not fh then optErr = v .. ": cannot read"; break end
+        for line in (fh:readAll() .. "\n"):gmatch("([^\n]*)\n") do
+            if line ~= "" then excludes[#excludes + 1] = line end
+        end
+        fh:close()
+        i = i + 1
+    elseif a:match("^%-%-directories=") or a == "--directories" or a == "--devices"
+        or a:match("^%-%-devices=") or a == "--binary-files" or a:match("^%-%-binary%-files=") then
+        stderr("grep: option '" .. a .. "' is not supported\n")
+        return 2
+    elseif a:match("^%-%-extended%-regexp") then flavor, fixed = "ere", false
+    elseif a:match("^%-%-basic%-regexp") then flavor, fixed = "bre", false
+    elseif a:match("^%-%-fixed%-strings") then fixed = true
     elseif a:sub(1, 2) == "--" and a:match("^%-%-[a-z][a-z-]+$") then
         optErr = "unrecognized option '" .. a .. "'"
         break
     elseif a:sub(1, 1) == "-" and a ~= "-" then
-        for k = 2, #a do
-            local ch = a:sub(k, k)
-            if ch == "e" then
-                local inline = a:sub(k + 1)
-                if inline ~= "" then
-                    patternArgs[#patternArgs + 1] = inline
-                else
-                    i = i + 1
-                    if not args[i] then
-                        optErr = "option requires an argument -- 'e'"
-                        break
+        -- 粘连的数字形式: -3 == -C 3 (GNU)
+        local digits = a:match("^%-(%d+)$")
+        if digits then
+            local nv = tonumber(digits)
+            beforeCtx, afterCtx = nv, nv; contextSet = true
+        else
+            local k = 2
+            while k <= #a do
+                local ch = a:sub(k, k)
+                if ch == "e" or ch == "f" or ch == "m" or ch == "A" or ch == "B" or ch == "C" then
+                    local inline = a:sub(k + 1)
+                    local val = inline
+                    if val == "" then
+                        i = i + 1
+                        val = args[i]
+                        if not val then optErr = "option requires an argument -- '" .. ch .. "'"; break end
                     end
-                    patternArgs[#patternArgs + 1] = args[i]
+                    if ch == "e" then patternArgs[#patternArgs + 1] = val
+                    elseif ch == "f" then patternFiles[#patternFiles + 1] = val
+                    elseif ch == "m" then
+                        maxCount = tonumber(val)
+                        if not maxCount then optErr = "invalid max count"; break end
+                    else
+                        local nv = tonumber(val)
+                        if not nv then optErr = "invalid context length argument"; break end
+                        if ch == "A" then afterCtx = nv
+                        elseif ch == "B" then beforeCtx = nv
+                        else beforeCtx, afterCtx = nv, nv end
+                        contextSet = true
+                    end
+                    k = #a + 1
+                elseif not setShort(ch) then
+                    break
+                else
+                    k = k + 1
                 end
-                break
-            elseif not setShort(ch) then
-                break
             end
         end
         if optErr then break end
@@ -151,6 +343,21 @@ end
 if optErr then
     stderr("grep: " .. optErr .. "\n")
     return 2
+end
+
+-- -f FILE: 每行一个模式("-" = stdin)
+for _, pf in ipairs(patternFiles) do
+    local fh, err
+    if pf == "-" then fh = io.stdin() else fh, err = fs.open(resolve(pf), "r") end
+    if not fh then
+        stderr("grep: " .. pf .. ": " .. ioeMsg(err) .. "\n")
+        return 2
+    end
+    local content = fh:readAll()
+    if pf ~= "-" then fh:close() end
+    for line in (content .. "\n"):gmatch("([^\n]*)\n") do
+        patternArgs[#patternArgs + 1] = line
+    end
 end
 
 -- 决定 pattern 与 files
@@ -208,24 +415,154 @@ local function collectMatches(line)
     return kept
 end
 
--- 总文件列表(含 -r 递归展开)。
+-- ---------------------------------------------------------------
+-- 颜色(GNU 的 GREP_COLORS 默认值与转义形式 \e[..m\e[K ... \e[m\e[K)
+-- ---------------------------------------------------------------
+local colorActive = false
+do
+    if colorWhen == "auto" then
+        local out = io.stdout()
+        colorActive = (out and out.isTTY) and true or false
+    elseif colorWhen == "always" then
+        colorActive = true
+    end
+end
+local CAP = {}
+do
+    local spec = os.getenv and os.getenv("GREP_COLORS") or nil
+    if not spec or spec == "" then
+        spec = "ms=01;31:mc=01;31:sl=:cx=:fn=35:ln=32:bn=32:se=36"
+    end
+    for item in (spec .. ":"):gmatch("([^:]*):") do
+        local k, v = item:match("^(%a+)=(.*)$")
+        if k then CAP[k] = v end
+    end
+end
+local function colorize(code, text)
+    if not colorActive or not code or code == "" then return text end
+    return "\27[" .. code .. "m\27[K" .. text .. "\27[m\27[K"
+end
+local function colorLine(text, spans)
+    if not colorActive or not CAP.ms or CAP.ms == "" or #spans == 0 then return text end
+    local out, pos = {}, 1
+    for _, m in ipairs(spans) do
+        if m.s >= pos then
+            out[#out + 1] = text:sub(pos, m.s - 1)
+            out[#out + 1] = colorize(CAP.ms, text:sub(m.s, m.e))
+            pos = m.e + 1
+        end
+    end
+    out[#out + 1] = text:sub(pos)
+    return table.concat(out)
+end
+local function lineSpans(line)
+    if not colorActive then return {} end
+    return collectMatches(line)
+end
+
+-- ---------------------------------------------------------------
+-- 递归展开(-r 不跟随遍历中遇到的符号链接, -R 全部跟随; 两者都有环路保护)
+-- ---------------------------------------------------------------
+local function dirExcluded(name)
+    for _, g in ipairs(excludeDirs) do
+        if globMatch(g, name) then return true end
+    end
+    return false
+end
+local function fileWanted(name)
+    if #includes > 0 then
+        local hit = false
+        for _, g in ipairs(includes) do if globMatch(g, name) then hit = true end end
+        if not hit then return false end
+    end
+    for _, g in ipairs(excludes) do
+        if globMatch(g, name) then return false end
+    end
+    return true
+end
+
+--- 词法规范化(与内核 resolve 同语义: "." 丢掉, ".." 弹一层, 到根就停)。
+local function normPath(p)
+    local out = {}
+    for seg in (p or ""):gmatch("[^/]+") do
+        if seg == ".." then
+            if #out > 0 then table.remove(out) end
+        elseif seg ~= "." then
+            out[#out + 1] = seg
+        end
+    end
+    return "/" .. table.concat(out, "/")
+end
+
+--- 把符号链接链一路解开, 得到最终路径 —— 用作"这个目录是否已经进过"的键。
+--- 只看链接本身(不 stat 目标), 因此树里的环(ln -s .. loop)会解析成已访问过的路径而被挡住。
+local function realKey(p)
+    for _ = 1, 40 do
+        local la = fs.lstat and fs.lstat(p)
+        if not la or la.kind ~= "symlink" then return normPath(p) end
+        local tgt = fs.readlink and fs.readlink(p)
+        if not tgt then return normPath(p) end
+        if tgt:sub(1, 1) ~= "/" then
+            local dir = p:match("^(.*)/[^/]*$") or "/"
+            tgt = dir .. "/" .. tgt
+        end
+        p = tgt
+    end
+    return normPath(p)
+end
+
+local anyDirOperand = false
 local function expandFiles(list)
     local out = {}
-    local function walk(p)
-        if fs.isDir(p) then
+    local visited = {}
+    local function walk(p, followHere)
+        local la = (fs.lstat and fs.lstat(p)) or fs.attributes(p)
+        local isLink = la and la.kind == "symlink"
+        local attr = la
+        if isLink then
+            if not followHere then
+                -- -r: 遍历中遇到的符号链接不下降(指向普通文件的仍然搜索) —— GNU 同此。
+                local ta = fs.attributes(p)
+                if ta and ta.isDir then return end
+                out[#out + 1] = p
+                return
+            end
+            attr = fs.attributes(p)
+        end
+        if attr and attr.isDir then
+            local k = realKey(p)
+            if visited[k] then return end
+            visited[k] = true
             local names = fs.list(p) or {}
             table.sort(names)
             for _, n in ipairs(names) do
                 if n ~= "." and n ~= ".." then
                     local full = (p == "/") and ("/" .. n) or (p .. "/" .. n)
-                    walk(full)
+                    local sub = fs.lstat and fs.lstat(full)
+                    local subIsLink = sub and sub.kind == "symlink"
+                    local subIsDir = sub and (sub.isDir or (subIsLink and (fs.attributes(full) or {}).isDir))
+                    if subIsDir then
+                        if not dirExcluded(n) then walk(full, followAll) end
+                    elseif fileWanted(n) then
+                        if subIsLink and not followAll then
+                            -- 指向普通文件的符号链接: grep -r 照搜
+                            out[#out + 1] = full
+                        else
+                            out[#out + 1] = full
+                        end
+                    end
                 end
             end
         else
-            out[#out + 1] = p
+            if fileWanted(baseName(p)) then out[#out + 1] = p end
         end
     end
-    for _, f in ipairs(list) do walk(resolve(f)) end
+    for _, f in ipairs(list) do
+        local rp = resolve(f)
+        local a = fs.attributes(rp)
+        if a and a.isDir then anyDirOperand = true end
+        walk(rp, true)
+    end
     return out
 end
 
@@ -237,65 +574,217 @@ if recursive then
 end
 
 local many = #allFiles > 1
-local showName = (not noFilename) and (withFilename or many or recursive)
+local showName = (not noFilename) and (withFilename or many or anyDirOperand or recursive and #allFiles > 1)
+local recordSep = zeroTerm and "\0" or "\n"
 
-local function search(fh, label)
-    local count = 0
-    local n = 0
+-- ---------------------------------------------------------------
+-- 搜索(带上下文/计数/上限/颜色)
+-- ---------------------------------------------------------------
+--- -c/-l/-L 只输出摘要, 不输出匹配行本身。
+local printLines = not (doCount or doFiles or doFilesWithout)
+
+local function processFile(label, fh)
+    local matches = 0        -- 选中行数(用于退出码与 -c)
+    local printed = 0        -- 已输出的匹配块数(用于 -m)
+    local lineno = 0
+    local offset = 0
+    local before = {}        -- 最近 beforeCtx 行 {line, n, off}
+    local afterLeft = 0
+    local lastEmitted = 0    -- 上一条已输出行的行号(判断是否需要组分隔)
+    local matchedAny = false
+
+    local function prefix(n, off, isMatch)
+        local parts = ""
+        if showName and label then parts = colorize(CAP.fn, label) .. colorize(CAP.se, isMatch and ":" or "-") end
+        if withNum then
+            parts = parts .. colorize(CAP.ln, tostring(n)) .. colorize(CAP.se, isMatch and ":" or "-")
+        end
+        if byteOffset then
+            parts = parts .. colorize(CAP.bn, tostring(off)) .. colorize(CAP.se, isMatch and ":" or "-")
+        end
+        return parts
+    end
+
+    local function emit(text, n, off, isMatch, spans)
+        if not printLines then return end
+        -- 组分隔符("--")只在真的带上下文时出现(GNU: 无上下文就不加分隔)
+        if (beforeCtx > 0 or afterCtx > 0) and groupSep ~= "" and lastEmitted > 0
+            and n > lastEmitted + 1 then
+            io.write(groupSep .. "\n")
+        end
+        local body = isMatch and colorLine(text, spans) or text
+        local out = prefix(n, off, isMatch) .. body .. recordSep
+        io.write(out)
+        yieldCheck(#out)
+        lastEmitted = n
+    end
+
+    local function flushAfter(text, n, off)
+        if afterLeft > 0 then
+            emit(text, n, off, false)
+            afterLeft = afterLeft - 1
+        end
+    end
+
+    local function wantMore()
+        return not maxCount or printed < maxCount
+    end
+
     while true do
         local line = fh:readLine()
         if line == nil then break end
-        n = n + 1
+        local off = offset
+        offset = offset + #line + 1
+        lineno = lineno + 1
         local m = lineMatches(line)
         if invert then m = not m end
         if m then
-            count = count + 1
-            if quiet then return count, n end
-            if doFiles then
-                local out = (label or "") .. "\n"
-                io.write(out)
-                yieldCheck(#out)
-                return count, n
-            elseif not doCount then
-                local prefix = ""
-                if showName and label then prefix = label .. ":" end
-                if withNum then prefix = prefix .. tostring(n) .. ":" end
-                if onlyMatch then
+            matchedAny = true
+            matches = matches + 1
+            if quiet then return matches, true end
+            if wantMore() then
+                printed = printed + 1
+                if beforeCtx > 0 then
+                    for _, b in ipairs(before) do
+                        if b.n > lastEmitted then emit(b.line, b.n, b.off, false) end
+                    end
+                end
+                if onlyMatch and printLines then
                     for _, span in ipairs(collectMatches(line)) do
-                        local out = prefix .. line:sub(span.s, span.e) .. "\n"
+                        local pre = prefix(lineno, off, true)
+                        local out = pre .. colorize(CAP.ms, line:sub(span.s, span.e)) .. "\n"
                         io.write(out)
                         yieldCheck(#out)
                     end
+                    if #collectMatches(line) > 0 then lastEmitted = lineno end
                 else
-                    local out = prefix .. line .. "\n"
-                    io.write(out)
-                    yieldCheck(#out)
+                    emit(line, lineno, off, true, lineSpans(line))
                 end
+                afterLeft = afterCtx
+            end
+            before = {}
+            if not wantMore() then
+                -- -m 已达上限: 只把剩余的上下文行打完
+                if afterCtx > 0 then
+                    for _ = 1, afterCtx do
+                        local l2 = fh:readLine()
+                        if l2 == nil then break end
+                        local o2 = offset
+                        offset = offset + #l2 + 1
+                        lineno = lineno + 1
+                        emit(l2, lineno, o2, false)
+                    end
+                end
+                break
+            end
+        else
+            if afterLeft > 0 and wantMore() then
+                emit(line, lineno, off, false)
+                afterLeft = afterLeft - 1
+            elseif beforeCtx > 0 then
+                before[#before + 1] = { line = line, n = lineno, off = off }
+                while #before > beforeCtx do table.remove(before, 1) end
             end
         end
     end
-    return count, n
+    return matches, matchedAny
 end
 
 local atLeastOne = false
 local hadError = false
-local function processOne(label, fh)
-    local c = search(fh, label)
-    if c > 0 then atLeastOne = true end
+local anyOutput = false
+
+local function handleFile(label, fh, isStdin)
+    local content = nil
+    if ignoreBinary or zeroTerm then
+        content = fh:readAll() or ""
+        if ignoreBinary and content:find("\0", 1, true) and not forceText then return end
+    end
+    if doFiles or doFilesWithout then
+        local cnt = 0
+        if content then
+            for rec in (content .. recordSep):gmatch("([^" .. recordSep .. "]*)" .. recordSep) do
+                if rec ~= "" and lineMatches(rec) ~= invert then cnt = cnt + 1; break end
+            end
+        else
+            local fh2 = fh
+            while true do
+                local line = fh2:readLine()
+                if line == nil then break end
+                if lineMatches(line) ~= invert then cnt = cnt + 1; break end
+            end
+        end
+        if cnt > 0 then atLeastOne = true end
+        if doFiles and cnt > 0 then
+            io.write((label or "standard input") .. "\n"); anyOutput = true
+        elseif doFilesWithout and cnt == 0 then
+            io.write((label or "standard input") .. "\n"); anyOutput = true
+        end
+        return
+    end
+    if content ~= nil then
+        -- -z / -I: 已经在内存里, 按记录切
+        local matches = 0
+        local lineno = 0
+        local offset = 0
+        local printed = 0
+        local before = {}
+        local lastEmitted = 0
+        local function prefixOf(n, off, isMatch)
+            local parts = ""
+            if showName and label then parts = colorize(CAP.fn, label) .. colorize(CAP.se, isMatch and ":" or "-") end
+            if withNum then parts = parts .. colorize(CAP.ln, tostring(n)) .. colorize(CAP.se, isMatch and ":" or "-") end
+            if byteOffset then parts = parts .. colorize(CAP.bn, tostring(off)) .. colorize(CAP.se, isMatch and ":" or "-") end
+            return parts
+        end
+        for rec in (content .. recordSep):gmatch("([^" .. recordSep .. "]*)" .. recordSep) do
+            local off = offset
+            offset = offset + #rec + 1
+            lineno = lineno + 1
+            local m = lineMatches(rec)
+            if invert then m = not m end
+            if m then
+                matches = matches + 1
+                if quiet then atLeastOne = true; return end
+                if (not maxCount or printed < maxCount) and printLines then
+                    printed = printed + 1
+                    local out = prefixOf(lineno, off, true) .. colorLine(rec, lineSpans(rec)) .. recordSep
+                    io.write(out)
+                    yieldCheck(#out)
+                    lastEmitted = lineno
+                end
+                before = {}
+                if maxCount and printed >= maxCount then break end
+            else
+                if beforeCtx > 0 then
+                    before[#before + 1] = { line = rec, n = lineno, off = off }
+                    while #before > beforeCtx do table.remove(before, 1) end
+                end
+            end
+        end
+        if matches > 0 then atLeastOne = true end
+        if doCount then
+            if showName and label then io.write(label .. ":") end
+            io.write(tostring(matches) .. "\n")
+        end
+        return
+    end
+    local cnt, matched = processFile(label, fh)
+    if cnt > 0 then atLeastOne = true end
     if doCount then
         if showName and label then io.write(label .. ":") end
-        io.write(tostring(c) .. "\n")
+        io.write(tostring(cnt) .. "\n")
     end
 end
 
 if #allFiles == 0 then
     local stdin = io.stdin()
-    if stdin then processOne("standard input", stdin) end
+    if stdin then handleFile(label or "standard input", stdin, true) end
 else
     for _, f in ipairs(allFiles) do
         if f == "-" then
             local stdin = io.stdin()
-            if stdin then processOne("standard input", stdin) end
+            if stdin then handleFile(label or "standard input", stdin, true) end
         else
             local p = resolve(f)
             if not fs.exists(p) then
@@ -309,7 +798,7 @@ else
                     hadError = true
                     if doCount then io.write("0\n") end
                 else
-                    processOne(p, fh)
+                    handleFile(p, fh, false)
                     fh:close()
                 end
             end

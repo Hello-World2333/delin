@@ -53,8 +53,11 @@ for _, a in ipairs(args) do
     elseif a == "--verbose" then verbose = true
     elseif a == "--preserve" then preserve = true
     elseif a == "--archive" then recursive = true; preserve = true
+    elseif a:sub(1, 2) == "--" then
+        stderr("cp: unrecognized option '" .. a .. "'\n")
+        return 1
     elseif a:sub(1, 1) == "-" and a ~= "-" then
-        for k = 2, #a do if not setShort(a:sub(k, k)) then return end end
+        for k = 2, #a do if not setShort(a:sub(k, k)) then return 1 end end
     else
         srcs[#srcs + 1] = a
     end

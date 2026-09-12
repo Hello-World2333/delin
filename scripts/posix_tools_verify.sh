@@ -290,6 +290,73 @@ echo "-- ls -l 复核(链接/管道类型字符与 umask 效果) --" >> $LOG
 ls -l "$T" >> $LOG
 
 # ---------------------------------------------------------------
+# 选项行为(批次 0/1): 未知选项退出码 / head/tail 的符号语义 / grep 上下文与 -r 环路
+#   / dmesg 时间戳与过滤 / lua -e / printf %q / echo -E / tail -f
+# 期望值全部对着宿主 GNU 核过; 这里只取单行的可判定量(走 wc/定值输出)。
+# ---------------------------------------------------------------
+echo "-- option semantics (head/tail/grep/dmesg/lua/printf) --" >> $LOG
+printf 'a\nb\nc\nd\ne\n' > "$T/five"
+
+# 未知选项的退出码必须与宿主 GNU 一致(不许静默返回 0)
+rc_chk() { # rc_chk <名字> <期望码> <命令...>
+    _n="$1"; _want="$2"; shift; shift
+    # 只写 stdout: Delin 的 sh **不支持 fd 前缀重定向**(2>f 会被切成操作数 2 + >>f, 见 for-ai.md),
+    # 所以错误信息照旧走控制台, 不进日志。
+    "$@" > "$T/rc.out" < /dev/null
+    _rc="$?"
+    if [ "$_rc" = "$_want" ]; then
+        echo "ok   $_n" >> $LOG
+    else
+        echo "ng   $_n (rc=$_rc, want=$_want)" >> $LOG; ng=1
+    fi
+}
+rc_chk opt_unknown_ls 2 ls --zz-bogus
+rc_chk opt_unknown_cp 1 cp --zz-bogus
+rc_chk opt_unknown_mkdir 1 mkdir --zz-bogus
+rc_chk opt_unknown_sort 2 sort --zz-bogus
+rc_chk opt_unknown_grep 2 grep --zz-bogus
+rc_chk opt_unsupported_dmesg 2 dmesg -s 64
+rc_chk opt_unsupported_touch 2 touch -d 2020-01-01 "$T/five"
+rc_chk opt_unsupported_umount 2 umount -l "$T"
+
+# head/tail 的符号语义(以前静默按"末 N 行"处理)
+out_chk tail_from_2 4 sh -c "tail -n +2 $T/five | wc -l"
+out_chk tail_c_from_3 8 sh -c "tail -c +3 $T/five | wc -c"
+out_chk head_minus_2 3 sh -c "head -n -2 $T/five | wc -l"
+out_chk head_c_minus_3 7 sh -c "head -c -3 $T/five | wc -c"
+out_chk head_qv_ok 6 sh -c "head -qv $T/five | wc -l"  # 5 行 + 1 行 "==> file <==" 表头
+
+# grep 的上下文 / 上限 / 计数
+out_chk grep_count 1 sh -c "grep -c b $T/five"
+out_chk grep_A1 2 sh -c "grep -A1 a $T/five | wc -l"
+out_chk grep_m1 1 sh -c "grep -m1 b $T/five | wc -l"
+out_chk grep_L_nonmatch 1 sh -c "grep -L zzz $T/five | wc -l"
+
+# grep -r 遇到符号链接环必须收敛(老实现无限递归: 命令永远不返回)
+mkdir -p "$T/loop/sub"
+printf 'hello\n' > "$T/loop/a.txt"
+ln -s .. "$T/loop/sub/up"
+out_chk grep_r_no_loop 1 sh -c "grep -r hello $T/loop | wc -l"
+cmd_chk grep_r_ok grep -r hello "$T/loop"
+
+# dmesg 的新选项(非阻塞的那些)
+cmd_chk dmesg_t dmesg -t
+cmd_chk dmesg_x dmesg -x
+cmd_chk dmesg_level dmesg -l err
+cmd_chk dmesg_facility dmesg -f kern
+cmd_chk dmesg_C dmesg -C
+
+# tail -f: --pid 指向不存在的进程时应正常收尾(退出码 0), 且要真的走过跟读路径
+rc_chk tail_f_pid_dead 0 tail -f --pid=999999 "$T/five"
+
+# lua -e / printf %q / echo -E / groups 多操作数
+out_chk lua_e 2 lua -e 'print(1+1)'
+out_chk printf_q 'a\ b' printf '%q\n' 'a b'
+out_chk printf_charconst 65 printf '%d\n' "'A"
+out_chk echo_E 'a\tb' sh -c 'echo -E "a\tb"'
+out_chk groups_multi 'root : root' groups root
+
+# ---------------------------------------------------------------
 # 标准正则(grep/sed/ed/expr/csplit 的 BRE/ERE 方言与退出码)
 # 独立的 scripts/regex_test.sh: 宿主与真机跑同一份, 期望值对着宿主 GNU 核过。
 # ---------------------------------------------------------------

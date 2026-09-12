@@ -80,7 +80,7 @@ chkeq id_Gn_alice_out alice $T/last
 chk id_G_alice id -G alice
 chkeq id_G_alice_out 1000 $T/last
 chk groups_alice groups alice
-chkeq groups_alice_out alice $T/last
+chkeq groups_alice_out 'alice : alice' $T/last
 chk groups_self groups
 chkeq groups_self_out root $T/last
 chkneg id_nouser id nosuchuser
@@ -88,7 +88,9 @@ chkneg id_bad_option id -q
 chkneg id_two_choices id -ug
 chkneg id_names_only id -n
 chkneg whoami_extra_operand whoami x
-chkneg groups_extra_operand groups alice root
+chk groups_multi_operand groups alice root
+chkeq groups_multi_operand_out1 'alice : alice' $T/last
+chkeq groups_multi_operand_out2 'root : root' $T/last
 
 # ---------------------------------------------------------------
 # 2. root 改 alice 的密码(不问旧密码), 用内核 user.verify 判定
@@ -146,10 +148,10 @@ chkempty useradd_failure_wrote_nothing $T/hit
 chk groupadd_staff groupadd staff
 chk usermod_append_staff usermod -aG staff bob
 chk groups_bob groups bob
-chkeq groups_bob_out 'bob alice staff' $T/last
+chkeq groups_bob_out 'bob : bob alice staff' $T/last
 chk usermod_replace_groups usermod -G staff bob
 chk groups_bob_replaced groups bob
-chkeq groups_bob_replaced_out 'bob staff' $T/last
+chkeq groups_bob_replaced_out 'bob : bob staff' $T/last
 chk usermod_comment_shell usermod -c "Robert B" -s /bin/sh bob
 chkcontain passwd_robert_comment '^bob:x:1001:1001:Robert B:' /etc/passwd
 chk usermod_rename usermod -l robert bob

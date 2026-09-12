@@ -97,8 +97,11 @@ for _, a in ipairs(args) do
     elseif a == "--recursive" then optRecursive = true
     elseif a == "--reverse" then optReverse = true
     elseif a == "--sort=time" then optTime = true
+    elseif a:sub(1, 2) == "--" then
+        stderr("ls: unrecognized option '" .. a .. "'\n")
+        return 2
     elseif a:sub(1, 1) == "-" and a ~= "-" then
-        for k = 2, #a do if not setShort(a:sub(k, k)) then return end end
+        for k = 2, #a do if not setShort(a:sub(k, k)) then return 2 end end
     else
         paths[#paths + 1] = a
     end

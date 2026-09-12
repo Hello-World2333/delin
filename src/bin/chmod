@@ -159,7 +159,7 @@ for _, a in ipairs(args) do
             elseif ch == "v" then optVerbose = true
             elseif ch == "c" then optChanges = true
             elseif ch == "f" then optSilent = true
-            else if not optSilent then stderr("chmod: invalid option -- '" .. ch .. "'\n") end return end
+            else if not optSilent then stderr("chmod: invalid option -- '" .. ch .. "'\n") end return 1 end
         end
     else
         positional[#positional + 1] = a

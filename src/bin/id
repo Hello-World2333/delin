@@ -22,6 +22,7 @@ local function usage(msg)
 end
 
 local just, names, operand, noMore = nil, false, nil, false
+local zero = false -- -z: 各条用 NUL 分隔(只与 -u/-g/-G 连用)
 for _, a in ipairs(args) do
     if noMore then
         if operand then return usage("extra operand '" .. a .. "'") end
@@ -36,6 +37,8 @@ for _, a in ipairs(args) do
                 just = ch
             elseif ch == "n" then names = true
             elseif ch == "r" then -- Delin 无 euid: 真实 ID 就是唯一的那份 ID
+            elseif ch == "z" then zero = true
+            elseif ch == "a" then -- GNU: 兼容保留, 无效果
             else return usage("invalid option -- '" .. ch .. "'") end
         end
     else
@@ -44,6 +47,11 @@ for _, a in ipairs(args) do
     end
 end
 if names and not just then return usage("cannot print only names in default format") end
+-- GNU: -z 只与 -u/-g/-G 连用; 用在默认格式上是错误(退出 1, 消息见下)。
+if zero and not just then
+    stderr("id: option --zero not permitted in default format\n")
+    return 1
+end
 
 if not (syscalls and syscalls["user.byUid"] and syscalls["user.groupByName"]) then
     stderr("id: user syscalls not available\n")
@@ -94,15 +102,18 @@ local function fmtId(id, name)
     return tostring(id)
 end
 
+local SEP = zero and "\0" or " "
+local EOL = zero and "\0" or "\n"
+
 if just == "u" then
-    io.write(fmtId(uidv, rec and rec.name) .. "\n")
+    io.write(fmtId(uidv, rec and rec.name) .. EOL)
 elseif just == "g" then
     local primary = syscalls["user.groupByGid"] and syscalls["user.groupByGid"](gidv)
-    io.write(fmtId(gidv, primary and primary.name) .. "\n")
+    io.write(fmtId(gidv, primary and primary.name) .. EOL)
 elseif just == "G" then
     local parts = {}
     for _, g in ipairs(allGroups()) do parts[#parts + 1] = fmtId(g.gid, g.name) end
-    io.write(table.concat(parts, " ") .. "\n")
+    io.write(table.concat(parts, SEP) .. EOL)
 else
     local groups = allGroups()
     local gs = {}

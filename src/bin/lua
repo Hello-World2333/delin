@@ -191,18 +191,65 @@ local function topLevelExit(packed)
 end
 
 -- ---------------------------------------------------------------
--- 参数解析: lua [script [args...]]
+-- 参数解析: lua [options] [script [args...]]   (与 lua(1) 一致)
+--   -e stat   执行字符串(可多次, 按序执行)
+--   -v        启动时打印版本
+--   -i        执行完脚本/字符串后进入交互模式
+--   --        结束选项解析(之后第一个词才是脚本名)
+--   -         脚本 = stdin(且停止选项解析)
+--   -l mod    需要模块加载器; Delin 的进程环境里没有 require/package -> fail-fast
 -- ---------------------------------------------------------------
 local script, scriptArgs = nil, {}
 local pargs = args or {}
-if pargs[1] ~= nil then
-    local first = pargs[1]
-    if first:sub(1, 1) == "-" and first ~= "-" then
-        errout("lua: unrecognized option '" .. first .. "'\nusage: lua [script [args...]]\n")
-        return 1
+local execChunks, wantVersion, wantInteractive = {}, false, false
+do
+    local i = 1
+    while i <= #pargs do
+        local a = pargs[i]
+        if a == "-v" or a == "--version" then
+            wantVersion = true
+        elseif a == "-i" or a == "--interactive" then
+            wantInteractive = true
+        elseif a == "--" then
+            i = i + 1
+            script = pargs[i]
+            break
+        elseif a == "-" then
+            script = "-"
+            break
+        elseif a == "-e" or a:match("^%-e.") then
+            local code = (a == "-e") and pargs[i + 1] or a:sub(3)
+            if a == "-e" then
+                if not code then errout("lua: '-e' needs argument\n"); return 2 end
+                i = i + 1
+            end
+            execChunks[#execChunks + 1] = code
+        elseif a == "-l" or a:match("^%-l.") then
+            errout("lua: option '-l' is not supported\n")
+            return 2
+        elseif a == "-E" or a == "-W" then
+            errout("lua: option '" .. a .. "' is not supported\n")
+            return 2
+        elseif a:sub(1, 1) == "-" and #a > 1 then
+            errout("lua: unrecognized option '" .. a .. "'\nusage: lua [options] [script [args...]]\n")
+            return 1
+        else
+            script = a
+            break
+        end
+        i = i + 1
     end
-    script = first
-    for i = 2, #pargs do scriptArgs[#scriptArgs + 1] = pargs[i] end
+    if script then
+        -- 脚本名之后的词都是脚本参数(即使以 - 开头)
+        local seen = false
+        for k = 1, #pargs do
+            if pargs[k] == script and not seen then
+                seen = true
+            elseif seen then
+                scriptArgs[#scriptArgs + 1] = pargs[k]
+            end
+        end
+    end
 end
 
 -- arg 表(与 lua(1) 一致): arg[-1]=解释器, arg[0]=脚本(无脚本时是解释器), arg[1..]=脚本参数。
@@ -333,7 +380,32 @@ end
 -- ---------------------------------------------------------------
 -- 主流程
 -- ---------------------------------------------------------------
-if script then return runScript() end
+if wantVersion then out(_VERSION .. "  Delin lua\n") end
+
+-- -e: 按序执行, 出错即停(退出码 1), 与 lua(1) 一致
+for _, code in ipairs(execChunks) do
+    local chunk, lerr = loadChunk(code, "=(command line)", G)
+    if not chunk then
+        report("lua: ", lerr)
+        return 1
+    end
+    local okc, packed = call(chunk, scriptArgs)
+    if not okc then
+        report("lua: ", packed)
+        return 1
+    end
+end
+
+if script then
+    local rc = runScript()
+    if rc ~= 0 or not wantInteractive then return rc end
+    return repl()
+end
+
+if #execChunks > 0 then
+    if wantInteractive then return repl() end
+    return 0
+end
 
 if stdin and stdin.isTTY then return repl() end
 

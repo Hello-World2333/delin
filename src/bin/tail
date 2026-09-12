@@ -1,11 +1,19 @@
 -- Delin tail: 打印文件末尾 (GNU 子集)。用法: tail [OPTION]... [FILE]...
 -- 选项:
---   -n N, --lines=N    打印末尾 N 行(缺省 10)
---   -c N, --bytes=N    打印末尾 N 字节
---   -q, --quiet        多文件时不打印文件名头
---   -v, --verbose      总是打印文件名头
---   -N / -nN / -cN     粘连形式亦支持; 无 FILE 或 FILE 为 "-" 时读 stdin。
---   说明: `-f`(follow)暂未实现(会无限等待)。
+--   -n N, --lines=N      末尾 N 行(缺省 10); -n +N 表示"从第 N 行起"
+--   -c N, --bytes=N      末尾 N 字节;         -c +N 表示"从第 N 字节起"
+--   -q, --quiet          多文件时不打印文件名头
+--   -v, --verbose        总是打印文件名头
+--   -z, --zero-terminated  以 NUL 而不是换行作为记录分隔符
+--   -f, --follow[=name]  末尾打印完后持续跟读新增内容(^C 退出, 退出码 130)
+--   -F                   同 --follow=name --retry(按名字跟, 文件不在也重试)
+--   --retry              文件暂时不存在时不放弃
+--   -s, --sleep-interval=N  轮询间隔秒数(缺省 1.0)
+--   --pid=PID            被跟的进程退出后停止跟读
+--   -N / -nN / -cN 粘连形式; 组合短选项(-qf)亦支持; 无 FILE 或 FILE 为 "-" 时读 stdin。
+-- 跟读实现: Delin 没有 inotify, 按 poll 语义做 —— 每次醒来重开文件(ext2 的 open 会把内容
+--   快照下来, 老句柄永远看不到追加)、seek 到上次偏移再按块读。文件变小 = 被截断/轮转,
+--   打一条 "file truncated" 并从 0 重新读(GNU 同此)。
 local args = args or {}
 local cwd = (type(cwd) == "string" and cwd) or "/"
 local function resolve(p)
@@ -31,14 +39,31 @@ local function ioeMsg(err)
     return "No such file or directory"
 end
 
-local n, mode = 10, "lines"
+local msleep = os.msleep or function(ms) os.sleep(math.max((ms or 0) / 1000, 0.05)) end
+local interrupted = false
+if syscalls and syscalls["signal.install"] then
+    syscalls["signal.install"](2, function() interrupted = true end)
+end
+
+local n, mode = 10, "lines" -- mode = "lines" | "bytes"
+local fromStart = false     -- -n +N / -c +N
+local zeroTerm = false
 local files = {}
 local quiet, verbose = false, false
+local follow, followName, retry = false, false, false
+local sleepInterval, pidWatch = 1.0, nil
 local noMoreOpts = false
 
+--- 解析计数: 支持 "+N"(从第 N 条起)与 "N"(末尾 N 条)。
 local function setCount(val, m)
-    local c = tonumber((val:match("%s*%-?(%d+)")) or val)
-    if c and c >= 0 then n = c; mode = m end
+    val = tostring(val or "")
+    local sign, digits = val:match("^%s*([+%-]?)(%d+)")
+    if not digits then return false end
+    local c = tonumber(digits)
+    if c < 0 then return false end
+    n, mode = c, m
+    fromStart = (sign == "+")
+    return true
 end
 
 local i = 1
@@ -48,39 +73,86 @@ while i <= #args do
         files[#files + 1] = a
     elseif a == "--" then
         noMoreOpts = true
-    elseif a == "--quiet" or a == "--silent" then quiet = true
-    elseif a == "--verbose" then verbose = true
-    elseif a == "-q" then quiet = true
-    elseif a == "-v" then verbose = true
-    elseif a:sub(1, 2) == "--" and a:match("^%-%-lines=") then
-        setCount(a:sub(9), "lines")
-    elseif a:sub(1, 2) == "--" and a:match("^%-%-bytes=") then
-        setCount(a:sub(9), "bytes")
+    elseif a == "--quiet" or a == "--silent" then quiet, verbose, quiet = true, false, false
+    elseif a == "--verbose" then verbose, quiet = true, false
+    elseif a == "--zero-terminated" then zeroTerm = true
+    elseif a == "--retry" then retry = true
+    elseif a == "--follow" then follow = true
+    elseif a:match("^%-%-follow=") then
+        local w = a:sub(10)
+        if w == "name" then follow, followName = true, true
+        elseif w == "descriptor" then follow = true
+        else stderr("tail: invalid argument '" .. w .. "' for '--follow'\n"); return 1 end
+    elseif a:match("^%-%-sleep%-interval=") then
+        sleepInterval = tonumber(a:sub(18))
+        if not sleepInterval then stderr("tail: invalid number of seconds: '" .. a:sub(18) .. "'\n"); return 1 end
+    elseif a:match("^%-%-pid=") then
+        pidWatch = a:sub(7)
+    elseif a:match("^%-%-max%-unchanged%-stats=") then
+        stderr("tail: option '--max-unchanged-stats' is not supported\n")
+        return 2
+    elseif a == "-q" then quiet, verbose, quiet = true, false, false
+    elseif a == "-v" then verbose, quiet = true, false
+    elseif a == "-z" then zeroTerm = true
+    elseif a == "-f" then follow = true
+    elseif a == "-F" then follow, followName, retry = true, true, true
+    elseif a:match("^%-%-lines=") then
+        if not setCount(a:sub(9), "lines") then stderr("tail: invalid number of lines: '" .. a:sub(9) .. "'\n"); return 1 end
+    elseif a:match("^%-%-bytes=") then
+        if not setCount(a:sub(9), "bytes") then stderr("tail: invalid number of bytes: '" .. a:sub(9) .. "'\n"); return 1 end
+    elseif a == "-n" or a == "--lines" then
+        i = i + 1
+        if not args[i] then stderr("tail: option requires an argument -- 'n'\n"); return 1 end
+        if not setCount(args[i], "lines") then stderr("tail: invalid number of lines: '" .. args[i] .. "'\n"); return 1 end
+    elseif a == "-c" or a == "--bytes" then
+        i = i + 1
+        if not args[i] then stderr("tail: option requires an argument -- 'c'\n"); return 1 end
+        if not setCount(args[i], "bytes") then stderr("tail: invalid number of bytes: '" .. args[i] .. "'\n"); return 1 end
+    elseif a == "-s" or a == "--sleep-interval" then
+        i = i + 1
+        if not args[i] then stderr("tail: option requires an argument -- 's'\n"); return 1 end
+        sleepInterval = tonumber(args[i])
+        if not sleepInterval then stderr("tail: invalid number of seconds: '" .. args[i] .. "'\n"); return 1 end
+    elseif a == "--pid" then
+        i = i + 1
+        if not args[i] then stderr("tail: option requires an argument -- 'pid'\n"); return 1 end
+        pidWatch = args[i]
+    elseif a:sub(1, 2) == "--" then
+        stderr("tail: unrecognized option '" .. a .. "'\n")
+        return 1
     elseif a:sub(1, 1) == "-" and a ~= "-" then
-        local optn = a:match("^%-n(.*)$")
-        local optc = a:match("^%-c(.*)$")
-        local optglued = a:match("^%-(%d+)$")
-        if optn then
-            if optn == "" then
-                i = i + 1
-                if not args[i] then stderr("tail: option requires an argument -- 'n'\n"); return end
-                setCount(args[i], "lines")
-            else
-                setCount(optn, "lines")
-            end
-        elseif optc then
-            if optc == "" then
-                i = i + 1
-                if not args[i] then stderr("tail: option requires an argument -- 'c'\n"); return end
-                setCount(args[i], "bytes")
-            else
-                setCount(optc, "bytes")
-            end
-        elseif optglued then
-            setCount(optglued, "lines")
+        if a:match("^%-(%d+)$") then
+            setCount(a:sub(2), "lines")
         else
-            stderr("tail: invalid option -- '" .. a .. "'\n")
-            return 1
+            -- 组合短选项: n/c/s 吃参数(粘连或下一个 argv), 其余是纯开关。
+            local k = 2
+            while k <= #a do
+                local ch = a:sub(k, k)
+                if ch == "n" or ch == "c" or ch == "s" then
+                    local rest = a:sub(k + 1)
+                    if rest == "" then
+                        i = i + 1
+                        rest = args[i]
+                        if not rest then stderr("tail: option requires an argument -- '" .. ch .. "'\n"); return 1 end
+                    end
+                    if ch == "s" then
+                        sleepInterval = tonumber(rest)
+                        if not sleepInterval then stderr("tail: invalid number of seconds: '" .. rest .. "'\n"); return 1 end
+                    elseif not setCount(rest, (ch == "n") and "lines" or "bytes") then
+                        stderr("tail: invalid number of " .. ((ch == "n") and "lines" or "bytes") .. ": '" .. rest .. "'\n")
+                        return 1
+                    end
+                    k = #a + 1
+                else
+                    if ch == "q" then quiet, verbose, quiet = true, false, false
+                    elseif ch == "v" then verbose, quiet = true, false
+                    elseif ch == "z" then zeroTerm = true
+                    elseif ch == "f" then follow = true
+                    elseif ch == "F" then follow, followName, retry = true, true, true
+                    else stderr("tail: invalid option -- '" .. ch .. "'\n"); return 1 end
+                    k = k + 1
+                end
+            end
         end
     else
         files[#files + 1] = a
@@ -98,21 +170,72 @@ local function header(name)
     io.write("==> " .. disp .. " <==\n")
 end
 
+--- 整个输入读成字符串(-z 模式需要按 NUL 切记录)。
+local function slurp(fh)
+    if fh.readAll then return fh:readAll() or "" end
+    local buf = {}
+    while true do
+        local line = fh:readLine()
+        if line == nil then break end
+        buf[#buf + 1] = line
+    end
+    return table.concat(buf, "\n")
+end
+
 local function emitLines(fh)
+    if zeroTerm then
+--- 按分隔符切记录(不丢"末尾没有分隔符"的残段, 也不把结尾分隔符算成空记录)。
+local function splitRecords(s, sep)
+    local recs, pos = {}, 1
+    while true do
+        local at = s:find(sep, pos, true)
+        if not at then
+            if pos <= #s then recs[#recs + 1] = s:sub(pos) end
+            return recs
+        end
+        recs[#recs + 1] = s:sub(pos, at - 1)
+        pos = at + 1
+    end
+end
+
+        local recs = splitRecords(slurp(fh), "\0")
+        local start = 1
+        if fromStart then start = n
+        else start = math.max(1, #recs - n + 1) end
+        if n == 0 and not fromStart then return end
+        for k = start, #recs do io.write(recs[k] .. "\0") end
+        return
+    end
     local lines = {}
     while true do
         local line = fh:readLine()
         if line == nil then break end
         lines[#lines + 1] = line
     end
-    local start = math.max(1, #lines - n + 1)
-    if n == 0 then return end
-    for k = start, #lines do
-        io.write(lines[k] .. "\n")
-    end
+    local start
+    if fromStart then start = n
+    else start = math.max(1, #lines - n + 1) end
+    if n == 0 and not fromStart then return end
+    for k = start, #lines do io.write(lines[k] .. "\n") end
 end
 
 local function emitBytes(fh)
+    if fromStart then
+        -- -c +N: 从第 N 字节起(1 起; N=1 即整个文件)
+        if fh.seek then
+            if fh:seek("set", n - 1) then
+                while true do
+                    local chunk = fh:read(4096)
+                    if not chunk or chunk == "" then break end
+                    io.write(chunk)
+                end
+                return
+            end
+        end
+        local s = slurp(fh)
+        io.write(s:sub(n))
+        return
+    end
     if fh.readAll then
         local s = fh:readAll() or ""
         io.write((n == 0) and "" or s:sub(-n))
@@ -132,7 +255,7 @@ local function emit(fh)
     if mode == "bytes" then emitBytes(fh) else emitLines(fh) end
 end
 
-for idx, raw in ipairs(files) do
+for _, raw in ipairs(files) do
     if raw == "-" then
         header("-")
         local stdin = io.stdin()
@@ -141,11 +264,80 @@ for idx, raw in ipairs(files) do
         local p = resolve(raw)
         local f, err = fs.open(p, "r")
         if not f then
-            stderr("tail: " .. p .. ": " .. ioeMsg(err) .. "\n")
-            return 1
+            if retry and follow then
+                stderr("tail: " .. p .. ": " .. ioeMsg(err) .. "\n")
+            else
+                stderr("tail: " .. p .. ": " .. ioeMsg(err) .. "\n")
+                return 1
+            end
+        else
+            header(raw)
+            emit(f)
+            f:close()
         end
-        header(raw)
-        emit(f)
-        f:close()
     end
 end
+
+-- ---------------------------------------------------------------
+-- -f / -F: 轮询跟读
+-- ---------------------------------------------------------------
+if not follow then return 0 end
+
+local nameWarned = {}
+local offsets = {}
+for idx, raw in ipairs(files) do
+    local p = (raw == "-") and nil or resolve(raw)
+    offsets[idx] = (p and fs.getSize(p)) or 0
+end
+
+--- 文件被截断/轮转后, 从新内容开头重新跟。
+local function drain(idx, raw)
+    local p = resolve(raw)
+    local size = fs.getSize(p)
+    if not size then
+        if retry then
+            if not nameWarned[idx] then
+                stderr("tail: '" .. p .. "' has become inaccessible: No such file or directory\n")
+                nameWarned[idx] = true
+            end
+            return
+        end
+        stderr("tail: " .. p .. ": No such file or directory\n")
+        return
+    end
+    nameWarned[idx] = nil
+    if size < offsets[idx] then
+        io.write("\ntail: " .. p .. ": file truncated\n")
+        offsets[idx] = 0
+    end
+    if size <= offsets[idx] then return end
+    local f = fs.open(p, "r")
+    if not f then return end
+    if f.seek then f:seek("set", offsets[idx]) end
+    header(raw)
+    local written = 0
+    while true do
+        local chunk = f:read(4096)
+        if not chunk or chunk == "" then break end
+        io.write(chunk)
+        written = written + #chunk
+    end
+    f:close()
+    offsets[idx] = offsets[idx] + written
+end
+
+-- --pid=PID: 被跟的进程消失就正常收尾(退出码 0, 与 GNU 一致);
+-- ^C 才是"被打断"(退出码 130)。
+local stoppedByPid = false
+while not interrupted do
+    for idx, raw in ipairs(files) do
+        if raw ~= "-" then drain(idx, raw) end
+    end
+    if pidWatch and not fs.exists("/proc/" .. pidWatch) then
+        stoppedByPid = true
+        break
+    end
+    msleep(math.max(math.floor(sleepInterval * 1000), 10))
+end
+if stoppedByPid then return 0 end
+return 130

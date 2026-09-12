@@ -86,6 +86,22 @@ function klog.kern(text) klog.write(klog.makePri(FACILITIES.kern, SEVERITIES.inf
 --- 用户态 facility=user severity=info 的快捷写(进程 print 走这条)。
 function klog.user(text) klog.write(klog.makePri(FACILITIES.user, SEVERITIES.info), text) end
 
+-- 清空 ring buffer(Linux dmesg -c/-C 用)。清完 firstSeq 跟到 nextSeq: 序号不回收,
+-- syslogd 持久化的游标因此仍单调, 下次从"最旧一条"重来而不是重放旧数据。
+function klog.clear()
+    ring = {}
+    firstSeq = nextSeq
+    ringBytes = 0
+end
+
+-- 控制台日志级别(Linux printk console_loglevel): severity 数值 <= 该级别才打印到终端。
+-- ring buffer 照旧全收 —— 与 Linux 一样, 级别只影响"是否上控制台"。
+local consoleLevel = SEVERITIES.debug
+function klog.consoleLevel() return consoleLevel end
+function klog.setConsoleLevel(n) consoleLevel = n end
+--- 该优先级是否应打印到控制台。
+function klog.consoleWants(pri) return (pri % 8) <= consoleLevel end
+
 --- ring buffer 统计(供 dmesg / 排障; boot 为本次引导标识)。
 function klog.stats()
     return { first = firstSeq, next = nextSeq, bytes = ringBytes, drops = ringDrops, boot = BOOT_ID }
@@ -260,6 +276,9 @@ function klog.registerSyscalls(sc)
     end
     sc["klog.stats"]           = function() return klog.stats() end
     sc["klog.logDrops"]        = function() return klog.logDrops() end
+    sc["klog.clear"]           = function() return klog.clear() end
+    sc["klog.consoleLevel"]    = function() return klog.consoleLevel() end
+    sc["klog.setConsoleLevel"] = function(n) return klog.setConsoleLevel(n) end
 end
 
 return klog

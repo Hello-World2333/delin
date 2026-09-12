@@ -46,6 +46,11 @@ end
 -- ---------------------------------------------------------------
 -- 返回 value, 是否完全转换。完全转换失败时 value 是"已转换的部分"(0 表示一点都没有)。
 local function parseIntArg(raw)
+    -- 'c: 取该字符的编码(与 C/printf(1) 一致, 如 printf '%d' \"'A\" -> 65)
+    if raw:sub(1, 1) == "'" and #raw >= 2 then
+        if #raw > 2 then badNumber("'" .. raw .. "': character constant too long") end
+        return string.byte(raw, 2), true
+    end
     local leading = raw:match("^%s*")
     local body = raw:sub(#leading + 1)
     local trailing = (body:match("%s+$") ~= nil)
@@ -359,6 +364,20 @@ local function runFormat()
             elseif conv == "s" then
                 local a = nextArg()
                 out[#out + 1] = formatStr(a or "", spec)
+            elseif conv == "q" then
+                -- %q: 把参数引成 shell 能重新读回的形式(空串 -> '', 有特殊字符 -> 单引号包裹)
+                local a = nextArg() or ""
+                if a == "" then
+                    out[#out + 1] = "''"
+                elseif a:match("[%c]") then
+                    -- 含控制字符: 用 ANSI-C 引用 $'...'(GNU coreutils 9.x 同此)
+                    local body = a:gsub("\\", "\\\\"):gsub("'", "\\'")
+                        :gsub("\n", "\\n"):gsub("\t", "\\t"):gsub("\r", "\\r")
+                    out[#out + 1] = "$'" .. body .. "'"
+                else
+                    -- 其余: 对每个"shell 会解释"的字符加反斜杠(GNU 的 %q 就是这么做的)
+                    out[#out + 1] = a:gsub("[^%w%-%._/:=@%+]", "\\%0")
+                end
             elseif conv == "b" then
                 local a = nextArg()
                 local src, body, k = a or "", {}, 1

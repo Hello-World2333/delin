@@ -1316,9 +1316,12 @@ builtins.echo = function(args)
     while i <= #args do
         local a = args[i]
         if a == "--" then i = i + 1; break end
-        if not a:match("^%-[ne]+$") then break end
+        if not a:match("^%-[neE]+$") then break end
         for k = 2, #a do
-            if a:sub(k, k) == "n" then newline = false else escapes = true end
+            local ch = a:sub(k, k)
+            if ch == "n" then newline = false
+            elseif ch == "e" then escapes = true
+            elseif ch == "E" then escapes = false end  -- -E 关掉转义(与 /bin/echo 一致)
         end
         i = i + 1
     end

@@ -617,6 +617,58 @@ shebang 支持 `#!/bin/sh` / `#!/usr/bin/env sh` 等形式，env 特殊解释为
 `cd /tmp; echo $(ls *.txt)` 静默列出 `/root` 下的东西。配套地 `login` 现在按 login(1) 语义用
 `cwd = <家目录>` spawn 用户 shell（登录 shell 的起始目录是家目录）。
 
+#### 选项约定：未知选项与"未实现"的选项一律 fail-fast
+
+工具的选项解析必须**分清三种情况**，不许把任何一种静默吞掉（判据都对着宿主 GNU 实测过）：
+
+| 情况 | 行为 | 退出码 |
+|---|---|---|
+| **未知选项**（GNU 也没有，如 `ls --zz-bogus`、`cp -%`） | 报 `invalid option`/`unrecognized option` | **与宿主 GNU 逐工具一致**：coreutils 文本/文件类（`cat cp mv rm mkdir touch chmod chown ln du df head tail wc uniq od cut tr sed find xargs cksum comm csplit expand unexpand fold join paste pr split strings tee basename dirname readlink realpath pathchk file dd dmesg logger systemctl mount umount lsblk ps kill`）是 **1**；`ls`/`sort`/`grep`/`cmp`/`printf`/`diff`/`patch`/`pgrep`/`pkill` 是 **2**（实测：`ls --zz` 给 2，`cat --zz` 给 1） |
+| **GNU 有、Delin 故意不实现**（如 `dmesg -s`、`touch -d`、`umount -l`） | 报 `option 'X' is not supported` | **2**（这是 Delin 自己的约定，GNU 没有对应行为） |
+| **缺选项参数**（`-n` 后面没有值） | 报 `option requires an argument` | 与上表同工具的未知选项码 |
+
+历史教训：一批工具在 `stderr(...)` 后面写**裸 `return`**（内核把 nil 当退出码 0），于是
+`ls --nope`、`cp --nope`、`mkdir -%`、`mount -%` 都"报了错却退出 0" —— 脚本据此判断会走错分支；
+`chmod`/`mkdir`/`touch`/`mount` 的站点已逐个改成显式码，`ls`/`cp`/`mv`/`wc` 还补上了
+缺失的长选项分支（以前 `--nope` 会掉进短选项循环，报成 `invalid option -- '-'`）。
+
+**"接受但什么都不做"比缺选项更危险**，因为脚本会据此认为副作用发生了。已清除的几处：
+
+- `touch -a/-m/-d/-r/-t/-h`：以前**接受却完全 no-op**（连 mtime 都不碰，而 ext2 明明持久化 mtime）。
+  现在一律 fail-fast 退出 2；真正实现要等 ext2 的 `setTimes`（见「已知缺口」）。
+- `mount -f/--fake`：GNU 是 **dry-run（只检查不挂）**，Delin 以前照样真挂上去。现在 `-f` 是
+  dry-run（`-v` 时打印 `would mount ...`），**不调用 `fs.mount`**。
+- `umount -l/-f`：GNU 是惰性脱离/强制卸载，Delin 的 VFS 没有引用计数 —— 以前"声称成功却什么都没变"，
+  现在退出 2；`-v` 才是真的开了详细输出。
+- `dmesg -n/-D/-E`：真的改内核控制台级别（见下），不是收下就完事。
+
+**`dmesg` / `/dev/kmsg` 的跟读**：`-w` 先冲掉现有缓冲再持续等新消息，`-W` 先用
+`h:seek(stats.next)` 跳过历史；两者都靠**轮询 `readAvailable()` + `os.msleep(50)`**（句柄的
+`readLine` 只在 `close()` 后才返回，不能拿来跟读），`^C` 由 SIGINT handler 置标志收尾、退出码 130。
+`/dev/kmsg` 的每个读者各有自己的游标，所以跟读的 `dmesg` 不会把 syslogd 的消息抢走。
+时间戳格式与 util-linux 逐项对齐：缺省 `[%5d.%06d]`、`-d` 是 `[绝对 < 间隔>]`、`-e` 是 `[  +间隔]`、
+`-T` 是 ctime、`--time-format=iso` 带 `,微秒`。`-x` 的前缀是 GNU 的 `kern  :info  : `（不是 `kern.info: `）。
+内核侧新增 `klog.clear()`（`dmesg -c/-C`）与**控制台日志级别**（`klog.setConsoleLevel`，由
+`boot.emit` 用 `klog.consoleWants(pri)` 判定是否上终端 —— ring buffer 照收，与 Linux 一样）。
+
+**`tail -f` / `-F` 的跟读**：Delin 没有 inotify，按 poll 语义做 —— 每次醒来**重开文件**
+（ext2 的 `open` 会把整份内容快照进内存，老句柄永远看不到追加）、`seek(set, off)` 再按块读；
+文件变小 = 截断/轮转，打一条 `file truncated` 并从 0 重读（GNU 同此）；`--pid=PID` 靠
+`fs.exists("/proc/<pid>")` 判活；`-s` 是轮询间隔（缺省 1.0s）。
+
+**`head`/`tail` 的符号**：`tail -n +N`（从第 N 行起）与 `head -n -N`（除末尾 N 行）以前**把符号丢掉**，
+于是"打印末 N 行"，是**静默输出错行**而不是报错；现在按 GNU 语义实现（`-c +N`/`-c -N` 同理）。
+组合短选项（`-qv`、`-n5v`）与长选项的空格形式（`--lines 5`）也补齐了；`-q`/`-v` 是**后者覆盖前者**
+（`head -vq` 无表头，GNU 同）。
+
+**`grep` 的 `-r` 与 `-R`**：以前两者同一条路径，且用 `fs.isDir`（跟随符号链接）递归 ——
+树里放一个 `ln -s .. loop` 就**无限递归**（真机症状：命令永远不返回）。现在 `-r` 不下降遍历中遇到的
+符号链接（命令行上显式给的仍跟随），`-R` 全部跟随，两者都用"符号链接链解开后的规范路径"做
+**已访问集合**，环被挡住。新增 `-A/-B/-C/-NUM`、`--group-separator/--no-group-separator`、`-m`、
+`-f`、`-L`、`-I`、`-a`、`-b`、`-z`、`--include/--exclude/--exclude-dir/--exclude-from`、
+`--color[=WHEN]`（认 `GREP_COLORS`，`auto` 看 stdout 的 `isTTY`）、`--label`。组分隔符（`--`）
+只在真的带上下文时出现（GNU 同）。
+
 #### POSIX 命令覆盖与 `proc.exec`
 
 按 Wikipedia 的 [List of POSIX commands](https://en.wikipedia.org/wiki/List_of_POSIX_commands)

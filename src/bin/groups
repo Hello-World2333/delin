@@ -10,31 +10,38 @@ local function stderr(s)
     if e and e.write then e:write(s) end
 end
 
-if args[2] then
-    stderr("groups: extra operand '" .. tostring(args[2]) .. "'\n")
-    return 1
-end
-local operand = args[1]
 if not (syscalls and syscalls["user.groupsOf"]) then
     stderr("groups: user syscalls not available\n")
     return 1
 end
 
-local name = operand
-if not name then
+--- 打印一个用户: 给了操作数时 GNU 带 "名字 : " 前缀(与 ids 一致)。
+local function show(name)
+    local list = syscalls["user.groupsOf"](name)
+    if not list then
+        stderr("groups: '" .. tostring(name) .. "': no such user\n")
+        return false
+    end
+    if #args > 0 then
+        io.write(name .. " : " .. table.concat(list, " ") .. "\n")
+    else
+        io.write(table.concat(list, " ") .. "\n")
+    end
+    return true
+end
+
+if #args == 0 then
     local me = syscalls["user.byUid"] and syscalls["user.byUid"](uid)
     if not me then
-        -- 没有 passwd 记录时 coreutils 打印 "groups: cannot find name for group ID N" 并退出 1
+        -- 没有 passwd 记录时 coreutils 打印 "cannot find name for user ID N" 并退出 1
         stderr("groups: cannot find name for user ID " .. tostring(uid) .. "\n")
         return 1
     end
-    name = me.name
+    return show(me.name) and 0 or 1
 end
 
-local list = syscalls["user.groupsOf"](name)
-if not list then
-    stderr("groups: '" .. tostring(name) .. "': no such user\n")
-    return 1
+local rc = 0
+for _, a in ipairs(args) do
+    if not show(a) then rc = 1 end
 end
-io.write(table.concat(list, " ") .. "\n")
-return 0
+return rc

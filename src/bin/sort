@@ -156,7 +156,7 @@ while i <= #args do
         i = i + 1                               -- 内存量: 接受但忽略
     elseif a:match("^%-%-") then
         stderr("sort: unrecognized option '" .. a .. "'\n")
-        return 1
+        return 2
     elseif a:sub(1, 1) == "-" and a ~= "-" then
         local k = 2
         while k <= #a do
@@ -183,7 +183,7 @@ while i <= #args do
                 k = k + 1
             else
                 stderr("sort: invalid option -- '" .. ch .. "'\n")
-                return 1
+                return 2
             end
         end
     else

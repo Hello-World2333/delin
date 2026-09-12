@@ -15,20 +15,31 @@ if #args == 0 then
     return 1
 end
 
+-- `sleep infinity` = 睡到天荒地老(coreutils >= 9.0; 用整数上限表示"到不了的那一天")。
+local INFINITE = 4294967295
 local total = 0
 for _, a in ipairs(args) do
-    local num, suf = a:match("^([%d%.]+)([smhdSMHD]?)$")
-    local n = num and tonumber(num)
-    if not n then
-        stderr("sleep: invalid time interval '" .. tostring(a) .. "'\n")
-        return 1
+    local seconds
+    if a == "--" then
+        -- 结束选项标记: 不是时间间隔
+        seconds = 0
+    elseif a == "infinity" then
+        seconds = INFINITE
+    else
+        local num, suf = a:match("^([%d%.]+)([smhdSMHD]?)$")
+        local n = num and tonumber(num)
+        if not n then
+            stderr("sleep: invalid time interval '" .. tostring(a) .. "'\n")
+            return 1
+        end
+        suf = (suf or ""):lower()
+        local mult = 1
+        if suf == "m" then mult = 60
+        elseif suf == "h" then mult = 3600
+        elseif suf == "d" then mult = 86400 end
+        seconds = n * mult
     end
-    suf = (suf or ""):lower()
-    local mult = 1
-    if suf == "m" then mult = 60
-    elseif suf == "h" then mult = 3600
-    elseif suf == "d" then mult = 86400 end
-    total = total + n * mult
+    total = total + seconds
 end
 
 local remaining = total * 1000

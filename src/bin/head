@@ -1,10 +1,12 @@
 -- Delin head: 打印文件开头 (GNU 子集)。用法: head [OPTION]... [FILE]...
 -- 选项:
---   -n N, --lines=N    打印前 N 行(缺省 10)
---   -c N, --bytes=N    打印前 N 字节
+--   -n N, --lines=N    前 N 行(缺省 10); -n -N 表示"除末尾 N 行外的全部"
+--   -c N, --bytes=N    前 N 字节;        -c -N 表示"除末尾 N 字节外的全部"
 --   -q, --quiet        多文件时不打印文件名头
 --   -v, --verbose      总是打印文件名头
---   -N / -nN / -cN     粘连形式亦支持; 无 FILE 或 FILE 为 "-" 时读 stdin。
+--   -z, --zero-terminated  以 NUL 而不是换行作为记录分隔符
+--   -N / -nN / -cN     粘连形式亦支持; 组合短选项(-qv)亦支持; 无 FILE 或 FILE 为 "-" 时读 stdin。
+-- 负计数(-n -N)必须先读完整个输入才知道边界 —— 与 GNU 一致, 此时按整文件缓冲处理。
 local args = args or {}
 local cwd = (type(cwd) == "string" and cwd) or "/"
 local function resolve(p)
@@ -31,14 +33,22 @@ local function ioeMsg(err)
 end
 
 local n, mode = 10, "lines" -- mode = "lines" | "bytes"
+local negative = false      -- -n -N / -c -N: 除末尾 N 条外的全部
+local zeroTerm = false
 local files = {}
 local quiet, verbose = false, false
 local noMoreOpts = false
 
--- 解析数值参数。
+--- 解析计数: "-N" 表示"除末尾 N 条外"(GNU head), 其余是"前 N 条"。
 local function setCount(val, m)
-    local c = tonumber((val:match("%s*%-?(%d+)")) or val)
-    if c and c >= 0 then n = c; mode = m end
+    val = tostring(val or "")
+    local sign, digits = val:match("^%s*([+%-]?)(%d+)")
+    if not digits then return false end
+    local c = tonumber(digits)
+    if c < 0 then return false end
+    n, mode = c, m
+    negative = (sign == "-")
+    return true
 end
 
 local i = 1
@@ -48,39 +58,49 @@ while i <= #args do
         files[#files + 1] = a
     elseif a == "--" then
         noMoreOpts = true
-    elseif a == "--quiet" or a == "--silent" then quiet = true
-    elseif a == "--verbose" then verbose = true
-    elseif a == "-q" then quiet = true
-    elseif a == "-v" then verbose = true
-    elseif a:sub(1, 2) == "--" and a:match("^%-%-lines=") then
-        setCount(a:sub(9), "lines")
-    elseif a:sub(1, 2) == "--" and a:match("^%-%-bytes=") then
-        setCount(a:sub(9), "bytes")
+    elseif a == "--quiet" or a == "--silent" then quiet, verbose, quiet = true, false, false
+    elseif a == "--verbose" then verbose, quiet = true, false
+    elseif a == "--zero-terminated" then zeroTerm = true
+    elseif a:match("^%-%-lines=") then
+        if not setCount(a:sub(9), "lines") then stderr("head: invalid number of lines: '" .. a:sub(9) .. "'\n"); return 1 end
+    elseif a:match("^%-%-bytes=") then
+        if not setCount(a:sub(9), "bytes") then stderr("head: invalid number of bytes: '" .. a:sub(9) .. "'\n"); return 1 end
+    elseif a == "-n" or a == "--lines" then
+        i = i + 1
+        if not args[i] then stderr("head: option requires an argument -- 'n'\n"); return 1 end
+        if not setCount(args[i], "lines") then stderr("head: invalid number of lines: '" .. args[i] .. "'\n"); return 1 end
+    elseif a == "-c" or a == "--bytes" then
+        i = i + 1
+        if not args[i] then stderr("head: option requires an argument -- 'c'\n"); return 1 end
+        if not setCount(args[i], "bytes") then stderr("head: invalid number of bytes: '" .. args[i] .. "'\n"); return 1 end
+    elseif a:sub(1, 2) == "--" then
+        stderr("head: unrecognized option '" .. a .. "'\n")
+        return 1
     elseif a:sub(1, 1) == "-" and a ~= "-" then
-        local opt = a:match("^%-n(.*)$")
-        local optc = a:match("^%-c(.*)$")
-        local optglued = a:match("^%-(%d+)$")
-        if opt then
-            if opt == "" then
-                i = i + 1
-                if not args[i] then stderr("head: option requires an argument -- 'n'\n"); return end
-                setCount(args[i], "lines")
-            else
-                setCount(opt, "lines")
-            end
-        elseif optc then
-            if optc == "" then
-                i = i + 1
-                if not args[i] then stderr("head: option requires an argument -- 'c'\n"); return end
-                setCount(args[i], "bytes")
-            else
-                setCount(optc, "bytes")
-            end
-        elseif optglued then
-            setCount(optglued, "lines")
+        if a:match("^%-(%d+)$") then
+            setCount(a:sub(2), "lines")
         else
-            stderr("head: invalid option -- '" .. a .. "'\n")
-            return 1
+            local k = 2
+            while k <= #a do
+                local ch = a:sub(k, k)
+                if ch == "n" or ch == "c" then
+                    local rest = a:sub(k + 1)
+                    if rest == "" then
+                        i = i + 1
+                        rest = args[i]
+                        if not rest then stderr("head: option requires an argument -- '" .. ch .. "'\n"); return 1 end
+                    end
+                    local what = (ch == "n") and "lines" or "bytes"
+                    if not setCount(rest, what) then stderr("head: invalid number of " .. what .. ": '" .. rest .. "'\n"); return 1 end
+                    k = #a + 1
+                else
+                    if ch == "q" then quiet, verbose, quiet = true, false, false
+                    elseif ch == "v" then verbose, quiet = true, false
+                    elseif ch == "z" then zeroTerm = true
+                    else stderr("head: invalid option -- '" .. ch .. "'\n"); return 1 end
+                    k = k + 1
+                end
+            end
         end
     else
         files[#files + 1] = a
@@ -98,7 +118,40 @@ local function header(name)
     io.write("==> " .. disp .. " <==\n")
 end
 
+--- 整个输入读成字符串(-z 与负计数都要整份数据)。
+local function slurp(fh)
+    if fh.readAll then return fh:readAll() or "" end
+    local buf = {}
+    while true do
+        local line = fh:readLine()
+        if line == nil then break end
+        buf[#buf + 1] = line
+    end
+    return table.concat(buf, "\n")
+end
+
 local function emitLines(fh)
+    if negative or zeroTerm then
+--- 按分隔符切记录(不丢"末尾没有分隔符"的残段, 也不把结尾分隔符算成空记录)。
+local function splitRecords(s, sep)
+    local recs, pos = {}, 1
+    while true do
+        local at = s:find(sep, pos, true)
+        if not at then
+            if pos <= #s then recs[#recs + 1] = s:sub(pos) end
+            return recs
+        end
+        recs[#recs + 1] = s:sub(pos, at - 1)
+        pos = at + 1
+    end
+end
+
+        local sep = zeroTerm and "\0" or "\n"
+        local recs = splitRecords(slurp(fh), sep)
+        local stop = negative and math.max(0, #recs - n) or math.min(n, #recs)
+        for k = 1, stop do io.write(recs[k] .. sep) end
+        return
+    end
     local c = 0
     while c < n do
         local line = fh:readLine()
@@ -109,6 +162,11 @@ local function emitLines(fh)
 end
 
 local function emitBytes(fh)
+    if negative then
+        local s = slurp(fh)
+        io.write(s:sub(1, math.max(0, #s - n)))
+        return
+    end
     local remaining = n
     if fh and fh.read then
         local hadData = false
@@ -122,13 +180,7 @@ local function emitBytes(fh)
         if hadData then return end
     end
     -- 生数据读取不可用(如 stdin): 逐行缓冲后截取前 n 字节。
-    local buf = {}
-    while true do
-        local line = fh:readLine()
-        if line == nil then break end
-        buf[#buf + 1] = line
-    end
-    local s = table.concat(buf, "\n")
+    local s = slurp(fh)
     io.write(s:sub(1, n))
 end
 
@@ -136,7 +188,7 @@ local function emit(fh)
     if mode == "bytes" then emitBytes(fh) else emitLines(fh) end
 end
 
-for idx, raw in ipairs(files) do
+for _, raw in ipairs(files) do
     if raw == "-" then
         header("-")
         local stdin = io.stdin()
@@ -153,3 +205,4 @@ for idx, raw in ipairs(files) do
         f:close()
     end
 end
+return 0

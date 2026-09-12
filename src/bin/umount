@@ -9,14 +9,24 @@ local function stderr(s)
     if e and e.write then e:write(s) end
 end
 
-local operands, noMoreOpts = {}, false
+local operands, noMoreOpts, verbose = {}, false, false
 for _, a in ipairs(args) do
     if noMoreOpts then
         operands[#operands + 1] = a
     elseif a == "--" then
         noMoreOpts = true
-    elseif a == "-l" or a == "-f" or a == "-v" then
-        -- 简化: 忽略 -l/-f/-v
+    elseif a == "-v" or a == "--verbose" then
+        verbose = true
+    elseif a == "-l" or a == "--lazy" or a == "-f" or a == "--force" then
+        -- Delin 的 VFS 没有引用计数/惰性脱离: 声称成功却什么都没做会骗过脚本, 直接 fail-fast。
+        stderr("umount: option '" .. a .. "' is not supported\n")
+        return 2
+    elseif a:sub(1, 2) == "--" then
+        stderr("umount: unrecognized option '" .. a .. "'\n")
+        return 1
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        stderr("umount: invalid option -- '" .. a:sub(2, 2) .. "'\n")
+        return 1
     else
         operands[#operands + 1] = a
     end

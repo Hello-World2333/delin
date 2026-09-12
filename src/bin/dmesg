@@ -1,7 +1,31 @@
--- Delin dmesg: 打印内核 ring buffer (/dev/kmsg)。
--- 用法: dmesg [-x] [-h]
---   -x  在每行前加 "facility.severity:" 前缀(调试用)
--- 读 /dev/kmsg 当前缓冲(读尽即返回, 不阻塞等待新消息)。
+-- Delin dmesg: 打印/跟读内核 ring buffer (/dev/kmsg), util-linux dmesg(1) 子集。
+-- 用法: dmesg [OPTION]...
+-- 显示:
+--   (无)              绝对时间戳 "[  秒.微秒]"
+--   -T, --ctime       人类可读时间(星期 月 日 时:分:秒 年)
+--   -H, --human       同 -T
+--   -t, --notime      不打印时间戳
+--   -d, --show-delta  绝对时间戳 + 与上一条的间隔 "[秒.微秒 < 间隔>]"
+--   -e, --reltime     只打印与上一条的间隔 "[  +秒.微秒]"
+--   --time-format=F   delta|reltime|ctime|notime|iso|raw
+--   -x, --decode      前缀 "facility  :severity  : "(GNU 的 -x 格式)
+-- 过滤:
+--   -l, --level LIST       只保留这些严重级(名或数字, 逗号分隔)
+--   -f, --facility LIST    只保留这些设施(名或数字, 逗号分隔)
+--   -k                     只要内核消息(facility=kern)
+--   -u                     只要用户态消息(facility!=kern)
+-- 动作:
+--   -w, --follow      打印当前缓冲后持续等待新消息(^C 退出, 退出码 130)
+--   -W, --follow-new  只跟读新消息(不打印现有缓冲)
+--   -c, --read-clear  打印后清空 ring buffer
+--   -C, --clear       只清空 ring buffer
+--   -n, --console-level LEVEL   设置控制台日志级别(只设置不打印)
+--   -D, --console-off           关闭控制台打印(ring buffer 照收)
+--   -E, --console-on            打开控制台打印(全部级别)
+--   -V, --version / -h, --help
+-- 已知偏离: 不支持 -s/--buffer-size(ring buffer 大小是内核常量)、-S/--syslog(无 syslog(2))、
+--   -F/--file 与 --since/--until; 这些"认得但没实现"的开关一律 fail-fast 退出 2, 不静默忽略。
+-- 让出调度器: 跟读循环每 ~50ms 让出一次, 保证 ^C 能被投递(见 for-ai.md 的信号一节)。
 local args = args or {}
 
 local function stderr(s)
@@ -9,16 +33,222 @@ local function stderr(s)
     if e and e.write then e:write(s) end
 end
 
-local showPri = false
-for _, a in ipairs(args) do
-    if a == "-x" or a == "--decode" then showPri = true
-    elseif a == "--help" or a == "-h" then
-        io.write("usage: dmesg [-x]\n")
-        return 0
-    elseif a:sub(1, 1) == "-" and a ~= "-" then
-        stderr("dmesg: invalid option '" .. a .. "'\n")
-        return 1
+local USAGE = "usage: dmesg [options]\n"
+    .. "  -w, --follow            follow new messages\n"
+    .. "  -W, --follow-new        wait and print only new messages\n"
+    .. "  -T, --ctime             human readable timestamps\n"
+    .. "  -t, --notime            don't print timestamps\n"
+    .. "  -d, --show-delta        show time delta between messages\n"
+    .. "  -e, --reltime           show only time delta\n"
+    .. "      --time-format=FMT   delta|reltime|ctime|notime|iso|raw\n"
+    .. "  -x, --decode            decode facility and level to printable names\n"
+    .. "  -l, --level LIST        restrict to levels\n"
+    .. "  -f, --facility LIST     restrict to facilities\n"
+    .. "  -k                      print kernel messages only\n"
+    .. "  -u                      print userspace messages only\n"
+    .. "  -c, --read-clear        read and clear the buffer\n"
+    .. "  -C, --clear             clear the buffer\n"
+    .. "  -n, --console-level L   set level of messages printed to console\n"
+    .. "  -D, --console-off       disable printing messages to console\n"
+    .. "  -E, --console-on        enable printing messages to console\n"
+    .. "  -V, --version           display version\n"
+    .. "  -h, --help              display this help\n"
+
+local function notSupported(a)
+    stderr("dmesg: option '" .. a .. "' is not supported\n")
+    return 2
+end
+
+-- ---------------------------------------------------------------
+-- 选项
+-- ---------------------------------------------------------------
+local timeFormat = "raw"
+local decode = false
+local follow, followNew = false, false
+local readClear, clearOnly = false, false
+local levels, facilities = nil, nil   -- 集合: 名/数字 -> true
+local kernelOnly, userOnly = false, false
+local consoleLevel, consoleOff, consoleOn = nil, false, false
+
+--- 把 "err,warn" / "3,4" 解析成集合; 名字表由内核 syscall 提供(唯一真源)。
+local function parseList(spec, kind)
+    local set = {}
+    local toNum = (kind == "level") and syscalls["syslog.severity"] or syscalls["syslog.facility"]
+    for item in (spec .. ","):gmatch("([^,]*),") do
+        item = item:gsub("^%s+", ""):gsub("%s+$", "")
+        if item ~= "" then
+            local n = toNum(item)
+            if not n and item:match("^%d+$") then n = tonumber(item) end
+            if not n then
+                stderr("dmesg: unknown " .. kind .. " '" .. item .. "'\n")
+                return nil
+            end
+            set[n] = true
+        end
     end
+    return set
+end
+
+local function needArg(at, opt)
+    local v = args[at + 1]
+    if not v then stderr("dmesg: option '" .. opt .. "' requires an argument\n") end
+    return v
+end
+
+local function levelNum(v)
+    local n = syscalls["syslog.severity"](v)
+    if not n and v:match("^%d+$") then n = tonumber(v) end
+    if not n or n < 0 or n > 7 then return nil end
+    return n
+end
+
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if a == "--" then
+        if args[i + 1] then stderr("dmesg: too many arguments\n"); return 2 end
+    elseif a == "-h" or a == "--help" then
+        io.write(USAGE)
+        return 0
+    elseif a == "-V" or a == "--version" then
+        io.write("dmesg (Delin OS)\n")
+        return 0
+    elseif a == "-w" or a == "--follow" then follow = true
+    elseif a == "-W" or a == "--follow-new" then follow, followNew = true, true
+    elseif a == "-T" or a == "--ctime" or a == "-H" or a == "--human" then timeFormat = "ctime"
+    elseif a == "-t" or a == "--notime" then timeFormat = "notime"
+    elseif a == "-d" or a == "--show-delta" then timeFormat = "delta"
+    elseif a == "-e" or a == "--reltime" then timeFormat = "reltime"
+    elseif a:match("^%-%-time%-format=") then
+        local f = a:sub(15)
+        if f ~= "delta" and f ~= "reltime" and f ~= "ctime" and f ~= "notime"
+            and f ~= "iso" and f ~= "raw" then
+            stderr("dmesg: unknown time format '" .. f .. "'\n")
+            return 2
+        end
+        timeFormat = f
+    elseif a == "-x" or a == "--decode" then decode = true
+    elseif a == "-k" then kernelOnly = true
+    elseif a == "-u" then userOnly = true
+    elseif a == "-c" or a == "--read-clear" then readClear = true
+    elseif a == "-C" or a == "--clear" then clearOnly = true
+    elseif a == "-D" or a == "--console-off" then consoleOff = true
+    elseif a == "-E" or a == "--console-on" then consoleOn = true
+    elseif a == "-l" or a == "--level" then
+        local v = needArg(i, a); if not v then return 2 end
+        levels = parseList(v, "level"); if not levels then return 2 end
+        i = i + 1
+    elseif a:match("^%-%-level=") then
+        levels = parseList(a:sub(9), "level"); if not levels then return 2 end
+    elseif a == "-f" or a == "--facility" then
+        local v = needArg(i, a); if not v then return 2 end
+        facilities = parseList(v, "facility"); if not facilities then return 2 end
+        i = i + 1
+    elseif a:match("^%-%-facility=") then
+        facilities = parseList(a:sub(12), "facility"); if not facilities then return 2 end
+    elseif a == "-n" or a == "--console-level" then
+        local v = needArg(i, a); if not v then return 2 end
+        local n = levelNum(v)
+        if not n then stderr("dmesg: unknown level '" .. v .. "'\n"); return 2 end
+        consoleLevel = n
+        i = i + 1
+    elseif a:match("^%-%-console%-level=") then
+        local v = a:sub(17)
+        local n = levelNum(v)
+        if not n then stderr("dmesg: unknown level '" .. v .. "'\n"); return 2 end
+        consoleLevel = n
+    elseif a == "-s" or a == "--buffer-size" or a == "-S" or a == "--syslog"
+        or a == "--since" or a == "--until" or a == "-F" or a == "--file"
+        or a == "-K" or a == "--kmsg-file" or a == "-r" or a == "--raw"
+        or a == "-p" or a == "--force-prefix" or a == "-J" or a == "--json"
+        or a == "-L" or a == "--color" or a == "--noescape" or a == "-P" or a == "--nopager" then
+        return notSupported(a)
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        stderr("dmesg: invalid option -- '" .. a:sub(2, 2) .. "'\n")
+        return 1
+    else
+        stderr("dmesg: too many arguments\n")
+        return 2
+    end
+    i = i + 1
+end
+
+-- ---------------------------------------------------------------
+-- 控制台级别(先于任何输出生效; -n 与 GNU 一样"只设置不打印")
+-- ---------------------------------------------------------------
+if consoleOff then syscalls["klog.setConsoleLevel"](-1) end
+if consoleOn then syscalls["klog.setConsoleLevel"](7) end
+if consoleLevel then syscalls["klog.setConsoleLevel"](consoleLevel) end
+if consoleLevel or consoleOff or consoleOn then return 0 end
+
+-- ---------------------------------------------------------------
+-- ^C: 只置标志, 由循环收尾(跟读模式下退出码 130)
+-- ---------------------------------------------------------------
+local interrupted = false
+if syscalls and syscalls["signal.install"] then
+    syscalls["signal.install"](2, function() interrupted = true end)
+end
+
+local stats = syscalls["klog.stats"]()
+local bootMs = stats.boot or 0
+
+-- ---------------------------------------------------------------
+-- 时间戳格式(与 util-linux 逐项对照)
+-- ---------------------------------------------------------------
+local prevUsec = nil
+
+local function stamp(usec)
+    if timeFormat == "notime" then return "" end
+    local sec = math.floor(usec / 1000000)
+    local us = usec % 1000000
+    if timeFormat == "raw" then
+        return string.format("[%5d.%06d] ", sec, us)
+    elseif timeFormat == "delta" then
+        local d = prevUsec and (usec - prevUsec) or 0
+        return string.format("[%5d.%06d < %5d.%06d>] ", sec, us,
+            math.floor(d / 1000000), d % 1000000)
+    elseif timeFormat == "reltime" then
+        local d = prevUsec and (usec - prevUsec) or 0
+        return string.format("[  +%5d.%06d] ", math.floor(d / 1000000), d % 1000000)
+    elseif timeFormat == "ctime" then
+        return "[" .. os.date("%a %b %e %H:%M:%S %Y", math.floor((bootMs + usec / 1000) / 1000)) .. "] "
+    elseif timeFormat == "iso" then
+        local t = math.floor((bootMs + usec / 1000) / 1000)
+        return os.date("%Y-%m-%dT%H:%M:%S", t) .. string.format(",%06d", us) .. " "
+    end
+    return ""
+end
+
+--- 一行 kmsg -> 输出(被过滤掉时返回 nil)。
+local function render(line)
+    local pri, usec, text = line:match("^(%d+),%d+,(%d+),%-?%d*;(.*)$")
+    if not pri then return line .. "\n" end
+    pri, usec = tonumber(pri), tonumber(usec)
+    local fac, sev = math.floor(pri / 8), pri % 8
+    if levels and not levels[sev] then return nil end
+    if facilities and not facilities[fac] then return nil end
+    if kernelOnly and fac ~= 0 then return nil end
+    if userOnly and fac == 0 then return nil end
+    local prefix = stamp(usec)
+    prevUsec = usec
+    if decode then
+        prefix = string.format("%-6s:%-6s: ", syscalls["syslog.facilityName"](fac),
+            syscalls["syslog.severityName"](sev)) .. prefix
+    end
+    return prefix .. text .. "\n"
+end
+
+local function emit(data)
+    for line in data:gmatch("[^\n]+") do
+        local s = render(line)
+        if s then io.write(s) end
+    end
+end
+
+-- -C: 只清空
+if clearOnly then
+    syscalls["klog.clear"]()
+    return 0
 end
 
 local h = fs.open("/dev/kmsg", "r")
@@ -27,22 +257,40 @@ if not h then
     return 1
 end
 
+-- -W: 跳过现有缓冲, 只跟新消息
+if followNew then
+    local ok, err = h:seek(stats.next)
+    if not ok then
+        stderr("dmesg: /dev/kmsg: " .. tostring(err) .. "\n")
+        h:close()
+        return 1
+    end
+end
+
+local msleep = os.msleep or function(ms) os.sleep(math.max((ms or 0) / 1000, 0.05)) end
+
+if follow then
+    -- 先冲掉当前缓冲(跟读时的历史消息), 再持续等新消息。
+    local data = h:readAvailable()
+    if data and data ~= "" then emit(data) end
+    while not interrupted do
+        data = h:readAvailable()
+        if data and data ~= "" then
+            emit(data)
+        else
+            msleep(50)
+        end
+    end
+    h:close()
+    if readClear then syscalls["klog.clear"]() end
+    return 130
+end
+
 while true do
     local data = h:readAvailable()
     if not data or data == "" then break end
-    for line in data:gmatch("[^\n]+") do
-        local pri, usec, text = line:match("^(%d+),%d+,(%d+),%-?%d*;(.*)$")
-        if pri then
-            local prefix = string.format("[%12.6f] ", tonumber(usec) / 1000000)
-            if showPri then
-                prefix = prefix .. syscalls["syslog.facilityName"](math.floor(tonumber(pri) / 8))
-                    .. "." .. syscalls["syslog.severityName"](tonumber(pri) % 8) .. ": "
-            end
-            io.write(prefix .. text .. "\n")
-        else
-            io.write(line .. "\n")
-        end
-    end
+    emit(data)
 end
 h:close()
+if readClear then syscalls["klog.clear"]() end
 return 0

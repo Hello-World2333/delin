@@ -870,6 +870,11 @@ do
     user.registerSyscalls(user.init(F), F)
     -- 标准正则引擎: 与真机同一份内核源码(kernel/regex.lua) —— grep/sed/ed/expr/pgrep 都用它。
     require("kernel.regex").registerSyscalls()
+    -- 内核日志(syslog.* / klog.*): dmesg / logger / syslogd 要用的名表与 ring buffer 统计。
+    -- 真机上由 boot 调 klog.registerSyscalls; 测试台漏了它, 于是 dmesg 在宿主上会报
+    -- "attempt to call local 'toNum' (a nil value)" —— 这种"只有测试台才有的缺口"必须补,
+    -- 否则新写的自检脚本在宿主上跑不过, 只能等到真机那一轮才发现。
+    require("kernel.klog").registerSyscalls(require("kernel.modules").syscalls())
     -- user.registerSyscalls 写进的是**内核的** syscall 表(kernel.modules), 而工具拿到的是
     -- 测试台自己那张(proc/job/signal/... 的桩都在这儿) —— 把 user.* 并进来。
     for k, v in pairs(require("kernel.modules").syscalls()) do syscalls[k] = v end

@@ -18,6 +18,8 @@ local function stderr(s)
 end
 
 local fstype, operands, noMoreOpts, mountAll = nil, {}, false, false
+-- -f/--fake = dry-run(只做检查不真的挂载), -v = 打印细节 —— 与 util-linux mount(8) 一致。
+local dryRun, verbose = false, false
 local i = 1
 while i <= #args do
     local a = args[i]
@@ -35,10 +37,15 @@ while i <= #args do
         fstype = a:sub(3)
     elseif a:match("^%-%-type=") then
         fstype = a:sub(8)
+    elseif a:sub(1, 2) == "--" then
+        stderr("mount: unrecognized option '" .. a .. "'\n")
+        return 1
     elseif a:sub(1, 1) == "-" and a ~= "-" then
         for k = 2, #a do
             local ch = a:sub(k, k)
-            if ch ~= "f" and ch ~= "v" then stderr("mount: invalid option -- '" .. ch .. "'\n"); return end
+            if ch == "f" then dryRun = true
+            elseif ch == "v" then verbose = true
+            else stderr("mount: invalid option -- '" .. ch .. "'\n"); return 1 end
         end
     else
         operands[#operands + 1] = a
@@ -69,6 +76,10 @@ local function doMount(device, dir)
     if not (syscalls and syscalls["fs.mount"]) then
         stderr("mount: fs.mount syscall not available\n")
         return 1
+    end
+    if dryRun then
+        if verbose then io.write("mount: would mount " .. device .. " on " .. dir .. "\n") end
+        return 0
     end
     local ok, info = syscalls["fs.mount"](device, dir, fstype)
     if not ok then
@@ -103,6 +114,9 @@ local function mountAllFromFstab()
             io.write(e.mountpoint .. ": already mounted\n")
         else
             if not fs.exists(e.mountpoint) then fs.makeDir(e.mountpoint) end
+            if dryRun then
+                if verbose then io.write("mount: would mount " .. e.device .. " on " .. e.mountpoint .. "\n") end
+            else
             local ok, info = syscalls["fs.mount"](e.device, e.mountpoint, e.fstype)
             if ok then
                 info = info or {}
@@ -111,6 +125,7 @@ local function mountAllFromFstab()
             else
                 stderr("mount: " .. tostring(info) .. "\n")
                 rc = 1
+            end
             end
         end
     end

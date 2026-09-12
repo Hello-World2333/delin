@@ -46,7 +46,8 @@ local function emit(pri, ...)
     klog.write(pri, line)
     -- CC 的 fs 文件句柄方法用点号(非冒号), 否则会写成 tostring(handle)
     if bootLog then bootLog.writeLine(line); bootLog.flush() end
-    write(line .. "\n") -- 也输出到终端(view 可见)
+    -- 也输出到终端(view 可见), 但受控制台级别约束(Linux console_loglevel; dmesg -n/-D/-E 可改)。
+    if klog.consoleWants(pri) then write(line .. "\n") end
 end
 
 --- 内核消息(facility=kern)。
