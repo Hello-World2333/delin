@@ -82,13 +82,15 @@ local function doLogin()
                 local u = syscalls["user.get"](name)
                 outln("Welcome, " .. name .. "!")
                 -- login(1) 语义: 按 passwd 设置登录环境, 再启动用户 shell。
+                -- cwd 必须是家目录(登录 shell 的起始目录; sh 自己按 /proc/self/cwd 取 cwd)。
                 local env = {
                     USER = name, LOGNAME = name, PATH = "/bin", TERM = "linux",
                     HOME = (u and u.home) or "/",
                     SHELL = (u and u.shell) or "/bin/sh",
                 }
+                local home = (u and u.home) or "/"
                 local child = spawn(shSrc, "sh", u and u.uid or 0, u and u.gid or 0,
-                    { [0] = "/bin/sh" }, { env = env })
+                    { [0] = "/bin/sh" }, { env = env, cwd = home })
                 if not child then
                     outln("login: failed to start shell for " .. name)
                 else

@@ -27,8 +27,22 @@ local uname = (uinfo and uinfo.name) or "root"
 local lastExit = 0
 local lastBgPid = nil -- $! : 最近一个后台作业的 pid
 
-local cwd = "/"
-if uinfo and uinfo.home and fs.isDir(uinfo.home) then cwd = uinfo.home end
+-- 起始工作目录 = **内核里这个进程的 cwd**(/proc/self/cwd, Linux 的 getcwd 等价物)。
+-- 不能拿 $HOME 当 cwd: 子 shell(`&` 的作业、`$( )` 命令替换)是**新进程**, 内核已把父 shell 的
+-- cwd 继承给它, 而按 HOME 初始化会让它跑到别处去 —— `cd /tmp; echo $(ls *.txt)` 会静默列出
+-- /root 下的东西。读不到(/proc 未挂载等)才退回 HOME。
+local function initialCwd()
+    local f = fs.open("/proc/self/cwd", "r")
+    if f then
+        local l = (f.readLine and f:readLine()) or ""
+        f:close()
+        l = l:gsub("%s+$", "")
+        if l ~= "" and fs.isDir(l) then return l end
+    end
+    if uinfo and uinfo.home and fs.isDir(uinfo.home) then return uinfo.home end
+    return "/"
+end
+local cwd = initialCwd()
 
 -- 父进程导出的环境块(内核注入的全局 env 表)。startup 变量的优先级:
 -- 继承的环境 > passwd/内核信息 > 内置缺省(与 login(1) 先设 USER/HOME/SHELL 再起 sh 一致)。
@@ -239,12 +253,94 @@ local function readVarName(src, i)
     return nil, i
 end
 
+-- ---------------------------------------------------------------
+-- 复合替换的原文扫描($( ) / ` ` / $(( )))
+-- ---------------------------------------------------------------
+-- 命令替换 $( ): i 指向 '(' 之后。返回 原文, 结束位置(闭括号之后); 未闭合返回 nil。
+-- 需按引号/转义/嵌套括号扫描: `$(echo ')')` 里的 ')' 不是收尾。
+local function scanCmdSub(src, i)
+    local depth, j, n = 1, i, #src
+    while j <= n do
+        local c = src:sub(j, j)
+        if c == "\\" then j = j + 2
+        elseif c == "'" then
+            j = j + 1
+            while j <= n and src:sub(j, j) ~= "'" do j = j + 1 end
+            j = j + 1
+        elseif c == '"' then
+            j = j + 1
+            while j <= n and src:sub(j, j) ~= '"' do
+                if src:sub(j, j) == "\\" then j = j + 1 end
+                j = j + 1
+            end
+            j = j + 1
+        elseif c == "(" then depth = depth + 1; j = j + 1
+        elseif c == ")" then
+            depth = depth - 1
+            if depth == 0 then return src:sub(i, j - 1), j + 1 end
+            j = j + 1
+        else j = j + 1 end
+    end
+    return nil
+end
+
+-- 反引号命令替换: i 指向第一个 '`'。POSIX 2.6.3: `\``/`\\`/`\$` 去掉反斜杠,
+-- 其它位置的反斜杠原样保留(与 $( ) 不同 —— 这是反引号的经典坑, 必须照抄)。
+local function scanBacktick(src, i)
+    local j, n, out = i + 1, #src, {}
+    while j <= n do
+        local c = src:sub(j, j)
+        if c == "\\" then
+            local nx = src:sub(j + 1, j + 1)
+            if nx == "`" or nx == "\\" or nx == "$" then out[#out + 1] = nx; j = j + 2
+            else out[#out + 1] = "\\"; j = j + 1 end
+        elseif c == "`" then return table.concat(out), j + 1
+        else out[#out + 1] = c; j = j + 1 end
+    end
+    return nil
+end
+
+-- 算术展开 $(( )): i 指向 '$'。返回 表达式原文, 结束位置; 未闭合返回 nil;
+-- 括号错位返回 nil, 消息(那是语法错, 不是"输入还没读完")。
+-- 体内括号要配对(`$(( (1+2)*3 ))`), 深度归 0 的那个 ')' 是表达式的收尾,
+-- 紧跟的第二个 ')' 才是 $(( 的收尾 —— 少一个就是语法错(bash/dash 也这么判:
+-- `$((-7)%2)` 在两者里同样是语法错, `$(( (-7)%2 ))` 才对)。
+local function scanArith(src, i)
+    local j, n, depth = i + 3, #src, 1
+    while j <= n do
+        local c = src:sub(j, j)
+        if c == "'" then
+            j = j + 1
+            while j <= n and src:sub(j, j) ~= "'" do j = j + 1 end
+            j = j + 1
+        elseif c == '"' then
+            j = j + 1
+            while j <= n and src:sub(j, j) ~= '"' do
+                if src:sub(j, j) == "\\" then j = j + 1 end
+                j = j + 1
+            end
+            j = j + 1
+        elseif c == "\\" then j = j + 2
+        elseif c == "(" then depth = depth + 1; j = j + 1
+        elseif c == ")" then
+            depth = depth - 1
+            if depth == 0 then
+                if src:sub(j + 1, j + 1) ~= ")" then return nil, "missing '))'" end
+                return src:sub(i + 3, j - 1), j + 2
+            end
+            j = j + 1
+        else j = j + 1 end
+    end
+    return nil
+end
+
 -- 词法: 返回 toks, inc。inc=true 表示输入在引号/行续接中结束 —— 即"输入不完整"
 -- (交互式应继续读下一行, 非交互式到 EOF 则是语法错误)。
 -- 每个 token 记 pos/fin(源文本起止下标): 后台作业 `&` 要按原文重新起子 shell 执行。
 local function lex(src)
     local toks, i, n = {}, 1, #src
     local inc = false
+    local lexErr = nil -- 确定的语法错(与"输入没读完"区分开: 后者交互式要继续读行)
     while i <= n do
         local c = src:sub(i, i)
         if c == " " or c == "\t" or c == "\r" then
@@ -266,9 +362,21 @@ local function lex(src)
             toks[#toks + 1] = { t = "op", op = c, pos = i, fin = i }; i = i + 1
         else
             local wordStart = i
-            local segs, raw, rawbuf = {}, "", ""
+            local segs, raw, rawbuf, qbuf = {}, "", "", ""
+            -- qbuf 与 rawbuf 等长: 逐字符记"是否被引用"。POSIX 只有**未引用**的
+            -- * ? [ 才是通配符, 而一个词可以是混合的(`a"*"*` 里前一个 * 是字面量),
+            -- 所以引号状态必须逐字符带着走, 不能在词这一层用一个布尔量。
             local function flushRaw()
-                if rawbuf ~= "" then segs[#segs + 1] = { raw = rawbuf }; rawbuf = "" end
+                if rawbuf ~= "" then
+                    local seg = { raw = rawbuf }
+                    if qbuf:find("1", 1, true) then seg.qm = qbuf end
+                    segs[#segs + 1] = seg
+                    rawbuf, qbuf = "", ""
+                end
+            end
+            local function pushRaw(text, quoted)
+                rawbuf = rawbuf .. text
+                qbuf = qbuf .. string.rep(quoted and "1" or "0", #text)
             end
             while i <= n do
                 local cc = src:sub(i, i)
@@ -283,7 +391,12 @@ local function lex(src)
                     elseif nx == "\r" and src:sub(i + 2, i + 2) == "\n" then
                         i = i + 3; if i > n then inc = true end
                     elseif nx == "" then inc = true; i = i + 1 -- 行尾反斜杠: 等续行
-                    else rawbuf = rawbuf .. "\\" .. nx; raw = raw .. "\\" .. nx; i = i + 2 end
+                    else
+                        -- 引号移除(POSIX 2.2): `\c` 就是字面 c, 且算"被引用"(通配符不生效)。
+                        pushRaw(nx, true)
+                        raw = raw .. "\\" .. nx -- token.raw 保留原文: isKw/赋值识别要看它
+                        i = i + 2
+                    end
                 elseif cc == "'" then
                     flushRaw()
                     local j = i + 1
@@ -293,36 +406,91 @@ local function lex(src)
                     i = (j <= n) and (j + 1) or j
                 elseif cc == '"' then
                     flushRaw()
-                    local j, dqsegs = i + 1, {}
+                    local j, dqsegs, dbuf = i + 1, {}, ""
+                    local function flushDq()
+                        if dbuf ~= "" then dqsegs[#dqsegs + 1] = { raw = dbuf }; dbuf = "" end
+                    end
                     while j <= n and src:sub(j, j) ~= '"' do
                         local dc, nx = src:sub(j, j), src:sub(j + 1, j + 1)
                         -- POSIX: 双引号内反斜杠仅在 \$ \` \" \\ 和换行前有特殊含义(去掉反斜杠),
                         -- 其它位置原样保留(如 "\t" 就是反斜杠+t)。
                         if dc == "\\" and (nx == '"' or nx == "$" or nx == "\\" or nx == "`") then
-                            dqsegs[#dqsegs + 1] = { raw = nx }; raw = raw .. nx; j = j + 2
+                            dbuf = dbuf .. nx; raw = raw .. nx; j = j + 2
                         elseif dc == "\\" and nx == "\n" then
                             j = j + 2 -- 行续接: 双引号内 `\` + 换行 也被删除
                         elseif dc == "\\" and nx == "\r" and src:sub(j + 2, j + 2) == "\n" then
                             j = j + 3
+                        elseif dc == "$" and src:sub(j + 1, j + 2) == "((" then
+                            local body, ni, aerr = scanArith(src, j)
+                            if aerr then lexErr = aerr; j = n + 1
+                            elseif not body then j = n + 1 else
+                                flushDq()
+                                dqsegs[#dqsegs + 1] = { arith = body }
+                                raw = raw .. src:sub(j, ni - 1)
+                                j = ni
+                            end
+                        elseif dc == "$" and src:sub(j + 1, j + 1) == "(" then
+                            local body, ni = scanCmdSub(src, j + 2)
+                            if not body then j = n + 1 else
+                                flushDq()
+                                dqsegs[#dqsegs + 1] = { cmdsub = body }
+                                raw = raw .. src:sub(j, ni - 1)
+                                j = ni
+                            end
                         elseif dc == "$" then
                             local name, ni = readVarName(src, j + 1)
                             if name then
+                                flushDq()
                                 dqsegs[#dqsegs + 1] = { var = name }; raw = raw .. tostring(getVarVal(name)); j = ni
-                            else dqsegs[#dqsegs + 1] = { raw = "$" }; raw = raw .. "$"; j = j + 1 end
+                            else dbuf = dbuf .. "$"; raw = raw .. "$"; j = j + 1 end
+                        elseif dc == "`" then
+                            local body, ni = scanBacktick(src, j)
+                            if not body then j = n + 1 else
+                                flushDq()
+                                dqsegs[#dqsegs + 1] = { cmdsub = body }
+                                raw = raw .. src:sub(j, ni - 1)
+                                j = ni
+                            end
                         else
-                            dqsegs[#dqsegs + 1] = { raw = dc }; raw = raw .. dc; j = j + 1
+                            dbuf = dbuf .. dc; raw = raw .. dc; j = j + 1
                         end
                     end
                     if j > n then inc = true end -- 双引号未闭合(含行尾反斜杠): 跨行待续
+                    flushDq()
                     segs[#segs + 1] = { dq = dqsegs }
                     i = (j <= n) and (j + 1) or j
+                elseif cc == "$" and src:sub(i + 1, i + 2) == "((" then
+                    local body, ni, aerr = scanArith(src, i)
+                    if aerr then lexErr = aerr; i = n + 1
+                    elseif not body then inc = true; i = n + 1 else
+                        flushRaw()
+                        segs[#segs + 1] = { arith = body }
+                        raw = raw .. src:sub(i, ni - 1) -- 原文进 token.raw: 它不是关键字, 也不是赋值前缀
+                        i = ni
+                    end
+                elseif cc == "$" and src:sub(i + 1, i + 1) == "(" then
+                    local body, ni = scanCmdSub(src, i + 2)
+                    if not body then inc = true; i = n + 1 else
+                        flushRaw()
+                        segs[#segs + 1] = { cmdsub = body }
+                        raw = raw .. src:sub(i, ni - 1)
+                        i = ni
+                    end
+                elseif cc == "`" then
+                    local body, ni = scanBacktick(src, i)
+                    if not body then inc = true; i = n + 1 else
+                        flushRaw()
+                        segs[#segs + 1] = { cmdsub = body }
+                        raw = raw .. src:sub(i, ni - 1)
+                        i = ni
+                    end
                 elseif cc == "$" then
                     flushRaw()
                     local name, ni = readVarName(src, i + 1)
                     if name then segs[#segs + 1] = { var = name }; raw = raw .. tostring(getVarVal(name)); i = ni
-                    else rawbuf = rawbuf .. "$"; raw = raw .. "$"; i = i + 1 end
+                    else pushRaw("$", false); raw = raw .. "$"; i = i + 1 end
                 else
-                    rawbuf = rawbuf .. cc; raw = raw .. cc; i = i + 1
+                    pushRaw(cc, false); raw = raw .. cc; i = i + 1
                 end
             end
             flushRaw()
@@ -332,42 +500,129 @@ local function lex(src)
             end
         end
     end
-    return toks, inc
+    return toks, inc, lexErr
 end
 
-local function expandGlue(segs)
+-- ---------------------------------------------------------------
+-- 展开: 参数 / 命令替换 / 算术 / 字段分割 / 路径名(通配符)
+-- ---------------------------------------------------------------
+-- 展开期的致命错误(算术表达式非法、除零、命令替换起不了子进程……): POSIX 要求这是
+-- shell 错误而不是"展开成空串继续跑"。不能写成 error()+pcall: 展开里会 os.sleep(命令替换
+-- 要等子进程, 会让出调度器), 而 Lua 5.1 不允许跨 pcall 让出("attempt to yield across
+-- metamethod/C-call boundary")。所以用一个显式标志, 由调用方在动任何东西之前检查。
+local expandFailed = nil
+local substRan = false -- 本次命令展开里跑过命令替换吗(纯赋值的 $? 要用, 见 evalSimple)
+local function expandFail(msg)
+    if not expandFailed then expandFailed = msg end
+end
+--- 取出并清空展开错误。返回错误消息或 nil。
+local function expandTakeError()
+    local m = expandFailed
+    expandFailed = nil
+    return m
+end
+--- 展开期致命错误的统一处理(报错 + 退出码 1)。返回 true 表示当前命令必须中止:
+--- 交互式丢弃这条命令继续, 非交互式退出 shell(与 set -u 的处理一致)。
+local function expandAbort()
+    local m = expandTakeError()
+    if not m then return false end
+    errln("sh: " .. m)
+    lastExit = 1
+    return true
+end
+-- cmdSubst/arithStr 的实现放在后面(它们要用之后才定义的 subshellPrologue/spawnChild)。
+local cmdSubst, arithStr
+
+local function zeroMask(n) return string.rep("0", n) end
+
+--- 展开一个 dq(双引号)体: 里面的每个字符都算被引用(通配符不生效)。
+local function expandDqParts(parts)
     local s = ""
-    for _, seg in ipairs(segs) do
-        if seg.raw then s = s .. seg.raw
-        elseif seg.sq then s = s .. seg.sq
-        elseif seg.dq then
-            for _, d in ipairs(seg.dq) do s = s .. (d.var and getVarVal(d.var) or d.raw) end
-        elseif seg.var then s = s .. getVarVal(seg.var) end
+    for _, d in ipairs(parts) do
+        if d.var then s = s .. getVarVal(d.var)
+        elseif d.cmdsub then s = s .. cmdSubst(d.cmdsub)
+        elseif d.arith then s = s .. arithStr(d.arith)
+        else s = s .. d.raw end
     end
     return s
 end
 
-local function expandSegs(segs)
-    local words = { { s = "", alive = false } }
+--- 展开成一个字符串(不做字段分割、不做通配): 赋值值、重定向目标、case 词用。
+--- 返回 串, 引用掩码(逐字符 "0"/"1", 通配符判定要用)。
+local function expandGlueMask(segs)
+    local s, qm = "", ""
     for _, seg in ipairs(segs) do
-        if seg.raw then for _, w in ipairs(words) do w.s = w.s .. seg.raw; w.alive = true end
-        elseif seg.sq then for _, w in ipairs(words) do w.s = w.s .. seg.sq; w.alive = true end
+        if seg.raw then
+            s = s .. seg.raw
+            qm = qm .. (seg.qm or zeroMask(#seg.raw))
+        elseif seg.sq then
+            s = s .. seg.sq
+            qm = qm .. string.rep("1", #seg.sq)
+        elseif seg.dq then
+            local ds = expandDqParts(seg.dq)
+            s = s .. ds
+            qm = qm .. string.rep("1", #ds)
+        elseif seg.var then
+            local v = getVarVal(seg.var)
+            s = s .. v
+            qm = qm .. zeroMask(#v)
+        elseif seg.cmdsub then
+            local v = cmdSubst(seg.cmdsub)
+            s = s .. v
+            qm = qm .. zeroMask(#v)
+        elseif seg.arith then
+            local v = arithStr(seg.arith)
+            s = s .. v
+            qm = qm .. zeroMask(#v)
+        end
+    end
+    return s, qm
+end
+local function expandGlue(segs) return (expandGlueMask(segs)) end
+
+--- 追加一段文本到"词列表"里(未引用的片段按 IFS 分割, 引用的片段整体拼上)。
+--- parts = 分割后的片段; quoted = 这些片段是否算被引用。
+local function appendParts(words, parts, quoted)
+    if #parts == 0 then return end
+    local new = {}
+    local mask = quoted and "1" or "0"
+    for _, w in ipairs(words) do
+        for _, p in ipairs(parts) do
+            new[#new + 1] = { s = w.s .. p, qm = w.qm .. string.rep(mask, #p), alive = true }
+        end
+    end
+    words = new
+    return words
+end
+
+local function expandSegs(segs)
+    local words = { { s = "", qm = "", alive = false } }
+    for _, seg in ipairs(segs) do
+        if seg.raw then
+            for _, w in ipairs(words) do
+                w.s = w.s .. seg.raw
+                w.qm = w.qm .. (seg.qm or zeroMask(#seg.raw))
+                w.alive = true
+            end
+        elseif seg.sq then
+            for _, w in ipairs(words) do
+                w.s = w.s .. seg.sq
+                w.qm = w.qm .. string.rep("1", #seg.sq)
+                w.alive = true
+            end
         elseif seg.dq then
             -- "$@" 特殊: 每个位置参数作为一个词(常见于 "for x in \"$@\"" / 透传参数)。
             if #seg.dq == 1 and seg.dq[1].var == "@" then
                 local parts = {}
                 for k = 1, #posArgs do parts[k] = posArgs[k] end
-                if #parts > 0 then
-                    local new = {}
-                    for _, w in ipairs(words) do
-                        for _, p in ipairs(parts) do new[#new + 1] = { s = w.s .. p, alive = true } end
-                    end
-                    words = new
-                end
+                words = appendParts(words, parts, true) or words
             else
-                local ds = ""
-                for _, d in ipairs(seg.dq) do ds = ds .. (d.var and getVarVal(d.var) or d.raw) end
-                for _, w in ipairs(words) do w.s = w.s .. ds; w.alive = true end
+                local ds = expandDqParts(seg.dq)
+                for _, w in ipairs(words) do
+                    w.s = w.s .. ds
+                    w.qm = w.qm .. string.rep("1", #ds)
+                    w.alive = true
+                end
             end
         elseif seg.var then
             local name = seg.var
@@ -376,19 +631,191 @@ local function expandSegs(segs)
                 parts = {}
                 for k = 1, #posArgs do parts[k] = posArgs[k] end
             else parts = splitIfs(getVarVal(name)) end
-            if #parts > 0 then
-                local new = {}
-                for _, w in ipairs(words) do
-                    for _, p in ipairs(parts) do new[#new + 1] = { s = w.s .. p, alive = true } end
-                end
-                words = new
-            end
+            words = appendParts(words, parts, false) or words
+        elseif seg.cmdsub then
+            -- 命令替换结果: 未加引号时同样按 IFS 分割并做通配(POSIX 2.6.3)。
+            words = appendParts(words, splitIfs(cmdSubst(seg.cmdsub)), false) or words
+        elseif seg.arith then
+            local v = arithStr(seg.arith)
+            if v ~= "" then words = appendParts(words, { v }, false) or words end
         end
     end
     local out = {}
-    for _, w in ipairs(words) do if w.alive then out[#out + 1] = w.s end end
+    for _, w in ipairs(words) do
+        if w.alive then out[#out + 1] = w end
+    end
     return out
 end
+
+-- ---------------------------------------------------------------
+-- 路径名展开(通配符 * ? [ ])
+-- ---------------------------------------------------------------
+--- 编码成"匹配用模式": 被引用的(以及展开得来的)通配符/反斜杠要变成字面量。
+--- 与 POSIX 一致: 只有**展开前就在源码里、且未加引号**的 * ? [ 才是通配符。
+local function encodePattern(s, qm)
+    local out = {}
+    for k = 1, #s do
+        local c = s:sub(k, k)
+        if c == "\\" then out[#out + 1] = "\\\\"
+        elseif qm:sub(k, k) == "1" and (c == "*" or c == "?" or c == "[" or c == "]" or c == "!") then
+            out[#out + 1] = "\\" .. c
+        else out[#out + 1] = c end
+    end
+    return table.concat(out)
+end
+
+--- 匹配一个 [] 字符组。i 指向 '[' 之后, ch 是待判字符。
+--- 返回 (下一个位置, 是否命中); 未闭合的组返回 nil(整个匹配失败 -> 当作字面量)。
+local function globClassAt(pat, i, ch)
+    local neg = false
+    local c0 = pat:sub(i, i)
+    if c0 == "!" or c0 == "^" then neg = true; i = i + 1 end
+    local hit, first = false, true
+    while i <= #pat do
+        local c = pat:sub(i, i)
+        if c == "]" and not first then return i + 1, (hit ~= neg) end
+        first = false
+        if c == "\\" and i < #pat then
+            local lit = pat:sub(i + 1, i + 1)
+            if ch == lit then hit = true end
+            i = i + 2
+        elseif pat:sub(i + 1, i + 1) == "-" and i + 2 <= #pat and pat:sub(i + 2, i + 2) ~= "]" then
+            local lo, hi = c, pat:sub(i + 2, i + 2)
+            if ch >= lo and ch <= hi then hit = true end
+            i = i + 3
+        else
+            if ch == c then hit = true end
+            i = i + 1
+        end
+    end
+    return nil, false
+end
+
+--- shell 式通配匹配(与 find -name 同一套语义): `*` 任意(含空), `?` 一个字符,
+--- [abc]/[a-z]/[!abc] 字符组, `\c` 转义。case 模式与路径名展开共用它。
+local function globMatch(pat, s)
+    local function m(pi, si)
+        while pi <= #pat do
+            local c = pat:sub(pi, pi)
+            if c == "*" then
+                while pat:sub(pi, pi) == "*" do pi = pi + 1 end
+                if pi > #pat then return true end
+                for k = si, #s do if m(pi, k) then return true end end
+                return false
+            elseif c == "?" then
+                if si > #s then return false end
+                pi, si = pi + 1, si + 1
+            elseif c == "[" then
+                if si > #s then return false end
+                local np, ok = globClassAt(pat, pi + 1, s:sub(si, si))
+                if not np or not ok then return false end
+                pi, si = np, si + 1
+            elseif c == "\\" then
+                if pi == #pat then return false end
+                if s:sub(si, si) ~= pat:sub(pi + 1, pi + 1) then return false end
+                pi, si = pi + 2, si + 1
+            else
+                if s:sub(si, si) ~= c then return false end
+                pi, si = pi + 1, si + 1
+            end
+        end
+        return si > #s
+    end
+    return m(1, 1)
+end
+
+--- 词里有没有"未加引号的"通配符(没有就不去碰文件系统)。
+local function hasUnquotedMeta(s, qm)
+    for k = 1, #s do
+        local c = s:sub(k, k)
+        if qm:sub(k, k) == "0" and (c == "*" or c == "?" or c == "[") then return true end
+    end
+    return false
+end
+
+--- 路径名展开(POSIX 2.13.3): 按 '/' 逐段匹配, `*` 不跨 '/'。
+--- 首字符为 '.' 的目录项只能被"模式里也显式写了 ."匹配(POSIX 的隐藏文件规则)。
+--- 返回匹配到的路径表(原样风格, 相对就是相对); 无匹配返回 nil(调用方保留原词)。
+local function pathGlob(word, qm)
+    local comps, cur, curm = {}, "", ""
+    local absolute = word:sub(1, 1) == "/" and qm:sub(1, 1) == "0"
+    local start = absolute and 2 or 1
+    for k = start, #word do
+        local c = word:sub(k, k)
+        local q = qm:sub(k, k)
+        if c == "/" and q == "0" then
+            comps[#comps + 1] = { pat = cur, mask = curm }
+            cur, curm = "", ""
+        else
+            cur = cur .. c
+            curm = curm .. q
+        end
+    end
+    comps[#comps + 1] = { pat = cur, mask = curm }
+    -- out = 按用户写的样子拼回去的显示路径(相对词保持相对); dir = 用来列目录的绝对路径。
+    local entries = { { out = absolute and "/" or "", dir = resolve(absolute and "/" or ".") } }
+    local function joinOut(prefix, name)
+        if prefix == "" or prefix:sub(-1) == "/" then return prefix .. name end
+        return prefix .. "/" .. name
+    end
+    for ci, comp in ipairs(comps) do
+        local keep = {}
+        if comp.pat == "" then
+            -- "//" 或结尾 '/': 空段不匹配任何东西, 只要求它是目录(POSIX: 结尾 '/' 只匹配目录)。
+            for _, e in ipairs(entries) do
+                if fs.isDir(e.dir) then
+                    local out = (ci == 1) and e.out or (e.out .. "/")
+                    keep[#keep + 1] = { out = out, dir = e.dir }
+                end
+            end
+        elseif comp.pat == "." or comp.pat == ".." then
+            -- fs.list 不含 "." / ".."(CC 原生 fs 就没有这两个条目), 得自己走一级。
+            for _, e in ipairs(entries) do
+                local d = resolve(e.dir .. "/" .. comp.pat)
+                if fs.isDir(d) then keep[#keep + 1] = { out = joinOut(e.out, comp.pat), dir = d } end
+            end
+        else
+            local meta = hasUnquotedMeta(comp.pat, comp.mask)
+            local pat = encodePattern(comp.pat, comp.mask)
+            -- '.' 开头的项只在模式也以字面 '.' 开头时才匹配(POSIX 隐藏文件规则)。
+            local dotOk = comp.pat:sub(1, 1) == "."
+            for _, e in ipairs(entries) do
+                local names = fs.list(e.dir)
+                if names then
+                    table.sort(names) -- POSIX: 结果按排序输出
+                    for _, nm in ipairs(names) do
+                        local hit = (not meta and nm == comp.pat) or (meta and globMatch(pat, nm))
+                        if hit and (dotOk or nm:sub(1, 1) ~= ".") then
+                            keep[#keep + 1] = { out = joinOut(e.out, nm), dir = e.dir .. "/" .. nm }
+                        end
+                    end
+                end
+            end
+        end
+        entries = keep
+        if #entries == 0 then return nil end
+    end
+    local out = {}
+    for _, e in ipairs(entries) do out[#out + 1] = e.out end
+    return out
+end
+
+--- 一个"词"的完整展开: 字段分割之后做路径名展开。返回词表; 展开出错返回 nil。
+local function expandWordList(segs)
+    local out = {}
+    for _, w in ipairs(expandSegs(segs)) do
+        if hasUnquotedMeta(w.s, w.qm) then
+            local m = pathGlob(w.s, w.qm)
+            if m then for _, p in ipairs(m) do out[#out + 1] = p end
+            else out[#out + 1] = w.s end -- 无匹配: 保留原词(POSIX sh 默认)
+        else
+            out[#out + 1] = w.s
+        end
+    end
+    if expandFailed then return nil end
+    return out
+end
+
 local function wordToStr(segs) return expandGlue(segs) end
 
 -- ---------------------------------------------------------------
@@ -412,7 +839,8 @@ local function skipNl() while true do local t = T[ti]; if t and t.t == "nl" then
 local function skipSep() while true do local t = T[ti]; if t and (t.t == "nl" or (t.t == "op" and t.op == ";")) then ti = ti + 1 else return end end end
 local function isStop(t, stop)
     if not t or not stop then return false end
-    if t.t == "word" and stop[t.raw] then return true end
+    -- 只认**未加引号的整词**: `"done"` 是命令名 done, 不是关键字(与 isKw 同一判据)。
+    if t.t == "word" and stop[t.raw] and #t.segs == 1 and t.segs[1].raw ~= nil then return true end
     if t.t == "op" and stop[t.op] then return true end
     return false
 end
@@ -710,14 +1138,32 @@ local specialBuiltins = { [":"] = true, ["exit"] = true, ["return"] = true, ["sh
     ["unset"] = true }
 
 local builtins = {}
-local evalNode, evalList, evalSimple, restoreRedir, matchGlob, evalPipe, spawnChild, evalProgram, promptExpand, runExternal
+local evalNode, evalList, evalSimple, restoreRedir, evalPipe, spawnChild, evalProgram, promptExpand, runExternal
 
+--- 展开一串词(命令 argv / for-in 列表): 字段分割 + 路径名展开(通配符)。
+--- 展开期发生致命错误时返回 nil(调用方必须先检查再动别的东西)。
 local function expandWords(words)
     local out = {}
     for _, w in ipairs(words) do
-        for _, s in ipairs(expandSegs(w)) do out[#out + 1] = s end
+        local ws = expandWordList(w)
+        if not ws then return nil end
+        for _, s in ipairs(ws) do out[#out + 1] = s end
     end
     return out
+end
+--- 重定向目标: 通配符展开后必须是**恰好一个**词(bash 的 "ambiguous redirect" 语义)。
+--- 失败时返回 nil(错误已记在 expandFailed 里)。
+local function expandRedirTarget(segs)
+    local ws = expandWordList(segs)
+    if not ws then return nil end
+    if #ws == 0 then
+        expandFail("ambiguous redirect")
+        return nil
+    elseif #ws > 1 then
+        expandFail(table.concat(ws, " ") .. ": ambiguous redirect")
+        return nil
+    end
+    return ws[1]
 end
 local function tail(t) local r = {}; for i = 2, #t do r[#r + 1] = t[i] end return r end
 -- set -u(nounset): 在命令真正执行前检查它要展开的变量是否都已定义。
@@ -1727,8 +2173,8 @@ local function resolveJob(ref)
     if tonumber(ref) then local pn = tonumber(ref); for _, j in ipairs(jobs) do if j.pid == pn then return j end end end
 end
 
--- 子 shell 前置注入: 变量赋值 + 函数定义原文。Delin 无 fork, 子 shell 是新进程, 不注入就
--- 会让 `echo $x &` 的 $x 展开成空串 —— 静默错, 比报错更糟。
+-- 子 shell 前置注入: 变量赋值 + 函数定义原文 + 别名。Delin 无 fork, 子 shell 是新进程,
+-- 不注入就会让 `echo $x &` 的 $x 展开成空串、`$(ll)` 变成 command not found —— 静默错, 比报错更糟。
 local function quoteShell(s)
     return "'" .. tostring(s):gsub("'", "'\"'\"'") .. "'"
 end
@@ -1747,7 +2193,374 @@ local function subshellPrologue()
     table.sort(exp)
     if #exp > 0 then parts[#parts + 1] = "export " .. table.concat(exp, " ") end
     for _, src in pairs(funcSrcs) do parts[#parts + 1] = src end
+    -- 别名也要注入: Delin 的别名是**求值期**替换, 子 shell(`&` 的作业 / `$( )`)里没有它,
+    -- `alias ll='ls -l'; echo $(ll)` 就变成 command not found。整条 `name=body` 加引号,
+    -- 名字或别名体里有空格也不会把子 shell 的语法拆坏。
+    local al = {}
+    for name, body in pairs(aliases) do al[#al + 1] = quoteShell(name .. "=" .. body) end
+    table.sort(al)
+    if #al > 0 then parts[#parts + 1] = "alias " .. table.concat(al, " ") end
     return parts
+end
+
+-- ---------------------------------------------------------------
+-- 命令替换 $( ) / ` `
+-- ---------------------------------------------------------------
+-- 在**子 shell**里跑 text 并捕获它的 stdout(POSIX 2.6.3):
+--   - Delin 无 fork, 用 `sh -c <原文>` 起子进程(与 `&` 的作业同一套办法), 变量/函数/导出标记
+--     经 subshellPrologue 注入; 因此子 shell 里的赋值/`cd` 不影响父 shell(POSIX 语义)。
+--   - stdout 接内核 pipe, 子进程退出(内核 onExit 关掉写端)后 readAll 读到 EOF;
+--     读端阻塞时让出调度器, 所以子进程能一直写到结束(与管道的流控同源)。
+--   - 结果末尾的换行**全部**删除(POSIX); 子进程退出码进 $?(bash 同此)。
+cmdSubst = function(text)
+    local r, w = syscalls["pipe.create"]()
+    if not r then expandFail("command substitution: pipe create failed"); return "" end
+    local prologue = subshellPrologue()
+    prologue[#prologue + 1] = text
+    local cargv = { "-c", table.concat(prologue, "; "), posArg0 }
+    for i = 1, #posArgs do cargv[#cargv + 1] = posArgs[i] end
+    local child, cerr = spawnChild("sh", cargv, { input = inH, output = w })
+    if not child then
+        pcall(r.close); pcall(w.close)
+        expandFail("command substitution: " .. tostring(cerr))
+        return ""
+    end
+    -- 写端**不能**在父进程里关: 子进程的 stdio 与本进程共用同一个管道句柄对象
+    -- (内核 spawn 不复制句柄), 父进程一关就等于把写端关了 —— 读端立刻 EOF, 子进程写不进去。
+    -- 子进程退出时由内核 process.onExit 关掉它, 那时 writers 归零, readAll 才读到 EOF。
+    local out = (r.readAll and r:readAll()) or ""
+    pcall(r.close)
+    local reason, code = pollWait(child)
+    lastExit = exitStatus(reason, code)
+    substRan = true
+    return (out:gsub("\n+$", ""))
+end
+
+-- ---------------------------------------------------------------
+-- 算术展开 $(( ))  (POSIX 2.6.4)
+-- ---------------------------------------------------------------
+-- C 风格整数运算: 一元 + - ! ~, 二元 * / % + - << >> < <= > >= == != & ^ |, && ||,
+-- 三目 ?:, 赋值 = += -= *= /= %= <<= >>= &= ^= |=, 自增自减(前缀/后缀), 逗号。
+-- 变量读写 shell 变量(POSIX: `i=0; echo $((i+=1))` 之后 $i 是 1); 变量的值若本身是
+-- 表达式就**递归**求值(与 bash 一致: `x='1+2'; echo $((x))` 得 3, 未定义/空 = 0)。
+-- CC 的 Lua 没有位运算: 按 32 位补码用纯算术实现(与 C 的 int 语义对齐)。
+
+--- 算术表达式文本里的参数/命令替换展开(POSIX: $(( )) 求值前先做参数展开与命令替换)。
+--- 只处理 $name/${name}/$( )/` ` 与引号移除; **裸标识符保持原样** —— 它们在算术里是变量名,
+--- 由求值阶段当 shell 变量解析(`x=1; echo $((x+1))` 的 x 不能在这层被展开)。
+local function expandTextForArith(s)
+    local out, i, n = {}, 1, #s
+    while i <= n do
+        local c = s:sub(i, i)
+        if c == "\\" and i < n then out[#out + 1] = s:sub(i + 1, i + 1); i = i + 2
+        elseif c == "'" then
+            local j = s:find("'", i + 1, true)
+            if not j then error("unterminated quote", 0) end
+            out[#out + 1] = s:sub(i + 1, j - 1); i = j + 1
+        elseif c == '"' then
+            local j = s:find('"', i + 1, true)
+            if not j then error("unterminated quote", 0) end
+            out[#out + 1] = expandTextForArith(s:sub(i + 1, j - 1)); i = j + 1
+        elseif c == "$" and s:sub(i + 1, i + 2) == "((" then
+            local body, ni = scanArith(s, i)
+            if not body then error("unterminated arithmetic expansion", 0) end
+            out[#out + 1] = arithStr(body); i = ni
+        elseif c == "$" and s:sub(i + 1, i + 1) == "(" then
+            local body, ni = scanCmdSub(s, i + 2)
+            if not body then error("unterminated command substitution", 0) end
+            out[#out + 1] = cmdSubst(body); i = ni
+        elseif c == "$" then
+            local name, ni = readVarName(s, i + 1)
+            if name then out[#out + 1] = getVarVal(name); i = ni
+            else out[#out + 1] = "$"; i = i + 1 end
+        elseif c == "`" then
+            local body, ni = scanBacktick(s, i)
+            if not body then error("unterminated command substitution", 0) end
+            out[#out + 1] = cmdSubst(body); i = ni
+        else out[#out + 1] = c; i = i + 1 end
+    end
+    return table.concat(out)
+end
+
+local ARITH_MAXDEPTH = 24 -- 变量递归求值的深度上限(自引用要 fail-fast, 不能挂死)
+
+local function u32(v) return v % 4294967296 end
+local function s32(v)
+    v = u32(v)
+    if v >= 2147483648 then v = v - 4294967296 end
+    return v
+end
+local function bitOp(a, b, f)
+    a, b = u32(a), u32(b)
+    local r, bit = 0, 1
+    for _ = 1, 32 do
+        local x, y = a % 2, b % 2
+        if f(x, y) then r = r + bit end
+        a, b, bit = (a - x) / 2, (b - y) / 2, bit * 2
+    end
+    return s32(r)
+end
+local function shl(a, b)
+    b = math.floor(b)
+    if b < 0 then return shr(a, -b) end
+    if b >= 32 then return 0 end
+    return s32(u32(a) * 2 ^ b)
+end
+local function shr(a, b)
+    b = math.floor(b)
+    if b < 0 then return shl(a, -b) end
+    a = math.floor(a)
+    if b >= 32 then return a < 0 and -1 or 0 end
+    -- 算术右移(C 的 int 语义): 负数补 1。
+    return math.floor(a / 2 ^ b)
+end
+
+-- 解析出的表达式树。求值阶段才读变量(两者分开是必须的: `?:`/`&&`/`||` 要短边求值,
+-- 否则 `$(( x != 0 ? 1/x : 0 ))` 会在 x=0 时炸掉)。
+local arithParse, arithGet, arithEvalBin, arithValue
+arithParse = function(text)
+    local toks, i, n = {}, 1, #text
+    local OP2 = { ["<<"]=1, [">>"]=1, ["<="]=1, [">="]=1, ["=="]=1, ["!="]=1,
+                  ["&&"]=1, ["||"]=1, ["++"]=1, ["--"]=1,
+                  ["+="]=1, ["-="]=1, ["*="]=1, ["/="]=1, ["%="]=1,
+                  ["&="]=1, ["^="]=1, ["|="]=1 }
+    local OP3 = { ["<<="]=1, [">>="]=1 }
+    local ASSIGN = { ["="]=1, ["+="]=1, ["-="]=1, ["*="]=1, ["/="]=1, ["%="]=1,
+                     ["<<="]=1, [">>="]=1, ["&="]=1, ["^="]=1, ["|="]=1 }
+    while i <= n do
+        local c = text:sub(i, i)
+        if c:match("%s") then i = i + 1
+        elseif c:match("%d") then
+            local num = text:match("^0[xX][%x]+", i) or text:match("^%d+", i)
+            i = i + #num
+            toks[#toks + 1] = { t = "num", v = num }
+        elseif c:match("[%a_]") then
+            local name = text:match("^[%a_][%w_]*", i)
+            i = i + #name
+            toks[#toks + 1] = { t = "id", v = name }
+        else
+            local three = text:sub(i, i + 2)
+            local two = text:sub(i, i + 1)
+            if OP3[three] then toks[#toks + 1] = { t = "op", v = three }; i = i + 3
+            elseif OP2[two] then toks[#toks + 1] = { t = "op", v = two }; i = i + 2
+            elseif c:match("[%+%-%*/%%<>=!~&%^|%?%:,%(%)]") then
+                toks[#toks + 1] = { t = "op", v = c }; i = i + 1
+            else error("invalid character '" .. c .. "'", 0) end
+        end
+    end
+    local p = 1
+    local function peekOp() local tk = toks[p]; if tk and tk.t == "op" then return tk.v end end
+    local function eat(op)
+        if peekOp() ~= op then return false end
+        p = p + 1
+        return true
+    end
+    local function expect(op)
+        if not eat(op) then error("'" .. op .. "' expected", 0) end
+    end
+    local function number(tk)
+        local s = tk.v
+        if s:match("^0[xX]") then return tonumber(s:sub(3), 16) end
+        if #s > 1 and s:sub(1, 1) == "0" then
+            -- C 风格八进制; 出现 8/9 就是非法常量(fail-fast 而不是猜一个十进制值)。
+            if s:match("[89]") then error("invalid octal constant " .. s, 0) end
+            return tonumber(s, 8)
+        end
+        return tonumber(s, 10)
+    end
+    local parseExpr, parseAssign, parseCond, parseBinary, parseUnary, parsePrimary, parsePostfix
+    local LEVELS = {
+        { "||" }, { "&&" }, { "|" }, { "^" }, { "&" }, { "==", "!=" },
+        { "<=", ">=", "<", ">" }, { "<<", ">>" }, { "+", "-" }, { "*", "/", "%" },
+    }
+    parseBinary = function(level)
+        if level > #LEVELS then return parseUnary() end
+        local node = parseBinary(level + 1)
+        while true do
+            local op = peekOp()
+            local found = false
+            for _, o in ipairs(LEVELS[level]) do if o == op then found = true end end
+            if not found then return node end
+            p = p + 1
+            node = { k = "bin", op = op, l = node, r = parseBinary(level + 1) }
+        end
+    end
+    parseCond = function()
+        local c = parseBinary(1)
+        if eat("?") then
+            local a = parseAssign()
+            expect(":")
+            local b = parseCond()
+            return { k = "cond", c = c, a = a, b = b }
+        end
+        return c
+    end
+    parseAssign = function()
+        local tk = toks[p]
+        if tk and tk.t == "id" then
+            local nx = toks[p + 1]
+            if nx and nx.t == "op" and ASSIGN[nx.v] then
+                local name = tk.v
+                p = p + 2
+                return { k = "assign", op = nx.v, name = name, e = parseAssign() }
+            end
+        end
+        return parseCond()
+    end
+    parseExpr = function()
+        local node = parseAssign()
+        while eat(",") do node = { k = "comma", l = node, r = parseAssign() } end
+        return node
+    end
+    parseUnary = function()
+        local op = peekOp()
+        if op == "+" or op == "-" or op == "!" or op == "~" then
+            p = p + 1
+            return { k = "un", op = op, e = parseUnary() }
+        end
+        if op == "++" or op == "--" then
+            p = p + 1
+            local t = toks[p]
+            if not (t and t.t == "id") then error("variable expected after " .. op, 0) end
+            p = p + 1
+            return { k = "pre", op = op, name = t.v }
+        end
+        return parsePostfix()
+    end
+    parsePostfix = function()
+        local node = parsePrimary()
+        while (peekOp() == "++" or peekOp() == "--") and node.k == "var" do
+            node = { k = "post", op = peekOp(), name = node.name }
+            p = p + 1
+        end
+        return node
+    end
+    parsePrimary = function()
+        local tk = toks[p]
+        if not tk then error("operand expected", 0) end
+        if tk.t == "num" then p = p + 1; return { k = "num", v = number(tk) } end
+        if tk.t == "id" then p = p + 1; return { k = "var", name = tk.v } end
+        if tk.v == "(" then
+            p = p + 1
+            local node = parseExpr()
+            expect(")")
+            return node
+        end
+        error("unexpected '" .. tostring(tk.v) .. "'", 0)
+    end
+    local root = parseExpr()
+    if p <= #toks then error("unexpected '" .. tostring(toks[p].v) .. "'", 0) end
+    return root
+end
+
+arithGet = function(name, depth)
+    depth = depth or 0
+    if depth > ARITH_MAXDEPTH then error("expression recursion too deep", 0) end
+    local v = vars[name]
+    if v == nil or v == "" then return 0 end
+    local num = tonumber(v)
+    if num then return math.floor(num) end
+    -- 值不是整数常量: 按算术表达式递归求值(POSIX; bash 同此, 'abc' 当未定义变量 -> 0)。
+    return arithValue(arithParse(v), depth + 1)
+end
+
+--- C 的整数除法: 向**零**截断(Lua 的 math.floor 是向下取整, 负数会差 1: -7/2 应为 -3)。
+local function arithDiv(a, b)
+    if b == 0 then error("division by zero", 0) end
+    local q = a / b
+    if q < 0 then return -math.floor(-q) end
+    return math.floor(q)
+end
+
+arithEvalBin = function(op, a, b)
+    if op == "+" then return a + b end
+    if op == "-" then return a - b end
+    if op == "*" then return a * b end
+    if op == "/" then return arithDiv(a, b) end
+    if op == "%" then
+        if b == 0 then error("division by zero", 0) end
+        return a - arithDiv(a, b) * b -- C 的 %: 结果符号跟被除数
+    end
+    if op == "<<" then return shl(a, b) end
+    if op == ">>" then return shr(a, b) end
+    if op == "<" then return a < b and 1 or 0 end
+    if op == "<=" then return a <= b and 1 or 0 end
+    if op == ">" then return a > b and 1 or 0 end
+    if op == ">=" then return a >= b and 1 or 0 end
+    if op == "==" then return a == b and 1 or 0 end
+    if op == "!=" then return a ~= b and 1 or 0 end
+    if op == "&" then return bitOp(a, b, function(x, y) return x == 1 and y == 1 end) end
+    if op == "|" then return bitOp(a, b, function(x, y) return x == 1 or y == 1 end) end
+    if op == "^" then return bitOp(a, b, function(x, y) return x ~= y end) end
+    error("unsupported operator '" .. op .. "'", 0)
+end
+
+arithValue = function(node, depth)
+    local k = node.k
+    if k == "num" then return node.v end
+    if k == "var" then return arithGet(node.name, depth) end
+    if k == "comma" then arithValue(node.l, depth); return arithValue(node.r, depth) end
+    if k == "un" then
+        local v = arithValue(node.e, depth)
+        if node.op == "+" then return v end
+        if node.op == "-" then return -v end
+        if node.op == "!" then return v == 0 and 1 or 0 end
+        return s32(-v - 1) -- ~
+    end
+    if k == "pre" or k == "post" then
+        local old = arithGet(node.name, depth)
+        local nv = (node.op == "++") and old + 1 or old - 1
+        vars[node.name] = tostring(nv)
+        return (k == "pre") and nv or old
+    end
+    if k == "assign" then
+        local old = (node.op == "=") and 0 or arithGet(node.name, depth)
+        local rhs = arithValue(node.e, depth)
+        local nv
+        if node.op == "=" then nv = rhs else nv = arithEvalBin(node.op:sub(1, -2), old, rhs) end
+        vars[node.name] = tostring(nv)
+        return nv
+    end
+    if k == "bin" then
+        local op = node.op
+        if op == "&&" then
+            if arithValue(node.l, depth) == 0 then return 0 end
+            return arithValue(node.r, depth) ~= 0 and 1 or 0
+        end
+        if op == "||" then
+            if arithValue(node.l, depth) ~= 0 then return 1 end
+            return arithValue(node.r, depth) ~= 0 and 1 or 0
+        end
+        return arithEvalBin(op, arithValue(node.l, depth), arithValue(node.r, depth))
+    end
+    if k == "cond" then
+        return arithValue(node.c, depth) ~= 0 and arithValue(node.a, depth) or arithValue(node.b, depth)
+    end
+    error("bad arithmetic node", 0)
+end
+
+--- $((expr)) 的求值入口: 表达式先做参数/命令替换(POSIX 顺序), 再解析求值。
+--- 出错一律 fail-fast(记 expandFail, 让当前命令中止), 不静默当 0。
+arithStr = function(text)
+    local lhs = text:gsub("^%s+", ""):gsub("%s+$", "")
+    if lhs == "" then
+        expandFail("$(( " .. text .. " )): expression expected")
+        return ""
+    end
+    -- 表达式里的 $var / $( ) / ` ` 先展开(POSIX: 算术展开前先做参数与命令替换)。
+    -- **必须在 pcall 之前**: 命令替换会 os.sleep(让出调度器), 而 Lua 5.1 不允许跨 pcall 让出
+    -- ("attempt to yield across metamethod/C-call boundary"); 解析/求值本身不 yield, 才敢包。
+    local ex = expandTextForArith(lhs)
+    if expandFailed then return "" end
+    -- 注意: 实参在 pcall **之前**求值, 所以解析必须写在闭包体里, 否则语法错会逃出 pcall。
+    local ok, v = pcall(function() return arithValue(arithParse(ex), 0) end)
+    if not ok then
+        expandFail("$(( " .. text .. " )): " .. tostring(v))
+        return ""
+    end
+    v = math.floor(v)
+    if v == 0 then return "0" end
+    return string.format("%.0f", v)
 end
 
 -- 后台执行一个列表项(POSIX 异步列表)。Delin 无 fork: 用 `sh -c <原文>` 起一个子 shell,
@@ -2051,7 +2864,18 @@ restoreRedir = function(out, inp)
 end
 
 -- 赋值前缀(命令作用域): 返回 restore 表, 或 nil 表示"留在当前环境"(特殊内建/函数/纯赋值)。
-local function applyAssigns(node)
+-- avals 是**已展开**的值(name -> 串): 命令替换有副作用, 一条命令里每个词只能展开一次,
+-- 所以调用方先展开好再传进来(xtrace 也复用这份结果, 否则 `x=$(cmd)` 会跑两次)。
+local function expandAssignValues(node)
+    local vals = {}
+    for i, a in ipairs(node.assigns) do
+        vals[i] = expandGlue(a.value)
+        if expandFailed then return nil end
+    end
+    return vals
+end
+
+local function applyAssigns(node, avals)
     if #node.assigns == 0 then return nil end
     local restore
     if #node.argv > 0 then
@@ -2059,13 +2883,10 @@ local function applyAssigns(node)
         local nm = (w and #w == 1) and w[1].raw or nil
         if not (nm and (specialBuiltins[nm] or funcSrcs[nm])) then restore = {} end
     end
-    if restore then
-        for _, a in ipairs(node.assigns) do
-            restore[a.name] = vars[a.name]
-            vars[a.name] = expandGlue(a.value)
-        end
-    else
-        for _, a in ipairs(node.assigns) do vars[a.name] = expandGlue(a.value) end
+    for i, a in ipairs(node.assigns) do
+        local v = avals[i]
+        if restore then restore[a.name] = vars[a.name] end
+        vars[a.name] = v
     end
     return restore
 end
@@ -2085,20 +2906,17 @@ local function xtraceLine(parts)
     local e = io.stderr()
     if e and e.write then e:write(promptExpand(vars.PS4 or "") .. table.concat(parts, " ") .. "\n") end
 end
-local function xtraceWords(words) -- words: 已展开的词, 逐个加显示用引号
+-- avals/rtargets: 调用方**已经展开好**的赋值值与重定向目标(不再展开第二遍)。
+local function xtraceCmd(node, argvs, avals, rtargets)
     if not opt.xtrace then return end
     local parts = {}
-    for _, w in ipairs(words) do parts[#parts + 1] = quoteTrace(w) end
-    xtraceLine(parts)
-end
-local function xtraceCmd(node, argvs)
-    if not opt.xtrace then return end
-    local parts = {}
-    for _, a in ipairs(node.assigns) do parts[#parts + 1] = a.name .. "=" .. quoteTrace(expandGlue(a.value)) end
+    for i, a in ipairs(node.assigns) do
+        parts[#parts + 1] = a.name .. "=" .. quoteTrace(avals and avals[i] or "")
+    end
     for _, w in ipairs(argvs) do parts[#parts + 1] = quoteTrace(w) end
-    for _, r in ipairs(node.redirects) do
+    for i, r in ipairs(node.redirects) do
         parts[#parts + 1] = r.op
-        parts[#parts + 1] = quoteTrace(wordToStr(r.target))
+        parts[#parts + 1] = quoteTrace(rtargets and rtargets[i] or "")
     end
     xtraceLine(parts)
 end
@@ -2109,8 +2927,21 @@ evalSimple = function(node)
     if abort then return lastExit, ctrl0 end
     local needOut, needIn = false, false
     local openOut, openIn = {}, {}
-    for _, r in ipairs(node.redirects) do
-        local abs = resolve(wordToStr(r.target))
+    substRan = false
+    -- 展开期致命错误(算术非法/除零/命令替换起不来)后的收尾: 关句柄、还原 fd、返回 1。
+    local function fail()
+        if not expandAbort() then return false end
+        for _, h in ipairs(openOut) do if h.close then pcall(h.close) end end
+        for _, h in ipairs(openIn) do if h.close then pcall(h.close) end end
+        restoreRedir(needOut, needIn)
+        return true
+    end
+    -- 重定向目标先展开(通配符必须是恰好一个词), 打开顺序保持从左到右。
+    local rtargets = {}
+    for i, r in ipairs(node.redirects) do
+        rtargets[i] = expandRedirTarget(r.target)
+        if fail() then return lastExit end
+        local abs = resolve(rtargets[i])
         if r.op == "<" then
             local h = fs.open(abs, "r")
             if not h then errln("sh: " .. abs .. ": cannot open"); lastExit = 1; restoreRedir(needOut, needIn); return lastExit end
@@ -2125,18 +2956,27 @@ evalSimple = function(node)
             outH = h; needOut = true; openOut[#openOut + 1] = h
         end
     end
-    local restore = applyAssigns(node)
+    local avals = expandAssignValues(node)
+    if fail() then return lastExit end
+    local restore = applyAssigns(node, avals)
     local ctrl
     if #node.argv == 0 then
-        xtraceCmd(node, {})
-        lastExit = 0
+        xtraceCmd(node, {}, avals, rtargets)
+        -- POSIX: 没有命令词时, 退出码 = 最后一次命令替换的退出码(没有就是 0),
+        -- 所以 `x=$(false)` 之后 $? 是 1(bash/dash 同此)。
+        lastExit = substRan and lastExit or 0
     else
         -- 先展开 argv($? 等用上一条命令的退出码), 再为本命令重置 lastExit。
         local argvs = expandWords(node.argv)
+        if not argvs then
+            undoAssigns(restore)
+            fail()
+            return lastExit
+        end
         lastExit = 0
         -- 展开成零个词(如无参数的 `"$@"`)是无操作(POSIX), 不是"找不到命令"。
         if #argvs > 0 then
-            xtraceCmd(node, argvs)
+            xtraceCmd(node, argvs, avals, rtargets)
             local cmd, rest = argvs[1], {}
             for i = 2, #argvs do rest[#rest + 1] = argvs[i] end
             -- 别名先于内建/外部命令(POSIX: 别名替换发生在查找内建之前)。
@@ -2192,6 +3032,15 @@ evalPipe = function(node)
     end
     local savedOut, savedIn = outH, inH
     local info, spawned, codes, openedRedirs = {}, {}, {}, {}
+    -- 展开期致命错误(算术/命令替换)的收尾: 释放管道端与已开的句柄, 整条管道以 1 中止。
+    local function pipeFail()
+        if not expandAbort() then return false end
+        for _, h in ipairs(openedRedirs) do if h.close then pcall(h.close) end end
+        for k = 1, n - 1 do
+            if pipes[k] then pcall(pipes[k].read.close); pcall(pipes[k].write.close) end
+        end
+        return true
+    end
     -- Pass A: 展开每个元素 argv, 判定内置/外部, 计算各自 stdio 句柄。
     -- 元素自身重定向(> >> <)覆盖该元素 fd0/fd1; 被覆盖而作废的管道端立即 close(让对端读到 EOF)。
     for i = 1, n do
@@ -2199,7 +3048,9 @@ evalPipe = function(node)
         local defOut = (i == n) and savedOut or pipes[i].write
         local inp, outp = defIn, defOut
         for _, r in ipairs(items[i].redirects or {}) do
-            local abs = resolve(wordToStr(r.target))
+            local tgt = expandRedirTarget(r.target)
+            if pipeFail() then return lastExit end
+            local abs = resolve(tgt)
             if r.op == "<" then
                 local h = fs.open(abs, "r")
                 if h then inp = h; openedRedirs[#openedRedirs + 1] = h
@@ -2219,6 +3070,9 @@ evalPipe = function(node)
         local node = items[i]
         if node.kind == "simple" then
             local argvs = expandWords(node.argv)
+            if not argvs then
+                if pipeFail() then return lastExit end
+            end
             if #argvs == 0 then
                 -- 展开成零个词: 无操作元素(只需让下游读到 EOF)。
                 info[i] = { noop = true, inH = inp, outH = outp, kind = "simple" }
@@ -2267,7 +3121,13 @@ evalPipe = function(node)
         elseif it.cmd and (it.builtin or it.alias) then
             inH, outH = it.inH, it.outH
             lastExit = 0
-            local restore = applyAssigns(items[i])
+            local avals = expandAssignValues(items[i])
+            if not avals then
+                inH, outH = savedIn, savedOut
+                pipeFail()
+                return lastExit
+            end
+            local restore = applyAssigns(items[i], avals)
             local ctrl, handled
             if it.alias then handled, ctrl = tryAlias(it.cmd, it.rest) end
             if not handled and not it.alias then ctrl = builtins[it.cmd](it.rest) end
@@ -2306,15 +3166,6 @@ evalPipe = function(node)
     end
     lastExit = codes[n] or 0
     return lastExit
-end
-
-matchGlob = function(s, pat)
-    if pat == "*" then return true end
-    if not pat:find("*") then return s == pat end
-    if pat:sub(1, 1) == "*" and pat:sub(-1) == "*" then return s:find(pat:sub(2, -2), 1, true) ~= nil end
-    if pat:sub(-1) == "*" then return s:sub(1, #pat - 1) == pat:sub(1, -2) end
-    if pat:sub(1, 1) == "*" then return s:sub(-(#pat - 1)) == pat:sub(2) end
-    return s == pat
 end
 
 -- 条件上下文深度: >0 时失败的命令不触发 set -e(if/while/until 的条件、&&/|| 的非末元素)。
@@ -2395,6 +3246,10 @@ evalNode = function(node)
             local abort, ctrl = nounsetCheck(node.items)
             if abort then return lastExit, ctrl end
             items = expandWords(node.items)
+            if not items and expandAbort() then
+                if interactive then return lastExit end
+                return lastExit, "exit"
+            end
         else items = {}; for i = 1, #posArgs do items[i] = posArgs[i] end end
         local lastst = 0
         for _, it in ipairs(items) do
@@ -2431,12 +3286,23 @@ evalNode = function(node)
     if node.kind == "case" then
         local abort, ctrl = nounsetCheck({ node.word })
         if abort then return lastExit, ctrl end
+        -- case 词只做展开, **不做**字段分割与路径名展开(POSIX 2.9.4.3).
         local w = wordToStr(node.word)
+        if expandFailed and expandAbort() then
+            if interactive then return lastExit end
+            return lastExit, "exit"
+        end
         for _, cs in ipairs(node.cases) do
             for _, pat in ipairs(cs.pats) do
                 local pabort, pctrl = nounsetCheck({ pat })
                 if pabort then return lastExit, pctrl end
-                if matchGlob(w, wordToStr(pat)) then
+                -- 模式里的引号要去掉(引用的 * 是字面量), 所以按引用掩码编码后再匹配。
+                local ps, pqm = expandGlueMask(pat)
+                if expandFailed and expandAbort() then
+                    if interactive then return lastExit end
+                    return lastExit, "exit"
+                end
+                if globMatch(encodePattern(ps, pqm), w) then
                     local rt, c = evalList(cs.body)
                     if c then return rt, c end
                     return rt
@@ -2494,7 +3360,8 @@ evalList = function(items)
 end
 
 evalProgram = function(src)
-    local toks, lexInc = lex(src)
+    local toks, lexInc, lexErr = lex(src)
+    if lexErr then return nil, false, lexErr end
     T = toks
     ti = 1
     curSrc = src -- 后台作业 `&` 按原文起子 shell: 解析时需回取源文本
@@ -2504,6 +3371,14 @@ evalProgram = function(src)
     if items == nil then
         if inc then return nil, true end
         return nil, false, err
+    end
+    if T[ti] then
+        -- 解析器没吃完的记号 = 不支持的语法(典型: `( list )` 子 shell 分组, Delin 没有)。
+        -- 这里必须报错: 静默丢掉剩下的输入会让 `(echo hi); echo after` 一条命令都不跑却报成功,
+        -- 正是 fail-fast 要防的那种"看着跑过了, 其实什么都没做"。
+        local t = T[ti]
+        return nil, false, "syntax error: unexpected " ..
+            (t.t == "op" and ("'" .. tostring(t.op) .. "'") or ("'" .. tostring(t.raw) .. "'"))
     end
     local rt, c = evalList(items)
     -- 把 "exit" 控制信号透传给顶层调用者(交互循环/`.` 内建靠它终止/退出当前 shell)。
@@ -2586,7 +3461,8 @@ if interactive then
         elseif ok then
             buf = ""
         else
-            errln("sh: " .. tostring(err)); buf = ""
+            -- 语法错误: 丢弃这条命令继续(POSIX 交互式语义), $? 置 2(dash/bash 同此)。
+            errln("sh: " .. tostring(err)); buf = ""; lastExit = 2
         end
     end
 else
@@ -2614,8 +3490,12 @@ else
         -- 非交互下 exit 已使 evalList 提前终止后续命令; 这里无需再 break。
         -- 输入已到 EOF, 所以"不完整"在这里就是语法错误(不回退, 不猜测)。
         local ok, inc, err = evalProgram(src)
-        if inc then errln("sh: syntax error: unexpected end of file")
-        elseif ok == nil and err then errln("sh: " .. tostring(err)) end
+        -- 语法错误: POSIX 要求非交互 shell 以非 0 退出(dash/bash 用 2, `.` 内建也是 2)。
+        if inc then
+            errln("sh: syntax error: unexpected end of file"); lastExit = 2
+        elseif ok == nil and err then
+            errln("sh: " .. tostring(err)); lastExit = 2
+        end
     end
 end
 

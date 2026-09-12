@@ -324,6 +324,8 @@ CC 原生文件系统没有这些概念、`ext2` 驱动里有 inode 类型却没
 `-`/`--` 开头的文件名；单独的 `-` 视为普通操作数。
 
 **sh（POSIX 核心子集）**：变量与展开（`$x`/`${x}`/`$?`/`$#`/`$@`/`$*`/`$!`/`$-`/`$1..`）；单/双引号；
+**命令替换**（`$( )` 与反引号）、**算术展开**（`$(( ))`）、**路径名展开**（通配符 `*` `?` `[ ]`）—— 见下文
+「词展开：命令替换 / 算术 / 通配符」；
 `if/elif/else`、`for`、`while`、`case`、函数（位置参数）、`[ ]`/`test`（`=` `!=` `-n` `-z` `-eq/-ne/-lt/-le/-gt/-ge`
 `-e/-f/-d/-s/-x/-r/-w`、`!`）；`&&`/`||`/`;`；文件重定向（`>` `>>` `<`）；管道（`|`，每元素一个进程/内建，
 经内核 pipe 缓冲传递，`$?`=末元素退出码，生产端写满/消费端读空时让出调度器，broken pipe 中止写端）；内建
@@ -383,7 +385,51 @@ shebang 支持 `#!/bin/sh` / `#!/usr/bin/env sh` 等形式，env 特殊解释为
 `>>`/`>` 写文件在命令结束后 `close` 提交到 ext2（handle 写入可能缓冲，需关闭才落盘）。
 自检脚本：`scripts/posix_test.sh`（POSIX 可移植子集，宿主与真机各跑一次比对）、
 `scripts/sh_builtin_test.sh`（内建/变量/选项自检，宿主用 harness 跑，真机由
-`scripts/sh_verify.sh` + `verify-sh.service` 跑并写 `/var/log/sh_verify.log`）。
+`scripts/sh_verify.sh` + `verify-sh.service` 跑并写 `/var/log/sh_verify.log`）、
+`scripts/sh_expand_test.sh`（展开自检 95 项：通配符/命令替换/算术，宿主 harness 与真机各跑一次，
+期望值逐条对着 bash/dash 核过）。
+
+#### 词展开：命令替换 / 算术 / 通配符
+
+三者都按 POSIX 2.6 的**展开顺序**走：参数/命令/算术展开 → 字段分割（未加引号时按 `IFS`）→ 路径名展开
+（通配符）→ 引号移除。实现落在 `src/bin/sh` 的 `lex`（切词的引用掩码 `qm`）与展开层
+（`expandGlue`/`expandSegs`/`expandWordList`）。
+
+**命令替换 `$( )` 与反引号**：Delin 无 fork，用 `sh -c <原文>` 起**子 shell**（与 `&` 作业同一套：
+`subshellPrologue` 把当前变量、`export` 标记、函数定义与别名注入子进程），stdout 接内核 pipe 读回。
+因此语义与 POSIX 一致：子 shell 里的 `cd`/赋值不影响父 shell、位置参数继承、结果末尾换行**全部删除**、
+**退出码进 `$?`**（纯赋值 `x=$(false)` 之后 `$?` 也是 1），未加引号的结果按 `IFS` 分割后再做通配符展开，
+加引号则整体一个词。反引号按 POSIX 处理 `\``/`\\`/`\$`（其余反斜杠原样保留），可嵌套 `$( )` 与反引号。
+输出大于内核管道缓冲（16KB）也不会死锁：读端阻塞时让出调度器，子进程继续写（自检里用 400 行长文本锁着）。
+
+**算术展开 `$(( ))`**：完整 POSIX 运算符集 —— 一元 `+ - ! ~`、`* / % + -`、`<< >>`、比较
+（`< <= > >= == !=`）、`& ^ |`、`&& ||`、三目 `?:`、赋值（`= += -= *= /= %= <<= >>= &= ^= |=`）、
+自增自减（前缀/后缀）、逗号。变量**读写 shell 变量**（`i=0; echo $((i+=1))` 之后 `$i` 是 1），
+变量的值若本身是表达式就递归求值（`x='1+2'` → 3；未定义/空 → 0，与 bash 一致），深度上限 24 层防自引用。
+表达式求值**前**先做参数/命令替换（`$(( $(echo 2)+3 ))` 是 5）。`CC` 的 Lua 没有位运算，
+`& | ^ ~ << >>` 按 **32 位补码**用纯算术实现；`/` 与 `%` 是 C 语义（**向零截断**，`-7/2 = -3`、`-7%2 = -1`，
+`math.floor` 的向下取整会差 1）。**出错一律 fail-fast**（除零/非法记号/缺操作数 → 报错 + 退出码 1，
+当前命令中止但不退出 shell），不当 0 静默混过去。`$((` 的收尾判定与 bash/dash 一致：深度归零的 `)` 后面
+必须紧跟另一个 `)`，所以 `$((-7)%2)` 是语法错、`$(( (-7)%2 ))` 才对。
+
+**路径名展开（通配符）**：`*`（任意，含空）、`?`（一个字符）、`[abc]`/`[a-z]`/`[!abc]`（字符组，`^` 也当取反）、
+`\c` 转义。规则对着 POSIX 2.13.3 与 bash/dash：**只有展开前就在源码里、且未加引号**的
+`* ? [` 才是通配符（切词时逐字符记引号掩码 `qm`，所以 `a"*"*` 只有后一个 `*` 生效）；按 `/` **逐段**匹配
+（`*` 不跨 `/`，`$(...)`/变量的结果里的 `/` 是普通字符）；`.` 开头的目录项只能被模式里也写了 `.` 的匹配
+（`*` 不含隐藏文件）；结果**按排序**输出；`*/` 只匹配目录；**没有匹配就保留原词字面**（POSIX 默认，
+`echo *.nope` 打印 `*.nope`）；只对同时含通配符的分量列目录，无通配符的分量走精确比对（路径不存在即无匹配）。
+**已知偏离**：`.*` 不会列出 `.` 与 `..`（真实 shell 会）—— Delin 的 `fs.list` 根本不含这两个条目；
+不支持 bash 的 `**`(globstar) 与花括号展开 `{a,b}`（非 POSIX，遇到按字面处理）。
+
+**通配符作用的位置**（POSIX 标准位置）：命令词与参数、`for ... in` 列表、**重定向目标**；
+**赋值右侧不展开**（`X=*.txt` 存的是字面 `*.txt`），`case` 的**模式**走的是模式匹配而不是路径展开
+（`case` 词本身只做参数/命令替换，不做字段分割与通配符）。重定向目标展开后必须是**恰好一个词**，
+否则 fail-fast 报 `<words>: ambiguous redirect` 并置退出码 1（bash 同此，不静默挑一个）。
+
+**子 shell 的起始 cwd**：`sh` 启动时从 `/proc/self/cwd` 取内核里这个进程的 cwd（而不是按 `$HOME` 猜）。
+这不是洁癖：`&` 的作业与 `$( )` 都是**新进程**，内核已把父 shell 的 cwd 继承给它，按 `$HOME` 初始化会让
+`cd /tmp; echo $(ls *.txt)` 静默列出 `/root` 下的东西。配套地 `login` 现在按 login(1) 语义用
+`cwd = <家目录>` spawn 用户 shell（登录 shell 的起始目录是家目录）。
 
 #### POSIX 命令覆盖与 `proc.exec`
 
@@ -414,15 +460,20 @@ Linux 的 exec 一样传给子进程（`process.setHandler` 认 `"ignore"`/`"def
 **已知偏离**：`grep`/`sed` 的正则用 **Lua pattern**（`%` 为转义符、`()` 为捕获）而非 POSIX ERE/BRE；
 替换区用 `&`=整串匹配、`\1..\9`=捕获组、`\n/\t`，不支持 BRE 风格 `\(...\)` 与模式内逆引用。
 注意 Lua pattern 里 `-` 是量词（非贪婪），要匹配字面连字符需 `%-`，与 GNU grep 的 `-`（字面）不同。
-不支持**命令替换 `$()`/反引号**、**算术 `$(( ))`**、**here-doc `<<`**（暂未实现，遇到即语法错误）。
-`&` 的子 shell 是重新执行的进程（无 fork）：父 shell 的变量与函数定义经赋值/定义语句注入，
-但 `$?` 在子 shell 里从 0 开始（不继承父 shell 的最后状态）。`VAR=value cmd` 的赋值在命令词
+不支持 **here-doc `<<`**（遇到即语法错误）；命令替换 `$()`/反引号、算术 `$(( ))` 与通配符已实现
+（见「词展开」一节）。
+`&` 的子 shell 是重新执行的进程（无 fork）：父 shell 的变量、函数定义与别名经赋值/定义语句注入，
+但 `$?` 在子 shell 里从 0 开始（不继承父 shell 的最后状态）；子 shell 的**起始 cwd** 由内核继承
+（`sh` 从 `/proc/self/cwd` 取自己的 cwd，不按 `$HOME` 猜）。`VAR=value cmd` 的赋值在命令词
 展开**之前**生效（POSIX/bash 是展开之后，故 `x=0; x=1 echo $x` 在 Delin 打印 1、在 bash 打印 0）；
 `read` 无法区分“末行无换行”（句柄 API 限制，按成功计）。
-`set -x` 只跟踪**简单命令**（含赋值/重定向），不打印 `for`/`if` 这类复合关键字行；
+**语法错误**：非交互 shell 报错后以 **2** 退出（dash/bash 与 `.` 内建同此），解析器没吃完的记号
+（典型：不支持的 `( list )` 子 shell 分组）算语法错而不是静默丢掉剩下的输入；关键字必须是**未加引号的
+整词**（`"done"` 是命令名 done）。`set -x` 只跟踪**简单命令**（含赋值/重定向），不打印 `for`/`if` 这类复合关键字行；
 `set -u` 的检查发生在命令执行前（未执行的分支不报错），交互式只丢弃当前命令、非交互式退出；
 子 shell 的 `$PPID` 取内核给的父 pid（不继承环境里的 `PPID`）；`.` 的参数按 bash 语义临时替换位置参数
-（dash 忽略它们）；未实现 `export -f`（函数导出）、`readonly`、`$()`/反引号命令替换。
+（dash 忽略它们）；未实现 `export -f`（函数导出）、`readonly`；**没有 `( list )` 子 shell 分组语法**
+（`$(( ))` 与 `$( (cmd) )` 里那个是算术/命令替换，不是分组），`${name:-default}` 一类参数默认值展开也未实现。
 因 CC 5.2 无位运算，`/etc/shadow` 哈希用盐+密码的 32 位滚动哈希（djb2）替代传统 `crypt`。
 
 ### init（systemd 风格服务管理器）
@@ -514,7 +565,7 @@ PID 1 现在是**用户态服务管理器**（`src/init/unit.lua` 单元解析 +
 `scripts/realmachine_verify.sh`。
 
 `src/bin/sh` 已升级为 POSIX 核心子集（变量/引号/if/for/while/case/函数/test/[ ]/&&/|| /文件重定向/管道
-`|`，无命令替换 `$()`、算术 `$(( ))`），支持脚本执行（`sh script.sh` / `./script.sh`，`#!` shebang）、
+`|` + 命令替换 `$()`/反引号 + 算术 `$(( ))` + 通配符 `* ? [ ]`），支持脚本执行（`sh script.sh` / `./script.sh`，`#!` shebang）、
 `rm`/`mkdir` 补了 GNU `-r/-f`/`-p`；新增 `chmod`（八进制 + 符号模式 + `-R`）、`chown`（`owner:group` + `-R`）、
 `mount`（挂载 `/dev/sdX`、`UUID=` 或镜像路径 / `-a` 按 fstab 挂载 / 无参列出）/ `umount` / `blkid` / `lsblk`；
 存储经 `devdisk` 抽象为整盘（ccdisk）与分区（manifest 里的 ext2 镜像）设备节点 —— **电脑自带存储恒为
@@ -907,6 +958,7 @@ lua5.1 tools/harness.lua /bin/sh < scripts/proc_test.sh   # /proc + ps/pgrep/pki
 lua5.1 tools/harness.lua /bin/sh < scripts/redstone_test.sh   # /sys/class/redstone 读写/校验自检(与真机比对)
 lua5.1 tools/harness.lua /bin/sh < scripts/lua_test.sh   # /bin/lua 脚本/stdin/arg/dofile/退出码 + 进程环境白名单(与真机比对)
 lua5.1 tools/harness.lua /bin/sh < scripts/user_test.sh  # 用户管理(passwd/useradd/usermod/group*/id)自检(与真机比对)
+lua5.1 tools/harness.lua /bin/sh < scripts/sh_expand_test.sh  # sh 展开(通配符/命令替换/算术)自检(与真机比对)
 sh scripts/lua_repl_test.sh        # /bin/lua 交互式 REPL(宿主专用: DELIN_HARNESS_TTY=1 伪装终端)
 lua5.1 tools/ext2test.lua        # ext2 驱动宿主回归: 真实镜像上跑目录增删, 再用宿主 e2fsck -fn 判定
 python3 tools/realmachine.py --base /mnt/bak/root.base.img   # 真机: 先关机->打包->部署->重启 #3->取回 /var/log/*
@@ -1022,6 +1074,8 @@ src/modules/*.ko           内核模块: ccdisk(ccdisk fstype) ccmonitor(CC 显�
 src/modules/modules.alias  驱动别名(modprobe 风格): tm_gpu->tom hologram->void monitor->ccmonitor printer->ccprinter
 src/modules/manifest       默认装载模块清单: demo ext2 ccdisk redstone
 scripts/posix_test.sh      可移植 POSIX 自检(host 与 Delin 各跑一次比对, 125 项全过)
+scripts/sh_expand_test.sh  sh 展开自检(通配符 * ? [ ]/命令替换 $( ) 与反引号/算术 $(( )), 95 项;
+                           host harness 与真机各跑一次比对, 期望值逐条对过 bash/dash)
 scripts/jobctl_test.sh     作业控制自检(& / $! / jobs / fg / bg / wait / kill %job, host 与真机各跑一次)
 scripts/sysinfo.sh         实用小工具: 系统信息(变量/函数/for/case/if/重定向/工具)
 scripts/proc_test.sh       /proc + ps/pgrep/pkill/killall 自检(host harness 与真机各跑一次比对, 41 项)
@@ -1077,7 +1131,11 @@ tools/harness.lua          host 测试台: 用真实 Delin 工具源码在宿主
                            /sys 与 /proc 走真实 kernel.sysfs/kernel.procfs 后端 + 桩显示设备
                            + 桩 printer(/dev/lp0) + 桩 redstone API(加载真实 redstone.ko)
                            + 桩进程表(ps/pgrep/pkill/killall);
-                           进程环境用内核同一份白名单(src/kernel/procenv.lua), 不放宽)
+                           进程环境用内核同一份白名单(src/kernel/procenv.lua), 不放宽;
+                           fs.list 必须与 CC 同语义: 路径不存在/不是目录 -> **空表**
+                           (`ls -A <文件>` 会把文件路径自己打印出来, 直接照搬会让宿主上的
+                           fs.list(file) 返回一条路径 —— 工具的"列目录失败"分支在宿主上永远
+                           走不到, 真机才炸)
 tools/hosttest.lua         宿主测试: init 单元引擎/fstab 生成/syslogd 规则/logrotate 轮转/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone/devdisk(547 项)
 tools/installertest.lua    安装器宿主回归: 假 CraftOS(fs/term/os/http/disk/peripheral + 脚本化事件队列)
                            + 假终端格子(含 fg/bg), 用 loadfile 跑 dist/install.lua, 按键序列驱动向导

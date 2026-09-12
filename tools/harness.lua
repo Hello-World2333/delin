@@ -74,6 +74,10 @@ end
 local function host(p) local n = norm(p); return ROOT .. n end
 
 function F.list(p)
+    -- CC 语义: 路径不存在或不是目录时 `fs.list` 返回**空表**(ext2 后端返回 nil, 工具侧两者
+    -- 等价处理)。不能直接照搬 GNU ls: `ls -A <文件>` 会把该文件路径自己打印出来, 宿主的
+    -- fs.list(文件) 于是返回一条**路径**而不是空表 —— 工具在宿主上跑得过、真机才炸。
+    if not F.isDir(p) then return {} end
     local h = host(p)
     local out = {}
     local f = assert(io.popen("ls -A -- " .. h))
