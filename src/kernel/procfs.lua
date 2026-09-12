@@ -170,6 +170,16 @@ local function liveProc(pid)
     return p
 end
 
+--- /proc/<pid>/<name> 这个文件存不存在(pid 存活 且 name 在 PID_FILES 里)。
+--- 单独抽出来是**必须**的: `local backend = { ... }` 的初始化表达式在 Lua 里位于该 local 的
+--- 作用域**之前**, 表内函数体引用 `backend` 会解析成全局(值为 nil) —— 于是 `ls /proc/self`
+--- 报 "attempt to index global 'backend' (a nil value)"(真机踩过, 见 for-ai.md)。
+local function pidFileExists(pid, name)
+    if not liveProc(pid) then return false end
+    for _, n in ipairs(PID_FILES) do if n == name then return true end end
+    return false
+end
+
 --- /proc/<pid>/cwd 的读权限(Linux 语义: 属主或 root)。
 ---@param p DelinProcess
 ---@return boolean
@@ -286,11 +296,7 @@ local backend = {
         end
         if kind == "randfile" then return name ~= nil end
         if kind == "pid" then return liveProc(pid) ~= nil end
-        if kind == "pidfile" then
-            if not liveProc(pid) then return false end
-            for _, n in ipairs(PID_FILES) do if n == name then return true end end
-            return false
-        end
+        if kind == "pidfile" then return pidFileExists(pid, name) end
         return false
     end,
     -- 目录判定必须与 exists 一致(否则 cd /proc/<不存在的 pid> 会成功)。
@@ -313,7 +319,7 @@ local backend = {
             return { size = 0, isDir = true, isReadOnly = true, name = tostring(pid) }
         end
         if kind == "pidfile" then
-            if not backend.exists(rel) then return nil end
+            if not pidFileExists(pid, name) then return nil end
             -- procfs 文件的 st_size 是 0(Linux 同样如此), 内容随读生成。
             return { size = 0, isDir = false, isReadOnly = true, name = name }
         end

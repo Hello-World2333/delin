@@ -3,8 +3,8 @@
 # 可移植 POSIX sh; 既能在宿主( lua5.1 tools/harness.lua /bin/sh < scripts/proc_test.sh )
 # 跑, 也能在真机跑(由 realmachine_verify.sh 调用)。输出 "ok <name>" / "ng <name>",
 # 全部 ok 退出码 0 —— 两边的输出应当一致。
-# 注意: 不依赖 grep 的退出码(Delin grep 目前恒返回 0), 用 "输出文件是否非空" 判定;
-#       不打印 pid 等每次运行都不同的值。
+# 注意: 判定一律用 "输出文件是否非空"(不依赖工具的退出码 —— 这样它在宿主 GNU 工具下
+#       也照样成立); 不打印 pid 等每次运行都不同的值。
 
 T=/tmp/proctest
 outcome=0
@@ -48,6 +48,16 @@ chk proc_uptime_file  [ -f /proc/uptime ]
 chk proc_version_file [ -f /proc/version ]
 chk proc_mounts_file  [ -f /proc/mounts ]
 chkneg proc_no_dead   [ -e /proc/99999/stat ]
+# ls 一个虚拟目录: ls 会对每个条目取 attributes, 而 pidfile 的存在判定曾经在
+# `local backend = { ... }` 的表构造里引用 backend 自己 —— Lua 里那是**全局**(nil),
+# 于是真机 `ls /proc/self` 报 "attempt to index global 'backend' (a nil value)"。
+# (重定向写在 ls 自己这一行上: Delin 的 sh 目前**不会**把"函数调用上的重定向"传给函数里
+#  启动的外部程序 —— chk foo ls /proc/self > f 会得到空文件, 见 for-ai.md 的已知偏离)
+ls /proc/self > $T/proc_self_ls
+chkfile proc_ls_self_listed $T/proc_self_ls
+chkcontain proc_ls_self_comm '^comm$' $T/proc_self_ls
+ls -l /proc/self > $T/proc_self_ls_l
+chkfile proc_ls_self_long_listed $T/proc_self_ls_l
 
 # ---------------------------------------------------------------
 # 2. 进程信息文件

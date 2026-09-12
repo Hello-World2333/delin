@@ -237,7 +237,13 @@ end
 local function popScope(p) p.scope = p.scope.parent end
 
 local function declare(p, tk)
-    local sym = { orig = tk.v, new = nil, tokens = { tk.i }, fn = p.scope.fn }
+    -- scopeLine = 这个局部**开始生效**的那一行(声明语句结束处; `local x = x` 的右值不在作用域里,
+    -- 而多行初始化表达式的结束行要等到最后一个 token) —— 门禁 D 用它判断"全局读是不是误以为
+    -- 这个名字是局部"。
+    local last = p.toks[p.pos - 1]
+    local sym = { orig = tk.v, new = nil, tokens = { tk.i }, fn = p.scope.fn,
+                  scopeLine = last and last.line or tk.line,
+                  scopeIdx = p.pos }   -- 生效位置(下一个 token 的下标, 见门禁 D)
     p.scope.syms[tk.v] = sym
     p.symbols[#p.symbols + 1] = sym
     p.scope.fn.symbols[#p.scope.fn.symbols + 1] = sym
@@ -255,6 +261,17 @@ local function reference(p, tk)
         s = s.parent
     end
     p.globals[tk.v] = true
+    -- 门禁 D: 正在解析 `local NAME = <初始化表达式>`, 而这里读的全局也叫 NAME, 且已经进到
+    -- **内层函数体**里 —— 闭包在声明**之后**才执行, 作者以为读到的是那个局部, 实际是全局(nil)。
+    -- 典型: `local backend = { attributes = function(r) ... backend.exists(r) ... end }`。
+    for i = #p.decls, 1, -1 do
+        local d = p.decls[i]
+        if d.name == tk.v and p.fnDepth > d.fnDepth then
+            p.shadowed = p.shadowed or {}
+            p.shadowed[#p.shadowed + 1] = { line = tk.line, name = tk.v, declLine = d.line }
+            break
+        end
+    end
     return nil
 end
 
@@ -342,6 +359,7 @@ end
 
 parseFunctionBody = function(p, isMethod)
     local fn = newFnScope(p.scope.fn)
+    p.fnDepth = p.fnDepth + 1
     p.scope = newScope(p.scope, fn)
     if isMethod then
         -- 方法隐式 self 参数: 不参与改名, 但要登记, 免得 self 被当成全局。
@@ -365,6 +383,7 @@ parseFunctionBody = function(p, isMethod)
     parseBlock(p)
     expectKw(p, "end")
     p.scope = p.scope.parent
+    p.fnDepth = p.fnDepth - 1
 end
 
 local function parseSimpleExpr(p)
@@ -525,7 +544,15 @@ parseStatement = function(p)
             while isOp(p, ",") do advance(p); names[#names + 1] = expectName(p) end
             if isOp(p, "=") then
                 advance(p)
-                parseExprList(p) -- 先解析右值: `local x = x` 的右值 x 是外层/全局
+                -- 先解析右值: `local x = x` 的右值 x 是外层/全局。单名声明时登记到 p.decls,
+                -- 供门禁 D 判断"初始化表达式里的闭包是不是把这个名字读成了全局"。
+                if #names == 1 then
+                    p.decls[#p.decls + 1] = { name = names[1].v, line = names[1].line, fnDepth = p.fnDepth }
+                    parseExprList(p)
+                    p.decls[#p.decls] = nil
+                else
+                    parseExprList(p)
+                end
             end
             for _, tk in ipairs(names) do declare(p, tk) end
         end
@@ -583,7 +610,8 @@ end
 --- 解析整个 chunk。
 ---@return table|nil plan { renames = {tokenIndex -> newName}, globals, symbols, rootFn }
 local function analyze(toks)
-    local p = { toks = toks, pos = 1, symbols = {}, globals = {}, fnState = {} }
+    local p = { toks = toks, pos = 1, symbols = {}, globals = {}, fnState = {},
+                decls = {}, fnDepth = 0, shadowed = nil }
     p.rootFn = newFnScope(nil)
     p.scope = newScope(nil, p.rootFn)
     parseBlock(p)
@@ -634,7 +662,8 @@ local function analyze(toks)
     for k in pairs(base) do rootForb[k] = true end
     walk(p.rootFn, rootForb)
 
-    return { renames = renames, globals = p.globals, symbols = p.symbols }
+    return { renames = renames, globals = p.globals, symbols = p.symbols, rootFn = p.rootFn,
+             shadowed = p.shadowed }
 end
 
 -- ===============================================================
@@ -723,6 +752,46 @@ local function checkTokens(toks, renames, from, outSrc)
     end
     if #outToks ~= k then return nil, "输出 token 多于输入" end
     return true
+end
+
+--- 门禁 D(可选调用): **全局读**里, 若该名字在本 chunk 的**文件级局部**声明之后才出现,
+--- 那多半是作者以为那是那个局部 —— Lua 的 local 作用域从声明语句**之后**才开始, 初始化表达式
+--- 里的同名引用一律是全局(运行期 nil)。典型:
+---   local backend = { attributes = function(r) ... backend.exists(r) ... end }   -- backend 是全局!
+--- 真机症状: `ls /proc/self` 报 "attempt to index global 'backend' (a nil value)"。
+--- 注意只看**文件级**局部: 函数参数/内层 local 同名不在此列(`local function f(argv)` 之后
+--- 再读全局 argv 是正常的)。
+---@return table[] | nil, string|nil  { line, name, declLine } 列表
+function minify.checkShadowedGlobals(src)
+    local lx, lerr = lex(src)
+    if not lx then return nil, "词法错误: " .. tostring(lerr) end
+    local toks, idxOf = {}, {}
+    for _, tk in ipairs(lx.toks) do
+        if tk.t ~= "comment" and tk.t ~= "shebang" then
+            toks[#toks + 1] = tk
+            idxOf[tk.i] = #toks
+        end
+    end
+    local ok, plan = pcall(analyze, toks)
+    if not ok then return nil, "语法错误: " .. tostring(plan) end
+    -- 文件级局部: 名字 -> 生效位置(取最早的那个声明)
+    local scopeIdx, localToks = {}, {}
+    for _, sym in ipairs(plan.symbols) do
+        for _, ti in ipairs(sym.tokens) do localToks[ti] = true end
+        if sym.fn == plan.rootFn then
+            local si = sym.scopeIdx or 0
+            if not scopeIdx[sym.orig] or si < scopeIdx[sym.orig] then scopeIdx[sym.orig] = si end
+        end
+    end
+    local out = {}
+    for _, h in ipairs(plan.shadowed or {}) do out[#out + 1] = h end
+    for _, tk in ipairs(toks) do
+        local si = scopeIdx[tk.v]
+        if tk.t == "name" and not tk.field and not localToks[tk.i] and si and idxOf[tk.i] >= si then
+            out[#out + 1] = { line = tk.line, name = tk.v, declLine = tk.line }
+        end
+    end
+    return out
 end
 
 --- 门禁 A: 产物语法。宿主进程是 lua5.1, 它不认识 goto/标签(5.2 语法) —— 遇到就改用

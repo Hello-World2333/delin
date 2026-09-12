@@ -20,6 +20,7 @@
          没有 dist/(它在 .gitignore 里)就直接报错。
        - **发布树与开发产物分离**: release 带 install 布局的 payload/, 不含任何测试脚本。
        - 压缩器的三重门禁在 minify.source 内部(解析 / 重词法逐 token 比对 / 不遮蔽全局名);
+         另有一条源文件门禁: 扫"局部被读成全局"(初始化表达式里的闭包自引用), 见 shadowGate;
          --check 再跑一遍"压缩树 vs 原始树"的行为等价性(那才是真正的保险)。 ]]
 
 package.path = "./tools/?.lua;" .. package.path
@@ -236,15 +237,24 @@ end
 -- ---------------------------------------------------------------
 
 local function buildRelease()
+    -- 先整棵清空: 发布树是"从零铺出来的安装源", 任何上一轮的残留都会**混进 manifest 与发布**。
+    -- (踩过: BIOS 从 payload/ 挪到发布树根后, 旧的 payload/startup.lua 仍留着, 于是装 ext2 时
+    --  又被铺进镜像根 —— 光删源码不干净, 产物树的残留也得清。)
+    run("清空发布树", "rm -rf '" .. RELEASE_ROOT .. "'")
     bundle.mkdirp(RELEASE_ROOT)
-    -- 安装布局: payload/ 下的相对路径 = 目标文件系统上的绝对路径
+    -- 安装布局: payload/ 下的相对路径 = **目标文件系统上的绝对路径**。
+    -- BIOS(startup.lua)不在这一层: 它不是"目标文件系统上的文件", 而是**电脑自身存储**上的
+    -- 引导文件(安装器单独从 <base>/startup.lua 取, 见 installer.lua 的 boot 配置步骤)。
+    -- 以前把它塞进 payload/, 于是装 ext2 时被整棵铺进镜像根 —— 镜像根多出一个永远不用的
+    -- /startup.lua(ext2 根是 Delin 的 /, 不是 CraftOS 的启动盘)。
     local mapping = {
-        { DIST .. "/bios/startup.lua", "startup.lua" },
         { DIST .. "/kernel.lua",       "boot/delin.lua" },
         { DIST .. "/dlub.lua",         "boot/dlub.lua" },
     }
-    -- 安装器本体放在发布树根: 用户 `wget run <base>/install.lua`
+    -- 安装器本体与 BIOS 放在发布树根:
+    --   用户 `wget run <base>/install.lua`; 安装器再把 <base>/startup.lua 写到电脑自身存储。
     writeAll(RELEASE_ROOT .. "/install.lua", readAll(DIST .. "/install.lua"))
+    writeAll(RELEASE_ROOT .. "/startup.lua", readAll(DIST .. "/bios/startup.lua"))
 
     local function copyTo(src, rel)
         local dst = RELEASE_ROOT .. "/payload/" .. rel
@@ -275,6 +285,53 @@ local function buildRelease()
     local bytes = 0
     for _, rel in ipairs(files) do bytes = bytes + #readAll(RELEASE_ROOT .. "/payload/" .. rel) end
     print(string.format("release: %s  (%d 个文件, %d 字节)", RELEASE_ROOT, n, bytes))
+end
+
+-- ---------------------------------------------------------------
+-- 门禁: 别把"局部变量读成全局"(Lua 作用域坑)
+-- ---------------------------------------------------------------
+
+--- `local backend = { ... function() ... backend.x ... end }`: 初始化表达式里的闭包读到的
+--- backend 是**全局**(Lua 的 local 作用域从声明语句之后才开始), 运行期必然 nil。
+--- 真机症状: `ls /proc/self` 报 "attempt to index global 'backend' (a nil value)"
+--- (见 for-ai.md 的 procfs 一节) —— 这种错静态看不出来、单测也未必走到, 所以在构建期拦。
+---@param files string[] 相对路径
+---@param dir string 源目录
+local function shadowGate(files, dir)
+    local bad = {}
+    for _, rel in ipairs(files) do
+        local src = readAll(dir .. "/" .. rel)
+        local hits, err = minify.checkShadowedGlobals(src)
+        if not hits then
+            bad[#bad + 1] = string.format("  %s: 解析失败: %s", rel, tostring(err))
+        else
+            for _, h in ipairs(hits) do
+                bad[#bad + 1] = string.format("  %s:%d: '%s' 读的是**全局**(声明在 %d 行前)",
+                    rel, h.line, h.name, h.declLine)
+            end
+        end
+    end
+    if #bad > 0 then
+        error("局部变量被读成了全局 —— 初始化表达式里的闭包引用同名 local 会解析成全局(运行期 nil):\n"
+            .. table.concat(bad, "\n")
+            .. "\n修法: 声明与赋值分开(`local backend; backend = { ... }`), 或把判定抽成独立函数。", 0)
+    end
+    return #files
+end
+
+--- 门禁: 源文件里的"局部被读成全局"(在压缩之前拦, 报的是源码行号)。
+local function runShadowGate()
+    local n = 0
+    for _, dir in ipairs({ "src/bin", "src/kernel", "src/init", "src/bios", "src/modules" }) do
+        local list = {}
+        for _, name in ipairs(listFiles(dir)) do
+            if name:match("%.lua$") or name:match("%.ko$") or not name:match("%.") then
+                list[#list + 1] = name
+            end
+        end
+        if #list > 0 then n = n + shadowGate(list, dir) end
+    end
+    print(string.format("shadow gate: %d 个源文件没有'局部被读成全局'", n))
 end
 
 --- 门禁覆盖: dist/ 全部产物 + manifest + 整棵 dist/release(发布树就是安装源)。
@@ -336,7 +393,7 @@ end
 local CHECK_SCRIPTS = {
     "posix_test.sh", "jobctl_test.sh", "proc_test.sh",
     "redstone_test.sh", "lua_test.sh", "sh_builtin_test.sh", "sh_expand_test.sh",
-    "user_test.sh",
+    "user_test.sh", "regex_test.sh",
 }
 
 local function check()
@@ -398,6 +455,7 @@ end
 build()
 buildManifest()
 if doRelease then buildRelease() end
+runShadowGate()
 asciiGate()
 if doCheck then check() end
 print("build ok (Delin " .. VERSION .. ")")
