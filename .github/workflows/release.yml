@@ -5,8 +5,10 @@
 #
 # 发布树形状(release 分支):
 #     <版本>/install.lua        安装器本体
+#     <版本>/startup.lua        Delin BIOS(装到**电脑自身存储**的 /startup.lua)
 #     <版本>/manifest           版本 + 每个 payload 文件的 size/crc32
 #     <版本>/payload/...        payload/ 下的相对路径 = 目标文件系统上的绝对路径
+#                               (所以 BIOS 不在 payload/ 里: 它不是目标文件系统上的文件)
 # 每个版本一个目录, 推新版本不会动旧版本目录(老安装器里写死的源仍然能装)。
 # 版本号以 src/kernel/version.lua 为唯一真源: tag 必须是 v<版本号>, 不一致直接失败。
 name: release

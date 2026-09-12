@@ -72,6 +72,26 @@ eq  glob_mixed_quoted 'a*' "$1"
 set -- "a"*
 eq  glob_mixed_unquoted_count 1 "$#"
 
+# 前缀匹配: 存在 bin/ls 时 bin/ls* 必须匹配到它(`*` 可以匹配**空串**)。
+# 这条是回归用例: 曾有报告说 /bin/ls* 匹配不到 /bin/ls(通配符与 POSIX 行为不一致)。
+mkdir -p $T/bin
+touch $T/bin/ls $T/bin/lsblk
+set -- $T/bin/ls*
+eq  glob_prefix_count 2 "$#"
+eq  glob_prefix_first "$T/bin/ls" "$1"
+eq  glob_prefix_second "$T/bin/lsblk" "$2"
+set -- $T/bin/ls[bl]*
+eq  glob_prefix_class "$T/bin/lsblk" "$1"
+set -- $T/bin/ls*z*
+eq  glob_prefix_nomatch "$T/bin/ls*z*" "$1"
+cd $T/bin
+set -- ls*
+eq  glob_prefix_relative_count 2 "$#"
+eq  glob_prefix_relative_first "ls" "$1"
+cd $T
+set -- $T/bin/l[st]*
+eq  glob_prefix_class2_count 2 "$#"
+
 # for 列表与重定向目标也做路径名展开
 n=0
 for f in *.txt; do n=$((n+1)); done

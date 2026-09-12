@@ -13,6 +13,7 @@
      它做什么:
        - 从 http 安装源(发布树)拉 manifest, 再逐文件下载 payload/ 并校验 size + CRC32;
        - 把 payload 铺到目标: CCFS(直接铺文件) 或 EXT2(现场 mkfs 出镜像再写进去);
+         payload/ 下的相对路径 = **目标文件系统上的绝对路径**(BIOS 不在里面, 见下);
        - 写引导配置: /startup.lua(Delin BIOS, 旧的备份成 /startup.lua.craftos)、
          /boot/{delin.lua,dlub.lua}、/.boot、/dlub.cfg;
        - 装完提示回车重启(其它键不处理)。
@@ -666,7 +667,9 @@ local function runInstall(state, targets)
             report("  backup /startup.lua -> /startup.lua.craftos")
         end
     end
-    local bios, biosErr = fetchText(urlJoin(state.url, "payload/startup.lua"))
+    -- BIOS 在发布树根(不在 payload/ 里): payload/ 是"目标文件系统上的文件", 而它是
+    -- 电脑自身存储上的引导文件 —— 混在一起会让 ext2 镜像根多出一个没用的 /startup.lua。
+    local bios, biosErr = fetchText(urlJoin(state.url, "startup.lua"))
     if not bios then return false, tostring(biosErr) end
     local okBio, eBio = boot.write("startup.lua", bios)
     if not okBio then return false, "/startup.lua -> " .. tostring(eBio) end

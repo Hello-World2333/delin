@@ -240,6 +240,9 @@ end
 
 --- 发布树上的一个文件(相对 payload/)
 local function payloadFile(rel) return readHostFile(RELEASE .. "/payload/" .. rel) end
+--- 发布树根的安装件(install.lua / startup.lua): 它们**不是**目标文件系统上的文件
+--- (BIOS 装到电脑自身存储), 所以不在 payload/ 里 —— payload/ 的相对路径 == 目标 FS 的绝对路径。
+local function releaseFile(rel) return readHostFile(RELEASE .. "/" .. rel) end
 
 local BASE_URL = string.format("http://127.0.0.1:10568/%s", MF.version) -- 本地开发期源(serve.sh)
 
@@ -1469,6 +1472,9 @@ local function checkImageAgainstPayload(w, label)
             end
         end
     end
+    -- 镜像根**不该**有 /startup.lua: 它是电脑自身存储上的 CraftOS 引导文件, 不是目标 FS 的文件
+    -- (曾经 bug: BIOS 混在 payload/ 里, 装 ext2 时被整棵铺进镜像根)。
+    eq(r.read("/startup.lua"), nil, label .. ": 镜像根没有多余的 /startup.lua")
     r.close()
 end
 
@@ -1531,8 +1537,8 @@ runCase("1", "EXT2 -> computer storage", function()
     end
 
     -- 落盘产物
-    ok(w:existsFile("/startup.lua"), "/startup.lua 存在")
-    eq(w:file("/startup.lua"), payloadFile("startup.lua"), "/startup.lua == payload/startup.lua")
+    ok(w:existsFile("/startup.lua"), "/startup.lua 存在(电脑自身存储的 BIOS)")
+    eq(w:file("/startup.lua"), releaseFile("startup.lua"), "/startup.lua == <发布树>/startup.lua")
     ok(w:existsFile("/boot/dlub.lua"), "/boot/dlub.lua 存在")
     eq(trim(w:file("/.boot")), "/boot/dlub.lua", "/.boot == /boot/dlub.lua")
     eq(trim(w:file("/dlub.cfg")), "rootfs /parts/root.img", "/dlub.cfg == rootfs /parts/root.img")
@@ -1585,7 +1591,7 @@ runCase("2", "CCFS -> computer storage (no Image size step)", function()
     eq(trim(w:file("/.boot")), "/boot/delin.lua", "/.boot == /boot/delin.lua")
     ok(not w:existsFile("/dlub.cfg"), "CCFS 到计算机存储不写 /dlub.cfg")
     ok(not w:existsFile("/parts/root.img"), "CCFS 不建 ext2 镜像")
-    for _, rel in ipairs({ "bin/sh", "boot/delin.lua", "etc/passwd", "startup.lua" }) do
+    for _, rel in ipairs({ "bin/sh", "boot/delin.lua", "etc/passwd" }) do
         if MF.byPath[rel] then
             ok(w:existsFile("/" .. rel), "payload 落地: /" .. rel)
         end
