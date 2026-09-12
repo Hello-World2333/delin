@@ -150,7 +150,7 @@ end
 local h
 if inName == "-" then
     h = io.stdin()
-    if not h then stderr("split: 无法读取 stdin\n"); return 1 end
+    if not h then stderr("split: cannot read stdin\n"); return 1 end
 else
     local err
     h, err = fs.open(resolve(inName), "r")

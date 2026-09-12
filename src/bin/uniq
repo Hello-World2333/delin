@@ -127,7 +127,7 @@ local function lineReader(fh)
 end
 local function nulReader(fh)
     if not fh.readAll then
-        stderr("uniq: -z 需要 readAll 句柄(宿主测试台的 stdin 不支持)\n")
+        stderr("uniq: -z requires a readAll handle (host testbed stdin does not support it)\n")
         return nil
     end
     local content = fh:readAll() or ""
@@ -164,7 +164,7 @@ local inName, outName = operands[1], operands[2]
 local inH
 if inName == nil or inName == "-" then
     inH = io.stdin()
-    if not inH then stderr("uniq: 无法读取 stdin\n"); return 1 end
+    if not inH then stderr("uniq: cannot read stdin\n"); return 1 end
 else
     local err
     inH, err = fs.open(resolve(inName), "r")

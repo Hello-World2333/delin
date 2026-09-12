@@ -172,7 +172,7 @@ end
 local function openInput(name)
     if name == "-" then
         local h = io.stdin()
-        if not h then diag("cmp: 无法读取 stdin\n"); return nil end
+        if not h then diag("cmp: cannot read stdin\n"); return nil end
         return h, nil
     end
     local p = resolve(name)

@@ -911,6 +911,13 @@ lua5.1 tools/build.lua --release   # 构建 + 生成 dist/release/<版本>/ 发�
 sh tools/serve.sh                  # 开发期: 把发布树挂在 10568 端口(游戏侧 wget 安装用)
 ```
 
+**ASCII 门禁 `asciiGate`（每次构建末尾都跑）**：逐字节扫 `dist/` 全部产物 + `manifest` +
+每棵 `dist/release/*/` 发布树，任何文件出现非 ASCII 字节即 fail-fast 并报出 `文件:行号`
+（判据与理由见「约定」一节）。它把"哪些注释会被压缩器丢掉、哪些会原样进产物"这条知识
+从人脑挪到了构建期 —— 往 `src/init/*.lua`、`src/modules/*.ko` 的 `--@` 头、`src/etc/*`、
+`src/units/*` 里写中文会当场挂构建。`dist/` 里**陈旧的目录也在扫描范围内**（上个版本留下的
+`dist/modules/<旧版本>/`、旧发布树都是可安装的产物），命中就 `rm -rf dist` 重来。
+
 **发布（CI）**：`.github/workflows/release.yml` 在**打 `v*` tag** 时跑
 `lua5.1 tools/build.lua --check --release` + `lua5.1 tools/installertest.lua`（门禁不过不发），
 然后把这棵发布树推成 **`release` 分支**的 `<版本>/` 目录（一个版本一个目录，推新版本不动旧版本）。
@@ -1113,8 +1120,18 @@ python3 ~/docs/tools/rcon.py "computercraft turn-on #3"   # 注入按键走完�
 ## 约定
 
 - 源码用 **EmmyLua** 注解仅为人类维护 / IDE 提示，不作为任何门禁；其警告与报错忽略。
-- **终端输出一律只用 ASCII**：CC 终端打印中文会乱码，因此 `sh`/工具/内核面向终端或 stderr 的
-  字符串（错误消息、`help`、提示符、日志）不得含中文；注释、README、测试日志可以中文。
+- **装到 CC 电脑上的任何文件一律只用 ASCII**（不只是终端输出）：CC 终端没有中文字形，非 ASCII
+  字节打出来是乱码，部分传输路径还会丢字节 —— 所以判据是**产物**：`/boot/delin.lua`、`/startup.lua`、
+  `/etc/*`、`/lib/systemd/system/*`、`/bin/*`、`/lib/modules/<版本>/*`、`install.lua`，以及宿主机的
+  `dist/` 全树。字符串（错误消息、`help`、提示符、日志、写入文件的文本）自不必说。
+- **注释能不能写中文，取决于压缩器丢不丢它**：`src/kernel/*`、`src/bin/*`、`src/bios/*`、
+  `tools/installer.lua` 的注释会被 `tools/minify.lua` 丢掉，可以中文；丢不掉的那几处必须 ASCII ——
+  `src/init/*.lua`（原样嵌进 `kernel.lua` 的字符串）、`src/modules/*.ko` 的 `--@` 元数据头、
+  `src/etc/*`、`src/units/*`、`src/modules/modules.alias`（原样拷贝进产物）。
+  这条区别不用记：构建期门禁 `asciiGate`（`tools/build.lua`）会在每次构建末尾逐字节扫
+  `dist/` 全部产物 + `manifest` + 每棵 `dist/release/*/` 发布树，有一处非 ASCII 就 fail-fast
+  并报出 `文件:行号`（把中文写进上面那几处 = 当场挂构建）。
+- README、for-ai.md、测试脚本（`tools/hosttest.lua`、`scripts/*.sh`）不装到 CC 上，随便用中文。
 - git 提交使用本仓库 local config。
 
 ## 目录

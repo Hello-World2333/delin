@@ -1,7 +1,7 @@
 --@name ccprinter
 --@version 0.1.0
---@description CC:Tweaked printer 驱动: /dev/lpN 字符设备(流式写, 满页自动翻页, close 打印末页)
---             + /sys/class/printer/<lpN> 状态(paper/ink/size)与页标题(title)。
+--@description CC:Tweaked printer driver: /dev/lpN char device (streamed writes, auto page break on a full page, close prints the last page)
+--             + /sys/class/printer/<lpN> state (paper/ink/size) and the page title (title).
 --@deps
 
 --[[ 抽象(对齐 Linux lp(4) 的打印机字符设备):

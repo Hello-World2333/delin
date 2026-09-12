@@ -437,7 +437,7 @@ local function readAllLines(name)
     local h
     if name == "-" then
         h = io.stdin()
-        if not h then stderr("sort: 无法读取 stdin\n"); return nil end
+        if not h then stderr("sort: cannot read stdin\n"); return nil end
     else
         local err
         h, err = fs.open(resolve(name), "r")

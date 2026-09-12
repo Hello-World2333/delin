@@ -513,7 +513,7 @@ do
     local r3, e3 = ext2.mkfs(b2, { blocks = 512, blockSize = 4096 + 1, dryRun = true })
     ok(r3 == nil and tostring(e3):find("block size") ~= nil, "mkfs: 非法块大小报错", tostring(e3))
     local r4, e4 = ext2.mkfs(b2, { blocks = 8 * 1024 + 1, dryRun = true })
-    ok(r4 == nil and tostring(e4):find("单块组") ~= nil, "mkfs: 超过单块组上限报错", tostring(e4))
+    ok(r4 == nil and tostring(e4):find("single block group") ~= nil, "mkfs: 超过单块组上限报错", tostring(e4))
     b2.close()
 end
 

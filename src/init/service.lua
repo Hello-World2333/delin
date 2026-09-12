@@ -1,25 +1,29 @@
---[[ Delin init 服务引擎 (systemd 风格子集, 跑在 PID 1 的用户态里)。
-     单元来源: /lib/systemd/system(厂商) 与 /etc/systemd/system(管理员, 同名覆盖),
-     <target>.wants/ 与 <target>.requires/ 目录里的条目等价于在该 target 上加 Wants=/Requires=
-     (Delin 的 CC 原生 fs 无符号链接, 故用同名空标记文件而非 systemd 的 symlink)。
-     依赖: Requires(硬依赖, 失败则本单元不启动) / Wants(软依赖) / After/Before(仅排序) /
-           Conflicts(启动前停掉冲突单元)。启动顺序 = 闭包 + 拓扑排序, 有环即 fail-fast。
-     类型: service(Type=simple|oneshot, Restart=no|always|on-failure|on-abnormal, RestartSec=) /
-           target / timer(OnBootSec= OnActiveSec= OnUnitActiveSec=) / mount(What= Where= Type=)。
-     服务监督: init 注册 proc.onExit 钩子, 子进程退出时在此更新状态并按 Restart= 排定重启。
-     本模块不做 I/O 阻塞, 唯一会让出的是等待 oneshot 启动完成(经 os.sleep, 由内核调度器驱动)。 ]]
+--[[ Delin init service engine (systemd-style subset, running in PID 1's user space).
+     Unit sources: /lib/systemd/system (vendor) and /etc/systemd/system (admin, same name overrides),
+     entries inside a <target>.wants/ or <target>.requires/ directory are equivalent to adding
+     Wants=/Requires= on that target (Delin's CC native fs has no symlinks, so an empty marker file
+     with the unit's name is used instead of systemd's symlink).
+     Dependencies: Requires (hard, the unit does not start when it fails) / Wants (soft) /
+           After/Before (ordering only) / Conflicts (stop the conflicting units before starting).
+           Start order = closure + topological sort, a cycle is fail-fast.
+     Kinds: service (Type=simple|oneshot, Restart=no|always|on-failure|on-abnormal, RestartSec=) /
+           target / timer (OnBootSec= OnActiveSec= OnUnitActiveSec=) / mount (What= Where= Type=).
+     Service supervision: init registers the proc.onExit hook, a child exit updates state here and
+     schedules a restart per Restart=.
+     This module never blocks on I/O; the only yield is waiting for a oneshot to finish starting
+     (via os.sleep, driven by the kernel scheduler). ]]
 
 local unitlib = __require("unit")
 
 local svc = {}
 
-svc.log = print          -- init 可换成带前缀的日志函数
+svc.log = print          -- init may replace this with a prefixed log function
 svc.units = {}           -- name -> rec
-svc.bootMs = 0           -- init 记录引导时刻(OnBootSec 基准)
-local byPid = {}         -- pid -> rec(服务监督)
+svc.bootMs = 0           -- init records the boot time (base for OnBootSec)
+local byPid = {}         -- pid -> rec (service supervision)
 
 local UNIT_DIRS = { "/lib/systemd/system", "/etc/systemd/system" }
-local STATE_DIR = "/etc/systemd/system" -- enable 标记写在这里(systemd 的 /etc 覆盖层)
+local STATE_DIR = "/etc/systemd/system" -- enable markers are written here (systemd's /etc overlay)
 
 local function log(...) svc.log(...) end
 
@@ -31,7 +35,7 @@ local function readFile(path)
     return s
 end
 
---- 在单元目录里定位单元文件(支持 getty@tty0.service -> getty@.service 模板)。
+--- Locate a unit file in the unit directories (getty@tty0.service -> getty@.service template).
 ---@param name string
 ---@return string|nil path, string|nil templatePath
 local function findUnitFile(name)
@@ -39,7 +43,7 @@ local function findUnitFile(name)
     if not kind then return nil end
     local base, instance = name:match("^([^@]+)@(.+)%.[%a]+$")
     local template = base and (base .. "@." .. kind) or nil
-    for i = #UNIT_DIRS, 1, -1 do -- 管理员目录优先(覆盖厂商)
+    for i = #UNIT_DIRS, 1, -1 do -- admin directories first (they override the vendor ones)
         local dir = UNIT_DIRS[i]
         if fs.exists(dir .. "/" .. name) then return dir .. "/" .. name end
     end
@@ -51,7 +55,7 @@ local function findUnitFile(name)
     end
 end
 
---- 装载一个单元(按名字)。已在表中则直接返回。
+--- Load a unit by name. Returns at once when it is already in the table.
 ---@param name string
 ---@return table|nil rec, string|nil err
 function svc.get(name)
@@ -69,7 +73,8 @@ function svc.get(name)
     return rec
 end
 
---- 把解析结果归一化成运行时记录(校验 + 字段提取)。fail-fast: 非法值直接返回 nil+err。
+--- Normalize a parse result into a runtime record (validation + field extraction).
+--- fail-fast: an invalid value returns nil+err right away.
 ---@param parsed table
 ---@param name string
 ---@param path string
@@ -143,7 +148,8 @@ function svc.finalize(parsed, name, path)
     return rec
 end
 
---- 扫描单元目录: 载入全部单元文件, 再把 <unit>.wants/.requires 标记目录折进依赖。
+--- Scan the unit directories: load every unit file, then fold the <unit>.wants/.requires
+--- marker directories into the dependency lists.
 ---@return integer count
 function svc.loadAll()
     local keep = svc.units
@@ -155,7 +161,7 @@ function svc.loadAll()
             table.sort(names)
             for _, fn in ipairs(names) do
                 if unitlib.kind(fn) and fs.exists(dir .. "/" .. fn) and not fs.isDir(dir .. "/" .. fn) then
-                    files[fn] = dir .. "/" .. fn -- 后扫到的目录(/etc)覆盖厂商
+                    files[fn] = dir .. "/" .. fn -- a later directory (/etc) overrides the vendor
                 end
             end
         end
@@ -180,7 +186,7 @@ function svc.loadAll()
             end
         end
     end
-    -- <unit>.wants / <unit>.requires 目录
+    -- <unit>.wants / <unit>.requires directories
     for _, dir in ipairs(UNIT_DIRS) do
         if fs.exists(dir) and fs.isDir(dir) then
             for _, sub in ipairs(fs.list(dir) or {}) do
@@ -209,7 +215,7 @@ function svc.loadAll()
             end
         end
     end
-    -- 重载时保留仍在运行的服务的状态
+    -- keep the state of services that are still running across a reload
     for name, old in pairs(keep) do
         local rec = svc.units[name]
         if rec and old.pid and old.active ~= "inactive" then
@@ -220,13 +226,13 @@ function svc.loadAll()
     return n
 end
 
---- 把新单元注入内存(init 生成的 fstab mount 单元 / getty 实例)。
+--- Inject a new unit into memory (fstab mount units / getty instances generated by init).
 ---@param rec table
 function svc.add(rec)
     svc.units[rec.name] = rec
 end
 
---- 给某单元追加 Wants/Requires 依赖(不存在则创建隐式 target 记录)。
+--- Append a Wants/Requires dependency to a unit (creating an implicit target record when absent).
 function svc.addDep(owner, dep, hard)
     local rec = svc.units[owner]
     if not rec then
@@ -240,7 +246,8 @@ function svc.addDep(owner, dep, hard)
     list[#list + 1] = dep
 end
 
---- 计算启动顺序: 从 root 出发收集 Requires/Wants 闭包, 按 After/Before 拓扑排序。
+--- Compute the start order: collect the Requires/Wants closure from root and topologically
+--- sort it by After/Before.
 ---@param root string
 ---@return string[]|nil order, string|nil err
 function svc.startOrder(root)
@@ -272,8 +279,8 @@ function svc.startOrder(root)
     for n, rec in pairs(closure) do
         for _, a in ipairs(rec.after) do edge(a, n) end
         for _, b in ipairs(rec.before) do edge(n, b) end
-        -- systemd.target(5): target 的 Requires=/Wants= 自动补 After= ——
-        -- target 只有在它拉起的单元都启动后才算 active。
+        -- systemd.target(5): a target's Requires=/Wants= implicitly adds After= --
+        -- a target is active only after all the units it pulled up have started.
         if rec.kind == "target" then
             for _, d in ipairs(rec.requires) do edge(d, n) end
             for _, d in ipairs(rec.wants) do edge(d, n) end
@@ -307,8 +314,8 @@ local function markFailed(rec, why)
     log("[init] " .. rec.name .. ": FAILED: " .. tostring(why))
 end
 
---- 记录一次启动尝试; 超过 StartLimitBurst/StartLimitIntervalSec 则拒绝重启
---- (systemd 的 start limit: 防止配置错误的服务无限重启刷屏)。
+--- Record a start attempt; refuse to restart once StartLimitBurst/StartLimitIntervalSec is exceeded
+--- (systemd's start limit: stops a misconfigured service from restarting forever and flooding the log).
 ---@return boolean allowed
 local function noteStart(rec)
     local now = os.epoch("utc")
@@ -332,7 +339,7 @@ local function scheduleRestart(rec)
     rec.active, rec.sub = "activating", "auto-restart"
 end
 
---- 启动单个单元(不做依赖检查, 由 svc.start 保证顺序)。
+--- Start a single unit (no dependency check; svc.start guarantees the order).
 ---@return boolean|nil ok, string|nil err
 local function startOne(rec)
     if rec.kind == "target" then
@@ -358,7 +365,7 @@ local function startOne(rec)
         rec.mounted = info
         return true
     elseif rec.kind == "service" then
-        -- ppid=1: 服务挂在 init 名下(与 systemd 一致), 而不是发起 systemctl 的进程。
+        -- ppid=1: the service is a child of init (as with systemd), not of the process that ran systemctl.
         local pid, err = syscalls["proc.spawnFile"](rec.exec, rec.execArgs, { cwd = "/", ppid = 1 })
         if not pid then return nil, rec.exec .. ": " .. tostring(err) end
         rec.pid = pid
@@ -375,9 +382,9 @@ local function startOne(rec)
     return nil, rec.name .. ": unsupported unit kind"
 end
 
---- 等待一个 oneshot 完成启动(或失败)。
---- 等待期间照常驱动引擎(延迟重启/timer/超时), 否则 init 会卡在一个慢 oneshot 上,
---- 让 timer 与重启排期停摆。
+--- Wait for a oneshot to finish starting (or fail).
+--- The engine keeps ticking while waiting (delayed restarts/timers/timeouts), otherwise init would
+--- stall on a slow oneshot and stop scheduling timers and restarts.
 local function waitUnit(rec)
     local deadline = os.epoch("utc") + rec.timeoutStartSec * 1000
     while rec.active == "activating" do
@@ -391,14 +398,15 @@ local function waitUnit(rec)
     end
 end
 
---- 启动一个单元(含其 Requires/Wants 闭包), 按依赖拓扑序执行。
+--- Start a unit together with its Requires/Wants closure, in dependency topological order.
 ---@param name string
 ---@return boolean|nil ok, string|nil err
 function svc.start(name)
     local order, err = svc.startOrder(name)
     if not order then return nil, err end
-    -- 显式 start 的根单元允许重试(等价 systemd 的 systemctl start 重试 failed 单元);
-    -- 依赖链上已经 failed 的单元不再重试, 否则"坏配置"会被静默修好。
+    -- The explicitly started root unit may be retried (systemd's systemctl start retries a failed
+    -- unit); units already failed inside the dependency chain are not retried, otherwise a bad
+    -- configuration would be silently papered over.
     local rootRec = svc.units[name]
     if rootRec and rootRec.active == "failed" then
         rootRec.active, rootRec.sub, rootRec.failReason = "inactive", "dead", nil
@@ -409,7 +417,7 @@ function svc.start(name)
         if rec.active == "failed" then
             failed[n] = true
         elseif rec.active ~= "active" and rec.active ~= "activating" then
-            -- 硬依赖必须已 active
+            -- hard dependencies must be active already
             local bad
             for _, d in ipairs(rec.requires) do
                 local dr = svc.units[d]
@@ -419,7 +427,7 @@ function svc.start(name)
                 failed[n] = true
                 markFailed(rec, "dependency failed: " .. bad)
             else
-                -- Conflicts=: 启动前停掉冲突单元
+                -- Conflicts=: stop the conflicting units before starting
                 for _, c in ipairs(rec.conflicts) do
                     local cr = svc.units[c]
                     if cr and cr.active ~= "inactive" then svc.stop(c) end
@@ -438,7 +446,7 @@ function svc.start(name)
     return true
 end
 
---- 停止一个单元(服务发 SIGTERM, 超时 SIGKILL; mount 卸载)。
+--- Stop a unit (services get SIGTERM, then SIGKILL on timeout; mount units are unmounted).
 ---@return boolean|nil ok, string|nil err
 function svc.stop(name)
     local rec, err = svc.get(name)
@@ -465,7 +473,7 @@ function svc.stop(name)
     return true
 end
 
---- 重启一个单元: 若正在运行则停掉并在退出后重新启动(退出钩子里排定)。
+--- Restart a unit: stop it when running and reschedule a start after it exits (scheduled in the exit hook).
 ---@return boolean|nil ok, string|nil err
 function svc.restart(name)
     local rec, err = svc.get(name)
@@ -477,7 +485,7 @@ function svc.restart(name)
     return svc.start(name)
 end
 
---- 子进程退出钩子(init 注册到内核 proc.onExit)。不得让出。
+--- Child exit hook (init registers it with the kernel proc.onExit). Must not yield.
 ---@param pid integer
 ---@param status string "dead"|"error"
 ---@param code integer|nil
@@ -524,7 +532,8 @@ function svc.onProcessExit(pid, status, code, termSig)
     end
 end
 
---- 周期驱动: 延迟重启 / timer 到期 / oneshot 与 stop 超时。init 主循环每 100ms 调用。
+--- Periodic tick: delayed restarts / timer expiry / oneshot and stop timeouts.
+--- Called by the init main loop every 100ms.
 function svc.tick()
     local now = os.epoch("utc")
     for _, rec in pairs(svc.units) do
@@ -535,8 +544,9 @@ function svc.tick()
         end
         if rec.kind == "timer" and rec.active == "active" and not rec.firing
             and rec.next and now >= rec.next then
-            -- 先把下一次到期时间排好, 再启动 Unit=: svc.start 可能驱动 tick(等待 oneshot),
-            -- 若此时 next 仍到期会重复触发同一个 timer(曾导致无限递归)。
+            -- Re-arm the next expiry before starting Unit=: svc.start may drive a tick (waiting for
+            -- a oneshot) and with next still expired the same timer would fire again (this once
+            -- caused infinite recursion).
             rec.firing = true
             rec.sub = "running"
             if rec.onUnitActiveSec then rec.next = now + rec.onUnitActiveSec * 1000
@@ -564,7 +574,7 @@ function svc.tick()
     end
 end
 
---- 单元状态快照(供 systemctl)。
+--- Unit state snapshot (for systemctl).
 function svc.snapshot(name)
     local rec = svc.get(name)
     if not rec then return nil end
@@ -578,7 +588,7 @@ function svc.snapshot(name)
     }
 end
 
---- 列出全部已装载单元(按名字排序)。
+--- List every loaded unit (sorted by name).
 function svc.list()
     local out = {}
     for name in pairs(svc.units) do out[#out + 1] = name end
@@ -588,12 +598,12 @@ function svc.list()
     return res
 end
 
---- enable 标记路径(systemd 的 <target>.wants/<unit> 空标记文件)。
+--- enable marker path (systemd's empty <target>.wants/<unit> marker file).
 local function markerPath(unitName, targetName)
     return STATE_DIR .. "/" .. targetName .. ".wants/" .. unitName
 end
 
---- 单元是否 enabled([Install] WantedBy= 目标下存在标记)。
+--- Whether a unit is enabled (a marker exists under one of its [Install] WantedBy= targets).
 ---@param name string
 ---@return boolean
 function svc.isEnabled(name)
@@ -607,7 +617,7 @@ function svc.isEnabled(name)
     return false
 end
 
---- 启用单元(按 [Install] WantedBy= 写标记文件)。
+--- Enable a unit (write the marker files named by [Install] WantedBy=).
 ---@return boolean|nil ok, string|nil err
 function svc.enable(name)
     local rec, err = svc.get(name)
@@ -625,7 +635,7 @@ function svc.enable(name)
     return true
 end
 
---- 禁用单元(删除标记文件)。
+--- Disable a unit (delete the marker files).
 ---@return boolean|nil ok, string|nil err
 function svc.disable(name)
     local rec, err = svc.get(name)

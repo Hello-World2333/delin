@@ -108,7 +108,7 @@ local profiles = {
 --- 约定: 最后一个 spec 是主程序, 顶层执行; 前面的都包成 __require 可取的模块。
 local function buildInitSource(specs)
     local out = {}
-    out[#out + 1] = "-- init bundle: 前 N-1 个为内部模块, 最后一个为顶层主程序"
+    out[#out + 1] = "-- init bundle: the first N-1 entries are internal modules, the last one is the top-level main program"
     out[#out + 1] = "local __initMods, __initLoaded = {}, {}"
     out[#out + 1] = "local function __require(name)"
     out[#out + 1] = "    if __initLoaded[name] ~= nil then return __initLoaded[name] end"

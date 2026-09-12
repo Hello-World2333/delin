@@ -1133,11 +1133,11 @@ function ext2.mkfs(bd, opts)
     local firstIno = 11                                -- 1..10 保留, 11 起给普通文件(与 mkfs.ext2 一致)
 
     local blocks = tonumber(opts.blocks)
-    if not blocks then return nil, "mkfs: 必须给 blocks" end
+    if not blocks then return nil, "mkfs: blocks is required" end
     blocks = math.floor(blocks)
-    if blocks < 64 then return nil, "mkfs: 块数至少 64(块大小 1024 时 64KB)" end
+    if blocks < 64 then return nil, "mkfs: at least 64 blocks (64KB at block size 1024)" end
     if blocks > blocksPerGroup then
-        return nil, string.format("mkfs: 只支持单块组(块大小 %d 时最多 %d 块 = %dKB)",
+        return nil, string.format("mkfs: single block group only (at block size %d at most %d blocks = %dKB)",
             blockSize, blocksPerGroup, blocksPerGroup * blockSize / 1024)
     end
 
@@ -1146,11 +1146,11 @@ function ext2.mkfs(bd, opts)
     local inodesPerGroup = tonumber(opts.inodes) or 256
     inodesPerGroup = math.floor(inodesPerGroup)
     if inodesPerGroup < 2 * firstIno then
-        return nil, string.format("mkfs: inode 数至少 %d", 2 * firstIno)
+        return nil, string.format("mkfs: at least %d inodes", 2 * firstIno)
     end
     inodesPerGroup = math.ceil(inodesPerGroup / perBlock) * perBlock
     if inodesPerGroup > blockSize * 8 then
-        return nil, string.format("mkfs: inode 数最多 %d(单块组的 inode 位图只有 %d 位)",
+        return nil, string.format("mkfs: at most %d inodes (the inode bitmap of a single block group has only %d bits)",
             blockSize * 8, blockSize * 8)
     end
 
@@ -1160,17 +1160,17 @@ function ext2.mkfs(bd, opts)
     local inodeTableBlocks = math.floor(inodesPerGroup * inodeSize / blockSize)
     local dataStart = inodeTable + inodeTableBlocks
     if blocks < dataStart + 2 then
-        return nil, string.format("mkfs: 块数至少 %d(元数据 %d 块 + 根目录 + lost+found)", dataStart + 2, dataStart)
+        return nil, string.format("mkfs: at least %d blocks (metadata %d blocks + root dir + lost+found)", dataStart + 2, dataStart)
     end
 
     local reservedPercent = tonumber(opts.reservedPercent) or 0
     if reservedPercent < 0 or reservedPercent > 99 then
-        return nil, "mkfs: 保留块比例必须在 0..99 之间"
+        return nil, "mkfs: reserved block percentage must be within 0..99"
     end
 
     local size = bd.getSize and bd.getSize() or nil
     if size and size > 0 and size < blocks * blockSize then
-        return nil, string.format("mkfs: 设备只有 %d 字节, 放不下 %d 块(%d 字节)", size, blocks, blocks * blockSize)
+        return nil, string.format("mkfs: device has only %d bytes, cannot hold %d blocks (%d bytes)", size, blocks, blocks * blockSize)
     end
 
     local now = math.floor(opts.time or (os.epoch and (os.epoch("utc") / 1000)) or os.time())
@@ -1183,7 +1183,7 @@ function ext2.mkfs(bd, opts)
     local freeBlocks = (blocks - firstDataBlock) - usedBlocks
     local rBlocks = math.floor(blocks * reservedPercent / 100)
     if rBlocks >= freeBlocks then
-        return nil, string.format("mkfs: 保留块(%d)不能占满空闲块(%d)", rBlocks, freeBlocks)
+        return nil, string.format("mkfs: reserved blocks (%d) must not fill all free blocks (%d)", rBlocks, freeBlocks)
     end
 
     local info = {
@@ -1207,7 +1207,7 @@ function ext2.mkfs(bd, opts)
         local n = math.min(#zero, blocks * blockSize - off)
         local ok, werr = bd.write(off, n == #zero and zero or zero:sub(1, n))
         if not ok then
-            return nil, string.format("mkfs: 清零失败于偏移 %d: %s", off, tostring(werr))
+            return nil, string.format("mkfs: zeroing failed at offset %d: %s", off, tostring(werr))
         end
         off = off + n
     end
@@ -1255,7 +1255,7 @@ function ext2.mkfs(bd, opts)
     end
     sb = sb:sub(1, 104) .. table.concat(uuid) .. sb:sub(121)
     sb = sb:sub(1, 120) .. label .. string.rep("\0", 16 - #label) .. sb:sub(137)
-    if not bd.write(1024, sb) then return nil, "mkfs: 写超级块失败" end
+    if not bd.write(1024, sb) then return nil, "mkfs: failed to write superblock" end
 
     -- 3) 块组描述符(单块组)
     --    位图映射(与宿主 mkfs.ext2 的产物逐字节核对过):
@@ -1264,7 +1264,7 @@ function ext2.mkfs(bd, opts)
     --    尾部填充位必须置 1, 否则 e2fsck 报 "Padding at end of ... bitmap is not set"。
     local gdt = w32(blockBitmap) .. w32(inodeBitmap) .. w32(inodeTable)
         .. w16(freeBlocks) .. w16(freeInodes) .. w16(1) .. w16(0) .. string.rep("\0", 12)
-    if not bd.write(gdtBlock * blockSize, gdt) then return nil, "mkfs: 写块组描述符失败" end
+    if not bd.write(gdtBlock * blockSize, gdt) then return nil, "mkfs: failed to write group descriptor" end
 
     local function setBit(s, bit)
         local pos = math.floor(bit / 8) + 1
@@ -1277,13 +1277,13 @@ function ext2.mkfs(bd, opts)
     local bmap = string.rep("\0", blockSize)
     for bit = 0, usedBlocks - 1 do bmap = setBit(bmap, bit) end
     for bit = blocks - firstDataBlock, bitsPerBitmap - 1 do bmap = setBit(bmap, bit) end
-    if not bd.write(blockBitmap * blockSize, bmap) then return nil, "mkfs: 写块位图失败" end
+    if not bd.write(blockBitmap * blockSize, bmap) then return nil, "mkfs: failed to write block bitmap" end
 
     -- inode 位图: inode 1..10 保留段标占用(inode 2 是根目录), 其余尾部填充位置 1。
     local imap = string.rep("\0", blockSize)
     for bit = 0, usedInodes - 1 do imap = setBit(imap, bit) end
     for bit = inodesPerGroup, bitsPerBitmap - 1 do imap = setBit(imap, bit) end
-    if not bd.write(inodeBitmap * blockSize, imap) then return nil, "mkfs: 写 inode 位图失败" end
+    if not bd.write(inodeBitmap * blockSize, imap) then return nil, "mkfs: failed to write inode bitmap" end
 
     -- 5) 根目录(固定 inode 2)+ 它的目录块
     local fs = {
@@ -1295,28 +1295,28 @@ function ext2.mkfs(bd, opts)
     local rootBlock = dataStart
     local e1 = w32(2) .. w16(12) .. string.char(1, FT_DIR) .. "." .. string.rep("\0", 3)
     local e2 = w32(2) .. w16(blockSize - 12) .. string.char(2, FT_DIR) .. ".." .. string.rep("\0", 2)
-    if not writeBlockStr(fs, rootBlock, e1 .. e2) then return nil, "mkfs: 写根目录失败" end
+    if not writeBlockStr(fs, rootBlock, e1 .. e2) then return nil, "mkfs: failed to write root directory" end
     local rootInode = {
         ino = 2, mode = T_DIR + 493, uid = 0, gid = 0, links = 2, size = blockSize, -- 0755
         blocks = math.floor(blockSize / 512), atime = now, ctime = now, mtime = now,
         ptrs = { rootBlock },
     }
     for n = 2, 15 do rootInode.ptrs[n] = 0 end
-    if not ext2.writeInode(fs, rootInode) then return nil, "mkfs: 写根 inode 失败" end
+    if not ext2.writeInode(fs, rootInode) then return nil, "mkfs: failed to write root inode" end
 
     -- 6) lost+found: 用驱动自己的 create(取 firstIno 的 inode、分配目录块、写 "."/".."、
     --    在根目录项里登记, 并把根的 links 加到 3)
     local lf, lerr = ext2.create(fs, "/", "lost+found", T_DIR + 448) -- 0700
-    if not lf then return nil, "mkfs: 建 lost+found 失败: " .. tostring(lerr) end
+    if not lf then return nil, "mkfs: failed to create lost+found: " .. tostring(lerr) end
 
     -- 7) 自检: 按 mount() 的路径重新挂回来, 根与 lost+found 必须都在
     local rfs, rerr = ext2.mount(bd)
-    if not rfs then return nil, "mkfs: 自检挂载失败: " .. tostring(rerr) end
+    if not rfs then return nil, "mkfs: self-check mount failed: " .. tostring(rerr) end
     local root = ext2.lookup(rfs, "/")
-    if not root or root.type ~= T_DIR then return nil, "mkfs: 自检读不到根目录" end
+    if not root or root.type ~= T_DIR then return nil, "mkfs: self-check cannot read root directory" end
     local lfi = ext2.lookup(rfs, "/lost+found")
-    if not lfi or lfi.type ~= T_DIR then return nil, "mkfs: 自检读不到 /lost+found" end
-    if root.links ~= 3 then return nil, "mkfs: 根目录 links 应为 3, 实得 " .. tostring(root.links) end
+    if not lfi or lfi.type ~= T_DIR then return nil, "mkfs: self-check cannot read /lost+found" end
+    if root.links ~= 3 then return nil, "mkfs: root directory should have links 3, got " .. tostring(root.links) end
     rfs.mkfsInfo = info
     return rfs
 end

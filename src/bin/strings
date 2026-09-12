@@ -160,7 +160,7 @@ end
 for _, f in ipairs(files) do
     if f == "-" then
         local h = io.stdin()
-        if not h then stderr("strings: 无法读取 stdin\n"); return 1 end
+        if not h then stderr("strings: cannot read stdin\n"); return 1 end
         scan(h, "-")
     else
         local h, err = fs.open(resolve(f), "r")

@@ -155,6 +155,10 @@ def main():
         # 安装内核模块(dist/modules/<version> -> /lib/modules/<version>/):
         # 基镜像的 /lib 可能因 debugfs 元数据损坏而无法 rdump, 且模块应始终取当前构建。
         ver = _module_version()
+        # 基镜像里**上个版本**的模块目录先整个删掉: 内核只按 /lib/modules/<当前版本> 找模块,
+        # 老目录永远不会被装载, 却作为陈旧产物留在机器上(旧行为 + 旧注释; ASCII 门禁扫的是
+        # dist/, 管不到基镜像)。重新部署的语义就是"镜像 == 当前构建", 所以清空再铺。
+        shutil.rmtree(os.path.join(rootfs, "lib", "modules"), ignore_errors=True)
         moddir = os.path.join(rootfs, "lib", "modules", ver)
         os.makedirs(moddir, exist_ok=True)
         for f in sorted(os.listdir(os.path.join(REPO, "dist/modules", ver))):

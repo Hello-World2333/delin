@@ -186,7 +186,7 @@ local function nodeOpen(name, mode)
     if not e then return nil, "/dev/" .. name .. ": no such device" end
     if e.type ~= "part" then
         -- 整盘是 CC 原生文件系统(目录树), 不是字节流设备 —— 只能挂载。
-        return nil, "/dev/" .. name .. ": CC native filesystem (ccdisk) — mount it, no byte stream"
+        return nil, "/dev/" .. name .. ": CC native filesystem (ccdisk) - mount it, no byte stream"
     end
     return openRaw(e, mode)
 end

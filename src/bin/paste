@@ -124,7 +124,7 @@ end
 local function openInput(name)
     if name == "-" then
         local h = io.stdin()
-        if not h then stderr("paste: 无法读取 stdin\n"); return nil end
+        if not h then stderr("paste: cannot read stdin\n"); return nil end
         return h
     end
     local h, err = fs.open(resolve(name), "r")

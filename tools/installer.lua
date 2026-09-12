@@ -364,20 +364,20 @@ local function parseManifest(text)
             n = n + 1
             if n == 1 then
                 local v = line:match("^version%s+(%S+)$")
-                if not v then return nil, "manifest: 第一行必须是 'version <版本>'" end
+                if not v then return nil, "manifest: first line must be 'version <version>'" end
                 mf.version = v
             elseif n == 2 and line:match("^files%s+%d+$") then
                 mf.count = tonumber(line:match("^files%s+(%d+)$"))
             else
                 local path, size, crc = line:match("^(%S+)%s+(%d+)%s+(%x+)$")
-                if not path then return nil, "manifest: 无法解析: " .. line end
+                if not path then return nil, "manifest: cannot parse: " .. line end
                 mf.files[#mf.files + 1] = { path = path, size = tonumber(size), crc = crc }
             end
         end
     end
-    if #mf.files == 0 then return nil, "manifest: 没有任何文件" end
+    if #mf.files == 0 then return nil, "manifest: no files at all" end
     if mf.count and mf.count ~= #mf.files then
-        return nil, string.format("manifest: 声明 %d 个文件, 实得 %d 个", mf.count, #mf.files)
+        return nil, string.format("manifest: declared %d files, got %d", mf.count, #mf.files)
     end
     return mf
 end
@@ -547,11 +547,11 @@ local function writePayload(t, mf, base)
         local data = res.readAll()
         res.close()
         if #data ~= f.size then
-            return nil, string.format("%s: 大小不符(期望 %d, 实得 %d)", f.path, f.size, #data)
+            return nil, string.format("%s: size mismatch (expected %d, got %d)", f.path, f.size, #data)
         end
         local got = crc32.hex(crc32.of(data))
         if got ~= f.crc then
-            return nil, string.format("%s: CRC32 不符(期望 %s, 实得 %s)", f.path, f.crc, got)
+            return nil, string.format("%s: CRC32 mismatch (expected %s, got %s)", f.path, f.crc, got)
         end
         local dir = f.path:match("^(.*)/[^/]+$")
         if dir then

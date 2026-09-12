@@ -1,6 +1,6 @@
 --@name ccmonitor
 --@version 0.1.0
---@description CC:Tweaked 原生 monitor 显示器驱动 (term 型: /dev/ttyN, 无 /dev/fbN)。
+--@description CC:Tweaked native monitor display driver (term type: /dev/ttyN, no /dev/fbN).
 --@deps
 
 return {

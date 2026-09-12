@@ -1,7 +1,7 @@
 --@name redstone
 --@version 0.2.0
---@description CC 红石驱动: /sys/class/redstone/<side>/{digital,analog,bundled}; 三个属性一律
---             读 = 该面输入, 写 = 该面输出。
+--@description CC redstone driver: /sys/class/redstone/<side>/{digital,analog,bundled}; all three attributes are
+--             read = that side's input, write = that side's output.
 --@deps
 
 --[[ 抽象(对齐 Linux gpio 的 sysfs 接口 /sys/class/gpio/gpioN/{direction,value}):

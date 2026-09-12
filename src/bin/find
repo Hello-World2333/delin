@@ -464,7 +464,7 @@ local function parsePrimary()
         if not v then return nil end
         local kind, digits = v:match("^([%-/]?)(.*)$")
         if not digits:match("^[0-7]+$") then
-            syntaxErr("invalid mode '" .. v .. "' (只支持八进制, 不支持符号模式)")
+            syntaxErr("invalid mode '" .. v .. "' (octal modes only, symbolic modes are not supported)")
             return nil
         end
         local mode = tonumber(digits, 8) % 4096
@@ -591,7 +591,7 @@ local function parsePrimary()
         return { op = "test", f = function() quitFlag = true; return true end }
     end
     if t == "-ls" then
-        syntaxErr("-ls: not implemented (CC 原生 fs 没有 inode/块数/属主)")
+        syntaxErr("-ls: not implemented (CC native fs has no inode/block count/owner)")
         return nil
     end
 

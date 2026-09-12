@@ -1,20 +1,21 @@
---[[ Delin init 单元文件解析 (systemd 风格子集)。
-     单元文件是 INI 风格纯文本:
+--[[ Delin init unit file parser (systemd-style subset).
+     Unit files are INI-style plain text:
        [Unit]     Description= After= Before= Requires= Wants= Conflicts=
        [Service]  Type=simple|oneshot  ExecStart=  Restart=  RestartSec=
                   TimeoutStartSec=  TimeoutStopSec=  RemainAfterExit=
        [Timer]    OnBootSec=  OnActiveSec=  OnUnitActiveSec=  Unit=
        [Mount]    What=  Where=  Type=  Options=
        [Install]  WantedBy=
-     值里可以出现多个空白分隔的单元名(After= a b); 同一个键可重复(等价于追加)。
-     %i / %I 为模板实例名(getty@tty0.service 从 getty@.service 实例化)。
-     本模块只做解析/字段归一化/模板替换, 不含任何运行状态。 ]]
+     A value may hold several whitespace-separated unit names (After= a b); a key may repeat
+     (equivalent to appending).
+     %i / %I are the template instance name (getty@tty0.service instantiated from getty@.service).
+     This module only parses/normalizes fields/substitutes templates; it holds no runtime state. ]]
 
 local unit = {}
 
 local KINDS = { service = true, target = true, timer = true, mount = true }
 
---- 单元名 -> 类型("service"|"target"|"timer"|"mount"), 非单元名返回 nil。
+--- Unit name -> kind ("service"|"target"|"timer"|"mount"); nil when it is not a unit name.
 ---@param name string
 ---@return string|nil
 function unit.kind(name)
@@ -23,14 +24,14 @@ function unit.kind(name)
     return nil
 end
 
---- 解析单元文件文本。
+--- Parse unit file text.
 ---@param text string
----@param name string 单元名(用于错误消息)
----@param instance string|nil 模板实例名(%i/%I)
+---@param name string unit name (used in error messages)
+---@param instance string|nil template instance name (%i/%I)
 ---@return table|nil rec, string|nil err
 function unit.parse(text, name, instance)
     if instance then
-        -- %% -> 哨兵, %i/%I -> 实例, 哨兵 -> %
+        -- %% -> sentinel, %i/%I -> instance, sentinel -> %
         text = text:gsub("%%%%", "\1"):gsub("%%i", instance):gsub("%%I", instance):gsub("\1", "%%")
     end
     local rec = { name = name, sections = {} }
@@ -60,7 +61,7 @@ function unit.parse(text, name, instance)
     return rec
 end
 
---- 取某键的最后一个值(单值键)。
+--- Last value of a key (single-valued keys).
 ---@return string|nil
 function unit.get(rec, section, key)
     local sec = rec.sections[section]
@@ -68,7 +69,7 @@ function unit.get(rec, section, key)
     return vals and vals[#vals] or nil
 end
 
---- 取某键的全部值(空白分隔展开; 键可重复)。
+--- All values of a key (whitespace-separated expansion; keys may repeat).
 ---@return string[]
 function unit.list(rec, section, key)
     local out = {}
@@ -81,12 +82,12 @@ function unit.list(rec, section, key)
     return out
 end
 
---- 取某键的原始字符串(保留空格, 如 ExecStart)。
+--- Raw string of a key (whitespace preserved, e.g. ExecStart).
 function unit.raw(rec, section, key)
     return unit.get(rec, section, key)
 end
 
---- 解析 systemd 风格时间: "10s" "5min" "1h" "2d" "500ms" 或纯数字(秒)。
+--- Parse a systemd-style time: "10s" "5min" "1h" "2d" "500ms" or a plain number (seconds).
 ---@param s string|nil
 ---@return number|nil seconds
 function unit.time(s)
@@ -110,9 +111,9 @@ function unit.time(s)
     return nil
 end
 
---- 解析 ExecStart 风格命令行(systemd 子集: 空白分隔 + 单/双引号)。
+--- Parse an ExecStart-style command line (systemd subset: whitespace separated + single/double quotes).
 ---@param s string
----@return string[] argv  argv[1] 为程序路径
+---@return string[] argv  argv[1] is the program path
 function unit.splitArgs(s)
     local out, i, n = {}, 1, #s
     while i <= n do

@@ -154,6 +154,51 @@ local function build()
 end
 
 -- ---------------------------------------------------------------
+-- 产物门禁: 装到 CC 上的文件必须全 ASCII
+-- ---------------------------------------------------------------
+
+--- 找出一处非 ASCII 字节(返回 { line, text }; 全 ASCII 返回 nil)。
+--- 逐字节扫, 不整读后 gsub —— 只需要**第一处**违规的位置, 报给人看。
+local function findNonAscii(path)
+    local data = readAll(path)
+    local line = 1
+    for i = 1, #data do
+        local b = data:byte(i)
+        if b == 10 then line = line + 1 end
+        if b > 127 then
+            local before = data:sub(1, i - 1):match("[^\n]*$") or ""
+            local after = data:sub(i):match("^[^\n]*") or ""
+            return { line = line, text = before .. after }
+        end
+    end
+    return nil
+end
+
+--- 逐个产物查非 ASCII, 有一处就 fail-fast。
+--- **为什么是硬门禁**: CC 终端没有中文字形(中文打出来是乱码), 而源码里的中文注释
+--- 只要走到产物里就是安装件的一部分 —— 注释被压缩器丢掉的那些无所谓, 丢不掉的
+--- (init 源码是原样嵌进 kernel.lua 的字符串、模块的 --@ 头、/etc 与 units 是原样拷贝)
+--- 必须自己保持 ASCII。这条门禁把"哪些注释会被丢"这个知识从人脑挪到构建期。
+---@param files string[] 相对路径
+---@param base string 这些路径的根目录
+---@param label string 报错时显示的路径前缀
+local function assertAscii(files, base, label)
+    local bad = {}
+    for _, rel in ipairs(files) do
+        local hit = findNonAscii(base .. "/" .. rel)
+        if hit then
+            bad[#bad + 1] = string.format("  %s/%s:%d: %s", label, rel, hit.line, hit.text)
+        end
+    end
+    if #bad > 0 then
+        error("产物出现非 ASCII 字节 —— 装到 CC 电脑上的文件必须全 ASCII:\n"
+            .. table.concat(bad, "\n")
+            .. "\n(dist/ 是构建产物: 陈旧发布树里的中文只能删掉重来 —— rm -rf dist)", 0)
+    end
+    return #files
+end
+
+-- ---------------------------------------------------------------
 -- dist/manifest: 版本 + 每个产物的 size/crc32
 -- ---------------------------------------------------------------
 
@@ -230,6 +275,28 @@ local function buildRelease()
     local bytes = 0
     for _, rel in ipairs(files) do bytes = bytes + #readAll(RELEASE_ROOT .. "/payload/" .. rel) end
     print(string.format("release: %s  (%d 个文件, %d 字节)", RELEASE_ROOT, n, bytes))
+end
+
+--- 门禁覆盖: dist/ 全部产物 + manifest + 整棵 dist/release(发布树就是安装源)。
+local function asciiGate()
+    local files = collectDist()
+    files[#files + 1] = "manifest"
+    local n = assertAscii(files, DIST, "dist")
+
+    local p = io.popen("cd '" .. DIST .. "' && ls -d release/*/ 2>/dev/null")
+    local trees = {}
+    for line in p:lines() do trees[#trees + 1] = line:gsub("/$", "") end
+    p:close()
+    for _, tree in ipairs(trees) do
+        local list = {}
+        local q = io.popen("cd '" .. DIST .. "/" .. tree .. "' && find . -type f | sort")
+        for line in q:lines() do list[#list + 1] = line:gsub("^%./", "") end
+        q:close()
+        n = n + assertAscii(list, DIST .. "/" .. tree, "dist/" .. tree)
+    end
+
+    print(string.format("ascii gate: %d 个产物全 ASCII%s", n,
+        #trees > 0 and (" (含 " .. #trees .. " 棵发布树)") or ""))
 end
 
 -- ---------------------------------------------------------------
@@ -331,5 +398,6 @@ end
 build()
 buildManifest()
 if doRelease then buildRelease() end
+asciiGate()
 if doCheck then check() end
 print("build ok (Delin " .. VERSION .. ")")

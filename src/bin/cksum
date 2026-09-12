@@ -134,7 +134,7 @@ end
 local out = {}
 if #files == 0 then
     local h = io.stdin()
-    if not h then stderr("cksum: 无法读取 stdin\n"); return 1 end
+    if not h then stderr("cksum: cannot read stdin\n"); return 1 end
     local crc, size = cksumStream(h)
     io.write(dec32(crc) .. " " .. size .. "\n")
     return
@@ -144,7 +144,7 @@ for _, f in ipairs(files) do
     local h
     if f == "-" then
         h = io.stdin()
-        if not h then stderr("cksum: 无法读取 stdin\n"); return 1 end
+        if not h then stderr("cksum: cannot read stdin\n"); return 1 end
     else
         local err
         h, err = fs.open(resolve(f), "r")

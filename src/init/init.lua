@@ -1,17 +1,20 @@
---[[ Delin PID 1 (init) —— 用户态服务管理器 (systemd 风格子集)。
-     运行在隔离进程环境中(pid/ppid/spawn/print/fs/syscalls 由内核注入, 其余原始 API 直用)。
+--[[ Delin PID 1 (init) -- the user-space service manager (systemd-style subset).
+     Runs inside an isolated process environment (pid/ppid/spawn/print/fs/syscalls are injected by
+     the kernel, every other raw API is used directly).
 
-     启动序列:
-       1. 建立 /run、/var/log(真实目录, 非 tmpfs —— Delin 无 tmpfs)
-       2. 安装信号处理(SIGTERM/SIGINT/SIGQUIT -> 关机, SIGHUP -> 重载单元)
-       3. 装载单元(/lib/systemd/system + /etc/systemd/system, .wants/.requires 标记目录)
-       4. 由 /etc/fstab 生成 <mountpoint>.mount 单元并挂到 local-fs.target
-       5. 为每个 /dev/ttyN 实例化 getty@ttyN.service 并挂到 getty.target
-       6. 注册 init.* 控制 syscall(systemctl 的私有控制通道; Delin 无 Unix socket/D-Bus)
-       7. 启动 default.target; 失败或缺失则进入 rescue(每个 tty 起 login)
-       8. 主循环: 驱动服务引擎(timer/延迟重启/超时)直到收到关机请求
+     Boot sequence:
+       1. create /run and /var/log (real directories, not tmpfs -- Delin has no tmpfs)
+       2. install signal handlers (SIGTERM/SIGINT/SIGQUIT -> shutdown, SIGHUP -> reload units)
+       3. load units (/lib/systemd/system + /etc/systemd/system, .wants/.requires marker dirs)
+       4. generate <mountpoint>.mount units from /etc/fstab and hook them onto local-fs.target
+       5. instantiate getty@ttyN.service for every /dev/ttyN and hook them onto getty.target
+       6. register the init.* control syscalls (systemctl's private control channel; Delin has no
+          Unix socket/D-Bus)
+       7. start default.target; on failure or absence enter rescue (a login on every tty)
+       8. main loop: drive the service engine (timers/delayed restarts/timeouts) until a shutdown
+          request arrives
 
-     不做任何自检 —— 测试代码见 scripts/ 与宿主测试台 tools/harness.lua。 ]]
+     No self-tests here -- test code lives in scripts/ and the host testbed tools/harness.lua. ]]
 
 local unitlib = __require("unit")
 local svc     = __require("service")
@@ -26,18 +29,20 @@ local reloadRequested = false
 local function log(msg) print("[init] " .. tostring(msg)) end
 
 -- ---------------------------------------------------------------
--- 信号: PID 1 不接受 ^C/^Z 之类的交互信号影响; 收到关机信号则走正常停机
+-- Signals: PID 1 is not affected by interactive signals such as ^C/^Z; a shutdown signal
+-- takes the normal shutdown path
 -- ---------------------------------------------------------------
 syscalls["signal.install"](15, function() shutdownRequested = true end) -- SIGTERM
 syscalls["signal.install"](2,  function() shutdownRequested = true end) -- SIGINT
 syscalls["signal.install"](3,  function() shutdownRequested = true end) -- SIGQUIT
 syscalls["signal.install"](1,  function() reloadRequested = true end)   -- SIGHUP: daemon-reload
-syscalls["signal.install"](20, function() end)                          -- SIGTSTP: 忽略
-syscalls["signal.install"](21, function() end)                          -- SIGTTIN: 忽略
-syscalls["signal.install"](22, function() end)                          -- SIGTTOU: 忽略
+syscalls["signal.install"](20, function() end)                          -- SIGTSTP: ignore
+syscalls["signal.install"](21, function() end)                          -- SIGTTIN: ignore
+syscalls["signal.install"](22, function() end)                          -- SIGTTOU: ignore
 
 -- ---------------------------------------------------------------
--- 目录: /run(pid 文件)、/var/log(日志)。缺失即建, 建不了则 fail-fast 报错。
+-- Directories: /run (pid files) and /var/log (logs). Created when missing, and a failed
+-- creation is a fail-fast error.
 -- ---------------------------------------------------------------
 for _, dir in ipairs({ "/run", "/var/log" }) do
     if not fs.exists(dir) then
@@ -48,12 +53,12 @@ for _, dir in ipairs({ "/run", "/var/log" }) do
 end
 
 -- ---------------------------------------------------------------
--- 单元生成: /etc/fstab -> mount 单元
+-- Unit generation: /etc/fstab -> mount units
 -- ---------------------------------------------------------------
 local function generateFstabUnits()
     local entries, err = syscalls["fstab.entries"]()
     if not entries then
-        -- 坏 fstab 一律 fail-fast: local-fs.target 失败 -> multi-user.target 失败 -> rescue
+        -- a bad fstab is always fail-fast: local-fs.target fails -> multi-user.target fails -> rescue
         log("FATAL: /etc/fstab: " .. tostring(err))
         local rec = svc.units["local-fs.target"]
         if rec then rec.active, rec.sub, rec.failReason = "failed", "failed", tostring(err) end
@@ -80,7 +85,7 @@ local function generateFstabUnits()
 end
 
 -- ---------------------------------------------------------------
--- 单元生成: 每个 /dev/ttyN 一个 getty@ttyN.service
+-- Unit generation: one getty@ttyN.service per /dev/ttyN
 -- ---------------------------------------------------------------
 local function generateGettys()
     local ttys = syscalls["tty.list"]()
@@ -102,8 +107,9 @@ local function generateGettys()
 end
 
 -- ---------------------------------------------------------------
--- rescue: 无可用 default.target(未部署单元 / 依赖启动失败)时, 每个 tty 起一个 login。
--- 等价 systemd 的 emergency/rescue 模式: 给管理员一个能修配置的 shell。
+-- rescue: when no default.target is usable (units not deployed / a dependency failed to start),
+-- start a login on every tty. Equivalent to systemd's emergency/rescue mode: it hands the admin
+-- a shell to fix the configuration.
 -- ---------------------------------------------------------------
 local function rescue(reason)
     log("rescue mode: " .. reason)
@@ -124,8 +130,9 @@ local function rescue(reason)
 end
 
 -- ---------------------------------------------------------------
--- 控制接口: systemctl 经共享 syscall 表调用(等价的 private socket)。
--- 这些函数在调用者(systemctl)的进程上下文里执行; 需要等待时由调用者协程让出。
+-- Control interface: systemctl calls through the shared syscall table (the equivalent of a
+-- private socket). These functions run in the caller's (systemctl's) process context; whenever
+-- waiting is needed the caller's coroutine yields.
 -- ---------------------------------------------------------------
 local function registerControl()
     syscalls["init.start"]     = function(name) return svc.start(name) end
@@ -142,7 +149,7 @@ local function registerControl()
 end
 
 -- ---------------------------------------------------------------
--- 装载 + 启动
+-- Load + start
 -- ---------------------------------------------------------------
 local function loadUnits()
     local n = svc.loadAll()
@@ -152,7 +159,7 @@ local function loadUnits()
     log("generated getty on " .. nTty .. " tty(s)")
 end
 
-syscalls["proc.onExit"](svc.onProcessExit) -- 服务监督: 子进程退出回调
+syscalls["proc.onExit"](svc.onProcessExit) -- service supervision: child exit callback
 registerControl()
 loadUnits()
 
@@ -162,7 +169,7 @@ if not ok then
 end
 
 -- ---------------------------------------------------------------
--- 主循环: 驱动服务引擎; init 永不退出(除非收到关机请求)
+-- Main loop: drive the service engine; init never exits (unless a shutdown is requested)
 -- ---------------------------------------------------------------
 log("init up (pid " .. pid .. "), default.target " .. (ok and "active" or "FAILED"))
 while not shutdownRequested do

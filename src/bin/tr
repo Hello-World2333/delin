@@ -276,7 +276,7 @@ end
 local h
 if #operands >= 1 then
     h = io.stdin()
-    if not h then stderr("tr: 无法读取 stdin\n"); return 1 end
+    if not h then stderr("tr: cannot read stdin\n"); return 1 end
 end
 local rd = makeReader(h)
 local out = {}
