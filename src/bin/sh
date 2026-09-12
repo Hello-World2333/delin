@@ -1,8 +1,10 @@
 -- Delin sh: POSIX-ish shell (core subset).
 -- 交互/脚本模式; 内建 cd pwd echo exit help jobs fg bg kill test [ true false :.
--- 支持: 变量与展开($x/${x}/$?/$#/$@/$*/$1..), 单/双引号, if/elif/else, for/while/until,
+-- 支持: 变量与展开($x/${x}/$?/$#/$@/$*/$1..), 单/双引号, 命令替换($() 与反引号),
+--       算术展开 $(( )), 路径名展开(通配符 * ? [ ]), if/elif/else, for/while/until,
 --       case, 函数, [ ] 与 test, &&/||/;, 文件重定向(> >> <), 管道(|), 命令后台(& + 作业控制)。
--- 不支持: 命令替换($() 与反引号)、算术 $(( ))。 正则用 Lua pattern(见 grep/sed)。
+-- 不支持: here-doc(<<)、`( list )` 子 shell 分组。case 的模式是**通配符**(POSIX 模式匹配),
+--         不是正则; 正则交给 grep/sed/ed/expr(标准 POSIX BRE/ERE, 见 kernel/regex.lua)。
 -- 输出走 io.stdout(父进程把它指向控制台 tty 或文件), 绝不 print(kprint 走日志+term)。
 
 local msleep = os.msleep or function(ms) os.sleep(math.max(ms / 1000, 0.05)) end

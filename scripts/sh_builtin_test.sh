@@ -217,7 +217,7 @@ chk ascii_help [ ! -s $T/help_nonascii ]
 
 # ---------------------------------------------------------------
 # 11. $TERM + ANSI 终端能力: echo -e/-n 与 /bin/clear
-#     grep 用 Lua pattern, "%c" 匹配控制字符(ESC/TAB 都是); 字节数用 wc -c 断言。
+#     grep 用标准正则, "[[:cntrl:]]" 匹配控制字符(ESC/TAB 都是); 字节数用 wc -c 断言。
 # ---------------------------------------------------------------
 chk var_term [ "$TERM" = "linux" ]
 sh -c 'echo $TERM' > $T/term_child
@@ -225,10 +225,10 @@ chkcontain term_child "linux" $T/term_child
 
 # echo -e 解释 \t(制表符=控制字符); 不加 -e 时 \t 原样是两个字符
 echo -e 'A\tB' > $T/echo_e_tab
-grep '%c' $T/echo_e_tab > $T/echo_e_tab_hit
+grep '[[:cntrl:]]' $T/echo_e_tab > $T/echo_e_tab_hit
 chk echo_e_tab [ -s $T/echo_e_tab_hit ]
 echo 'A\tB' > $T/echo_plain_tab
-grep '%c' $T/echo_plain_tab > $T/echo_plain_tab_hit
+grep '[[:cntrl:]]' $T/echo_plain_tab > $T/echo_plain_tab_hit
 chk echo_plain_tab [ ! -s $T/echo_plain_tab_hit ]
 
 # \e / \033 / \x1b 都产生 ESC(0x1B), 按输出字节数断言
@@ -257,7 +257,7 @@ chkcontain echo_ne_bytes "^3$" $T/echo_ne_n
 clear > $T/clear_out
 wc -c < $T/clear_out > $T/clear_n
 chkcontain clear_bytes "^11$" $T/clear_n
-grep '%c' $T/clear_out > $T/clear_hit
+grep '[[:cntrl:]]' $T/clear_out > $T/clear_hit
 chk clear_has_esc [ -s $T/clear_hit ]
 
 # ---------------------------------------------------------------

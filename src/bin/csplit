@@ -11,8 +11,9 @@
 --   /RE/[OFFSET]        匹配正则的行作为切点, OFFSET 可带符号(如 +2 / -2)
 --   {N} / {*}           重复前一个模式 N 次 / 重复到文件尾或再也匹配不到
 -- FILE 为 "-" 时读 stdin。每生成一段, 向 stdout 打印该段的字节数(除非 -s)。
+--   正则用 **标准正则**: POSIX 给 csplit 的模式是 **BRE**(与 sed 默认一致; 引擎见 kernel/regex.lua),
+--   模式对**去掉行尾换行**的那行文本匹配(与 GNU 一致)。
 -- 已知偏离:
---   - **正则用 Lua pattern**(不是 POSIX ERE): 如 /line0[1-9]/ 可用, 但 POSIX 的 \( \) \{ \} 等写法不适用。
 --   - 不支持 %RE% (跳过不切) 与 -b/--suffix-format; 只实现任务要求的选项集。
 --   - 需要把输入整读进内存(正则回溯与字节数统计都要全量), 不做流式。
 local args = args or {}
@@ -176,12 +177,32 @@ local function writePiece(from, to)
     return true
 end
 
+--- 编译一个模式(POSIX: csplit 的模式是 BRE)。
+local compileRegex = syscalls and syscalls["regex.compile"]
+local function compileRe(pat)
+    if not compileRegex then stderr("csplit: regex syscall not available\n"); return nil end
+    local re, err = compileRegex(pat, "bre")
+    if not re then
+        stderr("csplit: invalid regular expression (" .. tostring(err) .. "): " .. pat .. "\n")
+        return nil
+    end
+    return re
+end
+
 -- 解析一个模式参数。
 local function parsePattern(arg)
     local re = arg:match("^/(.*)/$")
-    if re then return { kind = "re", pat = re, offset = 0 } end
+    if re then
+        local compiled = compileRe(re)
+        if not compiled then return nil end
+        return { kind = "re", pat = re, re = compiled, offset = 0 }
+    end
     local re2, off = arg:match("^/(.*)/([%+%-]%d+)$")
-    if re2 then return { kind = "re", pat = re2, offset = tonumber(off) } end
+    if re2 then
+        local compiled = compileRe(re2)
+        if not compiled then return nil end
+        return { kind = "re", pat = re2, re = compiled, offset = tonumber(off) }
+    end
     if arg:match("^/") then
         stderr("csplit: '" .. arg .. "': integer expected after delimiter\n")
         return nil
@@ -221,7 +242,10 @@ while argIdx <= #operands do
         else
             local found = nil
             for n = searchFrom, total do
-                if lines[n]:sub(1, -2):match(pat.pat) or lines[n]:match(pat.pat) then found = n; break end
+                -- 去掉行尾换行后按 BRE 匹配(GNU 同此: 模式是"对整行"而不是"对含换行的字节")
+                local text = lines[n]
+                if text:sub(-1) == "\n" then text = text:sub(1, -2) end
+                if pat.re:find(text) then found = n; break end
             end
             if not found then
                 if repeatAll and round > 1 then break end

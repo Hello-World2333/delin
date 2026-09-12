@@ -182,6 +182,7 @@ def main():
     for src, dst in (("scripts/sh_verify.sh", "/root/sh_verify.sh"),
                      ("scripts/sh_builtin_test.sh", "/root/sh_builtin_test.sh"),
                      ("scripts/sh_expand_test.sh", "/root/sh_expand_test.sh"),
+                     ("scripts/regex_test.sh", "/root/regex_test.sh"),
                      ("scripts/proc_test.sh", "/root/proc_test.sh"),
                      ("scripts/redstone_test.sh", "/root/redstone_test.sh"),
                      ("scripts/redstone_verify.lua", "/root/redstone_verify.lua"),

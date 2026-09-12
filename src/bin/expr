@@ -8,20 +8,20 @@
 --   * / %                 乘除模(/ 向零截断, % 取被除数符号; 除零是错误)
 --   一元: ( EXPR ), length S, substr S POS LEN, index S CHARS, match S REGEX,
 --         + TOKEN 与 quote TOKEN(把 TOKEN 强制当字符串, 即使它是关键字/运算符)
--- 正则用 **Lua pattern**(与项目内 grep/sed 同一约定, 这是与 GNU BRE 的最大偏离):
---   % 是转义符, () 是捕获组; 匹配按 POSIX 语义**锚定在串首**;
+-- 正则用 **标准正则**(POSIX: expr 的模式是 BRE; 引擎见 kernel/regex.lua):
+--   \( \) 是捕获组, \1 是反向引用, \{m,n\} 是区间; 匹配按 POSIX 语义**锚定在串首**;
 --   有捕获组时返回第一组的内容, 没有时返回匹配到的长度(GNU 的 \(...\) 语义)。
 -- 退出码(POSIX): 结果为 null("")或数值 0 -> 1; 否则 0; 语法错/求值错 -> 2。
 -- 已知偏离:
---   1. 正则用 Lua pattern, 不是 BRE/ERE(见上)。
+--   1. 正则用标准 BRE(见上); 不支持 GNU 的 \+ \? \| 之外的扩展。
 --   2. length/substr/index 按**字节**计数, 与 LC_ALL=C 的 GNU expr 一致(GNU 在 UTF-8
 --      locale 下按字符数, 本内核没有 locale)。
 --   3. "null 或 0" 的判定照 GNU 的可观察行为: 结果为空串, 或形如 -?[0-9]+ 且数值为 0
 --      (`expr 00` 与 `expr -0` 退出 1, `expr +0`/`expr 0x0`/`expr 0.0` 退出 0)。
 --   4. 整数是 IEEE double: |v| > 2^53 时不再逐位精确(本机没有 64 位整数)。
 --   5. GNU coreutils 9.7 实际不接受 `quote`(语法错), 本工具按任务要求实现它。
---   6. 不用 pcall 兜底求值, 错误一律走显式的 evalErr 通道; 只有 Lua pattern 的
---      "malformed pattern" 异常必须接住才能映射成 expr 的"无效的正则表达式"(退出 2)。
+--   6. 不用 pcall 兜底求值, 错误一律走显式的 evalErr 通道; 正则编译失败由引擎返回
+--      nil, err(不抛异常), 映射成 expr 的"无效的正则表达式"(退出 2)。
 local args = args or {}
 
 local function stderr(s)
@@ -177,13 +177,17 @@ local function toIntOperand(s, what)
     return tonumber(s)
 end
 
+local compileRegex = syscalls and syscalls["regex.compile"]
 local function doMatch(s, pat)
-    if pat:sub(1, 1) ~= "^" then pat = "^" .. pat end -- POSIX: 匹配锚定在串首
-    local ok, a, b, cap = pcall(string.find, s, pat)
-    if not ok then return fail("invalid regular expression") end
-    if a == nil then return "" end -- 无匹配 -> null
-    if cap ~= nil then return cap end -- 有捕获组 -> 返回第一组(GNU 的 \(...\) 语义)
-    return tostring(b - a + 1)
+    if not compileRegex then return fail("invalid regular expression") end
+    local re, err = compileRegex(pat, "bre")
+    if not re then return fail("invalid regular expression (" .. tostring(err) .. ")") end
+    -- POSIX: expr 的匹配锚定在串首(引擎的 match 就是锚定语义)
+    local m = re:match(s)
+    if not m then return "" end -- 无匹配 -> null
+    local cap = m.caps[1]
+    if cap then return s:sub(cap.s, cap.e) end -- 有捕获组 -> 返回第一组
+    return tostring(m.e - m.s + 1)
 end
 
 local eval

@@ -868,6 +868,8 @@ setupRoot()
 do
     local user = require("kernel.user")
     user.registerSyscalls(user.init(F), F)
+    -- 标准正则引擎: 与真机同一份内核源码(kernel/regex.lua) —— grep/sed/ed/expr/pgrep 都用它。
+    require("kernel.regex").registerSyscalls()
     -- user.registerSyscalls 写进的是**内核的** syscall 表(kernel.modules), 而工具拿到的是
     -- 测试台自己那张(proc/job/signal/... 的桩都在这儿) —— 把 user.* 并进来。
     for k, v in pairs(require("kernel.modules").syscalls()) do syscalls[k] = v end

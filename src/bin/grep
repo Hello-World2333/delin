@@ -1,4 +1,9 @@
--- Delin grep: 按 Lua 模式查找行 (GNU 子集)。用法: grep [OPTION]... PATTERN [FILE]...
+-- Delin grep: 按**标准正则**查找行 (POSIX + GNU 子集)。用法: grep [OPTION]... PATTERN [FILE]...
+-- 正则方言(POSIX 1003.1):
+--   默认 = **BRE**(基本正则), 与 GNU grep 一致: 只有 . [ ] ^ $ * 与 \( \) \{m,n\} \1..\9 特殊;
+--   -E / --extended-regexp = **ERE**(扩展正则): . [ ] ^ $ * + ? {m,n} ( ) | ;
+--   -G / --basic-regexp    = 显式 BRE; -F / --fixed-strings = 模式按**字面**串;
+--   后出现的那个赢(GNU 语义)。引擎见 kernel/regex.lua(唯一真源)。
 -- 选项:
 --   -n, --line-number     显示行号
 --   -i, --ignore-case     忽略大小写
@@ -13,8 +18,8 @@
 --   -o, --only-matching   只打印匹配部分
 --   -H/-h, [--]with/--no-filename 文件名前缀开关
 --   -s, --no-messages     抑制错误信息
---   -F, --fixed-strings   PATTERN 按字面匹配(转义 Lua pattern 元字符)
---   正则为 Lua pattern(与 GNU BRE/ERE 不同)。无 FILE 或 FILE 为 "-" 时读 stdin。
+-- 退出码(POSIX/GNU): 0 = 选中了行, 1 = 没有选中行, 2 = 出错(选项/模式/文件读不了)。
+-- 无 FILE 或 FILE 为 "-" 时读 stdin。
 -- 让出调度器: 防止长输出/长计算饿死事件循环(CC 的 ~7s no-yield 限制)。
 -- 时间片式: 每累计 ~50ms CPU 时间让出一次, 不按字节让出 —— HSE 已改拉模式(waitNextTick),
 -- 每次让出都是一次事件往返, 高频让出会淹没事件队列并拖死键盘。50ms 时间片同时保证
@@ -56,10 +61,12 @@ end
 
 local withNum, ci, invert, wordBoundary, wholeLine = false, false, false, false, false
 local doCount, doFiles, recursive, quiet, onlyMatch, withFilename, noFilename, noMessages = false, false, false, false, false, false, false, false
-local fixed = false
-local patternArgs = {}       -- 来自 -e
+local flavor = "bre"         -- POSIX 默认方言 = BRE(GNU grep 同样)
+local fixed = false          -- -F: 模式按字面串
+local patternArgs = {}       -- 来自 -e / --regexp=
 local rest = {}
 local noMoreOpts = false
+local optErr = nil
 
 local function setShort(ch)
     if ch == "n" then withNum = true
@@ -75,9 +82,14 @@ local function setShort(ch)
     elseif ch == "H" then withFilename = true
     elseif ch == "h" then noFilename = true
     elseif ch == "s" then noMessages = true
+    elseif ch == "E" then flavor, fixed = "ere", false
+    elseif ch == "G" then flavor, fixed = "bre", false
     elseif ch == "F" then fixed = true
     elseif ch == "e" then -- 需带参数, 由调用方消费
-    else stderr("grep: invalid option -- '" .. ch .. "'\n"); return false end
+    else
+        optErr = "invalid option -- '" .. ch .. "'"
+        return false
+    end
     return true
 end
 
@@ -101,13 +113,15 @@ while i <= #args do
     elseif a == "--with-filename" then withFilename = true
     elseif a == "--no-filename" then noFilename = true
     elseif a == "--no-messages" then noMessages = true
+    elseif a == "--extended-regexp" then flavor, fixed = "ere", false
+    elseif a == "--basic-regexp" then flavor, fixed = "bre", false
     elseif a == "--fixed-strings" then fixed = true
-    elseif a:sub(1, 2) == "--" and a:match("^%-%-regexp=") then
+    elseif a:match("^%-%-regexp=") then
         patternArgs[#patternArgs + 1] = a:sub(10)
     elseif a:sub(1, 2) == "--" and a:match("^%-%-[a-z][a-z-]+$") then
-        stderr("grep: unrecognized option '" .. a .. "'\n"); return
+        optErr = "unrecognized option '" .. a .. "'"
+        break
     elseif a:sub(1, 1) == "-" and a ~= "-" then
-        local handledE = false
         for k = 2, #a do
             local ch = a:sub(k, k)
             if ch == "e" then
@@ -116,20 +130,27 @@ while i <= #args do
                     patternArgs[#patternArgs + 1] = inline
                 else
                     i = i + 1
-                    if not args[i] then stderr("grep: option requires an argument -- 'e'\n"); return end
+                    if not args[i] then
+                        optErr = "option requires an argument -- 'e'"
+                        break
+                    end
                     patternArgs[#patternArgs + 1] = args[i]
                 end
-                handledE = true
                 break
-            else
-                if not setShort(ch) then return end
+            elseif not setShort(ch) then
+                break
             end
         end
-        if handledE then end
+        if optErr then break end
     else
         rest[#rest + 1] = a
     end
     i = i + 1
+end
+
+if optErr then
+    stderr("grep: " .. optErr .. "\n")
+    return 2
 end
 
 -- 决定 pattern 与 files
@@ -138,67 +159,58 @@ if #patternArgs > 0 then
     for _, p in ipairs(patternArgs) do pats[#pats + 1] = p end
     -- rest 全部为 FILE
 else
-    if #rest < 1 then stderr("grep: missing pattern\n"); return end
+    if #rest < 1 then stderr("grep: missing pattern\n"); return 2 end
     pats[#pats + 1] = rest[1]
     table.remove(rest, 1)
-end
-if fixed then
-    for idx, p in ipairs(pats) do pats[idx] = p:gsub("([^%w])", "%%%1") end
 end
 local files = {}
 for _, f in ipairs(rest) do files[#files + 1] = f end
 
--- 整词匹配: 模式匹配处前后均非词字符([%w_] 之外的边界)。
-local function isWordChar(c) return c ~= "" and c:match("[%w_]") ~= nil end
-local function hasWordMatch(hay, p)
-    local pos = 1
-    while true do
-        local s, e = hay:find(p, pos)
-        if not s then return false end
-        local before = (s > 1) and hay:sub(s - 1, s - 1) or ""
-        local after = (e < #hay) and hay:sub(e + 1, e + 1) or ""
-        if not isWordChar(before) and not isWordChar(after) then return true end
-        pos = e + 1
+-- 编译模式(引擎是内核里的唯一真源: kernel/regex.lua)。模式非法 = 用法错(退出码 2)。
+local compileRegex = syscalls and syscalls["regex.compile"]
+if not compileRegex then stderr("grep: regex syscall not available\n"); return 2 end
+local res = {}
+for idx, p in ipairs(pats) do
+    local re, err = compileRegex(p, flavor, {
+        icase = ci, word = wordBoundary, line = wholeLine, fixed = fixed,
+    })
+    if not re then
+        stderr("grep: invalid regular expression (" .. tostring(err) .. "): " .. p .. "\n")
+        return 2
     end
+    res[idx] = re
 end
 
-local function lineMatches(hay)
-    for _, p in ipairs(pats) do
-        local ok
-        if wholeLine then
-            ok = hay:match("^" .. p .. "$") ~= nil
-        elseif wordBoundary then
-            ok = hasWordMatch(hay, p)
-        else
-            ok = hay:find(p, 1) ~= nil
-        end
-        if ok then return true end
+local function lineMatches(line)
+    for _, re in ipairs(res) do
+        if re:find(line) then return true end
     end
     return false
 end
 
--- 收集 -o 匹配的片段(整行/整词时仍按整行整词语义, 输出对应区间)。
-local function collectMatches(hay)
-    local out = {}
-    local pos = 1
-    while pos <= #hay + 1 do
-        local bestS, bestE
-        for _, p in ipairs(pats) do
-            local s, e = hay:find(p, pos)
-            if s then
-                if (not bestS) or s < bestS then bestS, bestE = s, e end
-            end
+-- -o: 一行里的全部非空匹配(GNU: 空匹配不输出), 按位置排序(重叠的取最左最长那个)。
+local function collectMatches(line)
+    local all = {}
+    for _, re in ipairs(res) do
+        for _, m in ipairs(re:findall(line)) do
+            if m.e >= m.s then all[#all + 1] = m end
         end
-        if not bestS then break end
-        out[#out + 1] = { bestS, bestE }
-        pos = bestE + 1
     end
-    return out
+    table.sort(all, function(a, b)
+        if a.s ~= b.s then return a.s < b.s end
+        return a.e > b.e
+    end)
+    local kept = {}
+    local lastEnd = 0
+    for _, m in ipairs(all) do
+        if m.s > lastEnd then kept[#kept + 1] = m; lastEnd = m.e end
+    end
+    return kept
 end
 
 -- 总文件列表(含 -r 递归展开)。
 local function expandFiles(list)
-    local res = {}
+    local out = {}
     local function walk(p)
         if fs.isDir(p) then
             local names = fs.list(p) or {}
@@ -210,11 +222,11 @@ local function expandFiles(list)
                 end
             end
         else
-            res[#res + 1] = p
+            out[#out + 1] = p
         end
     end
     for _, f in ipairs(list) do walk(resolve(f)) end
-    return res
+    return out
 end
 
 local allFiles = files
@@ -234,8 +246,7 @@ local function search(fh, label)
         local line = fh:readLine()
         if line == nil then break end
         n = n + 1
-        local hay = ci and line:lower() or line
-        local m = lineMatches(hay)
+        local m = lineMatches(line)
         if invert then m = not m end
         if m then
             count = count + 1
@@ -250,8 +261,8 @@ local function search(fh, label)
                 if showName and label then prefix = label .. ":" end
                 if withNum then prefix = prefix .. tostring(n) .. ":" end
                 if onlyMatch then
-                    for _, span in ipairs(collectMatches(hay)) do
-                        local out = prefix .. line:sub(span[1], span[2]) .. "\n"
+                    for _, span in ipairs(collectMatches(line)) do
+                        local out = prefix .. line:sub(span.s, span.e) .. "\n"
                         io.write(out)
                         yieldCheck(#out)
                     end
@@ -267,6 +278,7 @@ local function search(fh, label)
 end
 
 local atLeastOne = false
+local hadError = false
 local function processOne(label, fh)
     local c = search(fh, label)
     if c > 0 then atLeastOne = true end
@@ -288,11 +300,13 @@ else
             local p = resolve(f)
             if not fs.exists(p) then
                 if not noMessages then stderr("grep: " .. p .. ": No such file or directory\n") end
+                hadError = true
                 if doCount then io.write("0\n") end
             else
                 local fh, err = fs.open(p, "r")
                 if not fh then
                     if not noMessages then stderr("grep: " .. p .. ": " .. ioeMsg(err) .. "\n") end
+                    hadError = true
                     if doCount then io.write("0\n") end
                 else
                     processOne(p, fh)
@@ -302,3 +316,8 @@ else
         end
     end
 end
+
+-- POSIX/GNU 退出码: 出错 2 > 没选中 1 > 选中 0(GNU: 有错就是 2, 哪怕别的文件匹配上了)。
+if hadError then return 2 end
+if atLeastOne then return 0 end
+return 1

@@ -5,7 +5,8 @@
 --   命令: a i c d j k l m n p r s t u z = e E f w W wq q Q g G v V h H P !
 --   输入模式(a/i/c)以单独一行 . 结束; 行尾 \ 续行。
 --   s 命令: s/re/rep/[g|N|p|l|n], 裸 s 重复上次替换; 空模式用上次正则。
---   正则用 Lua pattern(与 grep/sed 一致): % 转义, () 捕获; 替换里 & = 整串匹配,
+--   正则用 **标准正则**(POSIX: ed 的模式是 BRE; 引擎见 kernel/regex.lua),
+--   \( \) 是捕获组、\{m,n\} 是区间、\1 是反向引用; 替换里 & = 整串匹配,
 --   \1..\9 = 捕获组, \n/\t, \\ 与 \& 转义。
 --   选项: -p 提示符(交互模式), -s 抑制 e/r/w 的字节数与 ! 后的 "!"。
 --   文件名与 ! 命令里的 % 展开为记忆文件名(\% 为字面 %)。
@@ -182,66 +183,40 @@ local function printRange(r1, r2, mode)
 end
 
 -- ---------------------------------------------------------------
--- 正则: Lua pattern 校验/查找/替换
+-- 正则: 标准 BRE 编译/查找/替换(kernel/regex.lua)
 -- ---------------------------------------------------------------
-local function patValid(p)
-    if not pcall(string.find, "", p) then ederror("invalid pattern") end
+local compileRegex = syscalls and syscalls["regex.compile"]
+local reCache = {}
+--- 编译并缓存(ed 里同一个模式会被反复用; 空模式已在上层换成上一个模式)。
+local function patCompile(pat)
+    local re = reCache[pat]
+    if re then return re end
+    if not compileRegex then ederror("invalid pattern (regex syscall not available)") end
+    local compiled, err = compileRegex(pat, "bre")
+    if not compiled then ederror("invalid pattern: " .. tostring(err)) end
+    reCache[pat] = compiled
+    return compiled
 end
 
 local function doSearch(pat, backward)
-    patValid(pat)
+    local re = patCompile(pat)
     local n = #lines
     if backward then
-        for i = cur - 1, 1, -1 do if lines[i]:find(pat) then return i end end
-        for i = n, cur, -1 do if lines[i]:find(pat) then return i end end
+        for i = cur - 1, 1, -1 do if re:find(lines[i]) then return i end end
+        for i = n, cur, -1 do if re:find(lines[i]) then return i end end
     else
-        for i = cur + 1, n do if lines[i]:find(pat) then return i end end
-        for i = 1, cur do if lines[i]:find(pat) then return i end end
+        for i = cur + 1, n do if re:find(lines[i]) then return i end end
+        for i = 1, cur do if re:find(lines[i]) then return i end end
     end
     ederror("invalid address")
 end
 
-local function buildRepl(repl, whole, caps)
-    local o = {}
-    local i = 1
-    while i <= #repl do
-        local c = repl:sub(i, i)
-        if c == "&" then o[#o + 1] = whole; i = i + 1
-        elseif c == "\\" then
-            local nx = repl:sub(i + 1, i + 1)
-            if nx:match("%d") then o[#o + 1] = caps[tonumber(nx)] or ""; i = i + 2
-            elseif nx == "&" then o[#o + 1] = "&"; i = i + 2
-            elseif nx == "\\" then o[#o + 1] = "\\"; i = i + 2
-            elseif nx == "n" then o[#o + 1] = "\n"; i = i + 2
-            elseif nx == "t" then o[#o + 1] = "\t"; i = i + 2
-            else o[#o + 1] = "\\" .. nx; i = i + 2 end
-        else o[#o + 1] = c; i = i + 1 end
-    end
-    return table.concat(o)
-end
-
--- 对单行应用替换; 返回新行, 是否有变化。
+--- 对单行应用替换(引擎的 sub: mode = true 全部 / 数字 第 N 次 / false 只替第一个);
+--- 返回新行, 是否有变化。
 local function applyToLine(text, sub)
-    local parts, b, nm, changed = {}, 1, 0, false
-    while b <= #text + 1 do
-        local s0, e0 = text:find(sub.pat, b)
-        if not s0 then break end
-        nm = nm + 1
-        local doIt = (sub.count and nm == sub.count) or (not sub.count and (sub.g or nm == 1))
-        if doIt then
-            local whole = text:sub(s0, e0)
-            local caps = { text:match(sub.pat, s0) }
-            parts[#parts + 1] = text:sub(b, s0 - 1)
-            parts[#parts + 1] = buildRepl(sub.repl, whole, caps)
-            b = e0 + 1
-            if e0 < s0 then b = s0 + 1 end -- 空匹配防死循环
-            changed = true
-            if not sub.g then break end
-        end
-    end
-    if not changed then return text, false end
-    parts[#parts + 1] = text:sub(b)
-    return table.concat(parts), true
+    local mode = sub.count or sub.g
+    local out, n = sub.re:sub(text, sub.repl, mode)
+    return out, n > 0
 end
 
 -- ---------------------------------------------------------------
@@ -395,10 +370,10 @@ end
 -- g/G/v/V: 预选目标行 id, 逐个 cur=目标 执行命令表
 local function globalExec(r1, r2, pat, rest, negate)
     if inGlobal then ederror("cannot nest global commands") end
-    patValid(pat)
+    local re = patCompile(pat)
     local targets = {}
     for i = r1, r2 do
-        if (lines[i]:find(pat) ~= nil) ~= negate then targets[#targets + 1] = ids[i] end
+        if (re:find(lines[i]) ~= nil) ~= negate then targets[#targets + 1] = ids[i] end
     end
     if rest == "" then rest = "p" end
     saveUndo()
@@ -590,8 +565,8 @@ execLine = function(line)
             if count and count < 1 then ederror("invalid command suffix") end
             if pat == "" then pat = lastRe or ederror("no previous regular expression")
             else lastRe = pat end
-            patValid(pat)
-            sub = { pat = pat, repl = repl, g = g, count = count, pr = pr, li = li, nu = nu }
+            local re = patCompile(pat)
+            sub = { pat = pat, re = re, repl = repl, g = g, count = count, pr = pr, li = li, nu = nu }
             lastSub = sub
         end
         local r1, r2 = norm2()

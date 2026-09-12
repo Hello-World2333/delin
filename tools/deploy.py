@@ -132,6 +132,7 @@ def main():
         shutil.copy(os.path.join(REPO, "scripts/posix_test.sh"), os.path.join(rootfs, "root/posix_test.sh"))
         shutil.copy(os.path.join(REPO, "scripts/jobctl_test.sh"), os.path.join(rootfs, "root/jobctl_test.sh"))
         shutil.copy(os.path.join(REPO, "scripts/sysinfo.sh"),    os.path.join(rootfs, "root/sysinfo.sh"))
+        shutil.copy(os.path.join(REPO, "scripts/regex_test.sh"), os.path.join(rootfs, "root/regex_test.sh"))
         # 单元文件: dist/units/* -> /lib/systemd/system/ (厂商单元)
         unitdir = os.path.join(rootfs, "lib", "systemd", "system")
         os.makedirs(unitdir, exist_ok=True)

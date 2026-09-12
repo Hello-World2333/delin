@@ -9,8 +9,8 @@
 #   - 不打印任何每次运行都不同的值(时间/pid/inode); 断言的是稳定量;
 #   - 断言"密码是否可用"一律问内核(user_helper.lua verify, 与 login 判定同源), 不直接读
 #     /etc/shadow —— 真机上它是 0600 root:root, 而宿主测试台的宿主文件权限不模拟这一条;
-#   - 断言消息用 grep -x -F(整行、字面): Delin 的 grep 用 Lua pattern, 正则里的 ()/./- 都有
-#     别的含义, 拿它比对含这些字符的文本会误判;
+#   - 断言消息用 grep -x -F(整行、字面): 模式走标准正则(BRE), 正则里的 ()/./[] 都有别的含义,
+#     拿它比对含这些字符的文本会误判, 所以断言一律 -F 按字面;
 #   - 需要普通用户身份的分支(改自己密码要旧密码、非 root 被拒)由 user_helper.lua 用内核
 #     spawn(uid) 起进程 —— Delin 没有 su/setuid, 这是唯一能拿到非 root 进程的办法;
 #   - 工具的错误提示与提示符都写 stderr, 而 Delin 的 stderr 就是 stdout, 所以断言消息用

@@ -3,9 +3,11 @@
 --   无 file 时读 stdin。输出到 stdout。
 --
 --   支持的命令: s y d p q a i c =  ; 行号/ $ / /regex/ 地址与区间, ! 取反。
---   支持的选项: -n -s -e script -f file -i[suffix]。
---   正则用 Lua pattern(与 grep 一致): % 是转义符, () 是捕获; 替换里 & = 整串匹配,
---   \1..\9 = 捕获组, \n/\t 换行/制表, \& \\ 转义。BRE 风格的 \(...\) 与模式内 \1 逆引用不支持。
+--   支持的选项: -n -s -e script -f file -i[suffix] -E/-r。
+--   正则用**标准正则**(POSIX 1003.1; 引擎见 kernel/regex.lua, 与 grep 同一份):
+--     默认 = BRE(\(...\) 分组, \{m,n\} 区间, \1 逆引用, GNU 扩展 \+ \? \|);
+--     -E / -r / --regexp-extended = ERE(( ) {m,n} + ? | 直接写)。
+--   替换串: & = 整串匹配, \1..\9 = 捕获组, \n \t \r 转义, \& 与 \\ = 字面量。
 -- 让出调度器: 防止长输出/长计算饿死事件循环(CC 的 ~7s no-yield 限制)。
 -- 时间片式: 每累计 ~50ms CPU 时间让出一次, 不按字节让出 —— HSE 已改拉模式(waitNextTick),
 -- 每次让出都是一次事件往返, 高频让出会淹没事件队列并拖死键盘。50ms 时间片同时保证
@@ -45,6 +47,24 @@ local function ioeMsg(err)
 end
 
 -- ---------------------------------------------------------------
+-- 标准正则(kernel/regex.lua 是唯一真源): sed 默认 BRE, -E/-r 切 ERE
+-- ---------------------------------------------------------------
+local flavor = "bre"
+local compileRegex = syscalls and syscalls["regex.compile"]
+local function compileRe(pat, icase)
+    if not compileRegex then
+        stderr("sed: regex syscall not available\n")
+        return nil
+    end
+    local re, err = compileRegex(pat, flavor, { icase = icase })
+    if not re then
+        stderr("sed: invalid regular expression (" .. tostring(err) .. "): " .. pat .. "\n")
+        return nil
+    end
+    return re
+end
+
+-- ---------------------------------------------------------------
 -- 命令行解析
 -- ---------------------------------------------------------------
 local quiet, inplace, inSuffix, perFile = false, false, nil, false
@@ -58,6 +78,8 @@ while i <= #args do
         quiet = true
     elseif a == "-s" or a == "--separate" then
         perFile = true
+    elseif a == "-E" or a == "-r" or a == "--regexp-extended" then
+        flavor = "ere"
     elseif a == "-e" or a == "--expression" then
         i = i + 1
         if not args[i] then stderr("sed: option requires an argument -- e\n"); return end
@@ -116,114 +138,6 @@ if inplace and #files == 0 then
     return 1
 end
 
--- ---------------------------------------------------------------
--- 工具: Lua pattern 大小写不敏感转换
--- ---------------------------------------------------------------
-local function swapcase(c)
-    local u = c:upper()
-    if u ~= c then return u end
-    return c:lower()
-end
-local function makeCI(pat)
-    -- 把模式里的大写/小写字母变成不区分大小写 (ASCII 近似)。
-    -- %转义原样保留; 方括号类追加对侧大小写; 其他元字符(.)(*)(+)(?)(^)($)不动。
-    local out = {}
-    local i = 1
-    local n = #pat
-    while i <= n do
-        local c = pat:sub(i, i)
-        if c == "%" then
-            out[#out + 1] = c .. (pat:sub(i + 1, i + 1) or "")
-            i = i + 2
-        elseif c == "[" then
-            local j = i + 1
-            local body = {}
-            local k = j
-            local neg = ""
-            if pat:sub(k, k) == "^" then neg = "^"; k = k + 1 end
-            while k <= n do
-                local ck = pat:sub(k, k)
-                if ck == "]" then break end
-                body[#body + 1] = ck
-                k = k + 1
-            end
-            -- 追加对侧大小写 (含区间端点; 简单起见把出现过的字母全补上对侧)
-            local extra = {}
-            for _, ch in ipairs(body) do
-                if ch:match("%a") then extra[#extra + 1] = swapcase(ch) end
-            end
-            out[#out + 1] = "[" .. neg .. table.concat(body) .. table.concat(extra) .. "]"
-            i = (pat:sub(k, k) == "]") and (k + 1) or k
-        elseif c:match("%a") then
-            out[#out + 1] = "[" .. c .. swapcase(c) .. "]"
-            i = i + 1
-        else
-            out[#out + 1] = c
-            i = i + 1
-        end
-    end
-    return table.concat(out)
-end
-
--- sed 替换串 -> Lua gsub 替换串
-local function toLuaRepl(repl)
-    local out = {}
-    local i = 1
-    while i <= #repl do
-        local c = repl:sub(i, i)
-        if c == "\\" then
-            local nx = repl:sub(i + 1, i + 1)
-            if nx:match("%d") then
-                out[#out + 1] = "%" .. nx; i = i + 2
-            elseif nx == "&" then
-                out[#out + 1] = "&"; i = i + 2
-            elseif nx == "\\" then
-                out[#out + 1] = "\\"; i = i + 2
-            elseif nx == "n" then
-                out[#out + 1] = "\n"; i = i + 2
-            elseif nx == "t" then
-                out[#out + 1] = "\t"; i = i + 2
-            else
-                out[#out + 1] = "\\" .. nx; i = i + 2
-            end
-        elseif c == "&" then
-            out[#out + 1] = "%0"; i = i + 1
-        elseif c == "%" then
-            out[#out + 1] = "%%"; i = i + 1
-        else
-            out[#out + 1] = c; i = i + 1
-        end
-    end
-    return table.concat(out)
-end
-local function buildRepl(repl, whole, caps)
-    local out = {}
-    local i = 1
-    while i <= #repl do
-        local c = repl:sub(i, i)
-        if c == "&" then
-            out[#out + 1] = whole; i = i + 1
-        elseif c == "\\" then
-            local nx = repl:sub(i + 1, i + 1)
-            if nx:match("%d") then
-                out[#out + 1] = caps[tonumber(nx)] or ""; i = i + 2
-            elseif nx == "&" then
-                out[#out + 1] = "&"; i = i + 2
-            elseif nx == "\\" then
-                out[#out + 1] = "\\"; i = i + 2
-            elseif nx == "n" then
-                out[#out + 1] = "\n"; i = i + 2
-            elseif nx == "t" then
-                out[#out + 1] = "\t"; i = i + 2
-            else
-                out[#out + 1] = "\\" .. nx; i = i + 2
-            end
-        else
-            out[#out + 1] = c; i = i + 1
-        end
-    end
-    return table.concat(out)
-end
 local function translit(pattern, cmd)
     local src, dst = cmd.src, cmd.dst
     local map = {}
@@ -266,7 +180,10 @@ local function parseAddr(script, i, n)
             if ch == "\\" and script:sub(j + 1, j + 1) == "/" then
                 buf[#buf + 1] = "/"; j = j + 2
             elseif ch == "/" then
-                return { kind = "regex", pat = table.concat(buf) }, j + 1
+                local pat = table.concat(buf)
+                local re = compileRe(pat)
+                if not re then return nil, i end
+                return { kind = "regex", pat = pat, re = re }, j + 1
             else
                 buf[#buf + 1] = ch; j = j + 1
             end
@@ -350,11 +267,12 @@ local function parseCmd(script, i)
         end
         cmd.pat = pat
         cmd.repl = repl
-        cmd.luaRepl = toLuaRepl(repl)
         cmd.global = g
         cmd.count = count
         cmd.print = pr
         cmd.ignorecase = ci
+        cmd.re = compileRe(pat, ci)
+        if not cmd.re then return nil, i end
     elseif c == "y" then
         local d = script:sub(i, i)
         if d == "" or d == ";" or d == "\n" then return nil, i end
@@ -428,7 +346,7 @@ end
 local function singleMatch(a, ln, pattern, L)
     if a.kind == "num" then return ln == a.n
     elseif a.kind == "dollar" then return ln == L
-    elseif a.kind == "regex" then return pattern:find(a.pat, 1) ~= nil end
+    elseif a.kind == "regex" then return a.re:find(pattern) ~= nil end
     return false
 end
 local function startMatch(a, ln, pattern, L)
@@ -436,13 +354,13 @@ local function startMatch(a, ln, pattern, L)
         if a.n == 0 then return true end
         return ln == a.n
     elseif a.kind == "dollar" then return ln == L
-    elseif a.kind == "regex" then return pattern:find(a.pat, 1) ~= nil end
+    elseif a.kind == "regex" then return a.re:find(pattern) ~= nil end
     return false
 end
 local function endMatch(a, ln, pattern, L)
     if a.kind == "num" then return ln == a.n
     elseif a.kind == "dollar" then return ln == L
-    elseif a.kind == "regex" then return pattern:find(a.pat, 1) ~= nil end
+    elseif a.kind == "regex" then return a.re:find(pattern) ~= nil end
     return false
 end
 local function addrMatch(cmd, ln, pattern, L)
@@ -479,36 +397,11 @@ end
 -- ---------------------------------------------------------------
 -- 替换 / 主循环
 -- ---------------------------------------------------------------
+--- s/// 的替换: mode = true(全部) | 数字(只替第 n 次) | false(只替第一次)。
 local function subst(pattern, cmd)
-    local pat = cmd.pat
-    if cmd.ignorecase then pat = makeCI(pat) end
-    local s = pattern
-    if cmd.count and cmd.count > 0 then
-        local b = 1
-        local seen = 0
-        while true do
-            local s0, e0 = string.find(s, pat, b)
-            if not s0 then break end
-            seen = seen + 1
-            if seen == cmd.count then
-                local whole = s:sub(s0, e0)
-                local caps = { string.match(s, pat, s0) }
-                local theRepl = buildRepl(cmd.repl, whole, caps)
-                return s:sub(1, s0 - 1) .. theRepl .. s:sub(e0 + 1), true
-            end
-            b = e0 + 1
-        end
-        return s, false
-    else
-        local repl = cmd.luaRepl
-        if cmd.global then
-            local res, n = s:gsub(pat, repl)
-            return res, (n > 0)
-        else
-            local res, n = s:gsub(pat, repl, 1)
-            return res, (n > 0)
-        end
-    end
+    local mode = cmd.count or cmd.global
+    local res, n = cmd.re:sub(pattern, cmd.repl, mode)
+    return res, (n > 0)
 end
 
 local curOut -- nil => stdout; 否则为写入的文件句柄

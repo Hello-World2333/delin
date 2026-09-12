@@ -5,7 +5,7 @@
 --   -x  整串精确匹配;  -v 反向选择
 --   -n  只杀最新的一个(pid 最大);  -o 只杀最老的一个(pid 最小)
 --   -u USER  只杀该用户的进程(用户名或 uid)
--- 默认信号 SIGTERM。PATTERN 用 Lua pattern(grep/sed 的同一约定; 不是 POSIX ERE)。
+-- 默认信号 SIGTERM。PATTERN 用 **标准正则**: procps 用 ERE(POSIX 扩展正则), 引擎见 kernel/regex.lua。
 -- 退出码: 0 = 至少匹配到一个进程; 1 = 无匹配; 2 = 用法/pattern 错误。pkill 不杀自己。
 local args = args or {}
 
@@ -157,6 +157,15 @@ end
 if not pattern then stderr("usage: pkill [-SIGNAL] [-fxvno] [-u user] pattern\n"); return 2 end
 if optN and optO then stderr("pkill: -n and -o are mutually exclusive\n"); return 2 end
 
+-- 模式编译一次(procps 的 pgrep/pkill 用 ERE)。
+local compileRegex = syscalls and syscalls["regex.compile"]
+if not compileRegex then stderr("pkill: regex syscall not available\n"); return 2 end
+local re, rerr = compileRegex(pattern, "ere", { line = optX })
+if not re then
+    stderr("pkill: invalid pattern: " .. tostring(rerr) .. "\n")
+    return 2
+end
+
 local self = selfPid()
 local hits = {}
 for _, p in ipairs(candidates()) do
@@ -168,12 +177,7 @@ for _, p in ipairs(candidates()) do
         end
         if uidOk then
             local text = optF and (p.cmd or p.comm) or p.comm
-            local ok, from = pcall(string.find, text, optX and ("^" .. pattern .. "$") or pattern)
-            if not ok then
-                stderr("pkill: invalid pattern: " .. tostring(from) .. "\n")
-                return 2
-            end
-            local match = from ~= nil
+            local match = re:find(text) ~= nil
             if match ~= optV then hits[#hits + 1] = p end
         end
     end

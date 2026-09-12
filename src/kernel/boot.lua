@@ -133,6 +133,8 @@ end
 --- 运行时 syscalls(给 shell / 工具用): 等待子进程、注入 stdio、前台 tty 控制。
 local function registerRuntimeSyscalls()
     local sc = modules.syscalls()
+    -- 标准正则引擎(POSIX BRE/ERE): grep/sed/ed/expr/pgrep 共用的唯一真源, 见 kernel/regex.lua。
+    require("kernel.regex").registerSyscalls()
     sc["proc.wait"] = function(pid)
         -- 阻塞等待一个子进程退出(轮询; 进程自身 yield, 调度器驱动)。
         while true do

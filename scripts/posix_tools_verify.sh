@@ -289,6 +289,19 @@ fi
 echo "-- ls -l 复核(链接/管道类型字符与 umask 效果) --" >> $LOG
 ls -l "$T" >> $LOG
 
+# ---------------------------------------------------------------
+# 标准正则(grep/sed/ed/expr/csplit 的 BRE/ERE 方言与退出码)
+# 独立的 scripts/regex_test.sh: 宿主与真机跑同一份, 期望值对着宿主 GNU 核过。
+# ---------------------------------------------------------------
+echo "-- standard regex (grep/sed/ed/expr/csplit) --" >> $LOG
+sh /root/regex_test.sh >> $LOG
+_rc="$?"
+if [ "$_rc" = "0" ]; then
+    echo "ok   regex_test" >> $LOG
+else
+    echo "ng   regex_test (rc=$_rc)" >> $LOG; ng=1
+fi
+
 echo "== summary: ng=$ng ==" >> $LOG
 if [ "$ng" = "0" ]; then echo "all ok" >> $LOG; else echo "some failed" >> $LOG; fi
 rm -rf "$T"

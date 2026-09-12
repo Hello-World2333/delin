@@ -28,7 +28,7 @@ chkrun() { # chkrun <name> <期望退出码> <输出文件> <cmd...>: 跑命令�
 }
 chkfile() { if [ -s "$2" ]; then ok "$1"; else ng "$1"; fi }
 chkempty() { if [ -s "$2" ]; then ng "$1"; else ok "$1"; fi }
-chkcontain() { # chkcontain <name> <Lua pattern> <file>
+chkcontain() { # chkcontain <name> <POSIX 基本正则(BRE)> <file>
     grep "$2" "$3" > $T/grepout
     if [ -s $T/grepout ]; then ok "$1"; else ng "$1"; fi
 }
@@ -47,9 +47,9 @@ chkcontain lua_arg_interp '/bin/lua' $T/args.out
 chkcontain lua_arg_script "$T/args.lua" $T/args.out
 chkcontain lua_arg_1      'foo' $T/args.out
 chkcontain lua_arg_2      'bar' $T/args.out
-chkcontain lua_arg_line   '/bin/lua%s.*%sfoo%sbar' $T/args.out
-chkcontain lua_vararg_n   '^2%s' $T/args.out
-chkcontain lua_vararg_val 'foo%sbar' $T/args.out
+chkcontain lua_arg_line   '/bin/lua[[:space:]].*[[:space:]]foo[[:space:]]bar' $T/args.out
+chkcontain lua_vararg_n   '^2[[:space:]]' $T/args.out
+chkcontain lua_vararg_val 'foo[[:space:]]bar' $T/args.out
 
 # print 无参数要输出空行(与 lua(1) 一致)
 echo 'print("x1") print() print("x2")' > $T/blank.lua
@@ -96,7 +96,7 @@ chkcontain lua_loadfile_result '^43$' $T/df.out
 # loadfile 失败返回 nil+err(不抛); dofile 失败抛错 -> 退出码 1
 echo -e 'local f, e = loadfile("'$T'/nope.lua")\nprint(f == nil, e ~= nil)' > $T/lfmiss.lua
 chkrun lua_loadfile_missing 0 $T/lfmiss.out lua $T/lfmiss.lua
-chkcontain lua_loadfile_missing_nilerr 'true%strue' $T/lfmiss.out
+chkcontain lua_loadfile_missing_nilerr 'true[[:space:]]true' $T/lfmiss.out
 
 echo 'dofile("'$T'/nope.lua")' > $T/dfmiss.lua
 chkrun lua_dofile_missing 1 $T/dfmiss.out lua $T/dfmiss.lua
@@ -109,7 +109,7 @@ echo 'local f, e' >> $T/eofmsg.lua
 echo 'if _VERSION == "Lua 5.1" then f, e = loadstring("if true then", "=p") else f, e = load("if true then", "=p", "t", {}) end' >> $T/eofmsg.lua
 echo 'print(f == nil, e ~= nil, e:find("<eof>" .. q .. "?%s*$") ~= nil)' >> $T/eofmsg.lua
 chkrun lua_incomplete_eof_msg 0 $T/eofmsg.out lua $T/eofmsg.lua
-chkcontain lua_incomplete_eof_msg_val '^true%strue%strue$' $T/eofmsg.out
+chkcontain lua_incomplete_eof_msg_val '^true[[:space:]]true[[:space:]]true$' $T/eofmsg.out
 
 # ---------------------------------------------------------------
 # 4. 错误消息与退出码
@@ -140,7 +140,7 @@ chmod 755 $T/shebang.lua
 chkrun lua_shebang_run 0 $T/shebang.out $T/shebang.lua hi
 chkcontain lua_shebang_tag  'shebang' $T/shebang.out
 chkcontain lua_shebang_path "$T/shebang.lua" $T/shebang.out
-chkcontain lua_shebang_arg  '%shi$' $T/shebang.out
+chkcontain lua_shebang_arg  '[[:space:]]hi$' $T/shebang.out
 
 # 没有 x 位就只能用解释器跑(126 = permission denied; root 也要至少一个 x 位)
 chmod 644 $T/shebang.lua
@@ -209,7 +209,7 @@ chkempty env_sandbox $T/env.ng
 # 同一份检查经 /bin/lua 跑: 解释器额外提供走 VFS 的 loadfile/dofile
 echo 'print(loadfile ~= nil, dofile ~= nil, os.run == nil, settings == nil, peripheral == nil)' > $T/luaenv.lua
 chkrun lua_env_ok 0 $T/luaenv.out lua $T/luaenv.lua
-chkcontain lua_env_provides '^true%strue%strue%strue%strue$' $T/luaenv.out
+chkcontain lua_env_provides '^true[[:space:]]true[[:space:]]true[[:space:]]true[[:space:]]true$' $T/luaenv.out
 
 # ---------------------------------------------------------------
 rm -rf $T   # 根映像 inode 很紧(256 个), 用完即清(与 proc_test/redstone_test 一致)

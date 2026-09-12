@@ -82,11 +82,11 @@ echo "TERM=$TERM" >> $LOG
 sh -c 'echo "TERM_child=$TERM"' >> $LOG
 echo -e 'a\eb' > /tmp/ansi_esc
 wc -c < /tmp/ansi_esc >> $LOG
-grep '%c' /tmp/ansi_esc > /tmp/ansi_hit
+grep '[[:cntrl:]]' /tmp/ansi_esc > /tmp/ansi_hit
 if [ -s /tmp/ansi_hit ]; then echo "echo_e_esc=ok" >> $LOG; else echo "echo_e_esc=ng" >> $LOG; fi
 clear > /tmp/clear_out
 wc -c < /tmp/clear_out >> $LOG
-grep '%c' /tmp/clear_out > /tmp/clear_hit
+grep '[[:cntrl:]]' /tmp/clear_out > /tmp/clear_hit
 if [ -s /tmp/clear_hit ]; then echo "clear_esc=ok" >> $LOG; else echo "clear_esc=ng" >> $LOG; fi
 echo "-- procfs /proc --" >> $LOG
 ls /proc >> $LOG
@@ -116,7 +116,7 @@ cat /proc/sys/kernel/random/uuid >> $LOG
 cat /proc/sys/kernel/random/uuid > /tmp/u1
 cat /proc/sys/kernel/random/uuid > /tmp/u2
 if cmp -s /tmp/u1 /tmp/u2; then echo "ng uuid_each_read_differs" >> $LOG; else echo "ok uuid_each_read_differs" >> $LOG; fi
-grep '%x%x%x%x%x%x%x%x%-%x%x%x%x%-4' /tmp/u1 > /tmp/uuidhit
+grep -E '^[0-9a-f]{8}-[0-9a-f]{4}-4' /tmp/u1 > /tmp/uuidhit
 if [ -s /tmp/uuidhit ]; then echo "ok uuid_v4_format" >> $LOG; else echo "ng uuid_v4_format" >> $LOG; fi
 # 内核那句 "random: crng init done" 要经 syslogd 落到 /var/log/kern.log。
 # 注意本脚本前面的 logrotate 段已经把 kern.log 轮转过一次(所以也查 .1)。
