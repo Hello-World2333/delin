@@ -40,6 +40,7 @@ local profiles = {
     kernel = {
         modules = {
             ["kernel.version"]   = "src/kernel/version.lua",
+            ["kernel.platform"]  = "src/kernel/platform.lua",
             ["kernel.scheduler"] = "src/kernel/scheduler.lua",
             ["kernel.process"]   = "src/kernel/process.lua",
             ["kernel.procenv"]   = "src/kernel/procenv.lua",

@@ -25,6 +25,7 @@ local pipe       = require("kernel.pipe")
 local klog       = require("kernel.klog")
 local random     = require("kernel.random")
 local fstab      = require("kernel.fstab")
+local platform   = require("kernel.platform")
 local INIT_SOURCE = require("kernel.init_src") -- 打包器注入的 init 源码字符串
 
 local bootLog = nil
@@ -385,6 +386,14 @@ function boot.boot()
 
     kprint("Delin OS " .. modules.version .. " boot")
     kprint("craftos=" .. os.version())
+
+    -- 平台: CC 电脑 / CEE:CC(CEECC) 电脑(见 kernel/platform.lua)。设备枚举与引脚 sysfs 都看它。
+    local pkind = platform.detect()
+    if pkind == "cee" then
+        kprint("platform=cee (CEE:CC, " .. #platform.pins() .. " signal pins)")
+    else
+        kprint("platform=cc")
+    end
 
     -- 1) 已被 DLUB 设置了 bootInfo -> 按 rootFstype 引导(ext2 / ccdisk)
     if __boot_info then

@@ -68,8 +68,13 @@ local function routeEvent(event)
         tty.feedInput(event)
     elseif event[1] == "key" or event[1] == "key_up" then
         tty.routeKey(event)
-    elseif (event[1] == "disk" or event[1] == "disk_eject") and diskHook then
+    elseif (event[1] == "disk" or event[1] == "disk_eject"
+            or event[1] == "peripheral" or event[1] == "peripheral_detach") and diskHook then
         -- 在被该事件唤醒的进程 resume 之前刷新, 保证它看到的 /dev 已是最新。
+        -- peripheral/peripheral_detach 也要接: CC 的电缆网络(modem 枢纽)把远端外设挂到本机的
+        -- 名字空间是**异步**的, 而内核在引导时已经扫过一次设备 —— 只认 disk 事件的话,
+        -- 晚到的那批设备要等到有人插拔磁盘才出现(台式 CEECC 实测: 同一次装机两次冷启动,
+        -- 一次在引导时就看见 28 个磁盘, 另一次只看见本机那一个)。
         diskHook(event)
     end
 end

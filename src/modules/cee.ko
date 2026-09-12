@@ -1,0 +1,184 @@
+--@name cee
+--@version 0.1.0
+--@description CEE:CC (CEECC) platform driver: /sys/class/power/supply (the machine's own feed) and
+--             /sys/class/pin/pinN (signal pins, their ports and the peripherals on them).
+--@deps
+
+--[[ 抽象: 把 CEE:CC 的两套 API 摊成 sysfs 文件, 与 redstone/printer/display 一个路子。
+     真机实测(台式 CEECC, 电脑 #6)确认了下面这些语义, 驱动据此设计:
+
+       power
+         /sys/class/power/supply/{present,voltage,current,power,max_power,headroom,state}  只读
+         /sys/class/power/supply/reset                                                     只写 "1"
+       present=hasPower  voltage=getPowerVoltage  current=getSupplyCurrent
+       power=getDeliveredPower  max_power=getMaxPower  headroom=getPowerHeadroom
+       state=getSupplyState('ok'|'overload'|'tripped'|'offline')  reset=resetSupply
+       台式机自持馈电(实测 ~300V, max 500W, busInfo()=nil, isBusPowered()=false);
+       机架机的总线/电源模块(busInfo/psu.*)与 fabric 不在本期: 机架式自带存储 4096 字节装不下 Delin。
+
+       pin
+         /sys/class/pin/pinN/{data,ports,powered,peripheral,peripheral_type}  只读, 每个引脚都有
+         /sys/class/pin/pinN/{analog_in,analog_out,digital_out}               仅**有端口**的引脚有
+       data=isDataPin(该引脚上有 Peripheral Cable)  ports=getPortCount  powered=isPortPowered
+       peripheral=hasPeripheral  peripheral_type=getPeripheralType(没有则空串)
+       analog_in=getAnalog(端口 I/O 面的红石输入)  analog_out=getAnalogOutput/setAnalog(0..15)
+       digital_out=getOutput/setOutput(0|1)
+
+       "有没有端口"必须看 getPortCount>0: 引脚没有端口时 getAnalog 返回 0、getInput 返回 false
+       **不报错**, 但 getAnalogOutput/getOutput 会报 "no signal port on pin N" —— 于是无端口的
+       引脚上那三个属性根本不该存在(sysfs 的 attrs(entry) 正好表达这件事)。
+
+       写校验 fail-fast: analog_out/digital_out 只收十进制整数且在范围内, 越界返回错误且**不改动**
+       端口状态; reset 只收 "1"。引脚号取 1..getSignalCount(), 越界的条目不存在。
+
+       引脚上的外设**不在这里**再枚举一遍: 实测台式机上引脚的端口外设同时出现在 CC 侧面平面上
+       (pin8 的 modem 就是侧面的 back), 设备节点统一由侧面平面产生 —— 重复枚举会给同一个
+       外设造出两个设备。存储的补漏在 kernel/devdisk.lua(按 CC 挂载路径精确去重)。 ]]
+
+local platform = require("kernel.platform")
+
+local POWER_ENTRY = "supply"
+local POWER_ATTRS = { "present", "voltage", "current", "power", "max_power", "headroom", "state", "reset" }
+local PIN_ATTRS   = { "data", "ports", "powered", "peripheral", "peripheral_type" }
+local PORT_ATTRS  = { "analog_in", "analog_out", "digital_out" }
+
+local activeKapi = nil
+
+local function api() return platform.cee end
+
+local function boolStr(v) return v and "1" or "0" end
+
+--- 解析属性值: 严格十进制整数 0..max(与 /sys/class/redstone 同一套: 不做 0x10/1e2/负数/小数)。
+---@return number|nil, string|nil
+local function parseValue(value, max, what)
+    local text = tostring(value)
+    local n = text:match("^%d+$") and tonumber(text) or nil
+    if not n or n > max then
+        return nil, "invalid " .. what .. ": '" .. text .. "' (expected decimal integer 0.." .. max .. ")"
+    end
+    return n
+end
+
+--- 条目名 "pinN" -> 引脚号(pinEntry 校验过才返回)。
+local function pinOf(entry) return tonumber(entry:match("^pin(%d+)$")) end
+
+--- 校验引脚号在 1..getSignalCount() 内: 越界 = 该引脚不存在, 条目/属性都不该存在。
+local function pinEntry(pin)
+    if not pin then return nil end
+    local n = api().getSignalCount()
+    if pin < 1 or pin > n then return nil end
+    return pin
+end
+
+local powerClass = {
+    list = function() return { POWER_ENTRY } end,
+    attrs = function(entry)
+        if entry ~= POWER_ENTRY then return nil end
+        return POWER_ATTRS
+    end,
+    get = function(entry, attr)
+        local c = api()
+        if attr == "present"   then return boolStr(c.hasPower()) end
+        if attr == "voltage"   then return tostring(c.getPowerVoltage()) end
+        if attr == "current"   then return tostring(c.getSupplyCurrent()) end
+        if attr == "power"     then return tostring(c.getDeliveredPower()) end
+        if attr == "max_power" then return tostring(c.getMaxPower()) end
+        if attr == "headroom"  then return tostring(c.getPowerHeadroom()) end
+        if attr == "state"     then return tostring(c.getSupplyState()) end
+        if attr == "reset"     then return "" end -- 只写属性(与 Linux sysfs 的 write-only 属性一致)
+        return nil
+    end,
+    writable = function(entry, attr)
+        if entry ~= POWER_ENTRY then return false end
+        return attr == "reset"
+    end,
+    set = function(entry, attr, value)
+        if attr ~= "reset" then return nil, "no such attribute: " .. tostring(attr) end
+        if value ~= "1" then
+            return nil, "invalid reset: '" .. value .. "' (write 1 to clear a tripped supply)"
+        end
+        api().resetSupply()
+        return true
+    end,
+}
+
+local pinClass = {
+    list = function()
+        local out = {}
+        for pin = 1, api().getSignalCount() do out[#out + 1] = "pin" .. pin end
+        return out
+    end,
+    attrs = function(entry)
+        local pin = pinEntry(pinOf(entry))
+        if not pin then return nil end
+        local out = {}
+        for _, a in ipairs(PIN_ATTRS) do out[#out + 1] = a end
+        if api().getPortCount(pin) > 0 then
+            for _, a in ipairs(PORT_ATTRS) do out[#out + 1] = a end
+        end
+        return out
+    end,
+    get = function(entry, attr)
+        local pin = pinEntry(pinOf(entry))
+        if not pin then return nil end
+        local c = api()
+        if attr == "data"            then return boolStr(c.isDataPin(pin)) end
+        if attr == "ports"           then return tostring(c.getPortCount(pin)) end
+        if attr == "powered"         then return boolStr(c.isPortPowered(pin)) end
+        if attr == "peripheral"      then return boolStr(c.hasPeripheral(pin)) end
+        if attr == "peripheral_type" then return tostring(c.getPeripheralType(pin) or "") end
+        if attr == "analog_in"       then return tostring(c.getAnalog(pin)) end
+        if attr == "analog_out"      then return tostring(c.getAnalogOutput(pin)) end
+        if attr == "digital_out"     then return boolStr(c.getOutput(pin)) end
+        return nil
+    end,
+    writable = function(entry, attr)
+        if not pinEntry(pinOf(entry)) then return false end
+        return (attr == "analog_out" or attr == "digital_out") and api().getPortCount(pinOf(entry)) > 0
+    end,
+    set = function(entry, attr, value)
+        local pin = pinEntry(pinOf(entry))
+        if not pin then return nil, "no such pin: " .. tostring(entry) end
+        if api().getPortCount(pin) == 0 then return nil, "no signal port on pin " .. pin end
+        if attr == "analog_out" then
+            local n, err = parseValue(value, 15, "analog_out")
+            if not n then return nil, err end
+            api().setAnalog(pin, n)
+            return true
+        end
+        if attr == "digital_out" then
+            local n, err = parseValue(value, 1, "digital_out")
+            if not n then return nil, err end
+            api().setOutput(pin, n == 1)
+            return true
+        end
+        return nil, "no such attribute: " .. tostring(attr)
+    end,
+}
+
+return {
+    init = function(kapi)
+        if platform.detect() ~= "cee" then
+            kapi.log("cee: not a CEE:CC computer (platform=" .. tostring(platform.kind) .. "), nothing registered")
+            return
+        end
+        activeKapi = kapi
+        kapi.registerSysfsClass("power", powerClass)
+        kapi.registerSysfsClass("pin", pinClass)
+
+        local pins, withPorts, withPeripheral = platform.pins(), 0, 0
+        for _, p in ipairs(pins) do
+            if p.ports > 0 then withPorts = withPorts + 1 end
+            if p.has then withPeripheral = withPeripheral + 1 end
+        end
+        kapi.log("cee: /sys/class/power/supply + /sys/class/pin registered (" .. #pins ..
+            " pins, " .. withPorts .. " with ports, " .. withPeripheral .. " with a peripheral)")
+    end,
+
+    exit = function()
+        if not activeKapi then return end
+        activeKapi.unregisterSysfsClass("power")
+        activeKapi.unregisterSysfsClass("pin")
+        activeKapi = nil
+    end,
+}

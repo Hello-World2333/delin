@@ -18,6 +18,7 @@
 local vfs      = require("kernel.vfs")
 local vfs_api  = require("kernel.vfs_api")
 local manifest = require("kernel.manifest")
+local platform = require("kernel.platform")
 -- mkfs/fsck 直接操作分区镜像的字节: 块设备层与 ext2 驱动都是**内核模块**(fstype 处理器由
 -- /lib/modules 里的 ext2.ko 注册), 所以这两个 require 是 devdisk 自己的依赖, 不是"模块装好
 -- 才有"的东西。少了它们, devdisk.mkfs 里 `blockdev.file` 会报 nil 索引 —— 真机上表现为
@@ -90,6 +91,28 @@ local function drives()
                 diskId = disk.getID(side),
                 label = disk.getLabel(side),
             }
+        end
+    end
+    -- CEE:CC(CEECC) 电脑的引脚上也可能挂着磁盘驱动器。台式机上引脚外设通常同时出现在侧面
+    -- 平面上(实测 pin8 的外设就是侧面的 modem), 所以这里按 CC 挂载路径去重 —— 同一个存储
+    -- 只能有一个设备节点。fs 看不到该挂载路径 = 它没进 CC 文件系统的命名空间(ccdisk 挂不上、
+    -- 盘上的 .img 也读不到), 这时不造节点: 能不能挂就是设备节点的判据(见 kernel/platform.lua)。
+    for _, pd in ipairs(platform.pinDrives()) do
+        local h = pd.handle
+        if h.isDiskPresent() then
+            local mp = h.getMountPath()
+            local known = false
+            for _, d in ipairs(rest) do
+                if d.mountPath == mp then known = true break end
+            end
+            if not known and fs.getCapacity(fsPath(mp)) then
+                rest[#rest + 1] = {
+                    side = pd.name,
+                    mountPath = mp,
+                    diskId = h.getDiskID(),
+                    label = h.getDiskLabel(),
+                }
+            end
         end
     end
     table.sort(rest, function(a, b)
