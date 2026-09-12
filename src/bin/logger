@@ -11,6 +11,8 @@ end
 
 local pri, tag = "user.notice", "logger"
 local operands = {}
+local appendPid, alsoStderr, skipEmpty, dryRun, prioPrefix = false, false, false, false, false
+local inputFile, maxSize = nil, nil
 local i = 1
 while i <= #args do
     local a = args[i]
@@ -18,6 +20,30 @@ while i <= #args do
     elseif a:match("^%-%-priority=") then pri = a:sub(12)
     elseif a == "-t" and args[i + 1] then tag = args[i + 1]; i = i + 1
     elseif a:match("^%-%-tag=") then tag = a:sub(7)
+    elseif a == "-i" or a == "--id" then appendPid = true
+    elseif a == "-s" or a == "--stderr" then alsoStderr = true
+    elseif a == "-e" or a == "--skip-empty" then skipEmpty = true
+    elseif a == "--no-act" then dryRun = true
+    elseif a == "--prio-prefix" then prioPrefix = true
+    elseif a == "-u" or a == "--socket" then
+        -- Delin 只有 /dev/log 这一个 syslog 入口: -u 收下但要求就是它
+        if args[i + 1] and args[i + 1] ~= "/dev/log" then
+            stderr("logger: option '-u' only supports /dev/log\n")
+            return 2
+        end
+        i = i + 1
+    elseif a == "-f" or a == "--file" then
+        inputFile = args[i + 1]
+        if not inputFile then stderr("logger: option '-f' requires an argument\n"); return 2 end
+        i = i + 1
+    elseif a:match("^%-S") or a == "--size" then
+        maxSize = tonumber(a:match("^%-S(%d+)$") or args[i + 1])
+        if not maxSize then stderr("logger: option '-S' requires a numeric argument\n"); return 2 end
+        if a == "--size" then i = i + 1 end
+    elseif a == "-n" or a == "--server" or a == "-P" or a == "--port" or a == "-d" or a == "--udp"
+        or a == "-T" or a == "--tcp" or a == "--rfc3164" or a:match("^%-%-rfc5424") then
+        stderr("logger: option '" .. a .. "' is not supported\n")
+        return 2
     elseif a == "--" then
         for k = i + 1, #args do operands[#operands + 1] = args[k] end
         break
@@ -54,18 +80,53 @@ if not log then
     return 1
 end
 
-local function send(msg)
-    log:writeLine("<" .. PRI .. ">" .. tag .. ": " .. msg)
+local effTag = tag
+if appendPid then effTag = tag .. "[" .. tostring(pid or 0) .. "]" end
+
+local function send(msg, linePRI)
+    if maxSize and #msg > maxSize then msg = msg:sub(1, maxSize) end
+    local p = linePRI or PRI
+    local full = "<" .. p .. ">" .. effTag .. ": " .. msg
+    if dryRun then
+        io.write(full .. "\n")
+    else
+        log:writeLine(full)
+    end
+    if alsoStderr then
+        local e = io.stderr()
+        if e and e.write then e:write(full .. "\n") end
+    end
 end
 
-if #operands > 0 then
+--- --prio-prefix: 每行可带 "<PRI>" 前缀, 用它覆盖 -p。
+local function sendLine(line)
+    if skipEmpty and line:match("^%s*$") then return end
+    local p
+    if prioPrefix then
+        local n, rest = line:match("^<(%-?%d+)>(.*)$")
+        if n then p, line = tonumber(n), rest end
+    end
+    send(line, p)
+end
+
+if inputFile then
+    local fh
+    if inputFile == "-" then fh = io.stdin() else fh = fs.open(inputFile, "r") end
+    if not fh then stderr("logger: " .. inputFile .. ": cannot open\n"); return 1 end
+    while true do
+        local line = fh.readLine and fh:readLine()
+        if line == nil then break end
+        sendLine(line)
+    end
+    if inputFile ~= "-" then fh:close() end
+elseif #operands > 0 then
     send(table.concat(operands, " "))
 else
     local stdin = io.stdin()
     while true do
         local line = stdin and stdin.readLine and stdin:readLine()
         if line == nil then break end
-        send(line)
+        sendLine(line)
     end
 end
 log:flush()

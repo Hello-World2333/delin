@@ -50,9 +50,9 @@ end
 -- 读 fs.lstat(不跟随符号链接, 等价 Linux ls -l 的 lstat), 兼容 ext2(mode/uid/gid/mtime/links)
 -- 与 CC 原生(modificationTime)。用 fs.lstat 而不是 fs.attributes 才看得到链接本身:
 -- 否则 `ls -l link` 显示的是目标, 类型字符也不是 "l"。
-local function attrs(p)
+local function attrs(p, follow)
     if fs.lstat or fs.attributes then
-        local fn = fs.lstat or fs.attributes
+        local fn = (follow and fs.attributes) or fs.lstat or fs.attributes
         local a = fn(p)
         if a then
             if not a.mtime and a.modificationTime then a.mtime = a.modificationTime end
@@ -67,6 +67,12 @@ end
 -- ---------------------------------------------------------------
 local optAll, optAlmost, optLong, optHuman = false, false, false, false
 local optDir, optRecursive, optReverse, optTime = false, false, false, false
+local optInode, optNumeric, optClassify, optSlash = false, false, false, false
+local optSizeSort, optNoSort, optExtSort = false, false, false
+local optQuote, optDeref, optDerefCmdline = false, false, false
+local optNoGroup, optNoOwner = false, false
+local optColorWhen = "never"
+
 local paths = {}
 local noMoreOpts = false
 
@@ -80,6 +86,23 @@ local function setShort(ch)
     elseif ch == "r" then optReverse = true
     elseif ch == "t" then optTime = true
     elseif ch == "1" then optLong = false
+    elseif ch == "i" then optInode = true
+    elseif ch == "n" then optLong, optNumeric = true, true
+    elseif ch == "F" then optClassify = true
+    elseif ch == "p" then optSlash = true
+    elseif ch == "S" then optSizeSort = true
+    elseif ch == "U" then optNoSort = true
+    elseif ch == "X" then optExtSort = true
+    elseif ch == "Q" then optQuote = true
+    elseif ch == "L" then optDeref = true
+    elseif ch == "H" then optDerefCmdline = true
+    elseif ch == "G" or ch == "o" then optNoGroup = true
+    elseif ch == "g" then optLong, optNoOwner = true, true
+    elseif ch == "s" or ch == "c" or ch == "u" then
+        -- -s 要"已分配块数"(st_blocks)、-c/-u 要 ctime/atime: 内核 attributes 都不暴露
+        -- (见 for-ai.md「已知缺口」)。收下却打错数据比报错更糟, 所以 fail-fast。
+        stderr("ls: option '-" .. ch .. "' is not supported\n")
+        return false
     else stderr("ls: invalid option -- '" .. ch .. "'\n"); return false end
     return true
 end
@@ -97,6 +120,21 @@ for _, a in ipairs(args) do
     elseif a == "--recursive" then optRecursive = true
     elseif a == "--reverse" then optReverse = true
     elseif a == "--sort=time" then optTime = true
+    elseif a == "--inode" then optInode = true
+    elseif a == "--numeric-uid-gid" then optLong, optNumeric = true, true
+    elseif a == "--classify" or a == "--file-type" then optClassify = true
+    elseif a == "--indicator-style=slash" then optSlash = true
+    elseif a == "--indicator-style=none" then optClassify, optSlash = false, false
+    elseif a == "--quote-name" then optQuote = true
+    elseif a == "--dereference" or a == "--dereference-command-line" then optDeref = true
+    elseif a == "--no-group" then optNoGroup = true
+    elseif a == "--color=always" or a == "--colour=always" then optColorWhen = "always"
+    elseif a == "--color=never" or a == "--colour=never" then optColorWhen = "never"
+    elseif a == "--color=auto" or a == "--colour=auto" or a == "--color" or a == "--colour" then
+        optColorWhen = "auto"
+    elseif a == "--full-time" or a:match("^%-%-time%-style") then
+        stderr("ls: option '" .. a .. "' is not supported\n")
+        return 2
     elseif a:sub(1, 2) == "--" then
         stderr("ls: unrecognized option '" .. a .. "'\n")
         return 2
@@ -166,19 +204,88 @@ local function fmtTime(t)
     end
     return mon .. " " .. day .. "  " .. y
 end
-local function classify(a, name)
-    if a.isDir then return name .. "/" end
-    if a.kind == "symlink" then return name .. "@" end
-    return name
+--- 名字末尾的类型指示符(-F / -p): GNU ls 的 */=@| 与"可执行 *"。
+local function indicator(a, p)
+    if a.isDir then return "/" end
+    if a.kind == "symlink" then return "@" end
+    if a.kind == "fifo" then return "|" end
+    if a.kind == "socket" then return "=" end
+    if optClassify and p then
+        local x = fs.canExecute and fs.canExecute(p)
+        if x == nil and a.mode then
+            -- 没有 canExecute 时退回看 mode 的三个 x 位(root 也要至少一个 x 才算可执行)
+            local bits = a.mode % 512
+            x = (math.floor(bits / 64) % 8 % 2 == 1) or (math.floor(bits / 8) % 8 % 2 == 1)
+                or (bits % 8 % 2 == 1)
+        end
+        if x then return "*" end
+    end
+    return ""
 end
-local function lineLong(a, name)
-    local s = modeStr(a)
+
+--- 名字装饰: 指示符 + -Q 的双引号(-Q 与 -F 可同用, 与 GNU 一致: 引号在外)。
+local function decorate(a, name, p)
+    local ind = ""
+    if optClassify then ind = indicator(a, p)
+    elseif optSlash and a.isDir then ind = "/" end
+    if optQuote then return '"' .. name .. '"' .. ind end
+    return name .. ind
+end
+
+--- --color[=WHEN]: 按文件类型上色。默认表取 Linux LS_COLORS 的常用项(可被环境覆盖)。
+local colorOn = false
+do
+    if optColorWhen == "always" then colorOn = true
+    elseif optColorWhen == "auto" then
+        local out = io.stdout()
+        colorOn = (out and out.isTTY) and true or false
+    end
+end
+local LSCOL = { di = "01;34", ln = "01;36", ex = "01;32", pi = "40;33", so = "01;35",
+                bd = "40;33;01", cd = "40;33;01", ["or"] = "40;31;01", mi = "00" }
+do
+    local spec = os.getenv and os.getenv("LS_COLORS") or nil
+    if spec and spec ~= "" then
+        for item in (spec .. ":"):gmatch("([^:]*):") do
+            local k, v = item:match("^([%a]+)=(.*)$")
+            if k and LSCOL[k] ~= nil then LSCOL[k] = v end
+        end
+    end
+end
+local function colorizeName(a, p, text)
+    if not colorOn then return text end
+    local key = a.isDir and "di" or (a.kind == "symlink" and "ln") or (a.kind == "fifo" and "pi")
+        or (a.kind == "socket" and "so")
+        or ((not a.isDir) and fs.canExecute and fs.canExecute(p) and "ex" or nil)
+    local code = key and LSCOL[key]
+    if not code or code == "" or code == "0" or code == "00" then return text end
+    return "\27[" .. code .. "m" .. text .. "\27[0m"
+end
+local function lineLong(a, name, p)
+    local s = ""
+    if optInode then s = string.format("%7s ", tostring(a.ino or 0)) end
+    s = s .. modeStr(a)
     s = s .. " " .. string.format("%2d", a.links or 1)
-    s = s .. " " .. ownerName(a.uid)
-    s = s .. " " .. tostring(a.gid or 0)
+    if not optNoOwner then
+        s = s .. " " .. (optNumeric and tostring(a.uid or 0) or ownerName(a.uid))
+    end
+    if not optNoGroup then
+        local gname = tostring(a.gid or 0)
+        if not optNumeric and a.gid and syscalls and syscalls["user.groupByGid"] then
+            local g = syscalls["user.groupByGid"](a.gid)
+            if g and g.name then gname = g.name end
+        end
+        s = s .. " " .. gname
+    end
     s = s .. " " .. string.format("%8s", optHuman and human(a.size) or tostring(a.size or 0))
     s = s .. " " .. fmtTime(a.mtime)
-    s = s .. " " .. classify(a, name)
+    local shown = decorate(a, name, p)
+    s = s .. " " .. colorizeName(a, p, shown)
+    -- 符号链接要显示指向(GNU: "name -> target"), 除非 -L/-H 已经把链接解开了
+    if a.kind == "symlink" and not (optDeref or optDerefCmdline) and fs.readlink then
+        local tgt = fs.readlink(p)
+        if tgt then s = s .. " -> " .. tgt end
+    end
     io.write(s .. "\n")
     yieldCheck(#s + 1)
 end
@@ -186,31 +293,50 @@ end
 -- ---------------------------------------------------------------
 -- 目录扫描与渲染
 -- ---------------------------------------------------------------
-local function entry(p)
-    local a = attrs(p)
+local function entry(p, follow)
+    local a = attrs(p, follow)
     return { isDir = a.isDir, size = a.size, mode = a.mode, uid = a.uid, gid = a.gid,
-             mtime = a.mtime, links = a.links, kind = a.kind, isReadOnly = a.isReadOnly }
+             mtime = a.mtime, links = a.links, kind = a.kind, isReadOnly = a.isReadOnly,
+             ino = a.ino }
 end
 local function classifyHidden(name)
     return name:sub(1, 1) == "."
 end
 
 local function renderOne(full, name)
-    local a = entry(full)
+    local a = entry(full, optDeref)
     if optLong then
-        lineLong(a, name)
+        lineLong(a, name, full)
     else
-        local out = name .. (a.isDir and "/" or "") .. "\n"
+        local out = ""
+        if optInode then out = string.format("%7s ", tostring(a.ino or 0)) end
+        out = out .. colorizeName(a, full, decorate(a, name, full)) .. "\n"
         io.write(out)
         yieldCheck(#out)
     end
 end
 
 local function sortNames(out, dir)
-    if optTime then
+    local function full(x) return (dir == "/") and ("/" .. x) or (dir .. "/" .. x) end
+    if optNoSort then
+        -- -U: 不排序(目录顺序)
+    elseif optSizeSort then
         table.sort(out, function(x, y)
-            local ax = entry(dir == "/" and ("/" .. x) or (dir .. "/" .. x))
-            local ay = entry(dir == "/" and ("/" .. y) or (dir .. "/" .. y))
+            local ax, ay = entry(full(x)), entry(full(y))
+            if (ax.size or 0) ~= (ay.size or 0) then return (ax.size or 0) > (ay.size or 0) end
+            return x < y
+        end)
+    elseif optExtSort then
+        table.sort(out, function(x, y)
+            local ex = x:match("%.([^.]*)$") or ""
+            local ey = y:match("%.([^.]*)$") or ""
+            if ex ~= ey then return ex < ey end
+            return x < y
+        end)
+    elseif optTime then
+        table.sort(out, function(x, y)
+            local ax = entry(full(x))
+            local ay = entry(full(y))
             return (ax.mtime or 0) > (ay.mtime or 0)
         end)
     else
@@ -275,11 +401,12 @@ for pi, raw in ipairs(paths) do
         if optRecursive then recurse(path) end
         if pi < #paths then io.write("\n") end
     else
-        local a = entry(path)
+        local a = entry(path, optDeref or optDerefCmdline)
         if optLong then
-            lineLong(a, raw)
+            lineLong(a, raw, path)
         else
-            io.write(raw .. (a.isDir and "/" or "") .. "\n")
+            io.write((optInode and (string.format("%7s ", tostring(a.ino or 0))) or "")
+                .. colorizeName(a, path, decorate(a, raw, path)) .. "\n")
         end
     end
 end

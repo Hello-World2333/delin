@@ -68,7 +68,50 @@ end
 
 local blockSize, humanOut, showAll, showType, posixFmt = 512, false, false, false, false
 local doInodes = false
+local siUnits = false            -- -H/--si: 1000 进制
+local showTotal = false          -- --total
+local includeTypes, excludeTypes = nil, nil
 local operands, noMoreOpts = {}, false
+
+--- -B/--block-size: 数字后缀(GNU: k/K=1024, KB=1000, M=1024^2, MB=10^6, ...)。
+local SIZE_UNITS = { k = 1024, K = 1024, KB = 1000, M = 1048576, MB = 1000000,
+                     G = 1073741824, GB = 1000000000, T = 1099511627776, TB = 1000000000000 }
+local function parseBlockSize(v)
+    v = tostring(v or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    local num, suf = v:match("^(%d+%.?%d*)(%a*)$")
+    if not num then return nil end
+    local n = tonumber(num)
+    if n <= 0 then return nil end
+    if suf ~= "" then
+        local mult = SIZE_UNITS[suf] or SIZE_UNITS[suf:upper()]
+        if not mult then return nil end
+        n = n * mult
+    end
+    return math.floor(n)
+end
+
+--- -t/-x 的类型表(逗号分隔)
+local function parseTypes(v)
+    local set = {}
+    for t in (tostring(v or "") .. ","):gmatch("([^,]*),") do
+        t = t:gsub("%s", "")
+        if t ~= "" then set[#set + 1] = t end
+    end
+    return set
+end
+
+local function typeAllowed(fstype)
+    fstype = fstype or ""
+    if includeTypes then
+        local hit = false
+        for _, t in ipairs(includeTypes) do if t == fstype then hit = true end end
+        if not hit then return false end
+    end
+    if excludeTypes then
+        for _, t in ipairs(excludeTypes) do if t == fstype then return false end end
+    end
+    return true
+end
 
 local function setShort(ch)
     if ch == "k" then blockSize, humanOut = 1024, false
@@ -77,32 +120,74 @@ local function setShort(ch)
     elseif ch == "a" then showAll = true
     elseif ch == "T" then showType = true
     elseif ch == "i" then doInodes = true
+    elseif ch == "H" then humanOut, siUnits = true, true
+    elseif ch == "B" or ch == "t" or ch == "x" then
+        -- 带参数的短选项由调用方消费(见下面的循环)
+        return true
     else stderr("df: invalid option -- '" .. ch .. "'\n"); return false end
     return true
 end
 
-for _, a in ipairs(args) do
+local di = 1
+while di <= #args do
+    local a = args[di]
     if noMoreOpts then
         operands[#operands + 1] = a
     elseif a == "--" then
         noMoreOpts = true
     elseif a == "--kilobytes" then blockSize, humanOut = 1024, false
     elseif a == "--human-readable" then humanOut = true
+    elseif a == "--si" then humanOut, siUnits = true, true
     elseif a == "--portability" then posixFmt = true
     elseif a == "--all" then showAll = true
     elseif a == "--print-type" then showType = true
     elseif a == "--inodes" then doInodes = true
+    elseif a == "--total" then showTotal = true
+    elseif a == "-B" or a == "--block-size" then
+        di = di + 1
+        local v = args[di]
+        if not v then stderr("df: option '" .. a .. "' requires an argument\n"); return 2 end
+        blockSize = parseBlockSize(v)
+        if not blockSize then stderr("df: invalid --block-size argument '" .. v .. "'\n"); return 2 end
+    elseif a:match("^%-%-block%-size=") then
+        blockSize = parseBlockSize(a:sub(14))
+        if not blockSize then stderr("df: invalid --block-size argument '" .. a:sub(14) .. "'\n"); return 2 end
+    elseif a:match("^%-B.") then
+        blockSize = parseBlockSize(a:sub(3))
+        if not blockSize then stderr("df: invalid --block-size argument '" .. a:sub(3) .. "'\n"); return 2 end
+    elseif a == "-t" or a == "--type" then
+        di = di + 1
+        local v = args[di]
+        if not v then stderr("df: option '" .. a .. "' requires an argument\n"); return 2 end
+        includeTypes = parseTypes(v)
+    elseif a:match("^%-%-type=") then
+        includeTypes = parseTypes(a:sub(8))
+    elseif a:match("^%-t.") then
+        includeTypes = parseTypes(a:sub(3))
+    elseif a == "-x" or a == "--exclude-type" then
+        di = di + 1
+        local v = args[di]
+        if not v then stderr("df: option '" .. a .. "' requires an argument\n"); return 2 end
+        excludeTypes = parseTypes(v)
+    elseif a:match("^%-%-exclude%-type=") then
+        excludeTypes = parseTypes(a:sub(16))
+    elseif a:match("^%-x.") then
+        excludeTypes = parseTypes(a:sub(3))
+    elseif a:sub(1, 2) == "--" then
+        stderr("df: unrecognized option '" .. a .. "'\n")
+        return 2
     elseif a:sub(1, 1) == "-" and a ~= "-" then
-        for k = 2, #a do if not setShort(a:sub(k, k)) then return 1 end end
+        for k = 2, #a do if not setShort(a:sub(k, k)) then return 2 end end
     else
         operands[#operands + 1] = a
     end
+    di = di + 1
 end
 
--- 内核没有 inode 统计接口: fail-fast, 不编造数字。
+-- 内核没有 inode 统计接口: fail-fast, 不编造数字(见 for-ai.md「已知缺口」)。
 if doInodes then
-    stderr("df: -i: inode statistics are not available\n")
-    return 1
+    stderr("df: option '-i' is not supported (no inode statistics)\n")
+    return 2
 end
 
 local mountsFn = syscalls and syscalls["fs.mounts"]
@@ -114,10 +199,11 @@ local mounts = mountsFn() or {}
 
 --- 人类可读: 1024 进制, 值 < 10 保留 1 位小数, 一律向上取整(GNU df -h 的舍入方向)。
 local function human(n)
-    if n < 1024 then return string.format("%d", n) end
-    local units = { "K", "M", "G", "T", "P", "E" }
-    local idx, v = 1, n / 1024
-    while v >= 1024 and idx < #units do v = v / 1024; idx = idx + 1 end
+    local base = siUnits and 1000 or 1024
+    if n < base then return string.format("%d", n) end
+    local units = { siUnits and "k" or "K", "M", "G", "T", "P", "E" }
+    local idx, v = 1, n / base
+    while v >= base and idx < #units do v = v / base; idx = idx + 1 end
     if v < 10 then
         local tenths = math.ceil(v * 10) / 10
         if tenths < 10 then return string.format("%.1f", tenths) .. units[idx] end
@@ -150,7 +236,7 @@ if #operands == 0 then
             rc = 1
         else
             local row = rowFor(mt)
-            if showAll or row.cap > 0 then rows[#rows + 1] = row end
+            if (showAll or row.cap > 0) and typeAllowed(row.fstype) then rows[#rows + 1] = row end
         end
     end
 else
@@ -177,6 +263,16 @@ else
             rows[#rows + 1] = rowFor(best)
         end
     end
+end
+
+--- --total: 追加一行合计(GNU 会另起一行 Filesystem=total)。
+if showTotal and #rows > 0 then
+    local t = { dev = "total", fstype = "-", root = "-", cap = 0, used = 0, free = 0 }
+    for _, row in ipairs(rows) do
+        t.cap = t.cap + row.cap; t.used = t.used + row.used; t.free = t.free + row.free
+    end
+    t.pct = (t.cap > 0) and math.ceil(t.used * 100 / t.cap) or nil
+    rows[#rows + 1] = t
 end
 
 --- 字节数 -> 单元格文本。

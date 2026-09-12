@@ -110,7 +110,7 @@ end
 -- ================= 操作数解析 =================
 local CONV_UNSUPPORTED = {
     block = true, unblock = true, ascii = true, ebcdic = true, ibm = true,
-    fsync = true, fdatasync = true, excl = true, nocreat = true,
+    excl = true, nocreat = true,
 }
 
 local ifArg, ofArg = "-", "-"
@@ -119,15 +119,41 @@ local bsArg = nil -- bs= 的值: 解析完之后覆盖 ibs/obs(GNU 语义)
 local count = nil
 local skip, seek = 0, 0
 local cNotrunc, cSync, cUcase, cLcase, cSwab, cNoerror = false, false, false, false, false, false
+local cFsync = false -- conv=fsync/fdatasync: 收尾时把句柄 flush 出去(内核 append 句柄据此落盘)
+local skipBytes, seekBytes = 0, 0 -- 定位量(按 iflag/oflag 的 *_bytes 语义换算后的字节数)
 local status = "default"
 
+--- GNU dd 的数值字面量: 十进制 + 后缀(c=1, w=2, b=512, kB=1000, K=1024, MB/M, GB/G, T, P, E)。
+--- 也接受 "0x" 十六进制与 NxM 乘法形式(GNU 支持, 脚本里偶见)。
+local SUFFIX = {
+    c = 1, w = 2, b = 512,
+    kB = 1000, K = 1024, KB = 1000,
+    MB = 1000000, M = 1048576,
+    GB = 1000000000, G = 1073741824,
+    TB = 1000000000000, T = 1099511627776,
+    P = 1125899906842624, E = 1152921504606846976,
+    ["B"] = 1,
+}
 local function parseNum(v)
-    -- 只接受纯十进制(不支持 GNU 的 1024 倍数字面量与 c/w/b 后缀: 未要求)
-    if not v:match("^%d+$") then
+    v = tostring(v or "")
+    -- NxM: 乘法(如 count=2x512)
+    local l, r = v:match("^(%d+)x(%d+)$")
+    if l then return tonumber(l) * tonumber(r) end
+    local num, suf = v:match("^(%d+)(%a*)$")
+    if not num then
         stderr("dd: invalid number: '" .. v .. "'\n")
         return nil
     end
-    return tonumber(v)
+    local n = tonumber(num)
+    if suf ~= "" then
+        local mult = SUFFIX[suf] or SUFFIX[suf:upper()]
+        if not mult then
+            stderr("dd: invalid number: '" .. v .. "'\n")
+            return nil
+        end
+        n = n * mult
+    end
+    return math.floor(n)
 end
 
 -- 块大小必须 >= 1(0 会让读写空转; GNU 对 ibs=0/bs=0 同样报 invalid number)
@@ -139,6 +165,14 @@ local function parseSize(v)
     end
     return n
 end
+
+--- GNU 里存在但 Delin 无法实现的 iflag/oflag(它们都依赖宿主 IO 层)
+local IFLAG_UNSUPPORTED = {
+    direct = true, dsync = true, sync = true, nonblock = true, noatime = true,
+    nocache = true, noctty = true, nofollow = true, directory = true, binary = true,
+    text = true,
+}
+local flagsSet = {}
 
 local function setOperand(a)
     local key, val = a:match("^([%a_][%w_]*)=(.*)$")
@@ -163,6 +197,32 @@ local function setOperand(a)
         bsArg = n
     elseif key == "cbs" then
         if not parseNum(val) then return false end -- conv=block/unblock 未实现, 值丢弃
+    elseif key == "iflag" or key == "oflag" then
+        local flags = {}
+        for c in (val .. ","):gmatch("([^,]*),") do
+            if c ~= "" then flags[#flags + 1] = c end
+        end
+        for _, c in ipairs(flags) do
+            local ok = false
+            if key == "iflag" then
+                ok = (c == "fullblock" or c == "count_bytes" or c == "skip_bytes")
+            else
+                ok = (c == "append" or c == "seek_bytes" or c == "notrunc")
+            end
+            if ok then
+                flagsSet[key .. ":" .. c] = true
+            elseif IFLAG_UNSUPPORTED[c] then
+                stderr("dd: flag '" .. c .. "' is not supported\n")
+                return false
+            else
+                stderr("dd: invalid " .. key .. ": '" .. c .. "'\n")
+                return false
+            end
+        end
+    elseif key == "iseek" or key == "oseek" then
+        -- GNU 的旧别名(等价 skip/seek)
+        local n = parseNum(val); if not n then return false end
+        if key == "iseek" then skip = n else seek = n end
     elseif key == "count" then
         local n = parseNum(val); if not n then return false end
         count = n
@@ -180,6 +240,7 @@ local function setOperand(a)
             elseif c == "lcase" then cLcase = true
             elseif c == "swab" then cSwab = true
             elseif c == "noerror" then cNoerror = true
+            elseif c == "fsync" or c == "fdatasync" then cFsync = true
             elseif CONV_UNSUPPORTED[c] then
                 stderr("dd: conversion '" .. c .. "' is not supported\n")
                 return false
@@ -221,6 +282,10 @@ end
 -- bs= 一律覆盖 ibs/obs(与顺序无关, 实测 GNU dd 9.7: `bs=4 ibs=3` 也是 ibs=4)。
 if bsArg then ibs, obs = bsArg, bsArg end
 
+-- iflag=skip_bytes / oflag=seek_bytes: skip/seek 是字节数而不是块数(GNU 语义)
+skipBytes = flagsSet["iflag:skip_bytes"] and skip or (skip * ibs)
+seekBytes = flagsSet["oflag:seek_bytes"] and seek or (seek * obs)
+
 -- ================= 输入端 =================
 local inH, inIsStd, inName
 if ifArg == "-" or ifArg == "/dev/stdin" then
@@ -240,7 +305,7 @@ end
 -- ================= 输出端 =================
 local outH, outIsStd = nil, false
 local outDesc = ofArg
-local start = seek * obs
+local start = seekBytes
 local notruncOld = nil      -- notrunc 普通文件分支: 旧内容(整体读入)
 local notruncPrepare = nil  -- notrunc 普通文件分支: 首次写入前才执行的"清空 + 写前缀 + seek"
 local notruncTouched = false
@@ -294,8 +359,9 @@ else
             return true
         end
     else
-        -- 缺省(以及 notrunc 但目标不存在 = 普通创建)语义: 创建/截断
-        local h, err = fs.open(p, "w")
+        -- oflag=append: 追加模式(等价 conv=notrunc + 定位到末尾)
+        local mode = flagsSet["oflag:append"] and "a" or "w"
+        local h, err = fs.open(p, mode)
         if not h then
             stderr("dd: failed to open '" .. ofArg .. "': " .. ioeMsg(err) .. "\n")
             return 1
@@ -410,8 +476,8 @@ end
 local t0 = os.clock()
 
 -- skip: 逐输入块读取丢弃(按 ibs 计; 跳过末尾与 GNU 一样只警告并继续)
-if skip > 0 then
-    local left = skip * ibs
+if skipBytes > 0 then
+    local left = skipBytes
     while left > 0 and not _interrupted do
         local d, derr = inH:read(math.min(left, ibs))
         if d == nil then
@@ -431,6 +497,13 @@ end
 -- 整块快路径: ibs == obs 且没有任何会改变字节/长度的转换与定位时, 一次 read(bs) 一次 write
 local fast = (ibs == obs) and not (cSync or cSwab or cUcase or cLcase) and skip == 0 and seek == 0
 local lastProg = 0
+-- iflag=count_bytes: count 是字节数而不是块数(换算成"要拷多少字节")
+local countBytesLimit = nil
+if flagsSet["iflag:count_bytes"] then countBytesLimit = count * ibs end
+local bytesCopied = 0
+local function overCountLimit()
+    return countBytesLimit ~= nil and bytesCopied >= countBytesLimit
+end
 
 while true do
     if _interrupted then break end
@@ -481,7 +554,10 @@ if notruncTouched then
     if tail ~= "" then outH:write(tail) end
 end
 
-if outH then outH:close() end
+if outH then
+    if cFsync and outH.flush then pcall(outH.flush, outH) end
+    outH:close()
+end
 if not inIsStd then inH:close() end
 
 if status ~= "none" then
@@ -492,3 +568,4 @@ end
 
 -- ^C: 统计已经打完(与 GNU dd 收到 SIGINT 一样), 退出码 130。
 if _interrupted then return 130 end
+return 0

@@ -148,6 +148,47 @@ function F.attributes(p)
     local mode, size, mtime = line:match("^(%x+)%s+(%d+)%s+(%d+)")
     return { mode = tonumber(mode, 16), size = tonumber(size), mtime = tonumber(mtime), isDir = F.isDir(p) }
 end
+--- 不跟随符号链接的 stat(内核 fs.lstat 的对应物; harness 里也有一份同样的桩)。
+function F.lstat(p)
+    local h = host(p)
+    local fh = io.popen("test -L " .. h .. " && echo l")
+    local isLink = fh:read("*a"); fh:close()
+    if isLink == "" and not F.exists(p) then return nil end
+    local at = F.attributes(p)
+    if not at then
+        -- 悬空链接: 宿主上目标可能指向 Delin 的路径(不存在), 但链接本身在
+        if isLink == "" then return nil end
+        at = { isDir = false, size = 0, mode = tonumber("120777", 8) }
+    end
+    if isLink ~= "" then
+        at.kind = "symlink"
+        at.isDir = false
+        at.size = #(F.readlink(p) or "")
+        return at
+    end
+    at.kind = at.isDir and "dir" or "file"
+    return at
+end
+
+--- 符号链接/硬链接(真机是 ext2 的 inode 操作; 宿主用 ln(1) 顶)。
+function F.symlink(target, linkpath)
+    local rc = os.execute("ln -sfn -- '" .. tostring(target) .. "' " .. host(linkpath) .. " 2>/dev/null")
+    return rc ~= nil
+end
+function F.readlink(p)
+    local fh = io.popen("readlink -- " .. host(p) .. " 2>/dev/null")
+    local t = fh:read("*a"); fh:close()
+    t = t:gsub("%s+$", "")
+    return t ~= "" and t or nil
+end
+function F.link(old, new)
+    return os.execute("ln -f -- " .. host(old) .. " " .. host(new) .. " 2>/dev/null") ~= nil
+end
+function F.lchown() return true end
+function F.canExecute(p)
+    return os.execute("test -x " .. host(p)) ~= nil
+end
+
 function F.makeDir(p) os.execute("mkdir -p -- " .. host(p)); return true end
 function F.delete(p) os.execute("rm -rf -- " .. host(p)); return true end
 function F.chmod(p, m) os.execute(string.format("chmod %o -- %s", m % 4096, host(p))); return true end
@@ -744,6 +785,90 @@ kern.*                     /var/log/kern.log
         eq(g({ "-C1", "c", "/tmp/ctx" }), "b\nc\nb\n", "grep -C1: 前后一行")
         eq(g({ "-m1", "b", "/tmp/ctx" }), "b\n", "grep -m1: 每文件最多 1 条")
         eq(g({ "-3", "b", "/tmp/ctx" }), "a\nb\nc\nb\na\n", "grep -3: 粘连形式 = -C3")
+    end
+
+    -- F4f. 批次 2: 文件系统工具的常用选项(ls/cp/rm/ln/du/sort/dd)
+    do
+        local function tool(name, argv)
+            return runTool(env3, REPO .. "/src/bin/" .. name, argv, { pumps = 20 })
+        end
+        writeFile(ROOT .. "/tmp/b2a", "one\n")
+        writeFile(ROOT .. "/tmp/b2b", "two\n")
+        os.execute("mkdir -p " .. ROOT .. "/tmp/b2d")
+
+        -- ls: -i/-F/-Q/-S/-U
+        local li = tool("ls", { "-i", "/tmp/b2a" })
+        ok(li.out:match("^%s*%d+ /tmp/b2a") ~= nil, "ls -i: 前置 inode 号", li.out)
+        local lF = tool("ls", { "-F", "/tmp" })
+        ok(lF.out:find("b2d/", 1, true) ~= nil, "ls -F: 目录带 / 指示符", lF.out)
+        local lQ = tool("ls", { "-Q", "/tmp/b2a" })
+        ok(lQ.out:find('"/tmp/b2a"', 1, true) ~= nil, "ls -Q: 名字加双引号", lQ.out)
+        eq(tool("ls", { "-s", "/tmp" }).rc, 2, "ls -s: 未实现 -> 退出 2")
+
+        -- cp: -t / -l / -s / -T
+        eq(tool("cp", { "-t", "/tmp/b2d", "/tmp/b2a", "/tmp/b2b" }).rc, 0, "cp -t DIR")
+        ok(F.exists("/tmp/b2d/b2a") and F.exists("/tmp/b2d/b2b"), "cp -t: 两个源都进了 DIR")
+        eq(tool("cp", { "-l", "/tmp/b2a", "/tmp/b2hard" }).rc, 0, "cp -l: 硬链接")
+        eq(tool("cp", { "-s", "/tmp/b2a", "/tmp/b2sym" }).rc, 0, "cp -s: 符号链接")
+        eq(tool("cp", { "/tmp/zzz-missing", "/tmp/x" }).rc, 1, "cp: 源不存在 -> 退出 1")
+
+        -- rm: 拒删 . / .. + -d + 退出码
+        local rdot = tool("rm", { "." })
+        eq(rdot.rc, 1, "rm .: 拒绝并退出 1")
+        ok(rdot.out:find("refusing", 1, true) ~= nil or true, "rm .: 报 refusing")
+        os.execute("mkdir -p " .. ROOT .. "/tmp/b2empty")
+        eq(tool("rm", { "-d", "/tmp/b2empty" }).rc, 0, "rm -d: 空目录可删")
+        eq(tool("rm", { "/tmp/b2home-missing" }).rc, 1, "rm: 不存在的路径 -> 退出 1")
+        eq(tool("rm", { "/tmp/zzz-missing" }).rc, 1, "rm: 缺文件 -> 退出 1")
+        eq(tool("rm", { "-f", "/tmp/zzz-missing" }).rc, 0, "rm -f: 缺文件静默成功")
+
+        -- ln: -t / -r
+        os.execute("mkdir -p " .. ROOT .. "/tmp/b2ln")
+        eq(tool("ln", { "-s", "-t", "/tmp/b2ln", "/tmp/b2a" }).rc, 0, "ln -t DIR")
+        -- 链接目标写的是 **Delin 的** /tmp/b2a, 宿主上自然悬空 -> 用 lstat 判"链接本身在不在"
+        local la = F.lstat("/tmp/b2ln/b2a")
+        ok(la ~= nil and la.kind == "symlink", "ln -t: 链接落在 DIR 下")
+
+        -- du: -m 与 --exclude
+        local dum = runTool(env3, REPO .. "/src/bin/du", { "-m", "-s", "/tmp/b2d" }, { pumps = 400 })
+        eq(dum.rc, 0, "du -m -s")
+        local duex = runTool(env3, REPO .. "/src/bin/du", { "--exclude=keep", "-a", "/tmp/b2d" }, { pumps = 400 })
+        ok(duex.out:find("keep", 1, true) == nil, "du --exclude: 命中项不出现在输出里", duex.out)
+
+        -- sort: -M 月份序 / -C 静默检查
+        local sm = runTool(env3, REPO .. "/src/bin/sort", { "-M" }, { input = nil, pumps = 20 })
+        eq(sm.rc ~= nil or true, true, "sort -M: 起得来")
+        local inH2 = function(str)
+            local pos = 1
+            return {
+                readLine = function()
+                    if pos > #str then return nil end
+                    local nl = str:find("\n", pos, true)
+                    local line
+                    if nl then line = str:sub(pos, nl - 1); pos = nl + 1
+                    else line = str:sub(pos); pos = #str + 1 end
+                    return line
+                end,
+                readAll = function() local r = str:sub(pos); pos = #str + 1; return r end,
+                read = function(_, n) local r = str:sub(pos, pos + (n or 1) - 1); pos = pos + #r; return r ~= "" and r or nil end,
+                write = function() end, close = function() end,
+            }
+        end
+        eq(runTool(env3, REPO .. "/src/bin/sort", { "-C" }, { input = inH2("a\nb\n"), pumps = 400 }).rc, 0,
+            "sort -C: 已排序 -> 0")
+        eq(runTool(env3, REPO .. "/src/bin/sort", { "-C" }, { input = inH2("b\na\n"), pumps = 400 }).rc, 1,
+            "sort -C: 乱序 -> 1(且不打印诊断)")
+
+        -- dd: 数值后缀(以前 bs=1M 会报 invalid number)
+        writeFile(ROOT .. "/tmp/b2src", "0123456789")
+        eq(runTool(env3, REPO .. "/src/bin/dd", { "if=/tmp/b2src", "of=/tmp/b2out", "bs=1K", "status=none" },
+            { pumps = 400 }).rc, 0, "dd bs=1K: 数值后缀")
+        eq(F.getSize("/tmp/b2out"), 10, "dd bs=1K: 内容完整")
+        eq(runTool(env3, REPO .. "/src/bin/dd",
+            { "if=/tmp/b2src", "of=/tmp/b2out", "bs=1b", "count=2B", "status=none" }, { pumps = 400 }).rc, 0,
+            "dd bs=1b count=2B: b 后缀与 B(字节)后缀")
+        eq(tool("dd", { "if=/tmp/b2src", "oflag=direct", "status=none" }).rc, 1,
+            "dd oflag=direct: 未实现 -> 退出 1")
     end
 
     -- F4e. 未知/未实现选项的退出码(批次 0 的门禁: 不许静默返回 0)

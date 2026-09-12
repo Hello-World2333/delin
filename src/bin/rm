@@ -23,6 +23,9 @@ local function stderr(s)
 end
 
 local recursive, force, interactive, verbose = false, false, false, false
+local dirOnly = false          -- -d: 删空目录(不递归)
+local promptOnce = false       -- -I: 删多于 3 个或递归时只问一次
+local noPreserveRoot = false   -- --no-preserve-root: 允许对 "/" 动手
 local rest = {}
 local noMoreOpts = false
 
@@ -31,6 +34,8 @@ local function setShort(ch)
     elseif ch == "f" then force = true
     elseif ch == "i" then interactive = true
     elseif ch == "v" then verbose = true
+    elseif ch == "d" then dirOnly = true
+    elseif ch == "I" then promptOnce = true
     else stderr("rm: invalid option -- '" .. ch .. "'\n"); return false end
     return true
 end
@@ -44,8 +49,19 @@ for _, a in ipairs(args) do
     elseif a == "--force" then force = true
     elseif a == "--interactive" then interactive = true
     elseif a == "--verbose" then verbose = true
+    elseif a == "--dir" then dirOnly = true
+    elseif a == "--preserve-root" then noPreserveRoot = false
+    elseif a == "--no-preserve-root" then noPreserveRoot = true
+    elseif a == "--interactive=once" then promptOnce = true
+    elseif a:match("^%-%-interactive=") then interactive = true
+    elseif a:match("^%-%-one%-file%-system") then
+        stderr("rm: option '" .. a .. "' is not supported\n")
+        return 2
+    elseif a:sub(1, 2) == "--" then
+        stderr("rm: unrecognized option '" .. a .. "'\n")
+        return 1
     elseif a:sub(1, 1) == "-" and a ~= "-" then
-        for k = 2, #a do if not setShort(a:sub(k, k)) then return end end
+        for k = 2, #a do if not setShort(a:sub(k, k)) then return 1 end end
     else
         rest[#rest + 1] = a
     end
@@ -64,31 +80,78 @@ local function askRemove(p, isDir)
     return line and line:match("^[yY]")
 end
 
+-- 让出调度器: 删大树(rm -rf 一个上千条目的目录)时逐条目让出一次 —— CC 对"~7s 不让出"
+-- 的进程直接报 "Too long without yielding" 并杀掉(真机引导日志里就是这么暴露的:
+-- verify 服务里的 rm -rf 被掐断, 后面的自检也就没跑完)。50ms CPU 时间片让出一次。
+local _msleep = os.msleep or function(ms) os.sleep(math.max((ms or 0) / 1000, 0.05)) end
+local _sliceAt = os.epoch("utc")
+local function yieldCheck()
+    local now = os.epoch("utc")
+    if now - _sliceAt >= 50 then
+        _sliceAt = now
+        _msleep(0)
+    end
+end
+
+--- 递归删除; 返回 true 表示全部删成功。
+--- (-d 只删空目录: 不递归, 让 fs.delete 的 ENOTEMPTY 报出来)
 local function rmTree(p)
     local isDir = fs.isDir(p)
-    if isDir then
+    if isDir and recursive then
         for _, n in ipairs(fs.list(p) or {}) do
+            yieldCheck()
             rmTree(fs.combine(p, n))
         end
     end
     if interactive and not force then
-        if not askRemove(p, isDir) then return end
+        if not askRemove(p, isDir) then return true end
     end
     local ok, err = pcall(fs.delete, p)
     if not ok then
-        stderr("rm: " .. p .. ": " .. tostring(err) .. "\n")
-    elseif verbose then
-        io.write("removed '" .. p .. "'\n")
+        stderr("rm: cannot remove '" .. p .. "': " .. tostring(err) .. "\n")
+        return false
+    end
+    if verbose then io.write("removed '" .. p .. "'\n") end
+    return true
+end
+
+-- -I: 删多于 3 个操作数、或递归删除时, 只问一次(GNU 语义)
+if promptOnce and not force and (#rest > 3 or recursive) then
+    io.write("rm: remove " .. #rest .. " argument" .. (#rest == 1 and "" or "s") .. "? ")
+    io.flush()
+    local sin = io.stdin()
+    local line = sin and sin.readLine and sin:readLine() or nil
+    if not (line and line:match("^[yY]")) then
+        return 0
     end
 end
 
-for _, p in ipairs(rest) do
-    p = resolve(p)
-    if not fs.exists(p) then
-        if not force then stderr("rm: " .. p .. ": No such file or directory\n") end
-    elseif fs.isDir(p) and not recursive then
-        stderr("rm: " .. p .. ": Is a directory\n")
+local rc = 0
+for _, raw in ipairs(rest) do
+    yieldCheck()
+    -- GNU 拒绝 "." 与 "..": `rm -r .` 会把当前目录整个删掉 —— 这条不是洁癖, 是安全底线。
+    local base = raw:gsub("/+$", "")
+    local lastSeg = base:match("[^/]*$") or base
+    if lastSeg == "." or lastSeg == ".." then
+        stderr("rm: refusing to remove '.' or '..' directory: skipping '" .. raw .. "'\n")
+        rc = 1
     else
-        rmTree(p)
+        local p = resolve(raw)
+        if p == "/" and recursive and not noPreserveRoot then
+            stderr("rm: it is dangerous to operate recursively on '/'\n"
+                .. "rm: use --no-preserve-root to override this failsafe\n")
+            rc = 1
+        elseif not fs.exists(p) then
+            if not force then
+                stderr("rm: cannot remove '" .. p .. "': No such file or directory\n")
+                rc = 1
+            end
+        elseif fs.isDir(p) and not (recursive or dirOnly) then
+            stderr("rm: cannot remove '" .. p .. "': Is a directory\n")
+            rc = 1
+        else
+            if not rmTree(p) then rc = 1 end
+        end
     end
 end
+return rc

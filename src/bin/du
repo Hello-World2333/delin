@@ -72,6 +72,38 @@ end
 local showAll, summarize, oneFs, totalOpt = false, false, false, false
 local blockSize, humanOut = 512, false
 local maxDepth, operands, noMoreOpts = math.huge, {}, false
+local siUnits = false             -- --si / -H: 1000 进制
+local countLinks = false          -- -l: 同一 inode 反复计数(GNU 默认只算一次)
+local threshold = nil             -- -t SIZE
+local excludes = {}               -- --exclude=GLOB
+local deref = nil                 -- -L 跟随 / -P 不跟随(缺省)
+
+--- -B/--block-size 与 -t 的尺寸后缀(与 df 同一张表)。
+local SIZE_UNITS = { k = 1024, K = 1024, KB = 1000, M = 1048576, MB = 1000000,
+                     G = 1073741824, GB = 1000000000, b = 512 }
+local function parseSize(v)
+    v = tostring(v or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    local num, suf = v:match("^(%d+%.?%d*)(%a*)$")
+    if not num then return nil end
+    local n = tonumber(num)
+    if n < 0 then return nil end
+    if suf ~= "" then
+        local mult = SIZE_UNITS[suf] or SIZE_UNITS[suf:upper()]
+        if not mult then return nil end
+        n = n * mult
+    end
+    return math.floor(n)
+end
+
+--- --exclude 的通配符匹配(与 grep/ls 的同一套简化 glob)。
+local function globMatch(pat, name)
+    local re = "^" .. pat:gsub("[%^%$%(%)%%%.%[%]%+%-%?%*]", function(c)
+        if c == "*" then return ".*" end
+        if c == "?" then return "." end
+        return "%" .. c
+    end) .. "$"
+    return name:match(re) ~= nil
+end
 
 local function setShort(ch)
     if ch == "a" then showAll = true
@@ -81,6 +113,12 @@ local function setShort(ch)
     elseif ch == "h" then blockSize, humanOut = 1, true
     elseif ch == "c" then totalOpt = true
     elseif ch == "x" then oneFs = true
+    elseif ch == "m" then blockSize, humanOut = 1048576, false
+    elseif ch == "H" then blockSize, humanOut, siUnits = 1, true, true
+    elseif ch == "l" then countLinks = true
+    elseif ch == "L" then deref = true
+    elseif ch == "P" then deref = false
+    elseif ch == "B" or ch == "t" then return true -- 带参数, 由循环消费
     else stderr("du: invalid option -- '" .. ch .. "'\n"); return false end
     return true
 end
@@ -108,6 +146,49 @@ while i <= #args do
     elseif a == "--human-readable" then blockSize, humanOut = 1, true
     elseif a == "--total" then totalOpt = true
     elseif a == "--one-file-system" then oneFs = true
+    elseif a == "--si" then humanOut, siUnits = true, true
+    elseif a == "--count-links" then countLinks = true
+    elseif a == "--dereference" then deref = true
+    elseif a == "--no-dereference" then deref = false
+    elseif a == "--apparent-size" or a == "--inodes" or a == "--files0-from"
+        or a:match("^%-%-time") then
+        stderr("du: option '" .. a .. "' is not supported\n")
+        return 2
+    elseif a:match("^%-%-exclude=") then
+        excludes[#excludes + 1] = a:sub(11)
+    elseif a == "--exclude" then
+        if not args[i + 1] then stderr("du: option '--exclude' requires an argument\n"); return 2 end
+        excludes[#excludes + 1] = args[i + 1]; i = i + 1
+    elseif a == "--threshold" or a == "-t" then
+        if not args[i + 1] then stderr("du: option '" .. a .. "' requires an argument\n"); return 2 end
+        local v = args[i + 1]
+        local neg = v:sub(1, 1) == "-"
+        threshold = parseSize(neg and v:sub(2) or v)
+        if not threshold then stderr("du: invalid --threshold argument '" .. v .. "'\n"); return 2 end
+        if neg then threshold = -threshold end
+        i = i + 1
+    elseif a:match("^%-%-threshold=") then
+        local v = a:sub(13)
+        local neg = v:sub(1, 1) == "-"
+        threshold = parseSize(neg and v:sub(2) or v)
+        if not threshold then stderr("du: invalid --threshold argument '" .. v .. "'\n"); return 2 end
+        if neg then threshold = -threshold end
+    elseif a == "--block-size" or a == "-B" then
+        if not args[i + 1] then stderr("du: option '" .. a .. "' requires an argument\n"); return 2 end
+        local n = parseSize(args[i + 1])
+        if not n or n < 1 then stderr("du: invalid block size '" .. args[i + 1] .. "'\n"); return 2 end
+        blockSize, humanOut = n, false
+        i = i + 1
+    elseif a:match("^%-B.") then
+        local n = parseSize(a:sub(3))
+        if not n or n < 1 then stderr("du: invalid block size '" .. a:sub(3) .. "'\n"); return 2 end
+        blockSize, humanOut = n, false
+    elseif a:match("^%-t.") then
+        local v = a:sub(3)
+        local neg = v:sub(1, 1) == "-"
+        threshold = parseSize(neg and v:sub(2) or v)
+        if not threshold then stderr("du: invalid --threshold argument '" .. v .. "'\n"); return 2 end
+        if neg then threshold = -threshold end
     elseif a == "--max-depth" then
         if not args[i + 1] then stderr("du: option '--max-depth' requires an argument\n"); return 1 end
         if not setMaxDepth(args[i + 1]) then return 1 end
@@ -115,11 +196,11 @@ while i <= #args do
     elseif a:match("^%-%-max%-depth=") then
         if not setMaxDepth(a:sub(13)) then return 1 end
     elseif a:match("^%-%-block%-size=") then
-        local s = a:sub(14)
-        local n = tonumber(s)
-        if not n or n < 1 or n ~= math.floor(n) then
-            stderr("du: invalid block size '" .. s .. "'\n")
-            return 1
+        local sv = a:sub(14)
+        local n = parseSize(sv)
+        if not n or n < 1 then
+            stderr("du: invalid block size '" .. sv .. "'\n")
+            return 2
         end
         blockSize, humanOut = n, false
     elseif a:sub(1, 1) == "-" and a ~= "-" then
@@ -133,10 +214,11 @@ if summarize then maxDepth = 0 end
 
 --- 人类可读: 1024 进制, 值 < 10 保留 1 位小数, 一律向上取整(GNU du/df -h 的舍入方向)。
 local function human(n)
-    if n < 1024 then return string.format("%d", n) end
-    local units = { "K", "M", "G", "T", "P", "E" }
-    local idx, v = 1, n / 1024
-    while v >= 1024 and idx < #units do v = v / 1024; idx = idx + 1 end
+    local base = siUnits and 1000 or 1024
+    if n < base then return string.format("%d", n) end
+    local units = { siUnits and "k" or "K", "M", "G", "T", "P", "E" }
+    local idx, v = 1, n / base
+    while v >= base and idx < #units do v = v / base; idx = idx + 1 end
     if v < 10 then
         local tenths = math.ceil(v * 10) / 10
         if tenths < 10 then return string.format("%.1f", tenths) .. units[idx] end
@@ -153,8 +235,21 @@ end
 
 local function emit(bytes, path, depth)
     if depth > maxDepth then return end
+    -- -t SIZE: 正数只列 >= SIZE 的; 负数只列 <= |SIZE| 的(GNU 语义)
+    if threshold then
+        if threshold >= 0 and bytes < threshold then return end
+        if threshold < 0 and bytes > -threshold then return end
+    end
     local s = humanOut and human(bytes) or string.format("%d", bytes / blockSize)
     io.write(s .. "\t" .. path .. "\n")
+end
+
+--- --exclude=GLOB: 名字命中就不算它(与 GNU 一样按 basename 匹配)。
+local function excluded(name)
+    for _, g in ipairs(excludes) do
+        if globMatch(g, name) then return true end
+    end
+    return false
 end
 
 --- /dev、/proc、/sys 下的条目(块设备与虚拟文件系统)在递归中一律跳过。
@@ -180,10 +275,15 @@ local function walk(dir, dispSelf, dispBase, depth, drive)
     table.sort(names)
     local total = 0
     for _, n in ipairs(names) do
-        if n ~= "." and n ~= ".." then
+        if n ~= "." and n ~= ".." and not excluded(n) then
             local child = joinPath(dir, n)
             local cdisp = joinPath(dispBase, n)
-            if not isVirtual(child) then
+            local isLink = false
+            if deref == false and fs.lstat then
+                local la = fs.lstat(child)
+                isLink = la and la.kind == "symlink" or false
+            end
+            if not isVirtual(child) and not isLink then
                 if fs.isDir(child) then
                     if not (oneFs and fs.getDrive(child) ~= drive) then
                         total = total + walk(child, cdisp, cdisp, depth + 1, drive)
@@ -239,3 +339,4 @@ if totalOpt then
     local s = humanOut and human(grand) or string.format("%d", grand / blockSize)
     io.write(s .. "\ttotal\n")
 end
+return 0

@@ -26,22 +26,36 @@ end
 
 local recursive, interactive, force, noClobber, verbose, preserve = false, false, false, false, false, false
 local srcs = {}
+local sourcesRaw = nil
 local noMoreOpts = false
+
+local optNoDeref, optUpdate, optLink, optSymlink = false, false, false, false
+local optNoTargetDir, targetDir = false, nil
 
 local function setShort(ch)
     if ch == "r" or ch == "R" then recursive = true
-    elseif ch == "a" then recursive = true; preserve = true
+    elseif ch == "a" then recursive, preserve = true, true
     elseif ch == "i" then interactive = true
     elseif ch == "f" then force = true
     elseif ch == "n" then noClobber = true
     elseif ch == "v" then verbose = true
     elseif ch == "p" then preserve = true
-    elseif ch == "d" then preserve = true
+    elseif ch == "d" then optNoDeref, preserve = true, true
+    elseif ch == "P" then optNoDeref = true
+    elseif ch == "L" then optNoDeref = false
+    elseif ch == "u" then optUpdate = true
+    elseif ch == "l" then optLink = true
+    elseif ch == "s" then optSymlink = true
+    elseif ch == "T" then optNoTargetDir = true
+    elseif ch == "t" then return true -- 带参数, 由下面的循环消费
     else stderr("cp: invalid option -- '" .. ch .. "'\n"); return false end
     return true
 end
 
-for _, a in ipairs(args) do
+local ci = 0
+while ci < #args do
+    ci = ci + 1
+    local a = args[ci]
     if noMoreOpts then
         srcs[#srcs + 1] = a
     elseif a == "--" then
@@ -52,7 +66,25 @@ for _, a in ipairs(args) do
     elseif a == "--no-clobber" then noClobber = true
     elseif a == "--verbose" then verbose = true
     elseif a == "--preserve" then preserve = true
-    elseif a == "--archive" then recursive = true; preserve = true
+    elseif a == "--archive" then recursive, preserve = true, true
+    elseif a == "--update" then optUpdate = true
+    elseif a == "--no-dereference" then optNoDeref = true
+    elseif a == "--dereference" then optNoDeref = false
+    elseif a == "--link" then optLink = true
+    elseif a == "--symbolic-link" then optSymlink = true
+    elseif a == "--no-target-directory" then optNoTargetDir = true
+    elseif a == "--preserve=all" or a:match("^%-%-preserve") then preserve = true
+    elseif a == "--parents" or a:match("^%-%-backup") or a:match("^%-%-suffix") then
+        stderr("cp: option '" .. a .. "' is not supported\n")
+        return 2
+    elseif a == "-t" or a == "--target-directory" then
+        ci = ci + 1
+        targetDir = args[ci]
+        if not targetDir then stderr("cp: option '" .. a .. "' requires an argument\n"); return 2 end
+    elseif a:match("^%-%-target%-directory=") then
+        targetDir = a:sub(20)
+    elseif a:match("^%-t.") then
+        targetDir = a:sub(3)
     elseif a:sub(1, 2) == "--" then
         stderr("cp: unrecognized option '" .. a .. "'\n")
         return 1
@@ -62,15 +94,26 @@ for _, a in ipairs(args) do
         srcs[#srcs + 1] = a
     end
 end
-if #srcs < 2 then
-    stderr("cp: missing destination file operand\n")
-    return 1
+if targetDir then
+    -- -t DIR: 全部操作数都是源
+    destRaw = targetDir
+    sourcesRaw = srcs
+    srcs = nil
+else
+    if #srcs < 2 then
+        stderr("cp: missing destination file operand\n")
+        return 1
+    end
+    destRaw = srcs[#srcs]
 end
-local destRaw = srcs[#srcs]
 local destHintIsDir = destRaw:sub(-1) == "/"
 local dest = resolve(destRaw)
 local sources = {}
-for j = 1, #srcs - 1 do sources[#sources + 1] = resolve(srcs[j]) end
+if sourcesRaw then
+    for _, r in ipairs(sourcesRaw) do sources[#sources + 1] = resolve(r) end
+else
+    for j = 1, #srcs - 1 do sources[#sources + 1] = resolve(srcs[j]) end
+end
 
 local function basename(p)
     p = (type(p) == "string" and p) or ""
@@ -97,9 +140,59 @@ local function shouldOverwrite(dst)
     return true
 end
 
+--- -u: 只有源比目标新才复制(目标不存在也算"要复制")。
+local function updateAllows(src, dst)
+    if not optUpdate then return true end
+    if not fs.exists(dst) then return true end
+    local a = attrsOrNil(src)
+    local b = attrsOrNil(dst)
+    local ms, md = a and (a.mtime or a.modificationTime), b and (b.mtime or b.modificationTime)
+    if not ms or not md then return true end
+    return ms > md
+end
+
 -- 流式复制单个文件。
 local function copyFile(src, dst)
     if src == dst then return nil, "`" .. src .. "' and `" .. dst .. "' are the same file" end
+    if not updateAllows(src, dst) then return true end
+    -- -P/-d: 源是符号链接就照原样复制链接(不跟随)
+    if optNoDeref and fs.lstat and fs.readlink and fs.symlink then
+        local la = fs.lstat(src)
+        if la and la.kind == "symlink" then
+            if fs.exists(dst) then
+                if not shouldOverwrite(dst) then return true end
+                if not force then return nil, "cannot create symbolic link: file exists" end
+                pcall(fs.delete, dst)
+            end
+            local tgt = fs.readlink(src)
+            local ok, err = pcall(fs.symlink, tgt, dst)
+            if not ok then return nil, tostring(err) end
+            if verbose then io.write("'" .. src .. "' -> '" .. dst .. "'\n") end
+            return true
+        end
+    end
+    -- -l: 建硬链接; -s: 建符号链接
+    if optLink and fs.link then
+        if fs.exists(dst) then
+            if not shouldOverwrite(dst) then return true end
+            if not force then return nil, "cannot create hard link: file exists" end
+            pcall(fs.delete, dst)
+        end
+        local ok, err = pcall(fs.link, src, dst)
+        if not ok then return nil, tostring(err) end
+        if verbose then io.write("'" .. src .. "' -> '" .. dst .. "'\n") end
+        return true
+    end
+    if optSymlink and fs.symlink then
+        if fs.exists(dst) then
+            if not force then return nil, "cannot create symbolic link: file exists" end
+            pcall(fs.delete, dst)
+        end
+        local ok, err = pcall(fs.symlink, src, dst)
+        if not ok then return nil, tostring(err) end
+        if verbose then io.write("'" .. src .. "' -> '" .. dst .. "'\n") end
+        return true
+    end
     local inF, ierr = fs.open(src, "r")
     if not inF then return nil, (ierr or ("cannot open " .. src)) end
     if not shouldOverwrite(dst) then inF:close(); return true end
@@ -130,6 +223,9 @@ local function copyTree(src, dst)
     if not fs.isDir(src) then
         return copyFile(src, dst)
     end
+    if fs.exists(dst) and not fs.isDir(dst) then
+        return nil, "cannot overwrite non-directory with directory"
+    end
     if not fs.exists(dst) then
         local ok, err = pcall(fs.makeDir, dst)
         if not ok then return nil, "mkdir '" .. dst .. "' failed: " .. tostring(err) end
@@ -148,30 +244,41 @@ local function copyTree(src, dst)
     return true
 end
 
+-- 任何一个操作数失败都要退出 1(以前这里是裸 return -> 内核当 0, "报错却成功")。
+local rc = 0
+if #sources == 0 then
+    stderr("cp: missing file operand\n")
+    return 1
+end
 for _, src in ipairs(sources) do
     if not fs.exists(src) then
         stderr("cp: " .. src .. ": No such file or directory\n")
-        return 1
-    end
-    local target
-    if fs.isDir(dest) or destHintIsDir then
-        target = join(dest, basename(src))
+        rc = 1
     else
-        if #sources > 1 then
-            stderr("cp: target '" .. destRaw .. "' is not a directory\n")
-            return 1
+        local target
+        if optNoTargetDir then
+            target = dest
+        elseif fs.isDir(dest) or destHintIsDir then
+            target = join(dest, basename(src))
+        else
+            if #sources > 1 then
+                stderr("cp: target '" .. destRaw .. "' is not a directory\n")
+                return 1
+            end
+            target = dest
         end
-        target = dest
-    end
-    if fs.isDir(src) then
-        if not recursive then
-            stderr("cp: " .. src .. ": is a directory (use -r)\n")
-            return 1
+        if fs.isDir(src) and not (optNoDeref and fs.lstat and fs.lstat(src).kind == "symlink") then
+            if not recursive then
+                stderr("cp: -r not specified; omitting directory '" .. src .. "'\n")
+                rc = 1
+            else
+                local ok, err = copyTree(src, target)
+                if not ok then stderr("cp: " .. src .. ": " .. tostring(err) .. "\n"); rc = 1 end
+            end
+        else
+            local ok, err = copyFile(src, target)
+            if not ok then stderr("cp: " .. src .. ": " .. tostring(err) .. "\n"); rc = 1 end
         end
-        local ok, err = copyTree(src, target)
-        if not ok then stderr("cp: " .. src .. ": " .. tostring(err) .. "\n"); return end
-    else
-        local ok, err = copyFile(src, target)
-        if not ok then stderr("cp: " .. src .. ": " .. tostring(err) .. "\n"); return end
     end
 end
+return rc

@@ -669,6 +669,48 @@ shebang 支持 `#!/bin/sh` / `#!/usr/bin/env sh` 等形式，env 特殊解释为
 `--color[=WHEN]`（认 `GREP_COLORS`，`auto` 看 stdout 的 `isTTY`）、`--label`。组分隔符（`--`）
 只在真的带上下文时出现（GNU 同）。
 
+#### 批次 2：各工具常用选项的落地（与 GNU 的取舍）
+
+用户态工具的选项一律**照宿主 GNU 逐项实测**对齐；下面只记那些"有坑"或"有取舍"的：
+
+- **`ls`**：新增 `-i -n -F -p -S -U -X -Q -L -H -G -g -o --color[=WHEN]`（`--color` 认 `LS_COLORS`，
+  `auto` 看 stdout 的 `isTTY`），`-l` 现在会打 `name -> target`。**`-s`/`-c`/`-u` 一律 fail-fast 退出 2**：
+  它们要"已分配块数"(st_blocks) 或 atime/ctime，而内核 `attributes` 都不暴露（见「已知缺口」）——
+  收下却打错数字比报错更糟。
+- **`cp`**：`-t DIR -T -u -l -s -P -L -d`。`-P/-d` 走 `fs.lstat`+`fs.readlink`+`fs.symlink`
+  复制链接本身（`fs.open` 必然跟随链接，不能拿它复制链接）。**每个操作数失败都要 `rc=1`** ——
+  老代码在循环里裸 `return`，于是"报错却退出 0"。
+- **`rm`**：`-d -I --[no-]preserve-root`，并且**拒绝 `.` 与 `..`**（`rm -r .` 会把当前目录整个删掉，
+  这条是安全底线），`"/"` 递归删除要显式 `--no-preserve-root`。退出码按 GNU 累计（任一失败即 1）。
+- **`ln`**：`-r -t -i -L/-P`。`-r` 的相对目标按**链接所在目录**算（GNU 语义）。
+- **`blkid`**：`-s TAG -o full|value|device|export|list -U UUID -L LABEL -t NAME=value -k -l`；
+  有过滤令牌而一个都没命中时退出 2（util-linux 同）。
+- **`df`**：`-B SIZE/--block-size -H/--si -t TYPE -x TYPE --total`；`-i` 改为 fail-fast 退出 2
+  （内核没有 inode 统计）。
+- **`du`**：`-m -H -l -L -P -B SIZE -t SIZE --si --exclude=GLOB`。**已知偏离**：Delin 按**表观大小**
+  向上取整到块（没有 st_blocks），所以 `du -m` 的绝对值与 GNU 不同 —— 这是 ext2 驱动不暴露
+  `i_blocks` 的直接后果，要等内核补。
+- **`dd`**：数值**后缀**（`bs=1M`、`count=1K`、`c/w/b`、`NxM`，以前 `bs=1M` 直接报 invalid number）、
+  `iflag=fullblock|count_bytes|skip_bytes`、`oflag=append|seek_bytes|notrunc`、`conv=fsync|fdatasync`
+  （收尾 flush）；`oflag=direct` 等依赖宿主 IO 的旗标 fail-fast。
+- **`sort`**：`-M`（月份序，未知月份在前）、`-C`（静默检查，**不打印诊断**）、`--sort=WORD`。
+  坑：`-C` 是**短选项**，在长选项 `elseif` 链里就被吃掉了，必须在那里同时置 `opt.C`，
+  否则 `quietCheck` 读不到（症状：`-C` 仍然打印 disorder）。
+- **`systemctl`**：`kill [-s SIG]`、`is-failed`（非 failed 退出 3）、`cat`、`list-timers`、
+  `--now`（enable 后接着 start）、`--quiet/--no-pager/--version`。
+- **`logger`**：`-i`（tag 后缀 `[pid]`）、`-s`（同时写 stderr）、`-f FILE`、`-e`（跳空行）、
+  `-[n]`（no-act，打印到 stdout）、`-S N`（截断）、`--prio-prefix`（每行 `<PRI>` 覆盖）；
+  网络类（`-n/-P/-d/-T/--rfc*`）fail-fast。
+- **用户工具**：`usermod -rG` 从附加组里移除（内核 `changes.groupsDel` 早就有，工具从没设过）、
+  `useradd -r`（扫一个 1000 以下的空闲 uid）、`groupadd -r/-f`；`useradd -N` 与 `groupadd -U`
+  需要内核支持（一定建同名私有组 / addGroup 没有成员参数）→ fail-fast 退出 2。
+
+**测试台的坑（这一批又踩了两次）**：`tools/hosttest.lua` 的 fs 桩缺 `lstat/symlink/readlink/link/canExecute`
+时，新写用例会在宿主上报 "attempt to call field 'symlink' (a nil value)" 而真机是好的 ——
+桩要照内核的语义补齐；`F.lstat` 对**悬空链接**必须返回一张 `kind="symlink"` 的表（宿主上的链接
+目标写的是 Delin 的路径，本来就不存在）。另外：工具**裸 `return`**（内核当 0）在宿主测试台里读到的是
+`nil`，`sort -C`/`du`/`dd` 因此把结尾补成了显式 `return 0`。
+
 #### POSIX 命令覆盖与 `proc.exec`
 
 按 Wikipedia 的 [List of POSIX commands](https://en.wikipedia.org/wiki/List_of_POSIX_commands)

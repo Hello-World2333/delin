@@ -71,7 +71,7 @@ ls $R > $T/sides
 wc -l < $T/sides > $T/n
 chkcontain six_sides '^6$' $T/n
 ls /sys/class > $T/classes
-chkcontain class_has_redstone '^redstone/$' $T/classes
+chkcontain class_has_redstone '^redstone$' $T/classes   # ls 缺省不补 '/'（GNU 语义；要斜杠用 ls -p/-F）
 for s in back bottom front left right top; do
     chk "side_${s}_dir" [ -d $R/$s ]
 done

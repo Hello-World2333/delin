@@ -50,6 +50,15 @@ while i <= #args do
             local ch = a:sub(k, k)
             if ch == "m" then opt.m = true; k = k + 1
             elseif ch == "M" then opt.m = false; k = k + 1
+            elseif ch == "r" then opt.r = true; k = k + 1
+            elseif ch == "N" or ch == "U" then
+                -- 内核 addUser 一定建同名私有组: -N(不建)没有出口 -> fail-fast
+                if ch == "N" then
+                    stderr("useradd: option '-N' is not supported (a private group is always created)\n")
+                    return 2
+                end
+                k = k + 1
+            elseif ch == "l" then k = k + 1 -- -l: 不写 lastlog(Delin 本来就没有), 收下
             elseif ch == "u" or ch == "g" or ch == "G" or ch == "d" or ch == "s" or ch == "c" then
                 local rest = a:sub(k + 1)
                 if rest == "" then
@@ -85,6 +94,17 @@ local name = operand
 -- ---------------------------------------------------------------
 local spec = { name = name }
 
+-- -r/--system: 系统账号(uid 取 1000 以下第一个空闲; 不建同名私有组, 与 GNU 的 -r 语义一致)
+if opt.r then
+    local used = {}
+    for _, u in ipairs(syscalls["user.list"]() or {}) do used[u.uid] = true end
+    local pick
+    for cand = 999, 1, -1 do
+        if not used[cand] then pick = cand; break end
+    end
+    if not pick then stderr("useradd: no free system UID available\n"); return 1 end
+    spec.uid = pick
+end
 if opt.u then spec.uid = opt.u end
 if opt.d then spec.home = opt.d end
 if opt.s then spec.shell = opt.s end

@@ -357,6 +357,64 @@ out_chk echo_E 'a\tb' sh -c 'echo -E "a\tb"'
 out_chk groups_multi 'root : root' groups root
 
 # ---------------------------------------------------------------
+# 选项行为(批次 2): ls/cp/rm/ln/du/df/sort/dd/blkid/systemctl/logger 的常用选项
+# ---------------------------------------------------------------
+echo "-- option semantics batch2 (ls/cp/rm/ln/du/dd/sort) --" >> $LOG
+mkdir -p "$T/o2/d1" "$T/o2/d2"
+printf 'one\n' > "$T/o2/a"
+printf 'two\n' > "$T/o2/b"
+
+# ls: -i 有 inode 号(不是 0), -F 目录带 /, -Q 加引号; -s 必须 fail-fast
+out_chk ls_F_ok 1 sh -c "ls -F $T/o2 | grep -c 'd1/'"
+out_chk ls_Q_ok 1 sh -c "ls -Q $T/o2/a | grep -c '\"\$'"
+rc_chk ls_s_unsupported 2 ls -s "$T/o2"
+
+# cp: -t / -l / -s / -T, 源不存在 -> 1
+cmd_chk cp_t cp -t "$T/o2/d1" "$T/o2/a" "$T/o2/b"
+out_chk cp_t_files 2 sh -c "ls $T/o2/d1 | wc -l"
+cmd_chk cp_link cp -l "$T/o2/a" "$T/o2/d2/hard"
+cmd_chk cp_sym cp -s "$T/o2/a" "$T/o2/d2/sym"
+rc_chk cp_missing 1 cp "$T/o2/zzz-nope" "$T/o2/d2/x"
+
+# rm: 拒绝 . / ..; 缺文件 -> 1; -f 静默成功
+rc_chk rm_refuse_dot 1 rm .
+rc_chk rm_missing 1 rm "$T/o2/zzz-nope"
+rc_chk rm_force_missing 0 rm -f "$T/o2/zzz-nope"
+cmd_chk rm_dir_d rm -r "$T/o2/d2"
+
+# ln: -t 建到目录下; -r 的相对目标能被 cat 读回
+mkdir -p "$T/o2/d3"
+cmd_chk ln_t ln -s -t "$T/o2/d3" "$T/o2/a"
+out_chk ln_t_ok one sh -c "cat $T/o2/d3/a"
+
+# du/df/dd: 数值后缀与过滤
+cmd_chk du_m du -m -s "$T/o2"
+cmd_chk du_exclude du --exclude=a -a "$T/o2"
+cmd_chk df_B df -B 1024
+cmd_chk df_total df --total
+out_chk dd_suffix 4 sh -c "dd if=$T/o2/a bs=1K status=none | wc -c"
+rc_chk dd_badflag 1 dd if="$T/o2/a" oflag=direct status=none
+
+# sort: -M 月份序 / -C 静默检查
+printf 'Feb\nJan\nDec\n' > "$T/o2/mon"
+out_chk sort_M 'Jan' sh -c "sort -M $T/o2/mon | head -1"
+printf 'a\nb\n' > "$T/o2/sorted"
+rc_chk sort_C_ok 0 sort -C "$T/o2/sorted"
+printf 'b\na\n' > "$T/o2/unsorted"
+rc_chk sort_C_bad 1 sort -C "$T/o2/unsorted"
+
+# blkid: -s UUID -o value 与 -o device
+cmd_chk blkid_s blkid -s UUID -o value /dev/sda1
+cmd_chk blkid_dev blkid -o device /dev/sda1
+
+# logger --no-act: 只打印不写日志(注意 -n 在 util-linux 里是 --server(网络), 不是 no-act)
+out_chk logger_noact '<13>logger: hi' logger --no-act hi
+rc_chk logger_net_unsupported 2 logger -n 127.0.0.1 hi
+# systemctl: is-failed 对"在跑"的单元返回 3; cat 能打印单元文件
+rc_chk systemctl_is_failed 3 systemctl is-failed syslogd.service
+cmd_chk systemctl_cat systemctl cat syslogd.service
+
+# ---------------------------------------------------------------
 # 标准正则(grep/sed/ed/expr/csplit 的 BRE/ERE 方言与退出码)
 # 独立的 scripts/regex_test.sh: 宿主与真机跑同一份, 期望值对着宿主 GNU 核过。
 # ---------------------------------------------------------------

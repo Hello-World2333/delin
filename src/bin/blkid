@@ -12,18 +12,98 @@ local function stderr(s)
     if e and e.write then e:write(s) end
 end
 
+-- 选项(util-linux blkid 子集):
+--   -s TAG, --match-tag TAG   只显示这些标签(UUID/TYPE/LABEL), 可多次
+--   -o FORMAT, --output FORMAT  full(缺省) / value / device / export / list
+--   -U UUID / -L LABEL        按 UUID/LABEL 反查设备(等价 -l -o device -t ...)
+--   -t NAME=value, --match-token NAME=value  按标签过滤设备
+--   -k, --list-filesystems    只列出内核认识的文件系统类型
+--   -l, --list-one            只输出第一个匹配
+--   -p/--probe 与 -c/-w/-i/-u/-n/-S 等缓存/拓扑类开关在 Delin 上无意义 -> fail-fast 退出 2
 local operands, noMoreOpts = {}, false
-for _, a in ipairs(args) do
+local matchTags, outFormat = nil, "full"
+local tokenFilter = nil
+local listOne, listFs = false, false
+
+local function needArg(i, a)
+    local v = args[i + 1]
+    if not v then stderr("blkid: option '" .. a .. "' requires an argument\n") end
+    return v
+end
+
+local function addTag(t)
+    t = (t or ""):upper()
+    if t ~= "UUID" and t ~= "TYPE" and t ~= "LABEL" then
+        stderr("blkid: unknown tag '" .. t .. "'\n")
+        return false
+    end
+    matchTags = matchTags or {}
+    matchTags[#matchTags + 1] = t
+    return true
+end
+
+local i = 1
+while i <= #args do
+    local a = args[i]
     if noMoreOpts then
         operands[#operands + 1] = a
     elseif a == "--" then
         noMoreOpts = true
+    elseif a == "-s" or a == "--match-tag" then
+        local v = needArg(i, a); if not v then return 2 end
+        if not addTag(v) then return 2 end
+        i = i + 1
+    elseif a:match("^%-%-match%-tag=") then
+        if not addTag(a:sub(13)) then return 2 end
+    elseif a == "-o" or a == "--output" then
+        local v = needArg(i, a); if not v then return 2 end
+        outFormat = v; i = i + 1
+    elseif a:match("^%-%-output=") then
+        outFormat = a:sub(10)
+    elseif a == "-U" or a == "--uuid" then
+        local v = needArg(i, a); if not v then return 2 end
+        tokenFilter = { key = "UUID", value = v }; outFormat = "device"; listOne = true; i = i + 1
+    elseif a:match("^%-%-uuid=") then
+        tokenFilter = { key = "UUID", value = a:sub(8) }; outFormat = "device"; listOne = true
+    elseif a == "-L" or a == "--label" then
+        local v = needArg(i, a); if not v then return 2 end
+        tokenFilter = { key = "LABEL", value = v }; outFormat = "device"; listOne = true; i = i + 1
+    elseif a:match("^%-%-label=") then
+        tokenFilter = { key = "LABEL", value = a:sub(9) }; outFormat = "device"; listOne = true
+    elseif a == "-t" or a == "--match-token" then
+        local v = needArg(i, a); if not v then return 2 end
+        local k, val = v:match("^([%a]+)=(.*)$")
+        if not k then stderr("blkid: invalid token '" .. v .. "'\n"); return 2 end
+        tokenFilter = { key = k:upper(), value = val }; i = i + 1
+    elseif a:match("^%-%-match%-token=") then
+        local k, val = a:sub(15):match("^([%a]+)=(.*)$")
+        if not k then stderr("blkid: invalid token '" .. a:sub(15) .. "'\n"); return 2 end
+        tokenFilter = { key = k:upper(), value = val }
+    elseif a == "-k" or a == "--list-filesystems" then listFs = true
+    elseif a == "-l" or a == "--list-one" then listOne = true
+    elseif a == "-h" or a == "--help" then
+        io.write("usage: blkid [-s TAG] [-o FORMAT] [-U UUID] [-L LABEL] [-t NAME=value] [device...]\n")
+        return 0
+    elseif a == "-V" or a == "--version" then
+        io.write("blkid (Delin OS)\n")
+        return 0
+    elseif a == "-p" or a == "--probe" or a == "-c" or a == "-w" or a == "-i" or a == "-u"
+        or a == "-n" or a == "-S" or a == "-g" or a == "-H" or a == "-d" or a == "-D" or a == "-O" then
+        stderr("blkid: option '" .. a .. "' is not supported\n")
+        return 2
     elseif a:sub(1, 1) == "-" and a ~= "-" then
         stderr("blkid: invalid option -- '" .. a:sub(2, 2) .. "'\n")
         return 1
     else
         operands[#operands + 1] = a
     end
+    i = i + 1
+end
+
+if outFormat ~= "full" and outFormat ~= "value" and outFormat ~= "device"
+    and outFormat ~= "export" and outFormat ~= "list" then
+    stderr("blkid: unsupported output format '" .. outFormat .. "'\n")
+    return 2
 end
 
 local list = syscalls and syscalls["blkdev.list"] and syscalls["blkdev.list"]()
@@ -40,23 +120,81 @@ local function find(spec)
     return nil
 end
 
-local function show(e)
-    local parts = {}
-    if e.uuid then parts[#parts + 1] = 'UUID="' .. e.uuid .. '"' end
-    if e.fstype then parts[#parts + 1] = 'TYPE="' .. e.fstype .. '"' end
-    if e.label then parts[#parts + 1] = 'LABEL="' .. e.label .. '"' end
-    io.write(e.node .. ": " .. table.concat(parts, " ") .. "\n")
+--- 设备的一个标签值。
+local function tagValue(e, key)
+    if key == "UUID" then return e.uuid end
+    if key == "TYPE" then return e.fstype end
+    if key == "LABEL" then return e.label end
 end
 
+local function matchesToken(e)
+    if not tokenFilter then return true end
+    local v = tagValue(e, tokenFilter.key)
+    if not v then return false end
+    -- UUID/LABEL 大小写不敏感(util-linux 同此)
+    if tokenFilter.key == "UUID" or tokenFilter.key == "LABEL" then
+        return v:lower() == tokenFilter.value:lower()
+    end
+    return v == tokenFilter.value
+end
+
+local function show(e)
+    if not matchesToken(e) then return false end
+    if outFormat == "device" then
+        io.write(e.node .. "\n")
+        return true
+    end
+    if outFormat == "list" then
+        io.write(e.node .. ":")
+        if e.uuid then io.write(" UUID=\"" .. e.uuid .. "\"") end
+        if e.fstype then io.write(" TYPE=\"" .. e.fstype .. "\"") end
+        if e.label then io.write(" LABEL=\"" .. e.label .. "\"") end
+        io.write("\n")
+        return true
+    end
+    local keys = matchTags or { "UUID", "TYPE", "LABEL" }
+    local parts = {}
+    for _, k in ipairs(keys) do
+        local v = tagValue(e, k)
+        if v then parts[#parts + 1] = k .. '="' .. v .. '"' end
+    end
+    if outFormat == "value" then
+        -- -o value: 只打印值(多标签时每行一个, 无设备名前缀)
+        for _, p in ipairs(parts) do
+            io.write((p:match('"(.*)"$') or p) .. "\n")
+        end
+    elseif outFormat == "export" then
+        for _, p in ipairs(parts) do io.write(p .. "\n") end
+    else
+        io.write(e.node .. ": " .. table.concat(parts, " ") .. "\n")
+    end
+    return true
+end
+
+if listFs then
+    local types = syscalls["fs.fstypes"] and syscalls["fs.fstypes"]() or {}
+    for _, t in ipairs(types) do io.write(t .. "\n") end
+    return 0
+end
+
+local matchedAny = false
 if #operands == 0 then
-    for _, e in ipairs(list) do show(e) end
+    for _, e in ipairs(list) do
+        if show(e) then
+            matchedAny = true
+            if listOne then break end
+        end
+    end
 else
     for _, spec in ipairs(operands) do
         local e = find(spec)
         if e then
-            show(e)
+            if show(e) then matchedAny = true end
         else
-            stderr("blkid: " .. spec .. ": not a block device\n")
+            if not listOne then stderr("blkid: " .. spec .. ": not a block device\n") end
         end
     end
 end
+-- util-linux: 有 -t/-U/-L 过滤而一个都没命中时退出 2
+if tokenFilter and not matchedAny then return 2 end
+return 0

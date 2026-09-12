@@ -124,6 +124,33 @@ while i <= #args do
         sepTab = v
     elseif a:match("^%-%-check=") and a:sub(9) == "quiet" then checkMode = true
     elseif a == "--check" or a == "-c" or a == "--quiet" then checkMode = true
+    elseif a == "--check=quiet" or a == "-C" then checkMode = true; opt.C = true
+    elseif a == "--month-sort" then opt.M = true
+    elseif a == "--sort" then
+        i = i + 1
+        local w = args[i]
+        if not w then stderr("sort: option '--sort' requires an argument\n"); return 2 end
+        if w == "general-numeric" then opt.g = true
+        elseif w == "human-numeric" then opt.h = true
+        elseif w == "month" then opt.M = true
+        elseif w == "numeric" then opt.n = true
+        elseif w == "version" then opt.V = true
+        elseif w == "random" then
+            stderr("sort: option '--sort=random' is not supported\n")
+            return 2
+        else
+            stderr("sort: unknown sort type '" .. w .. "'\n")
+            return 2
+        end
+    elseif a:match("^%-%-sort=") then
+        local w = a:sub(8)
+        if w == "general-numeric" then opt.g = true
+        elseif w == "human-numeric" then opt.h = true
+        elseif w == "month" then opt.M = true
+        elseif w == "numeric" then opt.n = true
+        elseif w == "version" then opt.V = true
+        else stderr("sort: unknown sort type '" .. w .. "'\n"); return 2 end
+    elseif a == "--debug" then opt.debug = true
     elseif a == "--ignore-leading-blanks" then opt.b = true
     elseif a == "--dictionary-order" then opt.d = true
     elseif a == "--ignore-case" then opt.f = true
@@ -178,7 +205,7 @@ while i <= #args do
                     sepTab = val
                 end
                 k = #a + 1
-            elseif ch:match("[bdfgihmnrsuVz]") then
+            elseif ch:match("[bCdfgihmMnrsuVz]") then
                 opt[ch] = true
                 k = k + 1
             else
@@ -193,6 +220,10 @@ while i <= #args do
 end
 if opt.n and opt.g then stderr("sort: options '-g' and '-n' are incompatible\n"); return 1 end
 if opt.h and (opt.n or opt.g) then stderr("sort: options '-h' and '-n'/'-g' are incompatible\n"); return 1 end
+if opt.M and (opt.n or opt.g or opt.h) then
+    stderr("sort: options '-M' and '-n'/'-g'/'-h' are incompatible\n")
+    return 2
+end
 
 -- 取一行的字段边界(1 起, 含端点)。有 -t 时按分隔符切; 否则按 POSIX 空白规则:
 -- 每个字段 = [一串空白][一串非空白], 行首空白归属第一个字段。
@@ -380,6 +411,19 @@ local function cmpKeyText(x, y, o)
         if a ~= b then return a < b and -1 or 1 end
         return 0
     end
+    if o.M then
+        -- -M: 月份序, 未知月份排在已知月份之前(GNU 语义)
+        local MONTHS = { JAN = 1, FEB = 2, MAR = 3, APR = 4, MAY = 5, JUN = 6,
+                         JUL = 7, AUG = 8, SEP = 9, OCT = 10, NOV = 11, DEC = 12 }
+        local function monthOf(t)
+            if not o.b then t = t:gsub("^[ \t]+", "") end
+            return MONTHS[(t:sub(1, 3):upper())] or 0
+        end
+        local a, b = monthOf(x), monthOf(y)
+        if a ~= b then return a < b and -1 or 1 end
+        if x == y then return 0 end
+        return x < y and -1 or 1
+    end
     if x == y then return 0 end
     return x < y and -1 or 1
 end
@@ -476,6 +520,8 @@ end
 if #files == 0 then files = { "-" } end
 
 -- -c: 只检查。
+-- -C/--check=quiet: 与 -c 同一套检查, 只是不打印诊断(GNU 语义)
+local quietCheck = (opt.C == true) or (opt.qcheck == true)
 if checkMode then
     local prev, prevName = nil, nil
     for _, f in ipairs(files) do
@@ -485,14 +531,16 @@ if checkMode then
             if prev then
                 local c = cmpLines(prev, l)
                 if c > 0 or (opt.u and c == 0) then
-                    stderr("sort: " .. f .. ":" .. n .. ": disorder: " .. l .. "\n")
+                    if not quietCheck then
+                        stderr("sort: " .. f .. ":" .. n .. ": disorder: " .. l .. "\n")
+                    end
                     return 1
                 end
             end
             prev, prevName = l, f
         end
     end
-    return
+    return 0 -- 已排序: 显式 0(裸 return 会被内核当 0, 但宿主测试台读到 nil)
 end
 
 -- 收集所有行(带原始序号, 用于稳定排序)。

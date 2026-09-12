@@ -374,8 +374,20 @@ def reboot_and_collect(printer=False):
     # 5a) 引导门禁: 磁盘根必须真的启动了。BIOS 只有扫不到磁盘 /.boot、或 DLUB 读不到该盘
     #     /dlub.cfg 时才会回退去引导电脑自身 FS —— 那种情况下这里读到的 verify.log 是**上一轮**的,
     #     会让"改了什么都没生效"看起来像全绿(踩过一次: 磁盘缺 /dlub.cfg, 机器回退到 CCFS 根)。
-    fresh = subprocess.run([DBG, "-R", "cat /var/log/verify.log", os.path.join(DISK, "parts/root.img")],
-                           capture_output=True, text=True).stdout
+    # 轮询等待自检跑完: 固定 sleep 是不够的 —— 自检脚本随批次增多而变长(每加一条检查就是一次
+    # 进程启动, 真机上很贵), 实测同一份代码会偶发卡在"日志变了但还没写完"上, 报成"失效验证"。
+    # 判据仍然是"日志里出现 === verify done ===", 只是给它足够的时间(最多 6 分钟)。
+    fresh = ""
+    deadline = time.time() + 360
+    while time.time() < deadline:
+        fresh = subprocess.run([DBG, "-R", "cat /var/log/verify.log", os.path.join(DISK, "parts/root.img")],
+                               capture_output=True, text=True).stdout
+        if "=== verify done ===" in fresh:
+            break
+        time.sleep(10)
+    if "=== verify done ===" not in fresh:
+        print("   (自检在 6 分钟内没有写出 '=== verify done ===', 下面是当前内容)")
+        print(fresh[-3000:])
     if fresh == verify_before:
         raise RuntimeError(
             "失效验证: 磁盘根没有启动 —— /var/log/verify.log 与部署时逐字节相同(本轮的 verify.service 没跑)。\n"

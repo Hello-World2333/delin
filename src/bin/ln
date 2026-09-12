@@ -74,17 +74,29 @@ local optSym, optForce, optNoDeref, optTargetDir, optVerbose = false, false, fal
 local operands = {}
 local noMoreOpts = false
 
+local optRelative, optInteractive = false, false
+local optLogical = false
+local targetDirOpt = nil
+
 local function setShort(ch)
     if ch == "s" then optSym = true
     elseif ch == "f" then optForce = true
     elseif ch == "n" then optNoDeref = true
     elseif ch == "T" then optTargetDir = true
     elseif ch == "v" then optVerbose = true
+    elseif ch == "r" then optRelative = true
+    elseif ch == "i" then optInteractive = true
+    elseif ch == "L" then optLogical = true
+    elseif ch == "P" then optLogical = false
+    elseif ch == "t" then return true -- 带参数, 由下面的循环消费
     else stderr("ln: invalid option -- '" .. ch .. "'\n"); return false end
     return true
 end
 
-for _, a in ipairs(args) do
+local li = 0
+while li < #args do
+    li = li + 1
+    local a = args[li]
     if noMoreOpts then
         operands[#operands + 1] = a
     elseif a == "--" then
@@ -94,6 +106,24 @@ for _, a in ipairs(args) do
     elseif a == "--no-dereference" then optNoDeref = true
     elseif a == "--no-target-directory" then optTargetDir = true
     elseif a == "--verbose" then optVerbose = true
+    elseif a == "--relative" then optRelative = true
+    elseif a == "--interactive" then optInteractive = true
+    elseif a == "--logical" then optLogical = true
+    elseif a == "--physical" then optLogical = false
+    elseif a == "-t" or a == "--target-directory" then
+        li = li + 1
+        targetDirOpt = args[li]
+        if not targetDirOpt then stderr("ln: option '" .. a .. "' requires an argument\n"); return 2 end
+    elseif a:match("^%-%-target%-directory=") then
+        targetDirOpt = a:sub(20)
+    elseif a:match("^%-t.") then
+        targetDirOpt = a:sub(3)
+    elseif a == "--backup" or a:match("^%-%-suffix") then
+        stderr("ln: option '" .. a .. "' is not supported\n")
+        return 2
+    elseif a:sub(1, 2) == "--" then
+        stderr("ln: unrecognized option '" .. a .. "'\n")
+        return 1
     elseif a:sub(1, 1) == "-" and a ~= "-" then
         for k = 2, #a do if not setShort(a:sub(k, k)) then return 1 end end
     else
@@ -119,7 +149,15 @@ end
 
 local destIsDir = false
 local destDirRaw = nil
-if #operands == 1 then
+if targetDirOpt then
+    -- -t DIR: 所有操作数都是 TARGET, 链接建到 DIR 下
+    destIsDir, destDirRaw = true, targetDirOpt
+    for i = 1, #operands do
+        local t = operands[i]
+        linkOf[#linkOf + 1] = { target = t, link = resolve(joinDisplay(targetDirOpt, basename(t))),
+                                display = joinDisplay(targetDirOpt, basename(t)) }
+    end
+elseif #operands == 1 then
     -- GNU: 单个操作数 = 在 cwd 下建同名链接(诊断里显示 "./name")。
     destIsDir = true
     destDirRaw = "."
@@ -168,6 +206,25 @@ local function failPrefix(targetRaw, linkRaw)
     return "ln: failed to create hard link '" .. linkRaw .. "' => '" .. targetRaw .. "': "
 end
 
+--- -r: 把 TARGET 换成相对链接目录的路径(GNU: 以链接所在目录为基准算相对路径)。
+local function relativeTarget(targetRaw, linkRaw)
+    local tgt = resolve(targetRaw)
+    local linkAbs = resolve(linkRaw)
+    local linkDir = linkAbs:match("^(.*)/[^/]*$") or "/"
+    if linkDir == "" then linkDir = "/" end
+    local ta = {}
+    for seg in tgt:gmatch("[^/]+") do ta[#ta + 1] = seg end
+    local la = {}
+    for seg in linkDir:gmatch("[^/]+") do la[#la + 1] = seg end
+    local i = 1
+    while i <= #ta and i <= #la and ta[i] == la[i] do i = i + 1 end
+    local parts = {}
+    for _ = i, #la do parts[#parts + 1] = ".." end
+    for k = i, #ta do parts[#parts + 1] = ta[k] end
+    if #parts == 0 then return "." end
+    return table.concat(parts, "/")
+end
+
 --- 同一文件判定: ino 相同(内核 ext2 给 ino; CC 原生 fs 没有, 退化成字面路径比较)。
 local function sameFile(a, b)
     local la, lb = lstat(a), lstat(b)
@@ -198,8 +255,16 @@ local function createOne(job)
             return false
         end
         if not optForce then
-            stderr(failPrefix(targetRaw, linkRaw) .. "File exists\n")
-            return false
+            if optInteractive then
+                io.write("ln: replace '" .. linkRaw .. "'? ")
+                io.flush()
+                local sin = io.stdin()
+                local line = sin and sin.readLine and sin:readLine() or nil
+                if not (line and line:match("^[yY]")) then return true end
+            else
+                stderr(failPrefix(targetRaw, linkRaw) .. "File exists\n")
+                return false
+            end
         end
         if la.isDir and la.kind ~= "symlink" then
             stderr("ln: cannot overwrite directory '" .. linkRaw .. "' with non-directory\n")
@@ -228,8 +293,14 @@ local function createOne(job)
 
     local ok, err
     if optSym then
-        ok, err = fs.symlink(targetRaw, link) -- target 原样保存(不 resolve)
+        local tgt = targetRaw
+        if optRelative then tgt = relativeTarget(targetRaw, linkRaw) end
+        ok, err = fs.symlink(tgt, link) -- target 原样保存(不 resolve)
     else
+        if optLogical then
+            -- -L: 硬链接要解引用 TARGET(指向链接的目标)
+            target = resolve(targetRaw)
+        end
         ok, err = fs.link(target, link)
     end
     if not ok then
