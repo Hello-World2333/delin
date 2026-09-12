@@ -22,6 +22,11 @@
 
 local tty = require("kernel.tty")
 
+-- 内核日志是**可选**依赖: 调度器要能被宿主测试台单独装载(见下面 setDiskHook 的说明),
+-- 所以 klog 不在就直接不记日志。
+local klog = nil
+pcall(function() klog = require("kernel.klog") end)
+
 local scheduler = {}
 
 ---@type DelinProc[]
@@ -138,8 +143,13 @@ function scheduler.run()
                     end
 
                     if not ok then
-                        -- 进程出错。
+                        -- 进程出错。**必须写进内核日志**: 父进程(sh)只拿到一个退出码 1,
+                        -- 工具内部崩了在真机上就完全看不到原因(排查 mkfs.ext2 时被卡住过一次)。
                         proc.status = "error"; proc.error = param; proc.dead = true
+                        if klog then
+                            klog.kern(string.format("process %s (pid %s) died: %s",
+                                tostring(proc.name), tostring(proc.pid), tostring(param)))
+                        end
                         if proc.onExit then proc.onExit(proc, "error", param) end
                         table.remove(procs, i)
                     elseif coroutine.status(proc.co) == "dead" then

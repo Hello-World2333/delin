@@ -1,0 +1,99 @@
+-- Delin fsck.ext2: 检查(并可选修复) ext2 文件系统 (e2fsck 子集)。
+-- 用法: fsck.ext2 [-a|-p|-n|-y] [-f] [-v] 设备
+--   设备   /dev/sdXN(存储 /parts/manifest 里的分区镜像)、UUID=<uuid> 或真实后端上的镜像文件路径
+--   -n     只检查, 一个字节都不写(只报告)
+--   -y     对所有问题都答 yes(自动修复)
+--   -p/-a  preen: 同 -y(Delin 没有"需要人工介入"的修复项分级)
+--   (都不给) 逐项询问, 从 stdin 读 y/n
+--   -f     强制检查(本实现本来就每次全查, 收下这个开关是为了和 fsck(8) 调用方式兼容)
+--   -v     详细输出(本实现总是打印五趟的进度, 收下 -v 同上)
+-- 退出码(与 e2fsck 一致): 0 没有错误 / 1 错误已修复 / 4 有错误没修 / 8 无法检查 / 16 用法错。
+-- 挂载中的文件系统一律拒绝检查(会把运行中的系统读成撕裂状态) —— 该判定在内核 devdisk 里。
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+local function usage()
+    stderr("Usage: fsck.ext2 [-a|-p|-n|-y] [-f] [-v] device\n")
+end
+
+-- 模式: check 只看不写 / fix 全修 / ask 逐项问
+local mode, operands, noMoreOpts = nil, {}, false
+for _, a in ipairs(args) do
+    if noMoreOpts then
+        operands[#operands + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "-n" then
+        if mode and mode ~= "check" then
+            stderr("fsck.ext2: -n conflicts with an earlier option\n")
+            return 16
+        end
+        mode = "check"
+    elseif a == "-y" or a == "-p" or a == "-a" then
+        if mode and mode ~= "fix" then
+            stderr("fsck.ext2: " .. a .. " conflicts with an earlier option\n")
+            return 16
+        end
+        mode = "fix"
+    elseif a == "-f" or a == "-v" or a == "-V" then
+        -- 强制/详细: 本实现总是全查并打印五趟进度, 收下开关不做别的
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        stderr("fsck.ext2: invalid option -- '" .. a:sub(2, 2) .. "'\n")
+        usage()
+        return 16
+    else
+        operands[#operands + 1] = a
+    end
+end
+
+if #operands == 0 then
+    stderr("fsck.ext2: no device specified\n")
+    usage()
+    return 16
+elseif #operands > 1 then
+    stderr("fsck.ext2: too many arguments\n")
+    usage()
+    return 16
+end
+local device = operands[1]
+
+if not (syscalls and syscalls["blkdev.fsck"]) then
+    stderr("fsck.ext2: blkdev.fsck syscall not available\n")
+    return 8
+end
+
+-- 逐项询问模式: 提示写 stdout, 回答从 stdin 读(e2fsck 同此; 读不到 = 非交互, 当 no)。
+local ask
+if mode == nil or mode == "ask" then
+    local stdin = io.stdin()
+    ask = function(prompt)
+        io.write(prompt)
+        local line = stdin and stdin:readLine() or nil
+        if not line then return false end
+        local c = line:sub(1, 1)
+        return c == "y" or c == "Y"
+    end
+end
+
+local report, err = syscalls["blkdev.fsck"](device, {
+    mode = mode or "ask",
+    ask = ask,
+    -- 五趟是边走边报的: 直接写出去, 不必等整盘查完(大盘上差别很大)。
+    emit = function(line) io.write(line .. "\n") end,
+})
+if not report then
+    stderr("fsck.ext2: " .. tostring(err) .. "\n")
+    return 8
+end
+
+if report.files and report.blocks then
+    local pct = report.files.used > 0 and (100 * (report.nonContiguous or 0) / report.files.used) or 0
+    io.write(string.format("%s: %d/%d files (%.1f%% non-contiguous), %d/%d blocks\n",
+        report.device or device, report.files.used, report.files.total, pct,
+        report.blocks.used, report.blocks.total))
+end
+return report.code

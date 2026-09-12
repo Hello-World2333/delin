@@ -1,0 +1,164 @@
+-- Delin mkfs.ext2: 在设备/镜像上建 ext2 文件系统 (mke2fs 子集)。
+-- 用法: mkfs.ext2 [-b 块大小] [-N inode 数] [-L 卷标] [-m 保留块百分比] [-n] [-q] [-F] [-v] 设备 [块数]
+--   设备    /dev/sdXN(存储 /parts/manifest 里的分区镜像)、UUID=<uuid> 或真实后端上的镜像文件路径
+--   块数    省略时按设备/镜像现有大小算(块设备或已经撑开的镜像); 空文件必须显式给块数
+--   -b      1024(缺省) | 2048 | 4096
+--   -N      inode 数(向上取整到 inode 表整块); 缺省 256
+--   -L      文件系统卷标(最长 15 字节, 由 blkid 读回)
+--   -m      给 root 保留的块百分比(缺省 0; Delin 无 root 保留语义, 保留块只是"不许普通分配")
+--   -n      只检查参数与设备, 一个字节都不写(相当于 dry run)
+--   -q      安静(只报错)
+--   -F      目标上已有文件系统时强制覆盖(没有它一律拒绝, 与 mke2fs 的 "proceed anyway?" 同义)
+--   -v      详细输出
+-- 退出码: 0 成功 / 1 失败(参数错、设备不可用、目标已挂载、已有文件系统且未给 -F)。
+-- 挂载中的文件系统一律拒绝格式化(会把运行中的系统写坏) —— 该判定在内核 devdisk 里。
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+local function usage()
+    stderr("Usage: mkfs.ext2 [-b block-size] [-N number-of-inodes] [-L volume-label]\n"
+        .. "                 [-m reserved-percentage] [-n] [-q] [-F] [-v] device [blocks]\n")
+end
+
+local blockSize, inodes, label, reservedPercent, blocks
+local dryRun, quiet, force, verbose = false, false, false, false
+local operands, noMoreOpts = {}, false
+
+local i = 1
+while i <= #args do
+    local a = args[i]
+    local function need(name)
+        local v = args[i + 1]
+        if not v then
+            stderr("mkfs.ext2: option requires an argument -- '" .. name .. "'\n")
+            return nil
+        end
+        i = i + 1
+        return v
+    end
+    if noMoreOpts then
+        operands[#operands + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "-n" then
+        dryRun = true
+    elseif a == "-q" then
+        quiet = true
+    elseif a == "-F" then
+        force = true
+    elseif a == "-v" then
+        verbose = true
+    elseif a == "-b" or a:match("^%-b.+") then
+        blockSize = (a == "-b") and need("b") or a:sub(3)
+        if blockSize == nil then return 1 end
+    elseif a == "-N" or a:match("^%-N.+") then
+        inodes = (a == "-N") and need("N") or a:sub(3)
+        if inodes == nil then return 1 end
+    elseif a == "-L" or a:match("^%-L.+") then
+        label = (a == "-L") and need("L") or a:sub(3)
+        if label == nil then return 1 end
+    elseif a == "-m" or a:match("^%-m.+") then
+        reservedPercent = (a == "-m") and need("m") or a:sub(3)
+        if reservedPercent == nil then return 1 end
+    elseif a == "-t" or a:match("^%-t.+") then
+        -- mkfs.ext2 是 mke2fs 的 ext2 前端: 只做 ext2, 其它类型 fail-fast 不装作支持
+        local t = (a == "-t") and need("t") or a:sub(3)
+        if t == nil then return 1 end
+        if t ~= "ext2" then
+            stderr("mkfs.ext2: unsupported filesystem type '" .. t .. "'\n")
+            usage()
+            return 1
+        end
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        stderr("mkfs.ext2: invalid option -- '" .. a:sub(2, 2) .. "'\n")
+        usage()
+        return 1
+    else
+        operands[#operands + 1] = a
+    end
+    i = i + 1
+end
+
+if #operands == 0 then
+    stderr("mkfs.ext2: no device specified\n")
+    usage()
+    return 1
+elseif #operands > 2 then
+    stderr("mkfs.ext2: too many arguments\n")
+    usage()
+    return 1
+end
+local device = operands[1]
+if operands[2] then
+    if not operands[2]:match("^%d+$") then
+        stderr("mkfs.ext2: invalid block count '" .. operands[2] .. "'\n")
+        return 1
+    end
+    blocks = tonumber(operands[2])
+end
+
+local function number(v, name, lo, hi)
+    if v == nil then return nil end
+    if not v:match("^%d+$") then
+        stderr("mkfs.ext2: invalid " .. name .. " '" .. v .. "'\n")
+        return false
+    end
+    local n = tonumber(v)
+    if n < lo or n > hi then
+        stderr(string.format("mkfs.ext2: %s %d is out of range (%d..%d)\n", name, n, lo, hi))
+        return false
+    end
+    return n
+end
+
+if blockSize then
+    blockSize = number(blockSize, "block size", 1024, 4096)
+    if blockSize == false then return 1 end
+end
+if inodes then
+    inodes = number(inodes, "inode count", 1, 1000000)
+    if inodes == false then return 1 end
+end
+if reservedPercent then
+    reservedPercent = number(reservedPercent, "reserved percentage", 0, 99)
+    if reservedPercent == false then return 1 end
+end
+if label and #label > 15 then
+    stderr("mkfs.ext2: volume label '" .. label .. "' is longer than 15 bytes\n")
+    return 1
+end
+
+if not (syscalls and syscalls["blkdev.mkfs"]) then
+    stderr("mkfs.ext2: blkdev.mkfs syscall not available\n")
+    return 1
+end
+local info, err = syscalls["blkdev.mkfs"](device, {
+    blocks = blocks, blockSize = blockSize, inodes = inodes, label = label,
+    reservedPercent = reservedPercent, force = force, dryRun = dryRun,
+})
+if not info then
+    stderr("mkfs.ext2: " .. tostring(err) .. "\n")
+    return 1
+end
+
+if not quiet then
+    io.write(string.format("%sCreating filesystem with %d %dk blocks and %d inodes\n",
+        dryRun and "(dry run) " or "", info.blocks, info.blockSize / 1024, info.inodes))
+    io.write("Filesystem label=" .. tostring(info.label) .. "\n")
+    io.write(string.format("Reserved block count=%d (%d%%)\n", info.rBlocks, info.reservedPercent or 0))
+    if verbose then
+        io.write(string.format("Free blocks=%d, free inodes=%d, data starts at block %d\n",
+            info.freeBlocks, info.freeInodes, info.dataStart))
+    end
+    if dryRun then
+        io.write("Nothing written (dry run)\n")
+    else
+        io.write("Allocating group tables: done\n")
+        io.write("Writing inode tables: done\n")
+        io.write("Writing superblocks and filesystem accounting information: done\n")
+    end
+end

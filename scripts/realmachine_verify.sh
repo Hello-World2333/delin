@@ -195,4 +195,70 @@ sh /root/user_test.sh >> $LOG
 echo "-- redstone_verify.lua (sysfs 与 CC 原始 redstone API 交叉核对) --" >> $LOG
 /root/redstone_verify.lua
 cat /var/log/redstone_verify.log >> $LOG
+# mkfs.ext2 / fsck.ext2: 在真设备上现场格式化 -> 挂载写文件 -> 检查 -> 破坏 -> 修复。
+# 目标用**电脑自带存储**上的一个分区镜像: 磁盘(/dev/sdb2 = data.img)上的那个要留给
+# 上面 `cat /dev/sdb2 | cksum` 的门禁(宿主拿它逐字节比), 不能动。
+# /dev/sdaN 来自该存储 /parts/manifest 的分区行 —— manifest 与空镜像都由游戏侧自己建
+# (宿主写在电脑自身 FS 上的新文件游戏侧不一定看得见, 自己建的必看得见)。
+echo "-- mkfs.ext2 / fsck.ext2 (自带存储 /dev/sda1) --" >> $LOG
+mkdir -p /mnt/hdd /mnt/scratch
+mount -t ccdisk /dev/sda /mnt/hdd >> $LOG
+mkdir -p /mnt/hdd/parts
+rm -f /mnt/hdd/parts/scratch.img
+touch /mnt/hdd/parts/scratch.img
+echo 'scratch /parts/scratch.img ext2' > /mnt/hdd/parts/manifest
+df /mnt/hdd >> $LOG
+umount /mnt/hdd
+mkfs.ext2 -L SCRATCH /dev/sda1 128 >> $LOG
+rc=$?
+echo "mkfs_rc=$rc" >> $LOG
+if [ "$rc" = "0" ]; then echo "ok mkfs_ext2" >> $LOG; else echo "ng mkfs_ext2" >> $LOG; fi
+# 已有文件系统又没给 -F: 必须拒绝(fail-fast, 不许把别人的盘当空白盘格式化)
+mkfs.ext2 -L AGAIN /dev/sda1 128 >> $LOG
+rc=$?
+echo "mkfs_existing_rc=$rc" >> $LOG
+if [ "$rc" != "0" ]; then echo "ok mkfs_refuses_existing" >> $LOG; else echo "ng mkfs_refuses_existing" >> $LOG; fi
+mkfs.ext2 -n -F /dev/sda1 128 >> $LOG
+echo "mkfs_dryrun_rc=$?" >> $LOG
+# -F 覆盖 + 挂载/写文件/卸载
+mkfs.ext2 -q -F -L SCRATCH /dev/sda1 128 >> $LOG
+echo "mkfs_force_rc=$?" >> $LOG
+blkid /dev/sda1 >> $LOG
+lsblk >> $LOG
+mount /dev/sda1 /mnt/scratch >> $LOG
+echo hello-from-mkfs > /mnt/scratch/hello.txt
+mkdir -p /mnt/scratch/dir
+echo inner > /mnt/scratch/dir/inner.txt
+ls -l /mnt/scratch >> $LOG
+cat /mnt/scratch/hello.txt >> $LOG
+umount /mnt/scratch
+# 干净盘: 检查必须 0(没有问题)
+fsck.ext2 -n /dev/sda1 >> $LOG
+echo "fsck_clean_rc=$?" >> $LOG
+# 已挂载的文件系统必须拒绝检查(/mnt/data 由 fstab 挂载)
+fsck.ext2 /dev/sdb2 >> $LOG
+rc=$?
+echo "fsck_mounted_rc=$rc" >> $LOG
+if [ "$rc" = "8" ]; then echo "ok fsck_refuses_mounted" >> $LOG; else echo "ng fsck_refuses_mounted" >> $LOG; fi
+# 破坏块位图的第一个字节(块 3 = 偏移 3072): 元数据块被标成空闲 -> 必须报出来
+lua /root/ext2_corrupt.lua /dev/sda1 3072 1 >> $LOG
+fsck.ext2 -n /dev/sda1 >> $LOG
+rc=$?
+echo "fsck_broken_rc=$rc" >> $LOG
+if [ "$rc" = "4" ]; then echo "ok fsck_detects_corruption" >> $LOG; else echo "ng fsck_detects_corruption" >> $LOG; fi
+# -y 修好(退出码 1), 再查必须 0
+fsck.ext2 -y /dev/sda1 >> $LOG
+rc=$?
+echo "fsck_fix_rc=$rc" >> $LOG
+if [ "$rc" = "1" ]; then echo "ok fsck_fixes_corruption" >> $LOG; else echo "ng fsck_fixes_corruption" >> $LOG; fi
+fsck.ext2 -n /dev/sda1 >> $LOG
+rc=$?
+echo "fsck_after_fix_rc=$rc" >> $LOG
+if [ "$rc" = "0" ]; then echo "ok fsck_clean_after_fix" >> $LOG; else echo "ng fsck_clean_after_fix" >> $LOG; fi
+# 修好后文件系统还能挂载, 且原来写进去的文件还在(修复没有把数据搞丢)
+mkdir -p /mnt/scratch
+mount /dev/sda1 /mnt/scratch >> $LOG
+cat /mnt/scratch/hello.txt >> $LOG
+cat /mnt/scratch/dir/inner.txt >> $LOG
+umount /mnt/scratch
 echo "=== verify done ===" >> $LOG

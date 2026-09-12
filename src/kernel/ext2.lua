@@ -1,7 +1,10 @@
 --[[ Delin EXT2 文件系统(读写).
      Mount 在一个块设备上; 块大小从 superblock 读; inode 的 mode/uid/gid/类型暴露。
      phase B 修订: 间接块(单/双)、多块组、删除/截断回收块、真实 ".."、硬链接计数、
-     isReadOnly=false、时间戳用秒、新块清零、保留块、符号链接、特殊文件类型。 ]]
+     isReadOnly=false、时间戳用秒、新块清零、保留块、符号链接、特殊文件类型。
+     另含两个"整盘级"入口: mkfs(建空白 fs: 块大小/inode 数/保留块/卷标可调, 单块组)
+     与 fsck(五趟检查与修复: inode/块 -> 目录结构 -> 连通性 -> 引用计数 -> 位图与计数)。
+     两者都是 /bin/mkfs.ext2、/bin/fsck.ext2 的内核实现, 裁判是宿主 e2fsck。 ]]
 
 local ext2 = {}
 
@@ -1095,49 +1098,106 @@ function ext2.backend(fs)
 end
 
 -- ---------------------------------------------------------------
--- mkfs: 建一个空白 ext2(安装器现场格式化用)
+-- mkfs: 建一个空白 ext2(mkfs.ext2 命令与安装器现场格式化共用)
 -- ---------------------------------------------------------------
 
 --- 在块设备上建一个空白 ext2 文件系统(mkfs.ext2 子集)。
---- 布局(块大小固定 1024, **单块组**):
----   block 0      引导扇区(全零)
----   block 1      超级块(1024 字节, 位于字节偏移 1024)
----   block 2      块组描述符表
----   block 3      块位图
----   block 4      inode 位图
----   block 5..36  inode 表(256 个 inode x 128 字节)
----   block 37..   数据块(根目录 / lost+found 依次分配)
---- 只做单块组(<= 8192 块 = 8MB): 安装场景只要几百 KB, 少一块组就少一处出错的地方;
---- 超了直接报错, 不静默截断。
+--- 布局(**单块组**, 与宿主 mkfs.ext2 的单块组产物同构):
+---   块大小 1024:  block0 引导扇区 | block1 超级块(偏移 1024) | block2 块组描述符
+---                  | block3 块位图 | block4 inode 位图 | block5.. inode 表 | 数据块
+---   块大小 >1024: block0 超级块(块内偏移 1024) | block1 块组描述符 | block2 块位图
+---                  | block3 inode 位图 | block4.. inode 表 | 数据块
+--- 只做**单块组**(块数上限 8*块大小: 1024 时 8192 块 = 8MB, 4096 时 32768 块 = 128MB):
+--- 少一块组就少一处出错的地方; 超了直接报错, 不静默截断。
 --- 根目录与 lost+found 用驱动自己的 create/allocBlock 建(而不是另写一份编码),
 --- 这样"mkfs 写出来的东西"与"驱动读得懂的东西"天生一致; 建完再 mount 回来自检。
 ---@param bd table 块设备
----@param opts table|nil { blocks = number 必需, label = string, time = number 秒 }
----@return table|nil fs, string|nil err
+---@param opts table|nil { blocks 必需, blockSize = 1024|2048|4096, inodes, label,
+---                         reservedPercent, time(秒), dryRun }
+---@return table|nil fs, string|nil err dryRun 时返回描述表(不写盘), 否则返回挂载好的 fs
 function ext2.mkfs(bd, opts)
     opts = opts or {}
-    local blockSize = 1024
+
+    -- 块大小: 只收 1024/2048/4096 —— ext2 理论上允许到 64KB, 但 CC 上没有任何意义,
+    -- 而且宿主 e2fsck 对非标准组合会直接报错(自检就失去裁判)。
+    local blockSize = tonumber(opts.blockSize) or 1024
+    if blockSize ~= 1024 and blockSize ~= 2048 and blockSize ~= 4096 then
+        return nil, string.format("mkfs: block size must be 1024, 2048 or 4096 (got %s)", tostring(opts.blockSize))
+    end
+    local logBlockSize = (blockSize == 1024) and 0 or ((blockSize == 2048) and 1 or 2)
+
+    local inodeSize = 128
+    local perBlock = math.floor(blockSize / inodeSize) -- 每块 inode 数(8/16/32)
+    local blocksPerGroup = 8 * blockSize               -- ext2 标准: 一位图块管 8*blockSize 块
+    local firstDataBlock = (blockSize == 1024) and 1 or 0
+    local firstIno = 11                                -- 1..10 保留, 11 起给普通文件(与 mkfs.ext2 一致)
+
     local blocks = tonumber(opts.blocks)
     if not blocks then return nil, "mkfs: 必须给 blocks" end
     blocks = math.floor(blocks)
-    if blocks < 64 then return nil, "mkfs: 块数至少 64(64KB)" end
-    if blocks > 8192 then return nil, "mkfs: 只支持单块组(最多 8192 块 = 8MB)" end
+    if blocks < 64 then return nil, "mkfs: 块数至少 64(块大小 1024 时 64KB)" end
+    if blocks > blocksPerGroup then
+        return nil, string.format("mkfs: 只支持单块组(块大小 %d 时最多 %d 块 = %dKB)",
+            blockSize, blocksPerGroup, blocksPerGroup * blockSize / 1024)
+    end
 
-    local inodeSize, inodesPerGroup, blocksPerGroup = 128, 256, 8192
-    local firstDataBlock = 1 -- blockSize==1024 时 block0 是引导扇区
-    local firstIno = 11      -- 1..10 保留, 11 起给普通文件(与 mkfs.ext2 一致)
-    local blockBitmap, inodeBitmap, inodeTable = 3, 4, 5
-    local inodeTableBlocks = math.ceil(inodesPerGroup * inodeSize / blockSize) -- 32
-    local dataStart = inodeTable + inodeTableBlocks                            -- 37
+    -- inode 总数: 缺省 256(正好铺满一个 1024/2048/4096 字节的 inode 表块数), -N 给的值
+    -- 向上取整到"每块 inode 数"的整数倍, 使 inode 表恰好占整数个块(不留半块, e2fsck 会报)。
+    local inodesPerGroup = tonumber(opts.inodes) or 256
+    inodesPerGroup = math.floor(inodesPerGroup)
+    if inodesPerGroup < 2 * firstIno then
+        return nil, string.format("mkfs: inode 数至少 %d", 2 * firstIno)
+    end
+    inodesPerGroup = math.ceil(inodesPerGroup / perBlock) * perBlock
+    if inodesPerGroup > blockSize * 8 then
+        return nil, string.format("mkfs: inode 数最多 %d(单块组的 inode 位图只有 %d 位)",
+            blockSize * 8, blockSize * 8)
+    end
+
+    -- 元数据块布局(见函数头注释)。块组描述符表只有一块(单块组)。
+    local gdtBlock = firstDataBlock + 1
+    local blockBitmap, inodeBitmap, inodeTable = gdtBlock + 1, gdtBlock + 2, gdtBlock + 3
+    local inodeTableBlocks = math.floor(inodesPerGroup * inodeSize / blockSize)
+    local dataStart = inodeTable + inodeTableBlocks
     if blocks < dataStart + 2 then
         return nil, string.format("mkfs: 块数至少 %d(元数据 %d 块 + 根目录 + lost+found)", dataStart + 2, dataStart)
     end
+
+    local reservedPercent = tonumber(opts.reservedPercent) or 0
+    if reservedPercent < 0 or reservedPercent > 99 then
+        return nil, "mkfs: 保留块比例必须在 0..99 之间"
+    end
+
     local size = bd.getSize and bd.getSize() or nil
     if size and size > 0 and size < blocks * blockSize then
         return nil, string.format("mkfs: 设备只有 %d 字节, 放不下 %d 块(%d 字节)", size, blocks, blocks * blockSize)
     end
 
     local now = math.floor(opts.time or (os.epoch and (os.epoch("utc") / 1000)) or os.time())
+    local label = tostring(opts.label or "delin"):sub(1, 15)
+
+    -- 计数(与下面写进超级块/块组描述符的值是同一份来源, 不各算一遍)
+    local usedInodes = firstIno - 1                       -- inode 1..10 保留位
+    local freeInodes = inodesPerGroup - usedInodes
+    local usedBlocks = dataStart - firstDataBlock + 1     -- 元数据块 + 根目录块
+    local freeBlocks = (blocks - firstDataBlock) - usedBlocks
+    local rBlocks = math.floor(blocks * reservedPercent / 100)
+    if rBlocks >= freeBlocks then
+        return nil, string.format("mkfs: 保留块(%d)不能占满空闲块(%d)", rBlocks, freeBlocks)
+    end
+
+    local info = {
+        blocks = blocks, blockSize = blockSize, inodes = inodesPerGroup,
+        freeBlocks = freeBlocks, freeInodes = freeInodes, rBlocks = rBlocks,
+        dataStart = dataStart, inodeTable = inodeTable, inodeTableBlocks = inodeTableBlocks,
+        blockBitmap = blockBitmap, inodeBitmap = inodeBitmap, label = label,
+        reservedPercent = reservedPercent,
+    }
+    -- -n(dry run): 只做上面那套校验并把参数报给调用者, 一个字节都不写。
+    if opts.dryRun then
+        info.dryRun = true
+        return info
+    end
 
     -- 1) 整盘清零。CC 的 fs 不支持预分配, 写入即扩展文件, 这里顺带把镜像撑到目标大小。
     local CHUNK = 64 * 1024
@@ -1152,19 +1212,19 @@ function ext2.mkfs(bd, opts)
         off = off + n
     end
 
-    -- 2) 超级块
+    -- 2) 超级块(永远位于字节偏移 1024)
     local sb = string.rep("\0", 1024)
     sb = setU32(sb, 0, inodesPerGroup)          -- s_inodes_count
     sb = setU32(sb, 4, blocks)                  -- s_blocks_count
-    sb = setU32(sb, 8, 0)                       -- s_r_blocks_count(单用户, 不留 root 保留块)
-    sb = setU32(sb, 12, blocks - dataStart - 1) -- s_free_blocks_count(根目录占 1 块)
-    sb = setU32(sb, 16, inodesPerGroup - 10)    -- s_free_inodes_count(1..10 保留; 根目录是 2, 在保留段内)
-    sb = setU32(sb, 20, firstDataBlock)
-    sb = setU32(sb, 24, 0)                      -- s_log_block_size: 0 -> 1024
-    sb = setU32(sb, 28, 0)                      -- s_log_frag_size
-    sb = setU32(sb, 32, blocksPerGroup)
-    sb = setU32(sb, 36, blocksPerGroup)
-    sb = setU32(sb, 40, inodesPerGroup)
+    sb = setU32(sb, 8, rBlocks)                 -- s_r_blocks_count
+    sb = setU32(sb, 12, freeBlocks)             -- s_free_blocks_count
+    sb = setU32(sb, 16, freeInodes)             -- s_free_inodes_count
+    sb = setU32(sb, 20, firstDataBlock)         -- s_first_data_block
+    sb = setU32(sb, 24, logBlockSize)           -- s_log_block_size
+    sb = setU32(sb, 28, logBlockSize)           -- s_log_frag_size(碎片大小 = 块大小)
+    sb = setU32(sb, 32, blocksPerGroup)         -- s_blocks_per_group
+    sb = setU32(sb, 36, blocksPerGroup)         -- s_frags_per_group
+    sb = setU32(sb, 40, inodesPerGroup)         -- s_inodes_per_group
     sb = setU32(sb, 44, now)                    -- s_mtime
     sb = setU32(sb, 48, now)                    -- s_wtime
     sb = setU16(sb, 52, 0)                      -- s_mnt_count
@@ -1179,8 +1239,8 @@ function ext2.mkfs(bd, opts)
     sb = setU32(sb, 76, 1)                      -- s_rev_level: dynamic
     sb = setU16(sb, 80, 0)                      -- s_def_resuid
     sb = setU16(sb, 82, 0)                      -- s_def_resgid
-    sb = setU32(sb, 84, firstIno)
-    sb = setU16(sb, 88, inodeSize)
+    sb = setU32(sb, 84, firstIno)               -- s_first_ino
+    sb = setU16(sb, 88, inodeSize)              -- s_inode_size
     sb = setU16(sb, 90, 0)                      -- s_block_group_nr
     sb = setU32(sb, 92, 0)                      -- s_feature_compat
     -- 目录项的 file_type 字段要有 INCOMPAT_FILETYPE 才合法(驱动一直写它)。
@@ -1194,20 +1254,17 @@ function ext2.mkfs(bd, opts)
         uuid[i] = string.char(math.floor(seed / 8388608) % 256)
     end
     sb = sb:sub(1, 104) .. table.concat(uuid) .. sb:sub(121)
-    local label = tostring(opts.label or "delin"):sub(1, 15)
     sb = sb:sub(1, 120) .. label .. string.rep("\0", 16 - #label) .. sb:sub(137)
     if not bd.write(1024, sb) then return nil, "mkfs: 写超级块失败" end
 
     -- 3) 块组描述符(单块组)
     --    位图映射(与宿主 mkfs.ext2 的产物逐字节核对过):
-    --      块位图: bit k <-> block (k+1)  —— blockSize==1024 时 block0 是引导块, **不进位图**
+    --      块位图: bit k <-> block (k + first_data_block) —— 块大小 1024 时 block0 是引导块, **不进位图**
     --      inode 位图: bit k <-> inode (k+1)
     --    尾部填充位必须置 1, 否则 e2fsck 报 "Padding at end of ... bitmap is not set"。
-    local usedBlocks = dataStart -- 从 block 1 数起的已用块数: 块 1..36 元数据 + 块 37 根目录
-    local freeBlocks = blocks - usedBlocks - 1 -- 再减掉不进位图的 block 0
     local gdt = w32(blockBitmap) .. w32(inodeBitmap) .. w32(inodeTable)
-        .. w16(freeBlocks) .. w16(inodesPerGroup - 10) .. w16(1) .. w16(0) .. string.rep("\0", 12)
-    if not bd.write(2 * blockSize, gdt) then return nil, "mkfs: 写块组描述符失败" end
+        .. w16(freeBlocks) .. w16(freeInodes) .. w16(1) .. w16(0) .. string.rep("\0", 12)
+    if not bd.write(gdtBlock * blockSize, gdt) then return nil, "mkfs: 写块组描述符失败" end
 
     local function setBit(s, bit)
         local pos = math.floor(bit / 8) + 1
@@ -1215,22 +1272,25 @@ function ext2.mkfs(bd, opts)
         return s:sub(1, pos - 1) .. string.char(v + 2 ^ (bit % 8)) .. s:sub(pos + 1)
     end
     local bitsPerBitmap = blockSize * 8
+    -- 块位图: 元数据块(firstDataBlock..dataStart-1) + 根目录块(dataStart)都标占用,
+    -- 位图容不下的尾部(bit >= blocks - firstDataBlock)必须置 1。
     local bmap = string.rep("\0", blockSize)
-    for bit = 0, usedBlocks - 1 do bmap = setBit(bmap, bit) end            -- 块 1..37
-    for bit = blocks - 1, bitsPerBitmap - 1 do bmap = setBit(bmap, bit) end -- 尾部填充
+    for bit = 0, usedBlocks - 1 do bmap = setBit(bmap, bit) end
+    for bit = blocks - firstDataBlock, bitsPerBitmap - 1 do bmap = setBit(bmap, bit) end
     if not bd.write(blockBitmap * blockSize, bmap) then return nil, "mkfs: 写块位图失败" end
 
+    -- inode 位图: inode 1..10 保留段标占用(inode 2 是根目录), 其余尾部填充位置 1。
     local imap = string.rep("\0", blockSize)
-    for bit = 0, 9 do imap = setBit(imap, bit) end -- inode 1..10(保留段; 2 是根目录)
-    for bit = inodesPerGroup, bitsPerBitmap - 1 do imap = setBit(imap, bit) end -- 尾部填充(inode 256 是合法空闲 inode)
+    for bit = 0, usedInodes - 1 do imap = setBit(imap, bit) end
+    for bit = inodesPerGroup, bitsPerBitmap - 1 do imap = setBit(imap, bit) end
     if not bd.write(inodeBitmap * blockSize, imap) then return nil, "mkfs: 写 inode 位图失败" end
 
     -- 5) 根目录(固定 inode 2)+ 它的目录块
     local fs = {
         bd = bd, blockSize = blockSize, inodes = inodesPerGroup, blocks = blocks,
-        rBlocks = 0, firstDataBlock = firstDataBlock, inodesPerGroup = inodesPerGroup,
+        rBlocks = rBlocks, firstDataBlock = firstDataBlock, inodesPerGroup = inodesPerGroup,
         blocksPerGroup = blocksPerGroup, inodeSize = inodeSize, firstIno = firstIno,
-        gdtOffset = 2 * blockSize, numGroups = 1,
+        gdtOffset = gdtBlock * blockSize, numGroups = 1,
     }
     local rootBlock = dataStart
     local e1 = w32(2) .. w16(12) .. string.char(1, FT_DIR) .. "." .. string.rep("\0", 3)
@@ -1244,7 +1304,7 @@ function ext2.mkfs(bd, opts)
     for n = 2, 15 do rootInode.ptrs[n] = 0 end
     if not ext2.writeInode(fs, rootInode) then return nil, "mkfs: 写根 inode 失败" end
 
-    -- 6) lost+found: 用驱动自己的 create(取 firstIno=11 的 inode、分配目录块、写 "."/".."、
+    -- 6) lost+found: 用驱动自己的 create(取 firstIno 的 inode、分配目录块、写 "."/".."、
     --    在根目录项里登记, 并把根的 links 加到 3)
     local lf, lerr = ext2.create(fs, "/", "lost+found", T_DIR + 448) -- 0700
     if not lf then return nil, "mkfs: 建 lost+found 失败: " .. tostring(lerr) end
@@ -1257,7 +1317,837 @@ function ext2.mkfs(bd, opts)
     local lfi = ext2.lookup(rfs, "/lost+found")
     if not lfi or lfi.type ~= T_DIR then return nil, "mkfs: 自检读不到 /lost+found" end
     if root.links ~= 3 then return nil, "mkfs: 根目录 links 应为 3, 实得 " .. tostring(root.links) end
+    rfs.mkfsInfo = info
     return rfs
+end
+
+-- ---------------------------------------------------------------
+-- fsck: 检查并修复(fsck.ext2 的内核实现)
+-- ---------------------------------------------------------------
+
+--- 把一串数字格式化成紧凑区间("1 2 3 8" -> "1--3 8"), 供位图差异那类报告用。
+local function formatRanges(nums)
+    table.sort(nums)
+    local parts, i = {}, 1
+    while i <= #nums do
+        local j = i
+        while j + 1 <= #nums and nums[j + 1] == nums[j] + 1 do j = j + 1 end
+        if j == i then
+            parts[#parts + 1] = tostring(nums[i])
+        elseif j == i + 1 then
+            parts[#parts + 1] = tostring(nums[i])
+            parts[#parts + 1] = tostring(nums[j])
+        else
+            parts[#parts + 1] = nums[i] .. "--" .. nums[j]
+        end
+        i = j + 1
+    end
+    return table.concat(parts, " ")
+end
+
+--- 检查(并可选修复)一个 ext2 文件系统 —— fsck.ext2 的内核实现。
+---
+--- 与真实 e2fsck 一样分五趟: ①inode/块 ②目录结构 ③连通性(孤儿 inode 重连 /lost+found)
+--- ④引用计数 ⑤位图与块组计数。块组数、块大小都是按超级块现算的, 所以宿主 mkfs.ext2
+--- 造出来的多块组镜像也走同一条路径(驱动自己只造单块组)。
+---
+--- **检查与修复是同一套代码**: mode == "check" 时 problem() 只打印不写盘, 一个字节都不落。
+---@param bd table 块设备
+---@param opts table|nil {
+---   mode  = "check"(只看) | "ask"(逐项问) | "fix"(全修),
+---   ask   = fun(desc: string): boolean,  mode=="ask" 的询问回调(工具接 stdin),
+---   emit  = fun(line: string),         每产出一行就回调(工具直接打印, 不必等跑完),
+---   yield = fun(),                     让出调度器(真机上长循环不让出会收不到 ^C),
+--- }
+---@return table report { code, errors, fixed, unfixed, lines, files, blocks, nonContiguous }
+function ext2.fsck(bd, opts)
+    opts = opts or {}
+    local mode = opts.mode or "check"
+    if mode ~= "check" and mode ~= "ask" and mode ~= "fix" then mode = "check" end
+
+    local lines = {}
+    local errors, fixed, unfixed = 0, 0, 0
+    local function out(s)
+        lines[#lines + 1] = s
+        if opts.emit then opts.emit(s) end
+    end
+    -- 运行期错误(超级块读不了/不是 ext2/不认识的特性): 直接以退出码 8 收场。
+    -- 这不是"发现问题", 而是"没法检查", 与 e2fsck 的 8 同义。
+    local function fatal(msg)
+        out(msg)
+        errors = errors + 1
+        unfixed = unfixed + 1
+        return { code = 8, errors = errors, fixed = fixed, unfixed = unfixed, lines = lines }
+    end
+
+    -- 让出调度器: 每 50ms CPU 时间一次(与 cat/dd 的分片规则一致)。
+    local yield = opts.yield
+    local lastYield = os.epoch and (os.epoch("utc") / 1000) or 0
+    local function tick()
+        if not yield then return end
+        local t = os.epoch("utc") / 1000
+        if t - lastYield >= 0.05 then lastYield = t; yield() end
+    end
+
+    --- 报告一个问题; 返回"是否真的修好了"。apply 为 nil = 没有安全的修法, 只报告。
+    local function problem(desc, apply)
+        errors = errors + 1
+        if mode == "check" or not apply then
+            out(desc .. "  <not fixed>")
+            unfixed = unfixed + 1
+            return false
+        end
+        if mode == "ask" then
+            local yes = opts.ask and opts.ask(desc .. "  Fix<y>? ")
+            if not yes then
+                out(desc .. "  <not fixed>")
+                unfixed = unfixed + 1
+                return false
+            end
+        end
+        if apply() == false then
+            out(desc .. "  <not fixed>")
+            unfixed = unfixed + 1
+            return false
+        end
+        fixed = fixed + 1
+        out(desc .. "  FIXED.")
+        return true
+    end
+
+    -- ---------- 超级块 ----------
+    local sb = bd.read(1024, 1024)
+    if not sb or #sb < 1024 then return fatal("fsck: cannot read superblock") end
+    if u16(sb, 56) ~= 0xEF53 then return fatal("fsck: bad magic number in superblock (not an ext2 filesystem)") end
+    local logBlockSize = u32(sb, 24)
+    if logBlockSize > 2 then
+        return fatal(string.format("fsck: unsupported block size (1024 << %d)", logBlockSize))
+    end
+    -- 只认识 INCOMPAT_FILETYPE(目录项的 file_type 字段); 其余不认识的特性说明盘上有我们
+    -- 读不懂的结构, 继续"修复"只会把它改坏 —— 直接拒绝(与 e2fsck 的 "unsupported feature" 同义)。
+    local incompat = u32(sb, 96)
+    local unknown = andNot(incompat, 0x2)
+    if unknown ~= 0 then
+        return fatal(string.format("fsck: unsupported incompat features (0x%x), refusing to check", unknown))
+    end
+
+    local fs = ext2.mount(bd)
+    if not fs then return fatal("fsck: cannot mount ext2 superblock") end
+    local blockSize = fs.blockSize
+    local totalBlocks, totalInodes = fs.blocks, fs.inodes
+    local inodesPerGroup, inodeSize, firstDataBlock = fs.inodesPerGroup, fs.inodeSize, fs.firstDataBlock
+    local blocksPerGroup = fs.blocksPerGroup
+    local numGroups = fs.numGroups
+    local bitsPerBitmap = blockSize * 8
+    local per = perIndirect(fs)
+
+    if blocksPerGroup ~= 8 * blockSize then
+        return fatal(string.format("fsck: bad blocks_per_group (%d, expected %d)", blocksPerGroup, 8 * blockSize))
+    end
+    if inodesPerGroup < 1 or inodesPerGroup > bitsPerBitmap then
+        return fatal(string.format("fsck: bad inodes_per_group (%d)", inodesPerGroup))
+    end
+    if inodeSize < 128 or inodeSize > blockSize or inodeSize % 128 ~= 0 then
+        return fatal(string.format("fsck: bad inode size (%d)", inodeSize))
+    end
+    if firstDataBlock ~= ((blockSize == 1024) and 1 or 0) then
+        return fatal(string.format("fsck: bad first_data_block (%d)", firstDataBlock))
+    end
+    if totalBlocks < numGroups * 1 or totalInodes < 11 then
+        return fatal("fsck: superblock counts are impossible")
+    end
+    if bd.getSize then
+        local size = bd.getSize()
+        if size and size > 0 and size < totalBlocks * blockSize then
+            return fatal(string.format("fsck: device is %d bytes, superblock claims %d blocks (%d bytes)",
+                size, totalBlocks, totalBlocks * blockSize))
+        end
+    end
+
+    local now = math.floor(os.epoch and (os.epoch("utc") / 1000) or os.time())
+    local sparseSuper = (u32(sb, 92) % 2) == 1 -- EXT2_FEATURE_COMPAT_SPARSE_SUPER
+    local reservedGdt = u16(sb, 206)
+    local gdtBlocks = math.ceil(numGroups * 32 / blockSize)
+
+    --- 该块组里是否有超级块副本(组 0 恒有; 稀疏超级块时只有 1 与 3/5/7 的幂)。
+    local function hasSuperCopy(g)
+        if g == 0 or not sparseSuper then return true end
+        for _, base in ipairs({ 3, 5, 7 }) do
+            local h = g
+            while h % base == 0 do h = h / base end
+            if h == 1 then return true end
+        end
+        return false
+    end
+
+    -- 元数据块(boot/superblock/gdt/位图/inode 表): 这些块被文件引用就是"文件用了文件系统的
+    -- 元数据", 位图里也永远必须标成占用。
+    local metaBlocks = {}
+    for g = 0, numGroups - 1 do
+        local gd = readGroupDesc(fs, g)
+        metaBlocks[gd.blockBitmap] = true
+        metaBlocks[gd.inodeBitmap] = true
+        local itBlocks = math.ceil(inodesPerGroup * inodeSize / blockSize)
+        for i = 0, itBlocks - 1 do metaBlocks[gd.inodeTable + i] = true end
+        if hasSuperCopy(g) then
+            local base = firstDataBlock + g * blocksPerGroup
+            local n = 1 + gdtBlocks + reservedGdt
+            for i = 0, n - 1 do metaBlocks[base + i] = true end
+        end
+    end
+
+    local function getBit(s, bit)
+        local v = s:byte(math.floor(bit / 8) + 1) or 0
+        return math.floor(v / 2 ^ (bit % 8)) % 2 == 1
+    end
+    local function setBitAt(s, bit, on)
+        local pos = math.floor(bit / 8) + 1
+        local v = s:byte(pos) or 0
+        local cur = math.floor(v / 2 ^ (bit % 8)) % 2 == 1
+        if cur == on then return s end
+        if on then v = v + 2 ^ (bit % 8) else v = v - 2 ^ (bit % 8) end
+        return s:sub(1, pos - 1) .. string.char(v) .. s:sub(pos + 1)
+    end
+    local function countFreeInRange(bitmap, from, to)
+        local n = 0
+        for bit = from, to - 1 do if not getBit(bitmap, bit) then n = n + 1 end end
+        return n
+    end
+    local imapCache = {}
+    local function inodeBitmap(g)
+        if not imapCache[g] then imapCache[g] = readBlockStr(fs, readGroupDesc(fs, g).inodeBitmap) end
+        return imapCache[g]
+    end
+    --- 改一个 inode 位图位并**立刻**落盘: 中途别的代码(如 lost+found 的 create)也会改位图,
+    --- 攒到最后一起写会把那些改动覆盖掉。
+    local function setInodeBit(g, bit, on)
+        local gd = readGroupDesc(fs, g)
+        local bmap = setBitAt(inodeBitmap(g), bit, on)
+        writeBlockStr(fs, gd.inodeBitmap, bmap)
+        imapCache[g] = bmap
+    end
+
+    local reservedIno = fs.firstIno -- 组 0 的 inode 1..firstIno-1 是保留段(mkfs 把它们标成占用)
+
+    -- ---------- Pass 1: inode / 块 ----------
+    out("Pass 1: Checking inodes, blocks, and sizes")
+    local blockOwner = {} -- 块号 -> 占用它的 inode
+    local nonContiguous = 0
+
+    --- 一个 inode 引用的块。每项带 set(newBlk) —— 多重占用时用它把指针改到克隆块上。
+    --- 快速符号链接(<= 60 字节)的目标字节内联在 i_block 里, **不是块号**
+    --- (与 readSymlink 的 60 字节分界必须一致, 否则会把目标字节当块号)。
+    local function inodeBlocks(inode)
+        local data, meta = {}, {}
+        if inode.type == T_SYM and (inode.size or 0) <= 60 then return data, meta end
+        local function slotSetter(slot)
+            return function(newBlk)
+                local i = ext2.readInode(fs, inode.ino)
+                i.ptrs[slot] = newBlk
+                ext2.writeInode(fs, i)
+            end
+        end
+        for n = 1, 12 do
+            local b = inode.ptrs[n]
+            if b ~= 0 then data[#data + 1] = { blk = b, idx = n - 1, set = slotSetter(n) } end
+        end
+        if inode.ptrs[13] ~= 0 then
+            local ind = inode.ptrs[13]
+            meta[#meta + 1] = { blk = ind, set = slotSetter(13) }
+            local d = readBlockStr(fs, ind)
+            if d then
+                for i = 0, per - 1 do
+                    local b, off = u32(d, i * 4), i * 4
+                    if b ~= 0 then
+                        data[#data + 1] = { blk = b, idx = 12 + i, set = function(nb)
+                            local dd = readBlockStr(fs, ind)
+                            if dd then writeBlockStr(fs, ind, setU32(dd, off, nb)) end
+                        end }
+                    end
+                end
+            end
+        end
+        if inode.ptrs[14] ~= 0 then
+            local dbl = inode.ptrs[14]
+            meta[#meta + 1] = { blk = dbl, set = slotSetter(14) }
+            local dblData = readBlockStr(fs, dbl)
+            if dblData then
+                for i = 0, per - 1 do
+                    local ioff, ind = i * 4, u32(dblData, i * 4)
+                    if ind ~= 0 then
+                        meta[#meta + 1] = { blk = ind, set = function(nb)
+                            local d2 = readBlockStr(fs, dbl)
+                            if d2 then writeBlockStr(fs, dbl, setU32(d2, ioff, nb)) end
+                        end }
+                        local indData = readBlockStr(fs, ind)
+                        if indData then
+                            for j = 0, per - 1 do
+                                local joff, b = j * 4, u32(indData, j * 4)
+                                if b ~= 0 then
+                                    data[#data + 1] = { blk = b, idx = 12 + per + i * per + j, set = function(nb)
+                                        local d3 = readBlockStr(fs, ind)
+                                        if d3 then writeBlockStr(fs, ind, setU32(d3, joff, nb)) end
+                                    end }
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        -- 三间接: 驱动没有写路径(文件大小上限就到双间接), 只如实记下来
+        if inode.ptrs[15] ~= 0 then meta[#meta + 1] = { blk = inode.ptrs[15], set = slotSetter(15) } end
+        return data, meta
+    end
+
+    for ino = 1, totalInodes do
+        if ino % 256 == 0 then tick() end
+        local g = math.floor((ino - 1) / inodesPerGroup)
+        local bit = (ino - 1) % inodesPerGroup
+        local inode = ext2.readInode(fs, ino)
+        if not inode then return fatal(string.format("fsck: cannot read inode %d", ino)) end
+        -- inode 1..10 是保留段(坏块 inode、root、resize inode、journal inode…): e2fsck 同此,
+        -- 既不查它们的块/链接计数, 也不把它们当孤儿。resize inode 的 i_block 本来就指着
+        -- 预留 GDT 块(那是它的正常形态, 不是"文件占了元数据")。
+        if ino < reservedIno then
+            -- 跳过
+        elseif inode.mode == 0 then
+            -- 空 inode 但位图标着占用(保留段除外, mkfs 一直这么标)
+            if ino >= reservedIno then
+                if getBit(inodeBitmap(g), bit) then
+                    problem(string.format("Inode %d is unused but marked in use", ino), function()
+                        setInodeBit(g, bit, false)
+                    end)
+                end
+            end
+        else
+            if not getBit(inodeBitmap(g), bit) then
+                problem(string.format("Inode %d is in use, but not marked in use", ino), function()
+                    setInodeBit(g, bit, true)
+                end)
+            end
+
+            local type = itype(inode.mode)
+            if type ~= T_DIR and type ~= T_REG and type ~= T_SYM and type ~= T_FIFO
+                and type ~= 0x2000 and type ~= 0x6000 and type ~= 0xC000 then
+                problem(string.format("Inode %d has invalid mode (0x%x)", ino, inode.mode), function()
+                    fs.bd.write(inodeDiskOffset(fs, ino), string.rep("\0", fs.inodeSize))
+                    setInodeBit(g, bit, false)
+                end)
+            else
+                local data, meta = inodeBlocks(inode)
+
+                --- 指针合法性 + 多重占用。返回 true 表示这个块最终归本 inode。
+                local function checkPtr(e)
+                    local b = e.blk
+                    if b < firstDataBlock or b >= totalBlocks then
+                        problem(string.format("Inode %d has a bad block pointer (%d, fs has %d blocks)",
+                            ino, b, totalBlocks), function() e.set(0) end)
+                        e.bad = true
+                    elseif metaBlocks[b] then
+                        problem(string.format("Inode %d block %d is filesystem metadata", ino, b), function()
+                            e.set(0)
+                        end)
+                        e.bad = true
+                    elseif blockOwner[b] and blockOwner[b] ~= ino then
+                        local other = blockOwner[b]
+                        problem(string.format("Block %d is multiply claimed by inode %d and inode %d",
+                            b, other, ino), function()
+                            -- 克隆: 把内容复制到新块, 本 inode 改指新块(e2fsck 的 "clone" 语义)
+                            local nb = ext2.allocBlock(fs)
+                            if not nb then return end
+                            local content = readBlockStr(fs, b)
+                            if content then writeBlockStr(fs, nb, content) end
+                            e.set(nb)
+                            e.blk = nb
+                            blockOwner[nb] = ino
+                        end)
+                    else
+                        blockOwner[b] = ino
+                    end
+                end
+                for _, e in ipairs(meta) do checkPtr(e) end
+                for _, e in ipairs(data) do checkPtr(e) end
+
+                -- i_blocks: 数据块 + 间接块, 单位是 512 字节扇区
+                local counted = 0
+                for _, e in ipairs(data) do if not e.bad then counted = counted + 1 end end
+                for _, e in ipairs(meta) do if not e.bad then counted = counted + 1 end end
+                local wantBlocks = counted * math.floor(blockSize / 512)
+                if (inode.blocks or 0) ~= wantBlocks then
+                    problem(string.format("Inode %d, i_blocks is %d, should be %d",
+                        ino, inode.blocks or 0, wantBlocks), function()
+                        local i = ext2.readInode(fs, ino)
+                        i.blocks = wantBlocks
+                        ext2.writeInode(fs, i)
+                    end)
+                end
+
+                if type == T_DIR then
+                    local nBlocks = math.ceil((inode.size or 0) / blockSize)
+                    if (inode.size or 0) == 0 or inode.size % blockSize ~= 0 or nBlocks > #data then
+                        local wantSize = math.max(1, #data) * blockSize
+                        problem(string.format("Inode %d is a directory with invalid size %d (should be %d)",
+                            ino, inode.size or 0, wantSize), function()
+                            local i = ext2.readInode(fs, ino)
+                            i.size = wantSize
+                            ext2.writeInode(fs, i)
+                        end)
+                    end
+                elseif type == T_REG then
+                    -- 非连续文件(块号不按逻辑块序递增)只统计, 给汇总行用
+                    local prevIdx, prevBlk
+                    for _, e in ipairs(data) do
+                        if prevBlk and e.idx == prevIdx + 1 and e.blk ~= prevBlk + 1 then
+                            nonContiguous = nonContiguous + 1
+                            break
+                        end
+                        prevIdx, prevBlk = e.idx, e.blk
+                    end
+                end
+            end
+        end
+    end
+
+    -- ---------- Pass 2: 目录结构 ----------
+    out("Pass 2: Checking directory structure")
+    local refs = {}         -- ino -> 被目录项引用的次数
+    local visitedDirs = {}  -- 已按树走过的目录
+    local parentOf = {}     -- 目录 -> 父目录
+
+    --- 把一个目录块按 live 条目重新打包(空条目归到块尾)。
+    --- 目录块里 inode=0 的条目只能是**块尾**的空闲空间: 中间的空洞、被删掉的坏条目
+    --- 一律靠重打包收干净 —— 这比为每条修补单独算 rec_len 简单得多, 也不会留下
+    --- "inode=0 条目夹在活条目之间"那种 e2fsck 判 "directory corrupted" 的形态。
+    local function packEntries(entries)
+        if #entries == 0 then
+            return w32(0) .. w16(blockSize) .. string.char(0, 0) .. string.rep("\0", blockSize - 8)
+        end
+        local outParts, off = {}, 0
+        for i, e in ipairs(entries) do
+            local actual = alignedSize(8 + #e.name)
+            local rec = (i == #entries) and (blockSize - off) or actual
+            outParts[#outParts + 1] = w32(e.ino) .. w16(rec) .. string.char(#e.name, e.type)
+                .. e.name .. string.rep("\0", rec - 8 - #e.name)
+            off = off + rec
+        end
+        return table.concat(outParts)
+    end
+
+    --- 处理一个目录(校验并修补它的每个目录块), 返回它引用的子目录列表。
+    local function checkDir(dirIno, parentIno)
+        local inode = ext2.readInode(fs, dirIno)
+        if not inode or itype(inode.mode) ~= T_DIR then return {} end
+        if (inode.size or 0) == 0 then
+            local okFix = problem(string.format("Inode %d (directory) has no data block", dirIno), function()
+                local blk = ext2.allocBlock(fs)
+                local i = ext2.readInode(fs, dirIno)
+                i.ptrs[1] = blk
+                i.size = blockSize
+                i.blocks = math.floor(blockSize / 512)
+                ext2.writeInode(fs, i)
+                writeBlockStr(fs, blk, packEntries({}))
+            end)
+            if not okFix then return {} end
+            inode = ext2.readInode(fs, dirIno)
+        end
+
+        local nBlocks = math.ceil(inode.size / blockSize)
+        local children, names = {}, {}
+        for idx = 0, nBlocks - 1 do
+            tick()
+            local inodeNow = (idx == 0) and inode or ext2.readInode(fs, dirIno)
+            local blk = ext2.getBlock(fs, inodeNow, idx)
+            if not blk or blk == 0 then
+                local okFix = problem(string.format("Inode %d (directory) has a hole at block %d", dirIno, idx), function()
+                    local i = ext2.readInode(fs, dirIno)
+                    local nb = ext2.ensureBlock(fs, i, idx)
+                    if nb then
+                        writeBlockStr(fs, nb, packEntries({}))
+                        ext2.writeInode(fs, i)
+                    end
+                end)
+                if okFix then
+                    blk = ext2.getBlock(fs, ext2.readInode(fs, dirIno), idx)
+                end
+            end
+            if blk and blk ~= 0 then
+                local raw = readBlockStr(fs, blk)
+                local live, issues, dirty = {}, {}, false
+                local off = 0
+                while off + 8 <= blockSize do
+                    local entIno = u32(raw, off)
+                    local recLen = u16(raw, off + 4)
+                    if recLen < 8 or recLen % 4 ~= 0 or off + recLen > blockSize then
+                        issues[#issues + 1] = string.format("Inode %d block %d has a bad entry length at offset %d", dirIno, idx, off)
+                        dirty = true
+                        break
+                    end
+                    local nameLen = raw:byte(off + 7) or 0
+                    local ftype = raw:byte(off + 8) or 0
+                    if entIno == 0 then
+                        if off + recLen < blockSize then
+                            issues[#issues + 1] = string.format("Inode %d block %d has free space in the middle", dirIno, idx)
+                            dirty = true
+                        end
+                    else
+                        local name = (nameLen > 0 and nameLen <= recLen - 8) and raw:sub(off + 9, off + 8 + nameLen) or nil
+                        local why
+                        if not name then why = "has an entry with a bad name length"
+                        elseif name:find("/", 1, true) or name:find("\0", 1, true) then why = "has an entry with an invalid name"
+                        elseif entIno > totalInodes then why = string.format("points to inode %d, which is out of range", entIno)
+                        else
+                            local ent = ext2.readInode(fs, entIno)
+                            if not ent or ent.mode == 0 then
+                                why = string.format("points to unused inode %d", entIno)
+                            elseif names[name] then
+                                why = string.format("has a duplicate entry '%s'", name)
+                            end
+                        end
+                        if why then
+                            issues[#issues + 1] = string.format("Inode %d block %d %s ('%s')", dirIno, idx, why, name or "?")
+                            dirty = true
+                        else
+                            local ent = ext2.readInode(fs, entIno)
+                            local wantType = typeToFileType(ent.type)
+                            if ftype ~= wantType then
+                                issues[#issues + 1] = string.format("Inode %d entry '%s' has type %d, should be %d",
+                                    dirIno, name, ftype, wantType)
+                                dirty = true
+                                ftype = wantType
+                            end
+                            names[name] = true
+                            live[#live + 1] = { ino = entIno, name = name, type = ftype }
+                        end
+                    end
+                    off = off + recLen
+                end
+
+                -- "." 与 ".." 必须在最前两条、且指向自己与父目录
+                if idx == 0 then
+                    local dot, dotdot, rest = nil, nil, {}
+                    for _, e in ipairs(live) do
+                        if e.name == "." then dot = e
+                        elseif e.name == ".." then dotdot = e
+                        else rest[#rest + 1] = e end
+                    end
+                    local need = false
+                    if not dot then
+                        issues[#issues + 1] = string.format("Inode %d is missing '.'", dirIno)
+                        need = true
+                    elseif dot.ino ~= dirIno then
+                        issues[#issues + 1] = string.format("Inode %d has a bad '.' entry (points to %d)", dirIno, dot.ino)
+                        need = true
+                    end
+                    if not dotdot then
+                        issues[#issues + 1] = string.format("Inode %d is missing '..'", dirIno)
+                        need = true
+                    elseif dotdot.ino ~= parentIno then
+                        issues[#issues + 1] = string.format("Inode %d has a bad '..' entry (points to %d, should be %d)",
+                            dirIno, dotdot.ino, parentIno)
+                        need = true
+                    end
+                    if need then
+                        dirty = true
+                        live = { { ino = dirIno, name = ".", type = FT_DIR }, { ino = parentIno, name = "..", type = FT_DIR } }
+                        for _, e in ipairs(rest) do live[#live + 1] = e end
+                    end
+                end
+
+                if dirty then
+                    problem(table.concat(issues, "; "), function()
+                        writeBlockStr(fs, blk, packEntries(live))
+                    end)
+                end
+
+                for _, e in ipairs(live) do
+                    if e.name == "." then
+                        refs[dirIno] = (refs[dirIno] or 0) + 1
+                    elseif e.name == ".." then
+                        refs[parentIno] = (refs[parentIno] or 0) + 1
+                    else
+                        refs[e.ino] = (refs[e.ino] or 0) + 1
+                        local ent = ext2.readInode(fs, e.ino)
+                        if ent and itype(ent.mode) == T_DIR then
+                            children[#children + 1] = e.ino
+                        end
+                    end
+                end
+            end
+        end
+        return children
+    end
+
+    --- 从 rootIno 起走一遍目录树(广度优先, 不递归 —— CC 的 C 栈很浅)。
+    local function walkTree(rootIno, rootParent)
+        local queue = { { ino = rootIno, parent = rootParent } }
+        local head = 1
+        while head <= #queue do
+            local item = queue[head]; head = head + 1
+            local children = checkDir(item.ino, item.parent)
+            for _, c in ipairs(children) do
+                if visitedDirs[c] then
+                    if parentOf[c] ~= item.ino then
+                        problem(string.format("Directory inode %d is referenced from two directories (%d and %d)",
+                            c, parentOf[c] or -1, item.ino), nil)
+                    end
+                else
+                    visitedDirs[c] = true
+                    parentOf[c] = item.ino
+                    queue[#queue + 1] = { ino = c, parent = item.ino }
+                end
+            end
+        end
+    end
+
+    visitedDirs[2] = true
+    walkTree(2, 2)
+
+    -- ---------- Pass 3: 连通性 ----------
+    out("Pass 3: Checking directory connectivity")
+    local lostFoundIno
+
+    --- /lost+found 的 inode 号; 没有就在允许写盘时建一个(e2fsck 同此)。
+    local function lostFound(create)
+        if lostFoundIno then return lostFoundIno end
+        local e = ext2.lookup(fs, "/lost+found")
+        if e and itype(e.mode) == T_DIR then
+            lostFoundIno = e.ino
+            return lostFoundIno
+        end
+        if e then
+            problem("'/lost+found' is not a directory", nil)
+            return nil
+        end
+        if not create then
+            out("  /lost+found does not exist (needed to reconnect orphaned inodes)")
+            return nil
+        end
+        local ino, err = ext2.create(fs, "/", "lost+found", T_DIR + 448)
+        if not ino then
+            out("  cannot create /lost+found: " .. tostring(err))
+            return nil
+        end
+        lostFoundIno = ino
+        out(string.format("  Created /lost+found (inode %d)", ino))
+        -- 新目录的 "."/".." 也要计进引用表, 否则 Pass 4 会把它的 links 改坏
+        visitedDirs[ino] = true
+        parentOf[ino] = 2
+        walkTree(ino, 2)
+        return lostFoundIno
+    end
+
+    -- 孤儿 inode: 在用的 inode 却没有任何目录项指向它 —— 挂到 /lost+found 下(名字用 #<ino>,
+    -- 与 e2fsck 一样), 目录型的还要修好它的 "."/".." 并继续往下走。
+    for ino = reservedIno, totalInodes do
+        tick()
+        local inode = ext2.readInode(fs, ino)
+        if inode.mode ~= 0 and (refs[ino] or 0) == 0 then
+            local type = itype(inode.mode)
+            problem(string.format("Inode %d is unconnected (will be reconnected to /lost+found)", ino), function()
+                local lf = lostFound(true)
+                if not lf then return false end
+                local lfInode = ext2.readInode(fs, lf)
+                if not ext2.addDirEntry(fs, lfInode, "#" .. ino, ino, typeToFileType(type)) then return false end
+                refs[ino] = (refs[ino] or 0) + 1
+                if type == T_DIR then
+                    visitedDirs[ino] = true
+                    parentOf[ino] = lf
+                    walkTree(ino, lf)
+                end
+            end)
+        end
+    end
+
+    -- ---------- Pass 4: 引用计数 ----------
+    out("Pass 4: Checking reference counts")
+    for ino = reservedIno, totalInodes do
+        tick()
+        local inode = ext2.readInode(fs, ino)
+        if inode.mode ~= 0 then
+            local want = refs[ino] or 0
+            if (inode.links or 0) ~= want then
+                problem(string.format("Inode %d ref count is %d, should be %d", ino, inode.links or 0, want), function()
+                    local i = ext2.readInode(fs, ino)
+                    i.links = want
+                    ext2.writeInode(fs, i)
+                end)
+            end
+        end
+    end
+
+    -- ---------- Pass 5: 位图与块组计数 ----------
+    out("Pass 5: Checking group summary information")
+
+    -- 5a) inode 位图: 与"实际在用"对齐(保留段保持标占用)
+    for g = 0, numGroups - 1 do
+        local gd = readGroupDesc(fs, g)
+        local bmap = readBlockStr(fs, gd.inodeBitmap)
+        imapCache[g] = bmap
+        local adds, dels = {}, {}
+        local newBmap = bmap
+        for bit = 0, inodesPerGroup - 1 do
+            local ino = g * inodesPerGroup + bit + 1
+            local inode = ext2.readInode(fs, ino)
+            local want = (inode.mode ~= 0) or ino < reservedIno
+            local marked = getBit(bmap, bit)
+            if want and not marked then
+                newBmap = setBitAt(newBmap, bit, true)
+                adds[#adds + 1] = ino
+            elseif marked and not want then
+                newBmap = setBitAt(newBmap, bit, false)
+                dels[#dels + 1] = ino
+            end
+        end
+        local padN = 0
+        for bit = inodesPerGroup, bitsPerBitmap - 1 do
+            if not getBit(newBmap, bit) then
+                newBmap = setBitAt(newBmap, bit, true)
+                padN = padN + 1
+            end
+        end
+        if #adds > 0 or #dels > 0 or padN > 0 then
+            local desc = string.format("Group %d inode bitmap differences:", g)
+            if #dels > 0 then desc = desc .. "  -" .. formatRanges(dels) end
+            if #adds > 0 then desc = desc .. "  +" .. formatRanges(adds) end
+            if padN > 0 then desc = desc .. "  (padding at end not set)" end
+            problem(desc, function()
+                writeBlockStr(fs, gd.inodeBitmap, newBmap)
+                imapCache[g] = newBmap
+            end)
+        end
+    end
+
+    -- 5b) 块位图: 用"最终落盘的 inode 内容"重算一遍占用
+    local usedBlocks = {}
+    for b in pairs(metaBlocks) do
+        if b >= 0 and b < totalBlocks then usedBlocks[b] = true end
+    end
+    for ino = 1, totalInodes do
+        tick()
+        local inode = ext2.readInode(fs, ino)
+        if inode.mode ~= 0 then
+            local data, meta = inodeBlocks(inode)
+            for _, e in ipairs(data) do
+                if e.blk >= firstDataBlock and e.blk < totalBlocks then usedBlocks[e.blk] = true end
+            end
+            for _, e in ipairs(meta) do
+                if e.blk >= firstDataBlock and e.blk < totalBlocks then usedBlocks[e.blk] = true end
+            end
+        end
+    end
+
+    for g = 0, numGroups - 1 do
+        local gd = readGroupDesc(fs, g)
+        local bmap = readBlockStr(fs, gd.blockBitmap)
+        local start = firstDataBlock + g * blocksPerGroup
+        local limit = math.min(blocksPerGroup, totalBlocks - start)
+        if limit < 0 then limit = 0 end
+        local adds, dels = {}, {}
+        local newBmap = bmap
+        for bit = 0, limit - 1 do
+            local blk = start + bit
+            local want = usedBlocks[blk] and true or false
+            local marked = getBit(bmap, bit)
+            if want and not marked then
+                newBmap = setBitAt(newBmap, bit, true)
+                adds[#adds + 1] = blk
+            elseif marked and not want then
+                newBmap = setBitAt(newBmap, bit, false)
+                dels[#dels + 1] = blk
+            end
+        end
+        local padN = 0
+        for bit = limit, bitsPerBitmap - 1 do
+            if not getBit(newBmap, bit) then
+                newBmap = setBitAt(newBmap, bit, true)
+                padN = padN + 1
+            end
+        end
+        if #adds > 0 or #dels > 0 or padN > 0 then
+            local desc = string.format("Group %d block bitmap differences:", g)
+            if #dels > 0 then desc = desc .. "  -" .. formatRanges(dels) end
+            if #adds > 0 then desc = desc .. "  +" .. formatRanges(adds) end
+            if padN > 0 then desc = desc .. "  (padding at end not set)" end
+            problem(desc, function()
+                writeBlockStr(fs, gd.blockBitmap, newBmap)
+            end)
+        end
+    end
+
+    -- 5c) 空闲计数与目录计数: 用最终位图重算, 与盘上的值逐项比对
+    local totalFreeBlocks, totalFreeInodes = 0, 0
+    for g = 0, numGroups - 1 do
+        local gd = readGroupDesc(fs, g)
+        local bmap = readBlockStr(fs, gd.blockBitmap)
+        local imap = readBlockStr(fs, gd.inodeBitmap)
+        local start = firstDataBlock + g * blocksPerGroup
+        local limit = math.min(blocksPerGroup, totalBlocks - start)
+        if limit < 0 then limit = 0 end
+        local freeB = countFreeInRange(bmap, 0, limit)
+        local freeI = countFreeInRange(imap, 0, inodesPerGroup)
+        totalFreeBlocks = totalFreeBlocks + freeB
+        totalFreeInodes = totalFreeInodes + freeI
+        local dirs = 0
+        for bit = 0, inodesPerGroup - 1 do
+            local ino = g * inodesPerGroup + bit + 1
+            local inode = ext2.readInode(fs, ino)
+            if inode.mode ~= 0 and itype(inode.mode) == T_DIR then dirs = dirs + 1 end
+        end
+        local raw = bd.read(fs.gdtOffset + g * 32, 32)
+        if u16(raw, 12) ~= freeB then
+            problem(string.format("Group %d free blocks count wrong (%d, counted=%d)", g, u16(raw, 12), freeB), function()
+                bd.write(fs.gdtOffset + g * 32, setU16(raw, 12, freeB))
+            end)
+        end
+        if u16(raw, 14) ~= freeI then
+            problem(string.format("Group %d free inodes count wrong (%d, counted=%d)", g, u16(raw, 14), freeI), function()
+                bd.write(fs.gdtOffset + g * 32, setU16(raw, 14, freeI))
+            end)
+        end
+        if u16(raw, 16) ~= dirs then
+            problem(string.format("Group %d directories count wrong (%d, counted=%d)", g, u16(raw, 16), dirs), function()
+                bd.write(fs.gdtOffset + g * 32, setU16(raw, 16, dirs))
+            end)
+        end
+    end
+
+    local sbNow = bd.read(1024, 1024)
+    local sbFreeBlocks, sbFreeInodes = u32(sbNow, 12), u32(sbNow, 16)
+    if sbFreeBlocks ~= totalFreeBlocks then
+        problem(string.format("Free blocks count wrong in superblock (%d, counted=%d)", sbFreeBlocks, totalFreeBlocks), function()
+            bd.write(1024, setU32(sbNow, 12, totalFreeBlocks))
+        end)
+    end
+    if sbFreeInodes ~= totalFreeInodes then
+        problem(string.format("Free inodes count wrong in superblock (%d, counted=%d)", sbFreeInodes, totalFreeInodes), function()
+            bd.write(1024, setU32(sbNow, 16, totalFreeInodes))
+        end)
+    end
+    if u16(sbNow, 58) ~= 1 then
+        problem("Filesystem state is not clean", function()
+            bd.write(1024, setU16(sbNow, 58, 1))
+        end)
+    end
+
+    -- 收尾: 改动过就把超级块标记成干净并刷新时间戳(e2fsck 语义)
+    if mode ~= "check" and fixed > 0 then
+        local sbEnd = bd.read(1024, 1024)
+        sbEnd = setU16(sbEnd, 58, 1)   -- s_state: clean
+        sbEnd = setU16(sbEnd, 52, 0)   -- s_mnt_count
+        sbEnd = setU32(sbEnd, 48, now) -- s_wtime
+        sbEnd = setU32(sbEnd, 64, now) -- s_lastcheck
+        bd.write(1024, sbEnd)
+    end
+
+    local code = 0
+    if errors > 0 then code = (unfixed == 0) and 1 or 4 end
+    return {
+        code = code, errors = errors, fixed = fixed, unfixed = unfixed, lines = lines,
+        files = { used = totalInodes - totalFreeInodes, total = totalInodes },
+        blocks = { used = totalBlocks - totalFreeBlocks, total = totalBlocks },
+        nonContiguous = nonContiguous,
+    }
 end
 
 return ext2

@@ -250,6 +250,11 @@ def main():
     df_write(out, unit_posix, "/lib/systemd/system/posix-verify.service")
     df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/posix-verify.service")
 
+    # 3f3) mkfs.ext2/fsck.ext2 真机验证要用的"造损坏"小工具(见 scripts/ext2_corrupt.lua 的头注释:
+    #      /dev/sdXN 的字节句柄没有 seek, dd seek= 在这种设备上明确报 cannot seek)。
+    df_write(out, os.path.join(REPO, "scripts/ext2_corrupt.lua"), "/root/ext2_corrupt.lua")
+    df(out, "set_inode_field /root/ext2_corrupt.lua mode 0100755")
+
     # 3g) 门禁: 注入后镜像仍必须干净, 不把坏镜像带上真机
     p = subprocess.run([FSCK, "-fn", out], capture_output=True, text=True)
     if p.returncode != 0:
@@ -425,6 +430,46 @@ def reboot_and_collect(printer=False):
     print("e2fsck exit=%d" % p.returncode)
     if p.returncode != 0:
         raise RuntimeError("运行一轮后 root.img 不再 fsck 干净 —— Delin 把自己写坏了, 见上面输出")
+
+    # 7) mkfs.ext2 / fsck.ext2: 真机在**电脑自带存储的 CC-fs** 上现场造了一个分区镜像
+    #    (/parts/scratch.img, 见 verify.sh 的 mkfs 段): mkfs.ext2 格式化 -> 挂载写文件 ->
+    #    fsck.ext2 判干净 -> 手工破坏块位图 -> -n 报出(4) -> -y 修好(1) -> 再查干净(0)。
+    #    这里是权威裁判: 把那个镜像拿回宿主机用真实 e2fsck 判, 并且要求修复后数据还在。
+    print("\n===== 真机 mkfs.ext2 造的镜像: 宿主 e2fsck -fn =====")
+    scratch = os.path.join(COMPUTER, "parts/scratch.img")
+    if not os.path.exists(scratch):
+        raise RuntimeError("真机 mkfs.ext2 门禁失败: %s 不存在(verify.sh 的 mkfs 段没跑成?)" % scratch)
+    p = subprocess.run([FSCK, "-fn", scratch], capture_output=True, text=True)
+    out = (p.stdout + p.stderr).strip()
+    print(out[-2000:] if out else "(no output)")
+    print("e2fsck exit=%d" % p.returncode)
+    if p.returncode != 0:
+        raise RuntimeError("真机 mkfs.ext2/fsck.ext2 出来的镜像 e2fsck 判不干净 —— 见上面输出")
+    lab = run("/sbin/blkid", scratch).strip()
+    print("   %s" % lab)
+    if 'LABEL="SCRATCH"' not in lab or 'TYPE="ext2"' not in lab:
+        raise RuntimeError("真机 mkfs.ext2 的卷标/类型不对: %s" % lab)
+    # debugfs 的 banner 会混在 stdout 里("debugfs 1.47.2 ..."), 只取第一行内容
+    hello = df(scratch, "cat /hello.txt").splitlines()[0].strip()
+    inner = df(scratch, "cat /dir/inner.txt").splitlines()[0].strip()
+    if hello != "hello-from-mkfs" or inner != "inner":
+        raise RuntimeError("真机 fsck.ext2 修完之后文件内容不对: /hello.txt=%r /dir/inner.txt=%r"
+                           % (hello, inner))
+    print("   ok e2fsck clean + LABEL=SCRATCH + 修复后数据完好")
+
+    # verify.log 里的 ok/ng 与退出码逐条设门禁(其余行由人读日志)
+    for name in ("mkfs_ext2", "mkfs_refuses_existing", "fsck_refuses_mounted",
+                 "fsck_detects_corruption", "fsck_fixes_corruption", "fsck_clean_after_fix"):
+        if ("ok " + name) not in fresh:
+            raise RuntimeError("真机自检未通过: %s(verify.log 里没有 'ok %s')" % (name, name))
+        print("   ok %s" % name)
+    for key, want in (("mkfs_rc", "0"), ("mkfs_existing_rc", "1"), ("mkfs_dryrun_rc", "0"),
+                      ("mkfs_force_rc", "0"), ("fsck_clean_rc", "0"), ("fsck_mounted_rc", "8"),
+                      ("fsck_broken_rc", "4"), ("fsck_fix_rc", "1"), ("fsck_after_fix_rc", "0")):
+        m = re.search(r"^%s=(\d+)" % key, fresh, re.M)
+        if not m or m.group(1) != want:
+            raise RuntimeError("真机 %s 不是 %s: %s" % (key, want, m.group(1) if m else "(missing)"))
+        print("   ok %s=%s" % (key, want))
 
 if __name__ == "__main__":
     main()

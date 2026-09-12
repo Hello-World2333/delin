@@ -14,7 +14,7 @@
 
 | 路径 | 作用 |
 |---|---|
-| `/bin/` | 用户工具（POSIX 强制命令已补齐，见「POSIX 命令覆盖」一节）：`basename cat chgrp chmod chown cksum clear cmp comm cp csplit cut dd df diff dirname du echo ed expand expr file find fold grep head id join kill killall ln ls mkdir mkfifo mount mv nohup od passwd paste patch pathchk pr printf ps readlink realpath rm rmdir sed sh sleep sort split strings tail tee touch tr umount unexpand uniq uudecode uuencode wc whoami xargs`；系统/服务类：`blkid dmesg logger login logrotate lp lsblk lua pgrep pkill syslogd systemctl`；用户管理：`groupadd groupdel groups useradd userdel usermod` |
+| `/bin/` | 用户工具（POSIX 强制命令已补齐，见「POSIX 命令覆盖」一节）：`basename cat chgrp chmod chown cksum clear cmp comm cp csplit cut dd df diff dirname du echo ed expand expr file find fold grep head id join kill killall ln ls mkdir mkfifo mount mv nohup od passwd paste patch pathchk pr printf ps readlink realpath rm rmdir sed sh sleep sort split strings tail tee touch tr umount unexpand uniq uudecode uuencode wc whoami xargs`；系统/服务类：`blkid dmesg fsck.ext2 logger login logrotate lp lsblk lua mkfs.ext2 pgrep pkill syslogd systemctl`；用户管理：`groupadd groupdel groups useradd userdel usermod` |
 | `/dev/` | 设备文件：`/dev/ttyN`（字符终端）、`/dev/fbN`（像素帧缓冲）、`/dev/sdX`（磁盘，见下）、`/dev/lpN`（打印机字符设备，只写，见下）、`/dev/null`（读 EOF/写丢弃）、`/dev/zero`（读 = 无限 NUL）、`/dev/random`、`/dev/urandom`（随机字节，见下）、`/dev/console`（系统控制台 = 控制台 tty）、`/dev/kmsg`（内核 ring buffer 只读流）、`/dev/log`（用户态 syslog 输入） |
 | `/etc/` | 系统配置：`passwd` `shadow`（0600 root:root）`group`、`fstab`、`syslog.conf`、`logrotate.conf`、`systemd/system/`（管理员单元与 enable 标记） |
 | `/proc/` | 虚拟进程/系统信息 fs（procfs，内核提供，见下）：`/proc/<pid>/{cmdline,comm,cwd,stat,status}`、`/proc/self`、`/proc/{mounts,uptime,version}`、`/proc/sys/kernel/random/{entropy_avail,poolsize,uuid}` |
@@ -67,6 +67,50 @@ CC 没有裸块 API：一块存储（**电脑自带存储**，或磁盘驱动器
   `bad argument #1 (boolean expected, got table)`（曾经的 bug，`hosttest` 里锁着）。
 - 磁盘插入/弹出（CC `disk` / `disk_eject` 事件）时内核重新扫描并刷新 `/dev` 节点。
   自带存储的 LABEL 取 `os.getComputerLabel()`。
+
+#### mkfs.ext2 与 fsck.ext2
+
+两个 e2fsprogs 风格的工具，逻辑都在内核里、`/bin` 只是薄壳（与 `user.*`/`init.*` 同一模式）：
+`kernel/ext2.lua` 的 `ext2.mkfs`/`ext2.fsck` 是真源，`devdisk.mkfs`/`devdisk.fsck` 负责
+「把设备规格解析成镜像路径、拒绝挂载中的文件系统」，boot 注册 `blkdev.mkfs`/`blkdev.fsck` syscall。
+
+| 命令 | 覆盖 |
+|---|---|
+| `mkfs.ext2 [-b 块大小] [-N inode 数] [-L 卷标] [-m 保留%] [-n] [-q] [-F] [-v] 设备 [块数]` | 建 ext2（`-t ext2` 也收，其它类型 fail-fast） |
+| `fsck.ext2 [-a\|-p\|-n\|-y] [-f] [-v] 设备` | 检查/修复（退出码与 e2fsck 一致：0/1/4/8/16） |
+
+- **设备**两种规格都收（与 `mount` 一致）：`/dev/sdXN`、`UUID=<uuid>`（节点规格，由 `devdisk.find`
+  解析）或**真实后端上的镜像路径**。省略块数时按设备/镜像现有大小算；0 字节的空镜像必须显式给块数。
+- **布局**（单块组，与宿主 `mkfs.ext2` 的单块组产物同构）：块大小 1024/2048/4096；
+  块大小 1024 时 block0 是引导块、block1 超级块、block2 块组描述符、block3/4 位图、block5.. inode 表；
+  块大小 >1024 时超级块在 block0 内偏移 1024 处，GDT 起自 block1。块数上限 `8*块大小`
+  （1024 时 8192 块 = 8MB，4096 时 32768 块 = 128MB）—— **只做单块组**，超了直接报错。
+- **`-N`** 向上取整到「每块 inode 数」的整数倍（inode 表恰好占整数个块，不留半块）；**`-m`** 写
+  `s_r_blocks_count`，驱动分配块时到保留线就停；**`-L`** 落进超级块的 16 字节卷标区（`blkid` 读得回）。
+- **`-F` 不是装饰**：目标上已经有（能被挂载的）ext2 又不给 `-F` 一律拒绝 —— 与 mke2fs 那句
+  "proceed anyway?" 同义，只是这里不交互；**挂载中的文件系统永远拒绝格式化/检查**（会把运行中的
+  系统写坏），判定在内核里（`devdisk.mountedAt`）。
+- **fsck 五趟**（与 e2fsck 同构，`mode` = `check` 只看不写 / `ask` 逐项问 / `fix` 全修，
+  **检查与修复是同一套代码**，`check` 模式一个字节都不落）：
+  ①inode/块（模式合法性、块指针范围、多重占用**克隆**、`i_blocks`、目录 size）；
+  ②目录结构（条目长度/名字/类型、指向空闲 inode 的条目、重复条目、`.`与`..`）；
+  ③连通性（孤儿 inode **重连到 `/lost+found`**，名字 `#<ino>`，没有 `/lost+found` 就建一个）；
+  ④引用计数（`links` 与实际引用对数）；⑤位图与块组计数（含尾部填充位、`bg_used_dirs_count`）。
+- **`inode 1..10` 是保留段**（坏块 inode、root、resize inode、journal inode…）：与 e2fsck 一样
+  **不查**它们的块/链接/孤儿 —— 宿主 mkfs 造的盘上 resize inode 的 `i_block` 本来就指着预留 GDT 块
+  （那是它的正常形态，不是"文件占了元数据"）。块组元数据、备份超级块与预留 GDT 块按
+  `s_reserved_gdt_blocks` + `3/5/7 的幂`规则算成元数据。**多块组镜像照样能查**（宿主
+  `mkfs.ext2` 造 20MB/3 块组的盘, 我们的 fsck 与 e2fsck 的文件数/块数逐项一致）。
+- **目录块修复用"重打包"**而不是逐条算 `rec_len`：解析出一个块里的活条目后整块重写（空闲空间归到块尾）。
+  这样"空闲条目夹在活条目之间""条目长度损坏""`.`/`..` 放错位置"都是同一条路径，也不会留下
+  e2fsck 判 `directory corrupted` 的形态。
+- **让出调度器**：fsck 每 50ms CPU 时间 `os.msleep(0)` 一次（与 `cat`/`dd` 同一套），否则长循环里
+  收不到 `^C`、整个系统也跟着卡住。
+- **已知偏离**：不支持三间接块（驱动也没有写路径，遇到只如实记录）；不校验/不搬移超级块校验和、
+  特性位与 `bg_used_dirs_count` 以外的记账；`-c`（坏块扫描）、`-b 备用超级块`、`-j`（journal）
+  等开关没有实现；交互式询问从 **stdin** 读（e2fsck 从 `/dev/tty` 读，管道一律当"不修"）；
+  **不做 root 检查** —— devtmpfs 与 `dd`/`mount` 都不检查设备权限（Linux 上 mkfs 靠的是
+  `/dev/sdX` 的属主/权限，Delin 的 `/dev` 目前没有这一层）。
 
 ### 打印机设备（`/dev/lpN`）
 
@@ -619,7 +663,7 @@ PID 1 现在是**用户态服务管理器**（`src/init/unit.lua` 单元解析 +
 用户态 `/dev/log`、`syslogd` 按 `/etc/syslog.conf` 写 `/var/log/*`（SIGHUP 重开、游标续读不重放）、
 `logrotate` + `logrotate.timer` 轮转、`logger`/`dmesg`。`/etc/fstab` 由 init 生成 mount 单元
 （`local-fs.target`），`mount -a` 复用同一解析器。init 里的自检代码已全部删除，验证改为
-宿主测试台 `tools/hosttest.lua`（603 项）与真机脚本 `tools/realmachine.py` +
+宿主测试台 `tools/hosttest.lua`（680 项）与真机脚本 `tools/realmachine.py` +
 `scripts/realmachine_verify.sh`。
 
 `src/bin/sh` 已升级为 POSIX 核心子集（变量/引号/if/for/while/case/函数/test/[ ]/&&/|| /文件重定向/管道
@@ -628,7 +672,15 @@ PID 1 现在是**用户态服务管理器**（`src/init/unit.lua` 单元解析 +
 `mount`（挂载 `/dev/sdX`、`UUID=` 或镜像路径 / `-a` 按 fstab 挂载 / 无参列出）/ `umount` / `blkid` / `lsblk`；
 存储经 `devdisk` 抽象为整盘（ccdisk）与分区（manifest 里的 ext2 镜像）设备节点 —— **电脑自带存储恒为
 `/dev/sda`**（曾经的 bug：只枚举磁盘驱动器，自带存储与其上的分区永远不是设备），磁盘驱动器接在其后，
-UUID 用 ID 加前缀模拟（`d<磁盘ID>`/`c<电脑ID>`），存储不随启动自动挂载（改由 `/etc/fstab` 声明）。作业控制落地：
+UUID 用 ID 加前缀模拟（`d<磁盘ID>`/`c<电脑ID>`），存储不随启动自动挂载（改由 `/etc/fstab` 声明）。
+文件系统侧新增 **`mkfs.ext2` / `fsck.ext2`**（e2fsprogs 风格，逻辑在内核 `ext2.mkfs`/`ext2.fsck`，
+`/bin` 只是薄壳，经 `blkdev.mkfs`/`blkdev.fsck` syscall 落到 `devdisk` 的目标解析上）：
+`mkfs.ext2 -b/-N/-L/-m/-n/-q/-F` 可调块大小(1024/2048/4096)/inode 数/保留块/卷标，单块组、
+已有文件系统不给 `-F` 拒绝、挂载中的一律拒绝；`fsck.ext2` 五趟检查与修复（inode/块 → 目录结构 →
+连通性(孤儿 inode 重连 `/lost+found`) → 引用计数 → 位图与块组计数），`-n` 一个字节都不写、
+退出码与 e2fsck 一致(0/1/4/8/16)。宿主回归 `tools/ext2test.lua`（235 项）与真机
+`scripts/realmachine_verify.sh` 的 mkfs/fsck 段都以**宿主 e2fsck** 当裁判（Delin 造/修的镜像必须被判干净）。
+作业控制落地：
 `&` 后台作业 + `jobs`/`fg`/`bg`/`wait`/`kill %job`/`$!`、
 前台作业进程组与 `^C`/`^Z` 路由、后台进程组读 tty 的 `SIGTTIN`、`/dev/null`、`sh -c`；
 新增 `read` 内建（POSIX，跟随 `IFS` 变量）与 `/bin/sleep`（GNU 风格，分片睡眠便于信号打断）。
@@ -711,7 +763,10 @@ sysfs 也从 display 专用泛化成 class 注册表（模块用 `kapi.registerS
 与 `/dlub.cfg` = `bootdisk left`，缺一不可）→ 装盘并按 md5 校验 → 开机 → **引导门禁**（`/var/log/verify.log`
 必须与本轮部署时不同且跑完）→ **块设备/dd 门禁**（真机 `cat /dev/sdb2 | cksum` 必须等于宿主的
 `cksum /parts/data.img`；`cat_blockdev_root_part`/`cat_binary_exact`/`dd_sigint_interrupt` 三条必须 ok，
-且 `dd_sigint_rc=130`）→ 用 `debugfs` 从镜像取回 `/var/log/*` → 再停机 fsck 一次）；
+且 `dd_sigint_rc=130`）→ 用 `debugfs` 从镜像取回 `/var/log/*` → 再停机 fsck 一次 →
+**mkfs/fsck 门禁**（verify.sh 在电脑自带存储的 CC-fs 上现造 `/parts/scratch.img` 并现场
+`mkfs.ext2`/`fsck.ext2`，宿主把该镜像取回来用真实 `e2fsck -fn` 复判：必须干净、`LABEL=SCRATCH`、
+修复后 `/hello.txt` 内容完好，并逐条核对 verify.log 里的 `ok mkfs_ext2`/`fsck_*` 与退出码））；
 `scripts/realmachine_verify.sh` 是它在真机上跑的验证脚本。
 
 **真机踩过的两个坑（别改回去）**：
@@ -802,6 +857,12 @@ sysfs 也从 display 专用泛化成 class 注册表（模块用 `kapi.registerS
   信号经调度器在 resume 前投递（`setSignalCheck`）。
 - **print 覆盖**：内核自供 `print`（写 klog + 引导日志 + 终端），因 CC 自带 `print` 不走 `io.stdout`；
   进程 `print` 记 user.info，内核消息记 kern.info。
+- **进程里未捕获的错误必须进内核日志**（`scheduler` 在协程 resume 失败时打
+  `process <名字> (pid N) died: ...`）：父进程（`sh`）只会拿到一个"退出码 1"，工具内部崩了在真机上
+  **完全看不到原因**。这行日志就是踩出来的：`devdisk.lua` 里的 `mkfs/fsck` 用了 `blockdev`/`ext2`
+  却没 `require`，真机上 `mkfs.ext2` 静默 `exit 1`、`/var/log/verify.log` 里一个字都没有
+  （宿主测试台也因为 `devdisk` 用的是桩而看不出来）。判据是**错误信息本身**进了 `klog`
+  （`dmesg`/`kern.log` 可见），不是"父进程多了个退出码"。
 - **stdio 按进程隔离**：每个进程有自己的 `stdin/stdout`；spawn 时从父进程继承（或 boot 默认终端），
   `stdio.set` 只改当前进程；`io.write/read` 经 `vfs_api.setStdio` 兜底到终端。
   进程退出时内核**只关带 `.pipe` 标记的管道端**（递减 writer/reader 计数，让对端读到 EOF）——
@@ -845,7 +906,7 @@ sysfs 也从 display 专用泛化成 class 注册表（模块用 `kapi.registerS
 
 ```bash
 lua5.1 tools/build.lua             # 构建 dist/: 压缩内核/DLUB/BIOS/工具/模块/配置 + manifest
-lua5.1 tools/build.lua --check     # 构建 + 压缩等价性门禁(hosttest 603 项 + 7 个自检脚本差分)
+lua5.1 tools/build.lua --check     # 构建 + 压缩等价性门禁(hosttest 680 项 + 7 个自检脚本差分)
 lua5.1 tools/build.lua --release   # 构建 + 生成 dist/release/<版本>/ 发布树(安装布局的 payload)
 sh tools/serve.sh                  # 开发期: 把发布树挂在 10568 端口(游戏侧 wget 安装用)
 ```
@@ -1018,7 +1079,7 @@ key/char 事件**来驱动向导。喂按键的时机靠 `wait` 盯 `/delin-inst
 验证：
 
 ```bash
-lua5.1 tools/hosttest.lua        # 宿主测试: init 引擎/fstab/syslogd/logrotate/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone/devdisk (603 项)
+lua5.1 tools/hosttest.lua        # 宿主测试: init 引擎/fstab/syslogd/logrotate/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone/devdisk (680 项)
 DELIN_REPO=<压缩后的源码树> lua5.1 tools/hosttest.lua         # 压缩器等价性: 同一套测试跑在压缩产物上
 DELIN_SRCBIN=<压缩后的 bin> lua5.1 tools/harness.lua /bin/sh # 同上, 工具级差分比对
 lua5.4 tools/hosttest.lua        # 同上用 5.4 跑一遍(CC 是 5.2 语义, 不能只在 5.1 上验;
@@ -1077,8 +1138,10 @@ src/kernel/klog.lua        内核日志: ring buffer + /dev/kmsg(带 cursor/seek
 src/kernel/fstab.lua       /etc/fstab 解析(fstab(5) 子集) + systemd 风格 mount 单元命名
 src/kernel/modules.lua     内核模块系统: .ko 解析(注释头)/依赖拓扑/装载/alias(use) + fstype 注册
 src/kernel/blockdev.lua    块设备层: 文件块设备(/parts/*.img, seek+read/write)
-src/kernel/devdisk.lua     存储设备抽象: 电脑自带存储/CC 磁盘 -> /dev/sdX 节点 + UUID(d<磁盘ID>/c<电脑ID>) + fstype 挂载/卸载
+src/kernel/devdisk.lua     存储设备抽象: 电脑自带存储/CC 磁盘 -> /dev/sdX 节点 + UUID(d<磁盘ID>/c<电脑ID>)
+                           + fstype 挂载/卸载 + mkfs/fsck 的入口(目标解析/拒绝挂载中的文件系统)
 src/kernel/ext2.lua        EXT2 读写: 超级块/inode(uid/gid/mode/硬链接/符号链接)/间接块/多块组
+                           + mkfs(可调块大小/inode 数/保留块/卷标, 单块组) + fsck(五趟检查与修复)
                             + 追加写增量落盘(appendFile/flush)
 src/kernel/user.lua        用户库: /etc/passwd|shadow|group, salt+hash, chmod/chown 权限
 src/kernel/display.lua     显示设备注册表: 统一 ScreenDevice -> /dev/ttyN + /dev/fbN
@@ -1098,6 +1161,8 @@ src/init/init.lua          PID 1 主程序: fstab->mount 单元, getty 实例化
 src/bin/cat                连接文件到 stdout (默认按字节拷贝, 行选项/终端下按行; ^C -> 130)
 src/bin/ls                 列目录
 src/bin/mkdir              建目录 (-p 递归建父)
+src/bin/mkfs.ext2          建 ext2 文件系统 (mke2fs 子集: -b/-N/-L/-m/-n/-q/-F/-v; 内核 ext2.mkfs)
+src/bin/fsck.ext2          检查/修复 ext2 (e2fsck 子集: -a/-p/-n/-y/-f/-v; 内核 ext2.fsck)
 src/bin/rm                 删文件/目录 (-r|-R 递归, -f 忽略不存在)
 src/bin/cp                 复制文件/目录(-r 递归)
 src/bin/mv                 移动/重命名(复制后删源)
@@ -1167,6 +1232,11 @@ scripts/lua_repl_test.sh   /bin/lua 交互式 REPL 自检(宿主专用: 测试�
 scripts/redstone_verify.lua  真机交叉核对: /sys/class/redstone/* 与 CC 原始 redstone API 逐项一致
                            (写 /var/log/redstone_verify.log; 由 realmachine_verify.sh 调用)
 scripts/realmachine_verify.sh  真机验证脚本(由 verify.service 以 oneshot 运行, 结果写 /var/log/verify.log)
+                           含 mkfs.ext2/fsck.ext2 段: 在电脑自带存储的 CC-fs 上现造 /parts/manifest +
+                           /parts/scratch.img, 现场 mkfs -> 挂载写文件 -> fsck 判干净 -> 破坏块位图 ->
+                           -n 报出(4) -> -y 修好(1) -> 再查干净(0); 镜像随后由宿主 e2fsck 复判
+scripts/ext2_corrupt.lua   真机"造损坏"小工具: 把设备/镜像从 offset 起的若干字节清零
+                           (/dev/sdXN 的字节句柄没有 seek, dd seek= 报 cannot seek, 故整体读出再写回)
 scripts/posix_tools_verify.sh  真机 POSIX 工具自检(由 posix-verify.service 运行, 写 /var/log/posix_verify.log;
                            工具这一层用 sh, 需要直接看内核句柄/管道的用 /bin/lua)
 scripts/posix_kernel_verify.lua  真机: 符号链接/硬链接/FIFO/umask/seek 的内核语义(上面那份用 /bin/lua 调)
@@ -1211,11 +1281,12 @@ tools/harness.lua          host 测试台: 用真实 Delin 工具源码在宿主
                            (`ls -A <文件>` 会把文件路径自己打印出来, 直接照搬会让宿主上的
                            fs.list(file) 返回一条路径 —— 工具的"列目录失败"分支在宿主上永远
                            走不到, 真机才炸)
-tools/hosttest.lua         宿主测试: init 单元引擎/fstab 生成/syslogd 规则/logrotate 轮转/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone/devdisk(603 项)
+tools/hosttest.lua         宿主测试: init 单元引擎/fstab 生成/syslogd 规则/logrotate 轮转/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone/devdisk/mkfs.ext2+fsck.ext2(680 项)
 tools/installertest.lua    安装器宿主回归: 假 CraftOS(fs/term/os/http/disk/peripheral + 脚本化事件队列)
                            + 假终端格子(含 fg/bg), 用 loadfile 跑 dist/install.lua, 按键序列驱动向导
                            并断言落盘文件/镜像/日志; 失败时 dump 每一屏(含反色行标记)
-tools/ext2test.lua         宿主 ext2 回归: 真实镜像上跑目录增删(空洞/links/回收), 宿主 e2fsck -fn 判定
+tools/ext2test.lua         宿主 ext2 回归: 真实镜像上跑目录增删(空洞/links/回收) + mkfs 各参数组合
+                           + fsck 的十种损坏/修复用例, 裁判一律是宿主 e2fsck -fn(235 项)
 tools/deploy.py            重建干净 ext2 根镜像(基镜像+内核/bin/单元/配置/标记), 属主按基镜像逐条写回;
                            基镜像损坏/rdump 漏文件/构建后 fsck 不过一律 fail-fast
 tools/realmachine.py       真机流程: 先关机->打包->部署->注入第二分区与 verify.service->fsck 门禁->

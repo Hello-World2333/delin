@@ -416,5 +416,402 @@ local out = f and f:read("*a") or ""
 if f then f:close() end
 ok(rc == 0, "e2fsck -fn 干净", "\n" .. out)
 
+
+-- ---------------------------------------------------------------
+-- 3) mkfs.ext2 / fsck.ext2 (内核 ext2.mkfs / ext2.fsck)
+--    裁判一律是宿主 e2fsck: Delin 自己造的镜像必须被 e2fsck 判干净, Delin 自己修的镜像
+--    也必须被判干净 —— 否则"修好了"只是自己说了算。
+-- ---------------------------------------------------------------
+local FS_FSCK = "/usr/sbin/e2fsck"
+
+local function hostFsck(path)
+    local log = path .. ".e2fsck.txt"
+    local rc = os.execute(string.format("%s -fn %s > %s 2>&1", FS_FSCK, path, log))
+    local f = io.open(log)
+    local out = f and f:read("*a") or ""
+    if f then f:close() end
+    return rc, out
+end
+local function newImage(blocks, bs)
+    local p = string.format("/tmp/delin-mkmix-%d-%d.img", blocks, bs or 1024)
+    os.remove(p)
+    local f = io.open(p, "wb"); f:close()
+    return p
+end
+--- 直接改镜像字节(破坏用): 从 off 起写入 bytes
+local function wr(path, off, bytes)
+    local f = assert(io.open(path, "r+b"))
+    f:seek("set", off); f:write(bytes); f:close()
+end
+local function fsckOn(path, mode, ask)
+    local b = filebd(path)
+    local rep = ext2.fsck(b, { mode = mode or "check", ask = ask })
+    b.close()
+    return rep
+end
+local function digest(path)
+    local f = io.open(path, "rb"); local d = f:read("*a"); f:close()
+    local h = 0
+    for i = 1, #d do h = (h * 31 + d:byte(i)) % 4294967296 end
+    return h, #d
+end
+
+-- 3a) mkfs: 块大小/inode 数/保留块/卷标都要被驱动与宿主 e2fsck 双方认可
+for _, c in ipairs({
+    { 512, 1024, nil, 0 },
+    { 1024, 2048, nil, 0 },
+    { 256, 4096, nil, 0 },
+    { 512, 1024, 128, 5 },
+    { 512, 4096, 300, 0 },
+}) do
+    local blocks, bs, inodes, rpct = c[1], c[2], c[3], c[4]
+    local p = newImage(blocks, bs)
+    local b = filebd(p)
+    local mfs, merr = ext2.mkfs(b, { blocks = blocks, blockSize = bs, inodes = inodes,
+                                     reservedPercent = rpct, label = "delintest" })
+    local tag = string.format("mkfs(-b %d -N %s -m %d)%d块", bs, tostring(inodes), rpct, blocks)
+    ok(mfs ~= nil, tag .. ": 成功", tostring(merr))
+    if mfs then
+        local info = mfs.mkfsInfo
+        eq(info.blockSize, bs, tag .. ": 块大小")
+        eq(info.blocks, blocks, tag .. ": 块数")
+        eq(info.rBlocks, math.floor(blocks * rpct / 100), tag .. ": 保留块数")
+        ok(info.inodes >= (inodes or 256) and info.inodes % math.floor(bs / 128) == 0,
+            tag .. ": inode 数向上取整到 inode 表整块(实得 " .. tostring(info.inodes) .. ")")
+        eq(ext2.lookup(mfs, "/") ~= nil, true, tag .. ": 有根目录")
+        eq(ext2.lookup(mfs, "/lost+found") ~= nil, true, tag .. ": 有 /lost+found")
+        -- 卷标落在超级块里(偏移 1024+120, 16 字节)
+        local sb = b.read(1024, 1024)
+        eq(sb:sub(121, 129), "delintest", tag .. ": 超级块里的卷标")
+        -- 驱动自己读写一遍(块大小变了以后 inode 表/位图的偏移都不在前几个块上)
+        assert(ext2.create(mfs, "/", "d", T_DIR + 493))
+        local ino = assert(ext2.create(mfs, "/d", "f", T_REG + 493))
+        assert(ext2.writeFile(mfs, ino, string.rep("abc", 300)))
+        local h = assert(ext2.backend(mfs).open("/d/f", "r"))
+        eq(h:readAll(), string.rep("abc", 300), tag .. ": 写进去读回来一致")
+        h:close()
+        b.close()
+        local rc, out = hostFsck(p)
+        ok(rc == 0, tag .. ": e2fsck -fn 干净", out)
+    else
+        b.close()
+    end
+end
+
+-- 3b) mkfs -n(dry run): 只校验参数, 一个字节都不写
+do
+    local p = newImage(512)
+    local b = filebd(p)
+    local dry, derr = ext2.mkfs(b, { blocks = 512, dryRun = true, label = "dry" })
+    ok(dry ~= nil and dry.dryRun == true, "mkfs -n: 返回参数摘要而不是文件系统", tostring(derr))
+    b.close()
+    eq(io.open(p, "rb"):read("*a"), "", "mkfs -n: 镜像仍是 0 字节(没写盘)")
+    -- 参数仍然要校验: 块数太少/块大小非法照样报错
+    local b2 = filebd(p)
+    local r2, e2 = ext2.mkfs(b2, { blocks = 32, dryRun = true })
+    ok(r2 == nil and tostring(e2):find("64") ~= nil, "mkfs -n: 块数不足仍然报错", tostring(e2))
+    local r3, e3 = ext2.mkfs(b2, { blocks = 512, blockSize = 4096 + 1, dryRun = true })
+    ok(r3 == nil and tostring(e3):find("block size") ~= nil, "mkfs: 非法块大小报错", tostring(e3))
+    local r4, e4 = ext2.mkfs(b2, { blocks = 8 * 1024 + 1, dryRun = true })
+    ok(r4 == nil and tostring(e4):find("单块组") ~= nil, "mkfs: 超过单块组上限报错", tostring(e4))
+    b2.close()
+end
+
+-- 3c) fsck: 干净盘必须判干净, 而且 fix 模式一个字节都不改(幂等)
+do
+    local p = newImage(512)
+    local b = filebd(p)
+    local mfs = assert(ext2.mkfs(b, { blocks = 512, label = "fscktest" }))
+    assert(ext2.create(mfs, "/", "bin", T_DIR + 493))
+    assert(ext2.create(mfs, "/", "etc", T_DIR + 493))
+    for i = 1, 5 do
+        local ino = assert(ext2.create(mfs, "/bin", "tool" .. i, T_REG + 493))
+        assert(ext2.writeFile(mfs, ino, string.rep("x", 100 * i) .. "\n"))
+    end
+    -- 快速符号链接(<=60 字节目标内联在 i_block 里, 不能被当块号)与硬链接
+    local be = assert(ext2.backend(mfs))
+    assert(be.symlink("bin/tool1", "/link1"))
+    assert(be.link("bin/tool1", "/bin/tool1.hard"))
+    b.close()
+    local before, sizeBefore = digest(p)
+    local rep = fsckOn(p, "check")
+    eq(rep.code, 0, "fsck: 干净盘 check 退出码 0")
+    eq(rep.errors, 0, "fsck: 干净盘没有问题")
+    eq(rep.files.used, 19, "fsck: 在用 inode 数(18 + 硬链接不占新 inode)")
+    rep = fsckOn(p, "fix")
+    eq(rep.code, 0, "fsck: 干净盘 fix 退出码 0")
+    local after, sizeAfter = digest(p)
+    ok(before == after and sizeBefore == sizeAfter, "fsck: 干净盘 fix 一个字节都不改(幂等)")
+    local rc, out = hostFsck(p)
+    ok(rc == 0, "fsck: 跑完之后 e2fsck 仍判干净", out)
+end
+
+-- 3d) 各种损坏: check 必须报出来(退出码 4), fix 必须修到宿主 e2fsck 判干净(退出码 1)
+local corruptCases = {}
+--- 通用: 造一个带 /bin/toolN 的镜像, 再让 case.fn 去破坏它
+local function freshWithTools(blocks)
+    local p = newImage(blocks or 512)
+    local b = filebd(p)
+    local mfs = assert(ext2.mkfs(b, { blocks = blocks or 512, label = "corrupt" }))
+    assert(ext2.create(mfs, "/", "bin", T_DIR + 493))
+    for i = 1, 5 do
+        local ino = assert(ext2.create(mfs, "/bin", "tool" .. i, T_REG + 493))
+        assert(ext2.writeFile(mfs, ino, string.rep("x", 100 * i) .. "\n"))
+    end
+    b.close()
+    return p
+end
+--- 单块组 1024 字节块的固定布局: inode 表在块 5 起, 每个 inode 128 字节。
+--- (只用于"手工破坏镜像字节"的用例; 布局本身由 3a 的用例锁着。)
+local function inodeOffset(ino)
+    return 5 * 1024 + (ino - 1) * 128
+end
+local function inoOfFile(p, path)
+    local b = filebd(p)
+    local mfs = assert(ext2.mount(b))
+    local ino = ext2.lookup(mfs, path).ino
+    b.close()
+    return ino
+end
+--- 用驱动自己的路径造状态, 再手工破坏镜像字节(模拟真实的元数据损坏)
+local function withImage(fn)
+    local p = freshWithTools(512)
+    local b = filebd(p)
+    local mfs = assert(ext2.mount(b))
+    fn(p, mfs, b)
+    b.close()
+    return p
+end
+
+-- (1) 块位图被清零: 元数据块被标成空闲
+corruptCases[#corruptCases + 1] = {
+    name = "块位图清零",
+    make = function()
+        local p = freshWithTools(512)
+        wr(p, 3 * 1024, string.rep("\0", 1024))
+        return p
+    end,
+    want = "block bitmap",
+}
+-- (2) 文件链接计数错
+corruptCases[#corruptCases + 1] = {
+    name = "链接计数错",
+    make = function()
+        local p = freshWithTools(512)
+        local ino = inoOfFile(p, "/bin/tool2")
+        wr(p, inodeOffset(ino) + 26, string.char(9, 0))
+        return p
+    end,
+    want = "ref count",
+}
+-- (3) i_blocks 错
+corruptCases[#corruptCases + 1] = {
+    name = "i_blocks 错",
+    make = function()
+        local p = freshWithTools(512)
+        local ino = inoOfFile(p, "/bin/tool3")
+        wr(p, inodeOffset(ino) + 28, string.char(0xEE, 0xEE, 0, 0))
+        return p
+    end,
+    want = "i_blocks",
+}
+-- (4) 超级块/块组描述符的空闲计数错
+corruptCases[#corruptCases + 1] = {
+    name = "空闲计数错",
+    make = function()
+        local p = freshWithTools(512)
+        wr(p, 1024 + 12, string.char(0xFF, 0, 0, 0)) -- s_free_blocks_count
+        wr(p, 2 * 1024 + 12, string.char(0xFF, 0))   -- bg_free_blocks_count
+        return p
+    end,
+    want = "count wrong",
+}
+-- (5) 坏块指针(超出文件系统范围)
+corruptCases[#corruptCases + 1] = {
+    name = "坏块指针",
+    make = function()
+        local p = freshWithTools(512)
+        local ino = inoOfFile(p, "/bin/tool5")
+        wr(p, inodeOffset(ino) + 40, string.char(0xFF, 0xFF, 0xFF, 0x7F))
+        return p
+    end,
+    want = "block pointer",
+}
+-- (6) 目录项指向一个已经释放的 inode
+corruptCases[#corruptCases + 1] = {
+    name = "目录项指向空闲 inode",
+    make = function()
+        return withImage(function(p, mfs, b)
+            local ino = ext2.lookup(mfs, "/bin/tool4").ino
+            assert(ext2.delete(mfs, "/bin", "tool4")) -- 删掉: 条目没了, inode 也被回收
+            local bin = ext2.readInode(mfs, ext2.lookup(mfs, "/bin").ino)
+            assert(ext2.addDirEntry(mfs, bin, "tool4", ino, 1)) -- 再把条目指回那个空闲 inode
+        end)
+    end,
+    want = "unused inode",
+}
+-- (7) 目录项长度损坏(整条坏掉)
+corruptCases[#corruptCases + 1] = {
+    name = "目录项长度损坏",
+    make = function()
+        return withImage(function(p, mfs, b)
+            local blk = ext2.getBlock(mfs, ext2.lookup(mfs, "/bin"), 0)
+            wr(p, blk * 1024 + 4, string.char(3, 0)) -- rec_len=3, 非法
+        end)
+    end,
+    want = "bad entry length",
+}
+-- (8) 孤儿 inode -> 必须重连到 /lost+found 且内容还在
+do
+    local p = withImage(function(p, mfs, b)
+        local ino = assert(ext2.create(mfs, "/bin", "orphan", T_REG + 493))
+        assert(ext2.writeFile(mfs, ino, "orphan data\n"))
+        assert(ext2.removeDirEntry(mfs, ext2.lookup(mfs, "/bin"), "orphan"))
+    end)
+    local rep = fsckOn(p, "check")
+    eq(rep.code, 4, "fsck: 孤儿 inode 在 check 模式报出来(退出码 4)")
+    ok(rep.lines ~= nil and #rep.lines > 0, "fsck: check 输出行不为空")
+    local joined = table.concat(rep.lines, "\n")
+    ok(joined:find("unconnected", 1, true) ~= nil, "fsck: 报 unconnected", joined)
+    rep = fsckOn(p, "fix")
+    eq(rep.code, 1, "fsck: 孤儿 inode 修好(退出码 1)")
+    local b = filebd(p)
+    local mfs = assert(ext2.mount(b))
+    local lf = ext2.lookup(mfs, "/lost+found")
+    local names = {}
+    for _, e in ipairs(ext2.readDir(mfs, lf) or {}) do names[#names + 1] = e.name end
+    b.close()
+    local found
+    for _, n in ipairs(names) do if n:sub(1, 1) == "#" then found = n end end
+    ok(found ~= nil, "fsck: 孤儿挂进 /lost+found(名字 #<ino>)", table.concat(names, ","))
+    if found then
+        local b2 = filebd(p)
+        local mfs2 = assert(ext2.mount(b2))
+        local h = assert(ext2.backend(mfs2).open("/lost+found/" .. found, "r"))
+        eq(h:readAll(), "orphan data\n", "fsck: 重连后的文件内容完好")
+        h:close()
+        b2.close()
+    end
+    local rc, out = hostFsck(p)
+    ok(rc == 0, "fsck: 重连孤儿之后 e2fsck 判干净", out)
+end
+-- (9) 孤立目录 -> 重连到 /lost+found, 子项仍在
+do
+    local orphanDir
+    local p = withImage(function(p, mfs, b)
+        orphanDir = assert(ext2.create(mfs, "/bin", "odir", T_DIR + 493))
+        assert(ext2.create(mfs, "/bin/odir", "inner", T_REG + 493))
+        assert(ext2.removeDirEntry(mfs, ext2.lookup(mfs, "/bin"), "odir"))
+    end)
+    local rep = fsckOn(p, "fix")
+    eq(rep.code, 1, "fsck: 孤立目录修好(退出码 1)")
+    local b = filebd(p)
+    local mfs = assert(ext2.mount(b))
+    local d = ext2.lookup(mfs, "/lost+found/#" .. orphanDir)
+    ok(d ~= nil and d.type == T_DIR, "fsck: 孤立目录挂在 /lost+found/#<ino> 下")
+    eq(d and d.links, 2, "fsck: 重连的目录链接数(自身 '.' + lost+found 的条目)")
+    local inner
+    for _, e in ipairs(ext2.readDir(mfs, d) or {}) do if e.name == "inner" then inner = e end end
+    ok(inner ~= nil, "fsck: 重连目录里的子项还在")
+    b.close()
+    local rc, out = hostFsck(p)
+    ok(rc == 0, "fsck: 重连孤立目录之后 e2fsck 判干净", out)
+end
+-- (10) 逐项询问模式: 全答 no = 什么都不改; 全答 yes = 修好
+do
+    local p = freshWithTools(512)
+    local ino = inoOfFile(p, "/bin/tool2")
+    wr(p, inodeOffset(ino) + 26, string.char(9, 0))
+    local asked = 0
+    local rep = fsckOn(p, "ask", function() asked = asked + 1; return false end)
+    eq(rep.code, 4, "fsck: ask 模式全答 no -> 有错没修(退出码 4)")
+    ok(asked > 0, "fsck: ask 模式真的问了问题")
+    eq(rep.fixed, 0, "fsck: ask 模式全答 no -> 一处都没修")
+    rep = fsckOn(p, "ask", function() return true end)
+    eq(rep.code, 1, "fsck: ask 模式全答 yes -> 修好(退出码 1)")
+    ok(rep.fixed > 0, "fsck: ask 模式确实修了东西")
+    local rc, out = hostFsck(p)
+    ok(rc == 0, "fsck: ask 模式修完 e2fsck 判干净", out)
+end
+
+-- 3e) 上面的每个损坏用例: check 报出(退出码 4) -> fix 修好(退出码 1) -> e2fsck 判干净
+for _, c in ipairs(corruptCases) do
+    local p = c.make()
+    local rep = fsckOn(p, "check")
+    eq(rep.code, 4, string.format("fsck(%s): check 报出问题(退出码 4)", c.name))
+    local joined = table.concat(rep.lines, "\n")
+    ok(joined:find(c.want, 1, true) ~= nil, string.format("fsck(%s): 报出的内容对得上('%s')", c.name, c.want), joined)
+    -- check 模式不许写盘: 字节与大小都不变
+    local h1, s1 = digest(p)
+    fsckOn(p, "check")
+    local h2, s2 = digest(p)
+    ok(h1 == h2 and s1 == s2, string.format("fsck(%s): check 模式一个字节都没写", c.name))
+    rep = fsckOn(p, "fix")
+    eq(rep.code, 1, string.format("fsck(%s): fix 修好(退出码 1)", c.name))
+    ok(rep.fixed > 0, string.format("fsck(%s): fix 计数 > 0", c.name))
+    -- 再查一遍必须干净
+    local again = fsckOn(p, "fix")
+    eq(again.code, 0, string.format("fsck(%s): 修完再查是干净的(幂等)", c.name))
+    local rc, out = hostFsck(p)
+    ok(rc == 0, string.format("fsck(%s): 修完 e2fsck 判干净", c.name), out)
+end
+
+-- 3f) 宿主 mkfs.ext2 造的多块组镜像(带备份超级块/resize inode)也要判干净 ——
+--     驱动自己只造单块组, 但 fsck 得能读别人造的盘: 保留 inode(1..10)、备份超级块、
+--     预留 GDT 块都不能被当成"文件占了元数据"或"孤儿"。
+do
+    local p = "/tmp/delin-hostmkfs-fsck.img"
+    os.remove(p)
+    local rc0 = os.execute(string.format("dd if=/dev/zero of=%s bs=1024 count=20480 status=none", p))
+    local rc1 = os.execute(string.format("/usr/sbin/mkfs.ext2 -q -F -b 1024 %s > /dev/null 2>&1", p))
+    local rc2 = os.execute(string.format("/usr/sbin/debugfs -w -R 'mkdir /d1' %s > /dev/null 2>&1", p))
+    os.execute("printf 'hello\\n' > /tmp/delin-hostmkfs-f.txt")
+    local rc3 = os.execute(string.format("/usr/sbin/debugfs -w -R 'write /tmp/delin-hostmkfs-f.txt /d1/f1' %s > /dev/null 2>&1", p))
+    if rc0 == 0 and rc1 == 0 and rc2 == 0 and rc3 == 0 then
+        local b = filebd(p)
+        local mfs = assert(ext2.mount(b))
+        eq(mfs.numGroups, 3, "fsck(宿主镜像): 读到 3 个块组")
+        b.close()
+        local rep = fsckOn(p, "check")
+        eq(rep.code, 0, "fsck(宿主 mkfs.ext2 多块组镜像): 判干净", table.concat(rep.lines, "\n"))
+        eq(rep.errors, 0, "fsck(宿主镜像): 没有问题")
+        -- 与宿主 e2fsck 的汇总口径一致(文件数/块数)
+        local rc, out = hostFsck(p)
+        ok(rc == 0, "fsck(宿主镜像): e2fsck 也判干净", out)
+        ok(out:find(string.format("%d/%d files", rep.files.used, rep.files.total), 1, true) ~= nil,
+            "fsck(宿主镜像): 文件数与 e2fsck 一致", out .. "\n ours=" .. rep.files.used .. "/" .. rep.files.total)
+        ok(out:find(string.format("%d/%d blocks", rep.blocks.used, rep.blocks.total), 1, true) ~= nil,
+            "fsck(宿主镜像): 块数与 e2fsck 一致", out .. "\n ours=" .. rep.blocks.used .. "/" .. rep.blocks.total)
+        -- fix 模式对该镜像也必须是零改动
+        local h1 = digest(p)
+        local rep2 = fsckOn(p, "fix")
+        eq(rep2.code, 0, "fsck(宿主镜像): fix 模式也是 0")
+        eq(digest(p), h1, "fsck(宿主镜像): fix 模式没改字节")
+    else
+        io.write("skip fsck(宿主 mkfs.ext2 多块组镜像): 宿主工具不可用\n")
+    end
+end
+
+-- 3g) 大文件(双间接块)也要被 fsck 正确统计
+do
+    local p = newImage(2048)
+    local b = filebd(p)
+    local mfs = assert(ext2.mkfs(b, { blocks = 2048 }))
+    local ino = assert(ext2.create(mfs, "/", "big", T_REG + 493))
+    local content = string.rep("0123456789abcdef", 20000) -- 320000 字节 = 313 块, 超过单间接
+    assert(ext2.writeFile(mfs, ino, content))
+    b.close()
+    local rep = fsckOn(p, "check")
+    eq(rep.code, 0, "fsck: 双间接大文件判干净", table.concat(rep.lines, "\n"))
+    local b2 = filebd(p)
+    local mfs2 = assert(ext2.mount(b2))
+    local h = assert(ext2.backend(mfs2).open("/big", "r"))
+    eq(#h:readAll(), #content, "fsck: 大文件内容长度不变")
+    h:close()
+    b2.close()
+    local rc, out = hostFsck(p)
+    ok(rc == 0, "fsck: 大文件镜像 e2fsck 判干净", out)
+end
+
 io.write(string.format("\n%d passed, %d failed\n", pass, fail))
 os.exit(fail == 0 and 0 or 1)

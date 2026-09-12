@@ -18,6 +18,12 @@
 local vfs      = require("kernel.vfs")
 local vfs_api  = require("kernel.vfs_api")
 local manifest = require("kernel.manifest")
+-- mkfs/fsck 直接操作分区镜像的字节: 块设备层与 ext2 驱动都是**内核模块**(fstype 处理器由
+-- /lib/modules 里的 ext2.ko 注册), 所以这两个 require 是 devdisk 自己的依赖, 不是"模块装好
+-- 才有"的东西。少了它们, devdisk.mkfs 里 `blockdev.file` 会报 nil 索引 —— 真机上表现为
+-- mkfs.ext2 "静默地退出码 1"(错误只进了内核对不上用户的日志, 见 scheduler 里新加的那行)。
+local blockdev = require("kernel.blockdev")
+local ext2     = require("kernel.ext2")
 
 local devdisk = {}
 
@@ -346,6 +352,109 @@ function devdisk.umount(dir)
         end
     end
     return nil, dir .. ": not mounted"
+end
+
+-- ---------------------------------------------------------------
+-- mkfs / fsck: /bin/mkfs.ext2 与 /bin/fsck.ext2 的内核入口
+-- ---------------------------------------------------------------
+
+--- 解析格式化/检查的目标: 设备节点规格(/dev/sdXN、UUID=..、裸节点名)或镜像文件路径
+--- (与 mount 收的两种规格一致; 都在内核里解析, 工具不做第二套猜测)。
+---@return table|nil target { img, node }, string|nil err
+local function targetOf(spec)
+    if type(spec) ~= "string" or spec == "" then return nil, "empty device" end
+    local isNodeSpec = spec:sub(1, 5) == "UUID=" or spec:sub(1, 5) == "/dev/"
+        or not spec:find("/", 1, true)
+    if isNodeSpec then
+        local e, err = devdisk.find(spec)
+        if not e then return nil, err end
+        if e.type ~= "part" then
+            return nil, e.node .. ": ccdisk (CC native filesystem), not a byte device"
+        end
+        return { img = e.img, node = e.node }
+    end
+    local backend, rel, rerr = vfs.resolve(spec)
+    if not backend then return nil, spec .. ": " .. tostring(rerr) end
+    if not backend.toReal then return nil, spec .. ": not a device node nor a file on a real filesystem" end
+    return { img = backend.toReal(rel), node = spec }
+end
+
+--- 目标是否正被挂载。格式化/检查一个挂载中的文件系统会把运行中的系统写坏, 一律拒绝
+--- (mke2fs/e2fsck 同此)。返回挂载点或 nil。
+local function mountedAt(t)
+    for _, mt in ipairs(vfs.list()) do
+        local dev = mt.meta and mt.meta.device
+        if dev and (dev == t.node or dev == t.img) then return mt.root end
+    end
+    return nil
+end
+
+--- 在设备/镜像上建一个 ext2 文件系统(mkfs.ext2 的内核实现)。
+---@param spec string /dev/sdXN | UUID=<uuid> | 镜像路径
+---@param opts table { blocks, blockSize, inodes, label, reservedPercent, force, dryRun }
+---@return table|nil info 成功时的布局摘要(mkfs 的 mkfsInfo + device), string|nil err
+function devdisk.mkfs(spec, opts)
+    opts = opts or {}
+    local t, err = targetOf(spec)
+    if not t then return nil, err end
+    local where = mountedAt(t)
+    if where then return nil, t.node .. " is mounted on " .. where .. " (refusing to format a mounted filesystem)" end
+    local bd, berr = blockdev.file(t.img)
+    if not bd then return nil, tostring(berr) end
+    -- 不给块数就按设备大小算(块设备/已撑开的镜像)。镜像文件是 0 字节时算不出来, fail-fast。
+    if not opts.blocks then
+        local size = bd.getSize and bd.getSize() or nil
+        if not size or size <= 0 then
+            bd.close()
+            return nil, t.node .. ": cannot determine size, give the block count"
+        end
+        opts.blocks = math.floor(size / (opts.blockSize or 1024))
+    end
+    -- 已经有 ext2 就要 -F 才覆盖(mke2fs 的 "proceed anyway?" 同义, 只是这里不交互)。
+    if not opts.force and not opts.dryRun and ext2.mount(bd) then
+        bd.close()
+        return nil, t.node .. " already contains an ext2 filesystem (use -F to overwrite)"
+    end
+    local fs, merr = ext2.mkfs(bd, opts)
+    if not fs then
+        bd.close()
+        return nil, tostring(merr)
+    end
+    -- dryRun 时 ext2.mkfs 返回的就是描述表(fs.mkfsInfo 还不存在, 因为它压根没建文件系统);
+    -- 否则返回的是挂载好的 fs, 布局摘要挂在它的 mkfsInfo 上。
+    local info = fs.mkfsInfo or fs
+    info.device = t.node
+    bd.close()
+    return info
+end
+
+--- 检查(可选修复)设备/镜像上的 ext2 文件系统(fsck.ext2 的内核实现)。
+---@param spec string /dev/sdXN | UUID=<uuid> | 镜像路径
+---@param opts table { mode = "check"|"ask"|"fix", ask, emit, force }
+---@return table|nil report ext2.fsck 的报告(带 device), string|nil err
+function devdisk.fsck(spec, opts)
+    opts = opts or {}
+    local t, err = targetOf(spec)
+    if not t then return nil, err end
+    local where = mountedAt(t)
+    if where and not opts.force then
+        return {
+            code = 8, errors = 0, fixed = 0, unfixed = 0, device = t.node,
+            lines = { t.node .. " is mounted on " .. where .. " (refusing to check a mounted filesystem)" },
+        }
+    end
+    local bd, berr = blockdev.file(t.img)
+    if not bd then return nil, tostring(berr) end
+    local report = ext2.fsck(bd, {
+        mode = opts.mode, ask = opts.ask, emit = opts.emit,
+        -- 长循环必须让出调度器: 不让出就收不到 ^C, 整个系统也跟着卡住(见 for-ai 的"信号"一节)。
+        yield = function()
+            if os.msleep then os.msleep(0) else os.sleep(0) end
+        end,
+    })
+    bd.close()
+    report.device = t.node
+    return report
 end
 
 return devdisk

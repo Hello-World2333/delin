@@ -213,6 +213,9 @@ local function registerRuntimeSyscalls()
     end
     sc["fs.fstypes"] = function() return devdisk.fstypes() end
     sc["blkdev.list"] = function() return devdisk.list() end
+    -- mkfs.ext2 / fsck.ext2: 目标规格的解析与"是不是挂载中"的判定都在内核里(见 devdisk 的注释)。
+    sc["blkdev.mkfs"] = function(device, opts) return devdisk.mkfs(device, opts) end
+    sc["blkdev.fsck"] = function(device, opts) return devdisk.fsck(device, opts) end
     -- /etc/fstab: 解析结果给 init(生成 mount 单元)与 mount -a。
     sc["fstab.entries"] = function(path) return fstab.read(vfs_api.fs, path) end
     klog.registerSyscalls(sc)

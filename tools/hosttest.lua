@@ -785,6 +785,182 @@ missingok
     eq(tm.out, "x\n", "tee 多文件: stdout 仍有数据")
     eq(readFile(ROOT .. "/tmp/tee.a"), "x\n", "tee 多文件: 第 1 个 FILE")
     eq(readFile(ROOT .. "/tmp/tee.b"), "x\n", "tee 多文件: 第 2 个 FILE")
+
+
+    -- ---------------------------------------------------------------
+    -- M. mkfs.ext2 / fsck.ext2: CLI 层(选项解析/退出码/输出)
+    --    真正的格式化与检查逻辑由 tools/ext2test.lua 在真镜像上跑、由宿主 e2fsck 当裁判;
+    --    这里锁的是"工具把选项翻译成了什么 syscall 参数、以及退出码与输出对不对"。
+    -- ---------------------------------------------------------------
+    do
+        local envM = makeEnv()
+        local mkfsCalls, fsckCalls, fsckAnswers = {}, {}, {}
+        envM.syscalls["blkdev.mkfs"] = function(device, opts)
+            mkfsCalls[#mkfsCalls + 1] = { device = device, opts = opts }
+            if device == "/dev/sda9" then return nil, "/dev/sda9: no such device" end
+            return {
+                blocks = opts.blocks or 512, blockSize = opts.blockSize or 1024,
+                inodes = opts.inodes or 256, freeBlocks = 400, freeInodes = 246,
+                rBlocks = 0, reservedPercent = opts.reservedPercent or 0, dataStart = 37,
+                label = opts.label or "delin", device = device, dryRun = opts.dryRun,
+            }
+        end
+        envM.syscalls["blkdev.fsck"] = function(device, opts)
+            fsckCalls[#fsckCalls + 1] = { device = device, opts = opts }
+            if device == "/dev/sda9" then return nil, "/dev/sda9: no such device" end
+            local lines = { "Pass 1: Checking inodes, blocks, and sizes" }
+            if opts.mode == "ask" then
+                -- 真的走一次询问: 内核 fsck 找到问题时就是这么调 opts.ask 的
+                fsckAnswers[#fsckAnswers + 1] = opts.ask("Inode 15 ref count is 1, should be 2  Fix<y>? ") and true or false
+                lines[#lines + 1] = "Inode 15 ref count is 1, should be 2  (asked)"
+            else
+                lines[#lines + 1] = "Inode 15 ref count is 1, should be 2  FIXED."
+            end
+            lines[#lines + 1] = "Pass 5: Checking group summary information"
+            for _, l in ipairs(lines) do if opts.emit then opts.emit(l) end end
+            return {
+                code = 1, errors = 1, fixed = 1, unfixed = 0, device = device, lines = lines,
+                files = { used = 12, total = 256 }, blocks = { used = 46, total = 512 },
+                nonContiguous = 0,
+            }
+        end
+
+        -- M1. 不给块数: 交给内核按设备大小算(镜像文件 0 字节时内核算不出来会报错)
+        local r = runTool(envM, REPO .. "/src/bin/mkfs.ext2", { "/dev/sdb1" })
+        ok(r.rc == nil or r.rc == 0, "mkfs.ext2: 新建成功(退出码 0)", tostring(r.rc))
+        eq(mkfsCalls[1].device, "/dev/sdb1", "mkfs.ext2: 设备原样交给内核")
+        eq(mkfsCalls[1].opts.blocks, nil, "mkfs.ext2: 省略块数时不猜, 交内核按大小算")
+        ok(r.out:find("Creating filesystem with 512 1k blocks and 256 inodes", 1, true) ~= nil,
+            "mkfs.ext2: 打印块数/inode 数(mke2fs 风格)", r.out)
+        ok(r.out:find("Filesystem label=delin", 1, true) ~= nil, "mkfs.ext2: 打印卷标", r.out)
+
+        -- M2. 完整选项
+        r = runTool(envM, REPO .. "/src/bin/mkfs.ext2",
+            { "-b", "2048", "-N", "128", "-L", "SCRATCH", "-m", "5", "-F", "/dev/sdb1", "512" })
+        ok(r.rc == nil or r.rc == 0, "mkfs.ext2: 选项齐全时成功", tostring(r.rc))
+        local o = mkfsCalls[2].opts
+        eq(o.blocks, 512, "mkfs.ext2: 块数位置参数")
+        eq(o.blockSize, 2048, "mkfs.ext2: -b 块大小")
+        eq(o.inodes, 128, "mkfs.ext2: -N inode 数")
+        eq(o.label, "SCRATCH", "mkfs.ext2: -L 卷标")
+        eq(o.reservedPercent, 5, "mkfs.ext2: -m 保留百分比")
+        eq(o.force, true, "mkfs.ext2: -F 强制覆盖")
+        eq(o.dryRun, false, "mkfs.ext2: 没给 -n 不是 dry run")
+        ok(r.out:find("2k blocks", 1, true) ~= nil, "mkfs.ext2: 摘要按块大小写 2k", r.out)
+
+        -- 贴在一起的写法(-b2048)与 -- 结束选项
+        mkfsCalls = {}
+        runTool(envM, REPO .. "/src/bin/mkfs.ext2", { "-b4096", "-Lx", "--", "-weird.img", "64" })
+        eq(mkfsCalls[1].opts.blockSize, 4096, "mkfs.ext2: -b4096 粘连写法")
+        eq(mkfsCalls[1].opts.label, "x", "mkfs.ext2: -Lx 粘连写法")
+        eq(mkfsCalls[1].device, "-weird.img", "mkfs.ext2: -- 之后的 - 开头操作数是设备名")
+
+        -- M3. -n 只算不写
+        mkfsCalls = {}
+        r = runTool(envM, REPO .. "/src/bin/mkfs.ext2", { "-n", "/dev/sdb1", "256" })
+        ok(r.rc == nil or r.rc == 0, "mkfs.ext2: -n 成功", tostring(r.rc))
+        eq(mkfsCalls[1].opts.dryRun, true, "mkfs.ext2: -n 传成 dryRun")
+        ok(r.out:find("(dry run)", 1, true) ~= nil and r.out:find("Nothing written", 1, true) ~= nil,
+            "mkfs.ext2: -n 明确说没写盘", r.out)
+
+        -- M4. -q 安静: 成功时一个字都不输出
+        r = runTool(envM, REPO .. "/src/bin/mkfs.ext2", { "-q", "/dev/sdb1", "256" })
+        ok(r.rc == nil or r.rc == 0, "mkfs.ext2: -q 成功", tostring(r.rc))
+        eq(r.out, "", "mkfs.ext2: -q 无输出")
+
+        -- M5. 参数错一律 fail-fast(退出码 1), 且**不调用** syscall
+        local before = #mkfsCalls
+        r = runTool(envM, REPO .. "/src/bin/mkfs.ext2", {})
+        eq(r.rc, 1, "mkfs.ext2: 缺设备 -> 1")
+        ok(r.out:find("no device specified", 1, true) ~= nil, "mkfs.ext2: 缺设备报错信息", r.out)
+        r = runTool(envM, REPO .. "/src/bin/mkfs.ext2", { "/dev/sdb1", "1", "2" })
+        eq(r.rc, 1, "mkfs.ext2: 多余参数 -> 1")
+        r = runTool(envM, REPO .. "/src/bin/mkfs.ext2", { "-Z", "/dev/sdb1" })
+        eq(r.rc, 1, "mkfs.ext2: 未知选项 -> 1")
+        ok(r.out:find("invalid option", 1, true) ~= nil, "mkfs.ext2: 未知选项报错信息", r.out)
+        r = runTool(envM, REPO .. "/src/bin/mkfs.ext2", { "-b", "1000", "/dev/sdb1" })
+        eq(r.rc, 1, "mkfs.ext2: 块大小不在范围 -> 1")
+        ok(r.out:find("out of range", 1, true) ~= nil, "mkfs.ext2: 块大小报错信息", r.out)
+        r = runTool(envM, REPO .. "/src/bin/mkfs.ext2", { "/dev/sdb1", "abc" })
+        eq(r.rc, 1, "mkfs.ext2: 块数不是数字 -> 1")
+        r = runTool(envM, REPO .. "/src/bin/mkfs.ext2", { "-L", "0123456789abcdef", "/dev/sdb1" })
+        eq(r.rc, 1, "mkfs.ext2: 卷标超 15 字节 -> 1")
+        r = runTool(envM, REPO .. "/src/bin/mkfs.ext2", { "-t", "ext4", "/dev/sdb1" })
+        eq(r.rc, 1, "mkfs.ext2: -t ext4 不支持 -> 1")
+        r = runTool(envM, REPO .. "/src/bin/mkfs.ext2", { "-t", "ext2", "/dev/sdb1", "256" })
+        ok(r.rc == nil or r.rc == 0, "mkfs.ext2: -t ext2 接受", tostring(r.rc))
+        eq(#mkfsCalls, before + 1, "mkfs.ext2: 参数错的那些一次 syscall 都没发")
+
+        -- M6. 内核报错(设备不存在/已挂载/已有文件系统) -> 退出码 1
+        r = runTool(envM, REPO .. "/src/bin/mkfs.ext2", { "/dev/sda9", "256" })
+        eq(r.rc, 1, "mkfs.ext2: 内核报错 -> 1")
+        ok(r.out:find("no such device", 1, true) ~= nil, "mkfs.ext2: 内核错误原样透出", r.out)
+
+        -- M7. fsck.ext2: 默认逐项询问, 回答从 stdin 读
+        local function inHandle(s)
+            local pos = 1
+            return {
+                readLine = function()
+                    if pos > #s then return nil end
+                    local nl = s:find("\n", pos, true)
+                    if not nl then local x = s:sub(pos); pos = #s + 1; return x end
+                    local x = s:sub(pos, nl - 1); pos = nl + 1
+                    return x
+                end,
+                read = function(_, n)
+                    if pos > #s then return nil end
+                    local x = s:sub(pos, pos + (n or 1) - 1); pos = pos + #x; return x
+                end,
+                readAll = function() local x = s:sub(pos); pos = #s + 1; return x end,
+            }
+        end
+        r = runTool(envM, REPO .. "/src/bin/fsck.ext2", { "/dev/sdb1" }, { input = inHandle("y\n") })
+        eq(r.rc, 1, "fsck.ext2: 默认询问模式退出码来自报告(1)")
+        eq(fsckCalls[1].opts.mode, "ask", "fsck.ext2: 默认是 ask 模式")
+        ok(fsckCalls[1].opts.ask ~= nil, "fsck.ext2: ask 模式必须带询问回调")
+        eq(fsckAnswers[1], true, "fsck.ext2: 回答 y -> 修")
+        ok(r.out:find("Fix<y>? ", 1, true) ~= nil, "fsck.ext2: 提示写到 stdout", r.out)
+
+        -- 回答 n / 直接 EOF 都是"不修"
+        runTool(envM, REPO .. "/src/bin/fsck.ext2", { "/dev/sdb1" }, { input = inHandle("n\n") })
+        eq(fsckAnswers[2], false, "fsck.ext2: 回答 n -> 不修")
+        runTool(envM, REPO .. "/src/bin/fsck.ext2", { "/dev/sdb1" }, { input = inHandle("") })
+        eq(fsckAnswers[3], false, "fsck.ext2: stdin EOF -> 不修")
+
+        -- M8. -n/-y/-p/-a 的模式
+        fsckCalls = {}
+        runTool(envM, REPO .. "/src/bin/fsck.ext2", { "-n", "/dev/sdb1" })
+        eq(fsckCalls[1].opts.mode, "check", "fsck.ext2: -n -> check")
+        eq(fsckCalls[1].opts.ask, nil, "fsck.ext2: -n 不带询问回调")
+        runTool(envM, REPO .. "/src/bin/fsck.ext2", { "-y", "/dev/sdb1" })
+        eq(fsckCalls[2].opts.mode, "fix", "fsck.ext2: -y -> fix")
+        runTool(envM, REPO .. "/src/bin/fsck.ext2", { "-p", "/dev/sdb1" })
+        eq(fsckCalls[3].opts.mode, "fix", "fsck.ext2: -p -> fix")
+        runTool(envM, REPO .. "/src/bin/fsck.ext2", { "-a", "-f", "-v", "/dev/sdb1" })
+        eq(fsckCalls[4].opts.mode, "fix", "fsck.ext2: -a/-f/-v 组合 -> fix")
+        eq(fsckCalls[4].device, "/dev/sdb1", "fsck.ext2: 设备名")
+
+        -- 五趟进度是边走边报的(emit 回调), 不是等跑完再打印
+        r = runTool(envM, REPO .. "/src/bin/fsck.ext2", { "-n", "/dev/sdb1" })
+        ok(r.out:find("Pass 1: Checking inodes, blocks, and sizes", 1, true) ~= nil,
+            "fsck.ext2: 逐行 emit 出五趟进度", r.out)
+        ok(r.out:find("12/256 files", 1, true) ~= nil and r.out:find("46/512 blocks", 1, true) ~= nil
+            and r.out:find("non-contiguous", 1, true) ~= nil,
+            "fsck.ext2: 收尾汇总行(e2fsck 风格)", r.out)
+
+        -- M9. fsck.ext2 的用法错都是 16(e2fsck 语义), 内核/系统错是 8
+        r = runTool(envM, REPO .. "/src/bin/fsck.ext2", {})
+        eq(r.rc, 16, "fsck.ext2: 缺设备 -> 16")
+        r = runTool(envM, REPO .. "/src/bin/fsck.ext2", { "/dev/sdb1", "/dev/sdb2" })
+        eq(r.rc, 16, "fsck.ext2: 多余参数 -> 16")
+        r = runTool(envM, REPO .. "/src/bin/fsck.ext2", { "-z", "/dev/sdb1" })
+        eq(r.rc, 16, "fsck.ext2: 未知选项 -> 16")
+        r = runTool(envM, REPO .. "/src/bin/fsck.ext2", { "-n", "-y", "/dev/sdb1" })
+        eq(r.rc, 16, "fsck.ext2: -n 与 -y 互斥 -> 16")
+        r = runTool(envM, REPO .. "/src/bin/fsck.ext2", { "/dev/sda9" })
+        eq(r.rc, 8, "fsck.ext2: 设备解析不了 -> 8")
+        ok(r.out:find("no such device", 1, true) ~= nil, "fsck.ext2: 设备错误透出", r.out)
+    end
 end
 
 -- ===============================================================
@@ -2148,6 +2324,96 @@ do
         local tr, terr = vfs_api.fs.open("/dev/sda", "r")
         ok(tr == nil and tostring(terr):find("ccdisk") ~= nil, "devdisk: 整盘(ccdisk)不是字节流设备")
         vfs.unmount("/dev") -- 后面的随机数用例会自己 mountDev, 不留下重复挂载
+    end
+
+    -- devdisk.mkfs / devdisk.fsck(/bin/mkfs.ext2、/bin/fsck.ext2 的内核入口):
+    -- 目标解析、已挂载拒绝、已有文件系统要 -F、以及"mkfs 出来的镜像 fsck 判干净"。
+    -- 这里把自带存储的 /parts/root.img 换成**真实临时文件**(blockdev.file 要能 seek),
+    -- 其余全局仍是上面的桩。
+    do
+        local vfs = require("kernel.vfs")
+        local IMG = "/tmp/delin-hosttest-mkfs.img"
+        os.remove(IMG)
+        local tmp = assert(io.open(IMG, "wb")); tmp:close()
+        -- blockdev.lua 用的是**全局 fs**(内核里是 CC 的原生 fs 句柄), 不是 devdisk 的环境变量,
+        -- 所以这里把 _G.fs 包一层: 只有 /parts/root.img 落到真实临时文件, 其余照旧走宿主门面。
+        local realFs = _G.fs
+        local facade = setmetatable({}, { __index = function(_, k) return realFs[k] end })
+        facade.open = function(path, mode)
+            if path == "/parts/root.img" then
+                local h = assert(io.open(IMG, mode == "r+" and "r+b" or "rb"), IMG)
+                -- CC 原生句柄是点号调用; 这里点号冒号都收(与 vfs 的 wrapCCHandle 同义)
+                return {
+                    read = function(a, b) return h:read((type(a) == "table") and b or a) end,
+                    write = function(a, b)
+                        local str = (type(a) == "table") and b or a
+                        h:write(str)
+                        return #str
+                    end,
+                    seek = function(a, b, c)
+                        local whence, off
+                        if type(a) == "table" then whence, off = b, c else whence, off = a, b end
+                        return h:seek(whence, off)
+                    end,
+                    close = function() h:close() end,
+                }
+            end
+            return realFs.open(path, mode)
+        end
+        facade.getSize = function(path)
+            if path == "/parts/root.img" then
+                local hh = io.open(IMG, "rb"); local n = hh:seek("end"); hh:close(); return n
+            end
+            return realFs.getSize(path)
+        end
+        _G.fs = facade
+
+        local info, merr = devdisk.mkfs("/dev/sda1", { blocks = 128, label = "HT" })
+        ok(info ~= nil, "devdisk.mkfs: 节点规格 -> 镜像上建出文件系统", tostring(merr))
+        if info then
+            eq(info.device, "/dev/sda1", "devdisk.mkfs: 摘要里带设备节点")
+            eq(info.blocks, 128, "devdisk.mkfs: 块数")
+            eq(info.blockSize, 1024, "devdisk.mkfs: 块大小")
+            eq(info.label, "HT", "devdisk.mkfs: 卷标")
+            local hh = io.open(IMG, "rb"); local n = hh:seek("end"); hh:close()
+            eq(n, 128 * 1024, "devdisk.mkfs: 镜像被撑到 128KB")
+        end
+        -- 已有文件系统: 不给 -F 必须拒绝, 给了才覆盖
+        local again, aerr = devdisk.mkfs("/dev/sda1", { blocks = 128 })
+        ok(again == nil and tostring(aerr):find("already contains") ~= nil,
+            "devdisk.mkfs: 已有 ext2 又不给 -F -> 拒绝(fail-fast)", tostring(aerr))
+        ok(devdisk.mkfs("/dev/sda1", { blocks = 128, force = true }) ~= nil, "devdisk.mkfs: -F 覆盖成功")
+        -- -n: 不写盘
+        local before = io.open(IMG, "rb"):read("*a")
+        local dry, dryErr = devdisk.mkfs("/dev/sda1", { blocks = 64, dryRun = true, label = "DRY" })
+        ok(dry ~= nil, "devdisk.mkfs: -n 成功", tostring(dryErr))
+        -- -n 返回的必须是**布局摘要**(而不是空表): 工具要靠它打印"会建成什么样"
+        eq(dry.blocks, 64, "devdisk.mkfs: -n 摘要里有块数")
+        eq(dry.blockSize, 1024, "devdisk.mkfs: -n 摘要里有块大小")
+        eq(dry.inodes, 256, "devdisk.mkfs: -n 摘要里有 inode 数")
+        eq(dry.label, "DRY", "devdisk.mkfs: -n 摘要里有卷标")
+        eq(io.open(IMG, "rb"):read("*a"), before, "devdisk.mkfs: -n 一个字节都没写")
+
+        -- fsck: 干净 -> 0; 已挂载 -> 拒绝(8)
+        local rep = devdisk.fsck("/dev/sda1", { mode = "check" })
+        ok(rep ~= nil and rep.code == 0, "devdisk.fsck: mkfs 出来的镜像判干净", rep and table.concat(rep.lines, "\n"))
+        eq(rep.device, "/dev/sda1", "devdisk.fsck: 报告里带设备节点")
+        vfs.mount("/mnt/x", { kind = "virtual", isReadOnly = function() return false end },
+            { device = "/dev/sda1", fstype = "ext2" })
+        local mrep = devdisk.fsck("/dev/sda1", { mode = "check" })
+        ok(mrep.code == 8 and table.concat(mrep.lines, "\n"):find("is mounted") ~= nil,
+            "devdisk.fsck: 已挂载的文件系统一律拒绝", mrep and table.concat(mrep.lines, "\n"))
+        local mres, mresErr = devdisk.mkfs("/dev/sda1", { blocks = 64, force = true })
+        ok(mres == nil and tostring(mresErr):find("is mounted") ~= nil,
+            "devdisk.mkfs: 已挂载的文件系统一律拒绝格式化", tostring(mresErr))
+        vfs.unmount("/mnt/x")
+        -- 未知设备/整盘节点(fstype 不是 ext2 的字节设备)都要报错
+        local bad, badErr = devdisk.mkfs("/dev/sdzz", { blocks = 64 })
+        ok(bad == nil and tostring(badErr):find("no such device") ~= nil, "devdisk.mkfs: 未知设备报错")
+        local whole, wholeErr = devdisk.mkfs("/dev/sda", { blocks = 64 })
+        ok(whole == nil and tostring(wholeErr):find("ccdisk") ~= nil, "devdisk.mkfs: 整盘(ccdisk)不能格式化")
+        _G.fs = realFs
+        os.remove(IMG)
     end
 end
 
