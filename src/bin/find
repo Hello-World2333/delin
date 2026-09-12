@@ -2,7 +2,7 @@
 -- 用法: find [PATH...] [EXPRESSION]
 --   缺省 PATH 是 "."; 缺省动作是 -print(表达式里已有别的动作时不追加)。
 -- 谓词:
---   -name PAT -iname PAT      名字匹配(shell 式通配 * ? [...], 不是 Lua pattern)
+--   -name PAT -iname PAT      名字匹配(shell 式通配 * ? [...], 不是正则)
 --   -path PAT -ipath PAT      整条打印路径匹配(同上通配)
 --   -type X                   X 取 f d l p c b 的组合(逗号分隔, 如 -type f,d); c 与 b 都看设备
 --   -size N[cwbkMG]           大小(缺省单位 512B; c=字节 w=2B b=512B k/M/G), 向上取整后比较
@@ -112,7 +112,7 @@ local function band(a, b)
 end
 
 -- ---------------------------------------------------------------
--- shell 式通配(-name/-path; 不是 Lua pattern)
+-- shell 式通配(-name/-path; 不是正则)
 -- ---------------------------------------------------------------
 --- 匹配一个 [] 字符组。i 指向 '[' 之后, ch 是待判字符。
 --- 返回 (下一个位置, 是否命中); 未闭合的组返回 nil(整个匹配失败)。

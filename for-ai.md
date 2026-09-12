@@ -295,6 +295,12 @@ uid/gid 从 1000 起分配（无 `login.defs`，`UID_MIN` 写死在 `user.lua`�
 - **不提供** `meminfo`/`cpuinfo`/`loadavg`/`fd` 等 —— Delin 没有对应数据源，不造假；
   `ps` 因此也没有 `TIME`/`%CPU`/`%MEM`/`VSZ`/`RSS`/`STIME` 列。
 - **无 zombie 语义**：进程退出后其 `/proc/<pid>` 立即消失（Linux 保留 zombie 直到父进程 `wait`）。
+- **目录判定必须与 `exists` 一致**：`ls /proc/self` 会对每个条目调 `attributes`，
+  所以 `pidfile` 的存在判定抽成了独立的 `pidFileExists(pid, name)` —— 不能在
+  `local backend = { ... }` 的表构造里写 `backend.exists(...)`：Lua 的 local 作用域从**声明语句之后**
+  才开始，初始化表达式里的同名引用解析成**全局**（`nil`），真机症状是
+  `[proc N ls] ERROR: ... attempt to index global 'backend' (a nil value)`
+  （`hosttest`/`regextest` 抓不到这种错 —— 只有真机跑 `ls /proc/self` 才炸）。
 
 **进程管理工具**：`ps`（POSIX ps + procps/GNU/BSD 常用子集，纯 `/proc` 消费者）、`pgrep`/`pkill`
 （procps：按进程名/命令行查找、发信号）、`killall`（psmisc：按进程名发信号），加上已有的 `kill`。
@@ -304,7 +310,7 @@ uid/gid 从 1000 起分配（无 `login.defs`，`UID_MIN` 写死在 `user.lua`�
 `--no-headers` 去表头；未知选项/未知列名 fail-fast（退出码 2）。默认输出 `PID TTY STAT COMMAND`，
 `-f` 是 `UID PID PPID STAT TTY COMMAND`，`-l` 是 `STAT UID PID PPID PGRP SESS TTY COMMAND`，
 `u`/`aux` 是 `USER PID PPID STAT TTY COMMAND`（无 TIME/%CPU/%MEM/VSZ/RSS/STIME 列）。
-`pgrep`/`pkill` 的模式用 **Lua pattern**（与 grep/sed 同一约定，不是 POSIX ERE），`-x` 锚定整串、
+`pgrep`/`pkill` 的模式用 **标准正则**（procps 同款：**ERE**，见「标准正则」一节），`-x` 锚定整串、
 `-f` 匹配完整命令行、`-n`/`-o` 取最新/最老（Delin 无启动时间，按 pid 大小）、`-u USER` 过滤用户，
 两者都不匹配自己（Linux 语义）；`pkill` 默认 `SIGTERM`，`killall` 要求进程名完全相同（不杀自己）。
 
@@ -384,6 +390,17 @@ CC 原生文件系统没有这些概念、`ext2` 驱动里有 inode 类型却没
 **用户态不要靠"自己先判空"兜底**: 直接调 `fs.delete` 的地方(真机自检脚本就是)照样会弄坏盘 ——
 `rmdir` 保留自己的判空只是为了给出 POSIX 那套措辞; `rm -r` 是递归删干净再删目录(正常路径)。
 
+#### 跨块目录的"块首条目"也能删（曾经的 rm -rf 陷阱）
+
+`ext2.removeDirEntry` 删条目时把被删条目的 `rec_len` **并入前一条**（条目直接从块里消失，不留
+`ino=0` 的空洞）。**块首条目没有前一条**：老代码在这里直接 `return nil, "cannot remove first dir
+entry"` —— 于是目录一旦跨块（>1KB 后每块第一条各中一次），那些条目就永远删不掉：真机 `rm -rf`
+一个大目录报这个错、目录删不干净（`scripts/regex_test.sh` 的自检把它试出来了）。
+修法：块首条目置 **`ino=0` 标空闲**，`rec_len`/`name_len` **原样留着**（`addDirEntry` 扫到
+`ino==0` 的条目会整条复用；缩 `rec_len` 或清 `name_len` 反而会留下 e2fsck 判
+`directory corrupted` 的空洞）。`tools/ext2test.lua` 里锁着这条（200 个文件的跨块目录逐条删完 +
+宿主 `e2fsck` 判干净）。
+
 **用户**：`/etc/passwd` `name:x:uid:gid:fullname:home:shell`、`/etc/shadow` `name:salt$hash`、
 `/etc/group`；`login` 提示用户名/密码（隐藏回显），验证通过后按该用户 `uid/gid` 起 `sh`。
 用户管理命令（`passwd`/`useradd`/…）与内核 `user.*` 写 syscall 见下文「用户管理」。
@@ -409,7 +426,8 @@ CC 原生文件系统没有这些概念、`ext2` 驱动里有 inode 类型却没
 `mkdir (-p)`、`rm (-r|-f)`、`cp (-r)`、`mv`、`touch`、`head (-n)`、`tail (-n)`、
 `sleep`（GNU 风格：小数秒 + `s/m/h/d` 后缀 + 多操作数求和；50ms 分片睡眠，信号可及时打断）、
 `dd`（POSIX 子集；拷贝循环 50ms 让出，`^C` 打完统计后退出 130，见「设计要点」的信号那一节）、
-`wc (-l|-w|-c)`、`grep (-n|-i|-v)`、`sed`（GNU 子集：`s/y/d/p/q/a/i/c/=`、行号/`$`/正则地址与区间、
+`wc (-l|-w|-c)`、`grep`（POSIX + GNU：`-E`/`-G`/`-F` 方言、`-n -i -v -w -x -c -l -q -o -r -s -H -h -e`，
+退出码 0/1/2 同 GNU）、`sed`（GNU 子集：`s/y/d/p/q/a/i/c/=`、行号/`$`/正则地址与区间、`-E`/`-r`、
 `!` 取反、`-n -s -e -f -i`）、`ed`（POSIX 子集：`a/i/c/d/p/n/l/s/t/m/r/w/q/u/g/v/=`、地址 `.` `$` n `/re/` `+n` `-n`、输入模式以 `.` 结束）、`kill`、
 `ps`/`pgrep`/`pkill`/`killall`（进程管理，见上文「procfs 与进程管理」）、`login`、
 `chmod`（八进制 + 符号模式 `[ugoa]*[+-=][rwx]*` + `-R` 递归）、`chown`（`[OWNER][:[GROUP]]` + `-R`）、
@@ -556,9 +574,29 @@ Linux 的 exec 一样传给子进程（`process.setHandler` 认 `"ignore"`/`"def
 再兜底，而 `"No such file or directory"` 里本来就含 `directory` —— 于是"文件不存在"被报成
 "Is a directory"（31 个文件），已改为先判 ENOENT（且用小写比较，Lua pattern 区分大小写）。
 
-**已知偏离**：`grep`/`sed` 的正则用 **Lua pattern**（`%` 为转义符、`()` 为捕获）而非 POSIX ERE/BRE；
-替换区用 `&`=整串匹配、`\1..\9`=捕获组、`\n/\t`，不支持 BRE 风格 `\(...\)` 与模式内逆引用。
-注意 Lua pattern 里 `-` 是量词（非贪婪），要匹配字面连字符需 `%-`，与 GNU grep 的 `-`（字面）不同。
+**构建期门禁（shadow gate）**：`local backend = { ... function() ... backend.x ... end }` 这种写法里，
+初始化表达式的闭包读到的 `backend` 是**全局**（Lua 的 local 作用域从声明语句之后才开始）—— 运行期
+必然 nil，而静态看不出来（真机症状：`ls /proc/self` 报 `attempt to index global 'backend'`）。
+`tools/build.lua` 在压缩之前用 `minify.checkShadowedGlobals` 扫 `src/{bin,kernel,init,bios,modules}`，
+命中即 fail-fast 并给出源码行号；修法是声明与赋值分开（`local backend; backend = { ... }`）。
+
+**标准正则**：`grep`/`sed`/`ed`/`expr`/`csplit`/`pgrep`/`pkill` 的**面向用户的模式**一律是
+**POSIX 标准正则**（BRE / ERE），实现是内核里的唯一真源 `src/kernel/regex.lua`，工具经
+`syscalls["regex.compile"](pattern, "bre"|"ere", {icase=, word=, line=, fixed=})` 用（与 user.*/init.*
+同一模式：进程环境是白名单，用户态没有 require，所以共享引擎只能放内核）。方言按各命令的 POSIX 规定：
+`grep` 默认 **BRE**（`-E` 切 ERE、`-G` 显式 BRE、`-F` 按字面串）；`sed` 默认 BRE（`-E`/`-r` 切 ERE）；
+`ed`/`expr`/`csplit` 是 BRE；`pgrep`/`pkill` 是 ERE（procps）。匹配语义 = POSIX 的**最左最长**，
+`grep -o` 与 `s///g` 都按它取（`echo ab | grep -oE 'a|ab'` 出 `ab`，不是 `a`）。
+**grep 的退出码也是 POSIX/GNU 的**：0 = 选中了行、1 = 没选中、2 = 出错（选项/模式/文件读不了）——
+自检脚本里 `if ... | grep -q` 因此是真门禁（以前恒 0，等于空转）。
+替换区（`sed`/`ed`）用 `&`=整串匹配、`\1..\9`=捕获组、`\n/\t/\r` 转义、`\&`/`\\` 转义，
+BRE 的 `s/\(a\)\(b\)/\2\1/` 与 ERE 的 `s/(a)(b)/\2\1/` 都对；`s///N` 只替第 N 次出现。
+**已知偏离**：`\t`/`\n` 在**模式里**是转义（GNU sed 认，GNU grep 不认——本引擎统一认）；
+子表达式捕获在退化情形（同一个 RE 里多个可选分支）按"整体最长 + 分支优先"近似 POSIX 的子表达式规则；
+不支持 `[[=x=]]` 等价类与 `[[.x.]]` 排序元素；文本按字节处理（`[[:alpha:]]` 是 ASCII 字母）。
+**已知 bug（未修）**：把重定向写在**函数调用**上时（`f arg > out`），函数体里启动的**外部程序**
+的输出不会进重定向的目标文件（内建如 `echo` 正常）——`f() { ls /proc/self; }; f > out` 得到空文件，
+而输出跑到终端上。绕法：把重定向写在实际那条命令上（`ls /proc/self > out`）。
 不支持 **here-doc `<<`**（遇到即语法错误）；命令替换 `$()`/反引号、算术 `$(( ))` 与通配符已实现
 （见「词展开」一节）。也**不支持带 fd 前缀的重定向**（`2>f`/`2>>f`/`>&`）：`2>>f` 会被切成
 操作数 `2` + `>>f`（实测：`dd ... 2>>log` 报 `unrecognized operand '2'`）—— 脚本里要收 stderr
@@ -987,8 +1025,12 @@ sh tools/serve.sh                 # dist/release 挂在 10568 端口
      真机实测：从 GitHub 默认源连拉 65 个 payload 会**随机**断在某个文件上（两次分别挂在
      `bin/mount` 与 `bin/chmod`，而宿主机 curl 同一批文件 0 失败）—— 一次失败就终止整个安装太脆。
      重试只包住**传输**：拉回来的 size/CRC32 不符仍然当场 FAIL，不做第二次。
-2. 把 payload 铺到目标：**CCFS**（直接铺文件）或 **EXT2**（现场 `mkfs` 出镜像再写进去）；
-3. 写引导配置：`/startup.lua`（Delin BIOS，旧的备份成 `/startup.lua.craftos`）、
+2. 把 payload 铺到目标：**CCFS**（直接铺文件）或 **EXT2**（现场 `mkfs` 出镜像再写进去）。
+   **`payload/` 下的相对路径 == 目标文件系统上的绝对路径**，所以里面**不含** BIOS：
+   BIOS 是"电脑自身存储上的 CraftOS 引导文件"，放在发布树根 `<版本>/startup.lua`（与 `install.lua` 同级），
+   安装器单独取它。曾经把 BIOS 塞进 `payload/`，于是装 ext2 时被整棵铺进**镜像根**，
+   凭空多出一个永远用不到的 `/startup.lua`；
+3. 写引导配置（**电脑自身存储**）：`/startup.lua`（Delin BIOS，旧的备份成 `/startup.lua.craftos`）、
    `/boot/delin.lua`、`/boot/dlub.lua`、`/.boot`、`/dlub.cfg`；
 4. 全程写 `/delin-install.log`（CC 读不了屏，装完/装挂了都要能被宿主机读回）。
 
@@ -1148,6 +1190,8 @@ src/kernel/procenv.lua     进程环境白名单: 只把列出的 CC/Lua 全局�
                            在内核层封掉 loadfile/dofile/os.run/require/settings/shell/disk/peripheral
                            /os.pullEvent/queueEvent/shutdown 等绕过 Delin 接口的渠道
 src/kernel/signal.lua      POSIX 信号编号/默认动作/可捕获表/名字表
+src/kernel/regex.lua       标准正则引擎(POSIX BRE/ERE; 最左最长 + 捕获组 + sed/ed 替换):
+                           编译 -> 指令序列 -> Pike VM; 经 syscalls["regex.compile"] 给 /bin 工具
 src/kernel/vfs.lua         虚拟文件系统: 挂载表 + resolve(路径规范化: 吃掉 "."/".." 并夹在根上)
                             + real/virtual 后端
 src/kernel/vfs_api.lua     VFS 门面(fs/io) + /dev 设备注册表 + stdio
@@ -1187,13 +1231,14 @@ src/bin/touch              创建空文件
 src/bin/head               打印前 N 行 (-n N|-N)
 src/bin/tail               打印后 N 行 (-n N|-N)
 src/bin/wc                 统计行/词/字节 (-l|-w|-c)
-src/bin/grep               按 Lua 模式查找行 (-n|-i|-v)
+src/bin/grep               按标准正则查找行 (默认 BRE; -E/-G/-F 切方言; -n -i -v -w -x -c -l -q -o -r -s;
+                           退出码 0 选中 / 1 没选中 / 2 出错)
 src/bin/sed                流式文本编辑器 (GNU 子集: s/y/d/p/q/a/i/c/=, 地址区间, -n -s -e -f -i)
 src/bin/ed                 行编辑器 (POSIX 子集: a/i/c/d/p/n/l/s/t/m/r/w/q/u/g/v/=, 正则地址与替换, 交互逐行读)
 src/bin/kill               发送信号到进程/进程组 (kill [-SIG] pid|-pgid; kill -l)
 src/bin/ps                 报告进程状态, 数据源 /proc (POSIX ps + procps/GNU/BSD 常用子集:
                            默认/-e/-A/-a/-x/-f/-l/u(aux)/-p/-t/-u/-o/--no-headers; 无 TIME/%CPU/%MEM 列)
-src/bin/pgrep              按进程名/命令行查找进程 (procps pgrep 子集: -f -x -v -l -a -n -o -u; Lua pattern)
+src/bin/pgrep              按进程名/命令行查找进程 (procps pgrep 子集: -f -x -v -l -a -n -o -u; ERE)
 src/bin/pkill              按进程名/命令行发信号 (procps pkill 子集: -SIG/-s/--signal + pgrep 的选择项)
 src/bin/killall            按进程名给所有同名进程发信号 (psmisc killall 子集: -SIG/-s/-l/-e/-q/-u)
 src/bin/chmod              修改文件权限 (八进制+符号模式 [ugoa]*[+-=][rwx]*; 以 - 开头的符号模式
@@ -1229,10 +1274,14 @@ src/modules/*.ko           内核模块: ccdisk(ccdisk fstype) ccmonitor(CC 显�
                            ext2(ext2 fstype) redstone(CC 红石 -> sysfs redstone 类) tom(Tom GPU 驱动)
                            void(Void 全息驱动)
 src/modules/modules.alias  驱动别名(modprobe 风格): tm_gpu->tom hologram->void monitor->ccmonitor printer->ccprinter
-src/modules/manifest       默认装载模块清单: demo ext2 ccdisk redstone
+src/modules/manifest       默认装载模块清单: ext2 ccdisk redstone
 scripts/posix_test.sh      可移植 POSIX 自检(host 与 Delin 各跑一次比对, 128 项全过; 含 cat 字节保真)
-scripts/sh_expand_test.sh  sh 展开自检(通配符 * ? [ ]/命令替换 $( ) 与反引号/算术 $(( )), 95 项;
-                           host harness 与真机各跑一次比对, 期望值逐条对过 bash/dash)
+scripts/sh_expand_test.sh  sh 展开自检(通配符 * ? [ ]/命令替换 $( ) 与反引号/算术 $(( ));
+                           host harness 与真机各跑一次比对, 期望值逐条对过 bash/dash;
+                           含"存在 bin/ls 时 bin/ls* 必须匹配到它"的前缀匹配回归用例")
+scripts/regex_test.sh      标准正则自检(grep 方言 -E/-G/-F 与退出码 0/1/2、最左最长、-o/-w/-x/-i、
+                           POSIX 字符类、sed 的 BRE/ERE 与 s///N、ed/expr/csplit) —— 同一份脚本
+                           在宿主(期望值由宿主 GNU 校验)、harness 与真机各跑一次
 scripts/jobctl_test.sh     作业控制自检(& / $! / jobs / fg / bg / wait / kill %job, host 与真机各跑一次)
 scripts/sysinfo.sh         实用小工具: 系统信息(变量/函数/for/case/if/重定向/工具)
 scripts/proc_test.sh       /proc + ps/pgrep/pkill/killall 自检(host harness 与真机各跑一次比对, 41 项)
