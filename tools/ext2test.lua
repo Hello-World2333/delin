@@ -4,7 +4,9 @@
           8 字节空洞夹在活条目之间, e2fsck 报 "directory corrupted"(变体 A);
           正确做法是删条目时把 rec_len 并入前一条(变体 B)。
        2) create 给普通文件也加父目录 links -> 引用计数只增不减
-          (真机 fsck: "Inode 115 ref count is 55, should be 3")。
+          (真机 fsck: "Inode 115 ref count is 55, should be 3");
+       3) removeDirEntry 只会"并入前一条" -> 目录跨块后每个非首块的**第一条**删不掉
+          (真机 rm -rf 一个大目录报 "cannot remove first dir entry")。
      用法: lua5.1 tools/ext2test.lua     需要 /usr/sbin/mkfs.ext2 与 /usr/sbin/e2fsck
 ]]
 
@@ -158,6 +160,34 @@ do
     assert(ext2.delete(fs, "/d/ne", "inner"))
     assert(ext2.delete(fs, "/d", "ne"))
     eq(ext2.lookup(fs, "/d").links, 2, "清空后删目录成功, links 回落")
+end
+
+-- 跨块目录: **每个块的第一条目录项**也必须能删掉。
+-- 曾经的 bug: removeDirEntry 只做"把 rec_len 并入前一条", 而块首条目没有前一条 —— 于是
+-- 目录一跨块, 每个非首块的第一条就永远删不掉(真机 rm -rf 一个大目录报
+-- "cannot remove first dir entry", 目录删不干净; regex_test.sh 在真机上把它试了出来)。
+-- 正确做法: 块首条目置 inode=0 标空闲(rec_len/name_len 原样留着, addDirEntry 会整条复用)。
+do
+    assert(ext2.create(fs, "/", "big", T_DIR + 493))
+    local N = 200
+    for i = 1, N do assert(ext2.create(fs, "/big", string.format("file%03d", i), T_REG + 420)) end
+    local dinode = ext2.lookup(fs, "/big")
+    ok((dinode.size or 0) > 1024, "跨块目录已建立(size=" .. tostring(dinode.size) .. ")")
+    local failed = 0
+    for i = 1, N do
+        local okd, derr = ext2.delete(fs, "/big", string.format("file%03d", i))
+        if not okd then
+            failed = failed + 1
+            if failed == 1 then io.write("   首个失败: file" .. string.format("%03d", i) .. " -- " .. tostring(derr) .. "\n") end
+        end
+    end
+    eq(failed, 0, "跨块目录的每一条(含各块第一条)都能删掉")
+    local left = 0
+    for _, e in ipairs(ext2.readDir(fs, ext2.lookup(fs, "/big")) or {}) do
+        if e.name ~= "." and e.name ~= ".." then left = left + 1 end
+    end
+    eq(left, 0, "删空后目录里没有残留条目")
+    assert(ext2.delete(fs, "/", "big"))
 end
 
 -- 写文件 + 读回(句柄路径)

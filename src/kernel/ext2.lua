@@ -744,9 +744,20 @@ function ext2.removeDirEntry(fs, dirIno, name)
                 local entNameLen = data:byte(off + 7)
                 if entNameLen == #name and data:sub(off + 9, off + 8 + entNameLen) == name then
                     -- ext2 的标准删除: 把被删条目的 rec_len 并入前一条(条目直接从块里消失)。
-                    -- 也可以只清 inode 留个 ino=0 的条目, 但那样要靠 addDirEntry 记得复用整条
-                    -- 空间才不留空洞; 合并更简单, 目录块也不会越用越碎。
-                    if not prevOff then return nil, "cannot remove first dir entry" end
+                    -- 合并更简单, 目录块也不会越用越碎。
+                    if not prevOff then
+                        -- 条目是本块的**第一条**(目录跨块后, 每个非首块的第一条都会走到这里):
+                        -- 没有前一条可以并进去, 于是把它标成**空闲条目**(inode 号置 0), rec_len 与
+                        -- name_len 原样保留 —— addDirEntry 扫到 ino==0 的条目会整条复用(条件
+                        -- `entRecLen >= rec`), 所以不能缩 rec_len, 更不能清 name_len: 那样会在
+                        -- 块里留下 e2fsck 判 "directory corrupted" 的空洞。
+                        -- 曾经的 bug: 这里直接 `return nil, "cannot remove first dir entry"`,
+                        -- 于是 >1 个块的目录永远删不掉每个块的第一条 —— 真机上 `rm -rf` 一个大目录
+                        -- 会报这个错、目录删不干净(regex_test.sh 的自检把它试出来了)。
+                        data = setU32(data, off, 0)
+                        writeBlockStr(fs, blockNum, data)
+                        return true
+                    end
                     data = setU16(data, prevOff + 4, prevRec + entRecLen)
                     writeBlockStr(fs, blockNum, data)
                     return true
