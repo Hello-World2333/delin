@@ -1461,7 +1461,42 @@ do
        "procfs: version 含 Delin OS")
     local mounts = openAt("/proc/mounts").readAll() or ""
     ok(mounts:find("proc /proc proc ro 0 0", 1, true) ~= nil, "procfs: mounts 含 /proc 条目", mounts)
+
+    -- /proc/sys/kernel/random/*(随机数子系统状态; 见下一节)
+    b, r = vfs.resolve("/proc")
+    local rootNames = {}
+    for _, n in ipairs(b.list(r)) do rootNames[n] = true end
+    ok(rootNames["sys"], "procfs: /proc 列出 sys")
+    b, r = vfs.resolve("/proc/sys")
+    ok(b.isDir(r), "procfs: /proc/sys 是目录")
+    eq(b.list(r)[1], "kernel", "procfs: /proc/sys 只列 kernel")
+    b, r = vfs.resolve("/proc/sys/kernel")
+    ok(b.isDir(r), "procfs: /proc/sys/kernel 是目录")
+    eq(b.list(r)[1], "random", "procfs: /proc/sys/kernel 只列 random")
+    b, r = vfs.resolve("/proc/sys/kernel/random")
+    ok(b.isDir(r), "procfs: /proc/sys/kernel/random 是目录")
+    local rnames = {}
+    for _, n in ipairs(b.list(r)) do rnames[n] = true end
+    ok(rnames["entropy_avail"] and rnames["poolsize"] and rnames["uuid"],
+       "procfs: random 目录列出 entropy_avail/poolsize/uuid")
+    eq(openAt("/proc/sys/kernel/random/poolsize").readAll(), "4096\n", "procfs: poolsize = 4096")
+    local ea = openAt("/proc/sys/kernel/random/entropy_avail").readAll() or ""
+    ok(ea:match("^%d+\n$") ~= nil, "procfs: entropy_avail 是十进制 bit 数", ea)
+    local uu = openAt("/proc/sys/kernel/random/uuid").readAll() or ""
+    ok(uu:match("^%x%x%x%x%x%x%x%x%-%x%x%x%x%-4%x%x%x%-[89ab]%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x\n$") ~= nil,
+       "procfs: uuid 是 RFC 4122 v4", uu)
+    ok(openAt("/proc/sys/kernel/random/uuid").readAll() ~= uu, "procfs: uuid 每次读都不同")
+    b, r = vfs.resolve("/proc/sys/kernel/random/nosuch")
+    ok(not b.exists(r), "procfs: random 下不存在的文件 exists=false")
+    b, r = vfs.resolve("/proc/sys/kernel/nosuch")
+    ok(not b.exists(r) and not b.isDir(r), "procfs: /proc/sys/kernel 下未知条目")
+    b, r = vfs.resolve("/proc/sys/nosuch")
+    ok(not b.exists(r) and not b.isDir(r), "procfs: /proc/sys 下未知条目")
+    b, r = vfs.resolve("/proc/sys/kernel/random")
+    local dirfh, direrr = b.open(r, "r")
+    ok(dirfh == nil and tostring(direrr):find("directory") ~= nil, "procfs: 打开目录报错", direrr)
 end
+
 
 -- ===============================================================
 -- L. redstone: /sys/class/redstone/<side>/{digital,analog,bundled}
@@ -1833,6 +1868,16 @@ do
     ok(user.verify(db6, "bob", "new"), "user: 新密码生效")
     ok(not user.verify(db6, "bob", "old"), "user: 旧密码失效")
 
+    -- 盐必须来自内核 CSPRNG(从前是 math.random: 进程里没播种, 序列可预测)
+    local s1, s2 = user.makeSalt(), user.makeSalt()
+    eq(#s1, 8, "user.makeSalt: 默认 8 字符")
+    ok(s1:match("^%x%x%x%x%x%x%x%x$") ~= nil, "user.makeSalt: 十六进制", s1)
+    ok(s1 ~= s2, "user.makeSalt: 两次不同")
+    eq(#user.makeSalt(12), 12, "user.makeSalt: 指定长度")
+    -- 落盘后仍能验证(盐随 shadow 存下来, 换盐不影响老条目)
+    ok(user.setPassword(db6, "bob", "new", "newer") and user.verify(db6, "bob", "newer"),
+       "user: 换盐后新密码可验证")
+
     -- addUser(root): 分配 id、私有组、锁定、附加组、失败不留残留
     callerUid = 0
     local db7 = user.parse(PW, SH, GR)
@@ -2065,6 +2110,91 @@ do
     eq(devdisk.byMountPath("").name, "sda", "devdisk: byMountPath(\"\") = 自带存储")
     eq(devdisk.byMountPath("disk2").name, "sdc", "devdisk: byMountPath 找驱动器里的盘")
     eq(devdisk.byMountPath("missing"), nil, "devdisk: byMountPath 找不到即 nil")
+end
+
+-- ===============================================================
+-- K2. 随机数: ChaCha20 核心 + 熵池 + /dev/zero,/dev/random,/dev/urandom
+--     ChaCha20 的期望值由 OpenSSL 生成(命令写在下面), 而不是"自己算一遍再和自己比"。
+-- ===============================================================
+do
+    _G.fs = F -- vfs_api 顶层取 fs.getName 等
+    local chacha = require("kernel.chacha20")
+    local vfs_api = require("kernel.vfs_api")
+    local random = require("kernel.random")
+    local vfs = require("kernel.vfs")
+
+    local function hex(s)
+        return (s:gsub(".", function(c) return string.format("%02x", c:byte()) end))
+    end
+    -- 向量来源(OpenSSL 3.x):
+    --   head -c 64 /dev/zero | openssl enc -chacha20 -K <key> -iv <ctr_LE|nonce> -nosalt | od -An -v -tx1
+    local key = ""
+    for i = 0, 31 do key = key .. string.char(i) end
+    eq(hex(chacha.blockBytes(key, 1, string.char(0, 0, 0, 9, 0, 0, 0, 0x4a, 0, 0, 0, 0))),
+       "10f1e7e4d13b5915500fdd1fa32071c4c7d1f4c733c068030422aa9ac3d46c4e"
+       .. "d2826446079faa0914c2d705d98b02a2b5129cd1de164eb9cbd083e8a2503c4e",
+       "chacha20: 密钥 00..1f / 计数器 1 的块(OpenSSL 向量)")
+    local zkey, znonce = string.rep("\0", 32), string.rep("\0", 12)
+    eq(hex(chacha.blockBytes(zkey, 0, znonce)),
+       "76b8e0ada0f13d90405d6ae55386bd28bdd219b8a08ded1aa836efcc8b770dc7"
+       .. "da41597c5157488d7724e03fb8d84a376a43b8f41518a11cc387b669b2ee6586",
+       "chacha20: 全零密钥/nonce 的块(OpenSSL 向量)")
+    eq(hex(chacha.blockBytes(key, 0, znonce)) .. hex(chacha.blockBytes(key, 1, znonce)),
+       "39fd2b7dd9c5196a8dbd0377b8dc4a498a35d86fbcde6accb2cc7d4cd8ea2492"
+       .. "2b23cce7a26023ab3f0eef693ac87f64258235eab1f7a32dc22762a0485b410c"
+       .. "18b84231ade6a6d113615c61af434e27f8b1f3f5e1ad5b5cecf8fc122a3575"
+       .. "5c7208086dd1ee3c5d9d815824640e003c9ba0f65ede5d59ce0d2a4a7f31955acd",
+       "chacha20: 连续两块(计数器 0/1)的密钥流")
+    -- 纯算术实现的自检: 32 位异或/循环移位在边界值上必须与定义一致
+    eq(chacha.xor32(0xFFFFFFFF, 0), 0xFFFFFFFF, "chacha20: xor32 全 1")
+    eq(chacha.xor32(0x0F0F0F0F, 0x00FF00FF), 0x0FF00FF0, "chacha20: xor32 交叉位")
+    eq(chacha.rotl32(0x80000001, 1), 0x00000003, "chacha20: rotl32 回绕")
+    eq(chacha.rotl32(0x12345678, 0), 0x12345678, "chacha20: rotl32 0 位")
+
+    -- /dev 设备: mountDev 之后 /dev/null 与 /dev/zero 已在注册表里(vfs_api 顶层注册)
+    vfs_api.mountDev()
+    local function openDev(path, mode)
+        local b, r = vfs.resolve(path)
+        return b.open(r, mode or "r")
+    end
+    local zh = openDev("/dev/zero")
+    ok(zh ~= nil, "devzero: 能打开")
+    eq(zh:read(4), "\0\0\0\0", "devzero: read(4) 给 4 个 NUL")
+    eq(#zh:read(1024), 1024, "devzero: read(1024) 给 1024 个 NUL")
+    eq(zh:read(3):byte(1), 0, "devzero: 内容是 NUL")
+    eq(zh:write("abc"), 3, "devzero: 写丢弃并返回长度")
+    ok(#zh:readLine() > 0, "devzero: readLine 一次给一块")
+
+    -- /dev/random 与 /dev/urandom: 只读(写打开必须报错, 不许静默)
+    random.register()
+    local rb, rr = vfs.resolve("/dev/random")
+    local okw, werr = pcall(rb.open, rr, "w")
+    ok(not okw and tostring(werr):find("read%-only") ~= nil, "devrandom: 拒写", werr)
+    local b2, r2 = vfs.resolve("/dev/urandom")
+    ok(b2.exists(r2) and not b2.isDir(r2), "devurandom: 存在且不是目录")
+    -- 未初始化时 /dev/urandom 照常出字节(Linux 同此), 只是记一次内核告警
+    local a1 = b2.open(r2, "r"):read(16)
+    local a2 = b2.open(r2, "r"):read(16)
+    eq(#a1, 16, "devurandom: read(16) 给 16 字节")
+    ok(a1 ~= a2, "devurandom: 两次读不同(换钥)")
+    ok(a1 ~= string.rep("\0", 16), "devurandom: 不是全零")
+    ok(not random.ready(), "random: 未喂事件时 CRNG 未初始化")
+
+    -- 熵源: 事件喂进池子 -> CRNG 就绪, 且新事件真的改变输出
+    local ea0 = random.entropyAvail()
+    for i = 1, 12 do random.feedEvent({ "timer", i, n = 2 }) end
+    ok(random.entropyAvail() >= ea0, "random: 事件喂进池子, entropy_avail 不降")
+    ok(random.ready(), "random: 样本满 128 bit fast-load 后 CRNG 就绪")
+    local rb2, rr2 = vfs.resolve("/dev/random")
+    eq(#rb2.open(rr2, "r"):read(8), 8, "devrandom: 就绪后能读")
+    local before = random.bytes(32)
+    for i = 1, 12 do random.feedEvent({ "timer", i, n = 2 }) end
+    ok(random.bytes(32) ~= before, "random: 新事件改变了输出")
+
+    -- uuid/hex 辅助
+    eq(#random.hex(5), 10, "random: hex(5) 是 10 个十六进制字符")
+    ok(random.hex(8):match("^%x+$") ~= nil, "random: hex 只含十六进制字符")
+    ok(random.uuid():match("^%x%x%x%x%x%x%x%x%-%x%x%x%x%-4") ~= nil, "random: uuid v4 前缀")
 end
 
 io.write(string.format("\n%d passed, %d failed\n", pass, fail))

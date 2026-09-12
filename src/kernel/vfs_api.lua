@@ -282,6 +282,28 @@ vfsapi.registerDevice("null", {
     open = function() return nullHandle() end,
 })
 
+-- /dev/zero: 读 = 无限 NUL 字节(read(n) 每次给 n 个), 写丢弃(POSIX/Linux 语义)。
+-- 与 /dev/null 是同一族"总是成功的特殊设备", 所以和它一起注册。
+-- 字节流设备没有"行": readLine 一次给一块(4096 个 NUL), 于是 `cat /dev/zero` 与 Linux 一样
+-- 是无限输出(要靠 ^C / head 收尾)。
+local ZERO_CHUNK = 4096
+local function zeroHandle()
+    return {
+        read = function(self, n)
+            if type(self) == "number" then n = self end
+            return string.rep("\0", n or ZERO_CHUNK)
+        end,
+        readLine = function() return string.rep("\0", ZERO_CHUNK) end,
+        write = function(_, s) return #tostring(s or "") end,
+        flush = function() return true end,
+        close = function() return true end,
+    }
+end
+vfsapi.registerDevice("zero", {
+    writable = true,
+    open = function() return zeroHandle() end,
+})
+
 --- 暴露 fs 门面(供内核/模块/cat 使用)。
 vfsapi.fs = fsapi
 

@@ -41,6 +41,15 @@ function scheduler.setDiskHook(fn)
     diskHook = fn
 end
 
+--- 事件钩子(random 注入): 每个系统事件(名称/参数/到达间隔)都喂给熵池。
+--- 与 diskHook 同样是**注入**而不是 require —— 调度器不依赖任何子系统,
+--- 而且这样宿主测试台(没有 CC fs)也能单独装载它。
+local eventHook = nil
+
+function scheduler.setEventHook(fn)
+    eventHook = fn
+end
+
 --- 向调度器注册一个进程协程。
 ---@param proc DelinProc
 function scheduler.addProcess(proc)
@@ -151,6 +160,10 @@ function scheduler.run()
 
         if #procs > 0 then
             event = table.pack(os.pullEventRaw())
+            -- 随机数熵源: 每一个系统事件都掺进内核熵池(见 kernel/random.lua)。
+            -- 放在这里而不是 routeEvent 里 —— 这是**唯一的事件入口**, 每个事件恰好掺一次,
+            -- 与"哪些进程在等什么事件"无关。
+            if eventHook then eventHook(event) end
         end
     end
 end

@@ -23,6 +23,7 @@ local sysfs      = require("kernel.sysfs")
 local procfs     = require("kernel.procfs")
 local pipe       = require("kernel.pipe")
 local klog       = require("kernel.klog")
+local random     = require("kernel.random")
 local fstab      = require("kernel.fstab")
 local INIT_SOURCE = require("kernel.init_src") -- 打包器注入的 init 源码字符串
 
@@ -61,6 +62,8 @@ local function setupVfs()
     vfs.mount("/", vfs.real(""), { device = rootDev.node, fstype = "ccdisk", uuid = rootDev.uuid })
     vfs_api.mountDev()
     klog.register() -- /dev/kmsg + /dev/log
+    random.register() -- /dev/random + /dev/urandom
+    scheduler.setEventHook(random.feedEvent) -- 每个系统事件都进熵池
     procfs.mount(bootMs, modules.version) -- /proc: 进程/系统信息
 
     -- 终端 stdio(io.write/read 兜底)。用冒号调用(io.write 经 stdio.output:write)。
@@ -334,6 +337,8 @@ local function bootFromInfo(bi)
 
     vfs_api.mountDev()
     klog.register()
+    random.register() -- /dev/random + /dev/urandom
+    scheduler.setEventHook(random.feedEvent) -- 每个系统事件都进熵池
     procfs.mount(bootMs, modules.version) -- /proc: 进程/系统信息
     registerConsole() -- 电脑自身 term 控制台(键盘输入焦点)
     setupDevices()    -- /dev/sdX 设备节点(磁盘不自动挂载)

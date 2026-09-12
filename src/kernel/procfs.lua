@@ -3,6 +3,7 @@
        /proc/<pid>/{cmdline,comm,cwd,stat,status}
        /proc/self/...       调用者自身 pid 的别名(Linux 是符号链接; Delin 无 symlink, 当目录)
        /proc/{mounts,uptime,version}
+       /proc/sys/kernel/random/{entropy_avail,poolsize,uuid}   随机数子系统状态(见 kernel/random.lua)
      进程集合 = 内核进程表里仍存活的进程(process.list: running|stopped)。
      Delin 无 zombie 语义: 进程退出后 /proc/<pid> 立即消失(Linux 保留到父进程 wait)。
      没有数据源的东西一律不提供(meminfo/cpuinfo/loadavg 等) —— 不造假; ps 因此也没有
@@ -13,6 +14,7 @@
 
 local vfs     = require("kernel.vfs")
 local process = require("kernel.process")
+local random  = require("kernel.random")
 
 local procfs = {}
 
@@ -23,6 +25,10 @@ local osVersion = "0.0.0" -- Delin 版本串(mount 时由 boot 传入)
 local PID_FILES = { "cmdline", "comm", "cwd", "stat", "status" }
 -- /proc/ 下的系统信息文件
 local SYS_FILES = { "mounts", "uptime", "version" }
+-- /proc/sys/kernel/random/ 下的文件(Linux 同名路径; 值为打开时的快照)
+local SYS_RANDOM_FILES = { "entropy_avail", "poolsize", "uuid" }
+-- /proc/sys 这一层只有 kernel/random 一个分支: Delin 没有 sysctl 可调项, 不造假树。
+local SYS_SUBDIRS = { "kernel" }
 
 local function norm(rel) return (rel or ""):gsub("^/+", "") end
 
@@ -112,7 +118,7 @@ end
 
 --- 解析 /proc 下的相对路径。
 ---@param rel string
----@return string|nil kind "root"|"pid"|"pidfile"|"sysfile"
+---@return string|nil kind "root"|"pid"|"pidfile"|"sysfile"|"sysroot"|"syskernel"|"sysrandom"|"randfile"
 ---@return integer|nil pid
 ---@return string|nil name
 local function parse(rel)
@@ -130,6 +136,20 @@ local function parse(rel)
         local pid = tonumber(head)
         if #parts == 1 then return "pid", pid end
         if #parts == 2 then return "pidfile", pid, parts[2] end
+        return nil
+    end
+    if head == "sys" then
+        -- /proc/sys/kernel/random/{entropy_avail,poolsize,uuid}
+        if #parts == 1 then return "sysroot" end
+        if parts[2] ~= "kernel" then return nil end
+        if #parts == 2 then return "syskernel" end
+        if parts[3] ~= "random" then return nil end
+        if #parts == 3 then return "sysrandom" end
+        if #parts == 4 then
+            for _, n in ipairs(SYS_RANDOM_FILES) do
+                if n == parts[4] then return "randfile", nil, n end
+            end
+        end
         return nil
     end
     if #parts == 1 then
@@ -176,6 +196,14 @@ local function sysFileText(name)
     if name == "uptime" then return uptimeText() end
     if name == "version" then return versionText() end
     if name == "mounts" then return mountsText() end
+    return nil, "no such file: " .. tostring(name)
+end
+
+--- /proc/sys/kernel/random/<name> 的内容(Linux 同名文件; uuid 每次读都取新值)。
+local function randomFileText(name)
+    if name == "entropy_avail" then return tostring(random.entropyAvail()) .. "\n" end
+    if name == "poolsize" then return tostring(random.poolsize()) .. "\n" end
+    if name == "uuid" then return random.uuid() .. "\n" end
     return nil, "no such file: " .. tostring(name)
 end
 
@@ -228,6 +256,18 @@ local backend = {
             for _, p in ipairs(process.list()) do out[#out + 1] = tostring(p.pid) end
             out[#out + 1] = "self"
             for _, n in ipairs(SYS_FILES) do out[#out + 1] = n end
+            out[#out + 1] = "sys"
+            return out
+        end
+        if kind == "sysroot" then
+            local out = {}
+            for i, n in ipairs(SYS_SUBDIRS) do out[i] = n end
+            return out
+        end
+        if kind == "syskernel" then return { "random" } end
+        if kind == "sysrandom" then
+            local out = {}
+            for i, n in ipairs(SYS_RANDOM_FILES) do out[i] = n end
             return out
         end
         if kind == "pid" then
@@ -240,7 +280,11 @@ local backend = {
     end,
     exists = function(rel)
         local kind, pid, name = parse(rel)
-        if kind == "root" or kind == "sysfile" then return true end
+        if kind == "root" or kind == "sysfile" or kind == "sysroot" or kind == "syskernel"
+            or kind == "sysrandom" then
+            return true
+        end
+        if kind == "randfile" then return name ~= nil end
         if kind == "pid" then return liveProc(pid) ~= nil end
         if kind == "pidfile" then
             if not liveProc(pid) then return false end
@@ -252,13 +296,18 @@ local backend = {
     -- 目录判定必须与 exists 一致(否则 cd /proc/<不存在的 pid> 会成功)。
     isDir = function(rel)
         local kind, pid = parse(rel)
-        if kind == "root" then return true end
+        if kind == "root" or kind == "sysroot" or kind == "syskernel" or kind == "sysrandom" then
+            return true
+        end
         if kind == "pid" then return liveProc(pid) ~= nil end
         return false
     end,
     attributes = function(rel)
         local kind, pid, name = parse(rel)
         if kind == "root" then return { size = 0, isDir = true, isReadOnly = true, name = "proc" } end
+        if kind == "sysroot" or kind == "syskernel" or kind == "sysrandom" then
+            return { size = 0, isDir = true, isReadOnly = true, name = norm(rel):gsub("^.*/", "") }
+        end
         if kind == "pid" then
             if not liveProc(pid) then return nil end
             return { size = 0, isDir = true, isReadOnly = true, name = tostring(pid) }
@@ -268,7 +317,7 @@ local backend = {
             -- procfs 文件的 st_size 是 0(Linux 同样如此), 内容随读生成。
             return { size = 0, isDir = false, isReadOnly = true, name = name }
         end
-        if kind == "sysfile" then
+        if kind == "sysfile" or kind == "randfile" then
             return { size = 0, isDir = false, isReadOnly = true, name = name }
         end
         return nil
@@ -280,7 +329,10 @@ local backend = {
     isReadOnly = function() return true end,
     open = function(rel, mode)
         local kind, pid, name = parse(rel)
-        if kind == "root" or kind == "pid" then return nil, "is a directory" end
+        if kind == "root" or kind == "pid" or kind == "sysroot" or kind == "syskernel"
+            or kind == "sysrandom" then
+            return nil, "is a directory"
+        end
         if not kind then return nil, "no such path: /proc/" .. norm(rel) end
         if mode and mode:find("w") then return nil, "read-only fs: /proc/" .. norm(rel) end
         local content, err
@@ -288,6 +340,8 @@ local backend = {
             local p = liveProc(pid)
             if not p then return nil, "no such process: " .. tostring(pid) end
             content, err = pidFileText(p, name)
+        elseif kind == "randfile" then
+            content, err = randomFileText(name)
         else
             content, err = sysFileText(name)
         end

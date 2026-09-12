@@ -717,6 +717,9 @@ package.loaded["kernel.display"] = {
     byName = function(n) return n == "top" and sysfsDev or nil end,
     resize = function() return true end,
 }
+-- kernel.vfs_api / procfs / random 装载时会抓全局 fs(与内核同一份源码); 宿主上没有 CC 的 fs,
+-- 用宿主门面顶上 —— 必须在 require 之前设好(vfs_api 顶层就取 fs.getName 等)。
+_G.fs = _G.fs or F
 local vfs = require("kernel.vfs")
 require("kernel.sysfs").mount()
 
@@ -855,10 +858,6 @@ do
         return prevDelete(p)
     end
 end
-
--- kernel.modules/vfs_api 装载时会抓全局 fs(与内核同一份源码); 宿主上没有 CC 的 fs,
--- 用宿主门面顶上 —— 下面 setupRoot / user 库的 require 都会走到它。
-_G.fs = _G.fs or F
 
 setupRoot()
 

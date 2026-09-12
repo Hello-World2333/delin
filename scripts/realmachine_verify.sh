@@ -96,6 +96,32 @@ cat /proc/mounts >> $LOG
 cat /proc/1/stat >> $LOG
 cat /proc/1/status >> $LOG
 cat /proc/self/comm >> $LOG
+echo "-- 随机数设备: /dev/zero /dev/urandom /dev/random --" >> $LOG
+ls /dev >> $LOG
+echo -n "zero8=" >> $LOG
+dd status=none if=/dev/zero bs=8 count=1 | od -An -v -tx1 >> $LOG
+echo -n "urandom16=" >> $LOG
+dd status=none if=/dev/urandom bs=16 count=1 | od -An -v -tx1 >> $LOG
+dd status=none if=/dev/urandom bs=32 count=1 of=/tmp/rnd1
+dd status=none if=/dev/urandom bs=32 count=1 of=/tmp/rnd2
+if [ "$(wc -c < /tmp/rnd1)" = "32" ]; then echo "ok urandom_read_32_bytes" >> $LOG; else echo "ng urandom_read_32_bytes" >> $LOG; fi
+if cmp -s /tmp/rnd1 /tmp/rnd2; then echo "ng urandom_two_reads_differ" >> $LOG; else echo "ok urandom_two_reads_differ" >> $LOG; fi
+echo "-- /dev/random: CRNG 就绪后直接可读(未就绪时会阻塞, 见 init 日志的 crng 那行) --" >> $LOG
+dd status=none if=/dev/random bs=16 count=1 of=/tmp/rndr
+if [ "$(wc -c < /tmp/rndr)" = "16" ]; then echo "ok devrandom_read_16_bytes" >> $LOG; else echo "ng devrandom_read_16_bytes" >> $LOG; fi
+echo "-- /proc/sys/kernel/random --" >> $LOG
+cat /proc/sys/kernel/random/poolsize >> $LOG
+cat /proc/sys/kernel/random/entropy_avail >> $LOG
+cat /proc/sys/kernel/random/uuid >> $LOG
+cat /proc/sys/kernel/random/uuid > /tmp/u1
+cat /proc/sys/kernel/random/uuid > /tmp/u2
+if cmp -s /tmp/u1 /tmp/u2; then echo "ng uuid_each_read_differs" >> $LOG; else echo "ok uuid_each_read_differs" >> $LOG; fi
+grep '%x%x%x%x%x%x%x%x%-%x%x%x%x%-4' /tmp/u1 > /tmp/uuidhit
+if [ -s /tmp/uuidhit ]; then echo "ok uuid_v4_format" >> $LOG; else echo "ng uuid_v4_format" >> $LOG; fi
+# 内核那句 "random: crng init done" 要经 syslogd 落到 /var/log/kern.log。
+# 注意本脚本前面的 logrotate 段已经把 kern.log 轮转过一次(所以也查 .1)。
+grep 'crng init done' /var/log/kern.log /var/log/kern.log.1 > /tmp/crnghit
+if [ -s /tmp/crnghit ]; then echo "ok crng_init_done_logged" >> $LOG; else echo "ng crng_init_done_logged" >> $LOG; fi
 echo "-- ps --" >> $LOG
 ps -e >> $LOG
 ps -ef >> $LOG

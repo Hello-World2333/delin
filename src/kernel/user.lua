@@ -13,6 +13,7 @@
 local user = {}
 
 local modules = require("kernel.modules")
+local random  = require("kernel.random") -- 盐 = CSPRNG 输出(见 makeSalt)
 
 -- 权限判定与特权写都要当前进程凭据; 不在内核 bundle 里(宿主测试台/DLUB)时视为 root。
 local process = nil
@@ -31,15 +32,13 @@ function user.hash(salt, pw)
     return string.format("%x", h)
 end
 
+--- 盐取自内核 CSPRNG(ChaCha20 CRNG, 见 kernel/random.lua)。
+--- 从前这里用 math.random: CC 的 math.random 在进程里没有播种, 每个进程的序列是可预测的,
+--- 于是 `/etc/shadow` 的盐是可预测的 —— 盐的全部意义就是不可预测, 所以必须走内核随机数。
+--- 十六进制表示顺带避开了取模偏差(bias)。
 function user.makeSalt(len)
     len = len or 8
-    local c = "abcdefghijklmnopqrstuvwxyz0123456789"
-    local out = {}
-    for i = 1, len do
-        local r = math.random(#c)
-        out[i] = c:sub(r, r)
-    end
-    return table.concat(out)
+    return random.hex(math.ceil(len / 2)):sub(1, len)
 end
 
 --- 名字会原样写进以 ':' 分隔的表里, 所以严格校验 —— 冒号/换行/空格会让文件结构破掉。

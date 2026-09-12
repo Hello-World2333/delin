@@ -15,9 +15,9 @@
 | 路径 | 作用 |
 |---|---|
 | `/bin/` | 用户工具（POSIX 强制命令已补齐，见「POSIX 命令覆盖」一节）：`basename cat chgrp chmod chown cksum clear cmp comm cp csplit cut dd df diff dirname du echo ed expand expr file find fold grep head id join kill killall ln ls mkdir mkfifo mount mv nohup od passwd paste patch pathchk pr printf ps readlink realpath rm rmdir sed sh sleep sort split strings tail tee touch tr umount unexpand uniq uudecode uuencode wc whoami xargs`；系统/服务类：`blkid dmesg logger login logrotate lp lsblk lua pgrep pkill syslogd systemctl`；用户管理：`groupadd groupdel groups useradd userdel usermod` |
-| `/dev/` | 设备文件：`/dev/ttyN`（字符终端）、`/dev/fbN`（像素帧缓冲）、`/dev/sdX`（磁盘，见下）、`/dev/lpN`（打印机字符设备，只写，见下）、`/dev/null`（读 EOF/写丢弃）、`/dev/console`（系统控制台 = 控制台 tty）、`/dev/kmsg`（内核 ring buffer 只读流）、`/dev/log`（用户态 syslog 输入） |
+| `/dev/` | 设备文件：`/dev/ttyN`（字符终端）、`/dev/fbN`（像素帧缓冲）、`/dev/sdX`（磁盘，见下）、`/dev/lpN`（打印机字符设备，只写，见下）、`/dev/null`（读 EOF/写丢弃）、`/dev/zero`（读 = 无限 NUL）、`/dev/random`、`/dev/urandom`（随机字节，见下）、`/dev/console`（系统控制台 = 控制台 tty）、`/dev/kmsg`（内核 ring buffer 只读流）、`/dev/log`（用户态 syslog 输入） |
 | `/etc/` | 系统配置：`passwd` `shadow`（0600 root:root）`group`、`fstab`、`syslog.conf`、`logrotate.conf`、`systemd/system/`（管理员单元与 enable 标记） |
-| `/proc/` | 虚拟进程/系统信息 fs（procfs，内核提供，见下）：`/proc/<pid>/{cmdline,comm,cwd,stat,status}`、`/proc/self`、`/proc/{mounts,uptime,version}` |
+| `/proc/` | 虚拟进程/系统信息 fs（procfs，内核提供，见下）：`/proc/<pid>/{cmdline,comm,cwd,stat,status}`、`/proc/self`、`/proc/{mounts,uptime,version}`、`/proc/sys/kernel/random/{entropy_avail,poolsize,uuid}` |
 | `/sys/` | sysfs 挂载点（虚拟）：`/sys/class/<class>/<条目>/<属性>`，class 由内核/模块注册 —— `display`（每显示设备一项，`name/type/size` 只读，分辨率/位置/旋转/缩放 可读写）、`printer`（每打印设备一项，见下）与 `redstone`（每个红石面一项，见下）；属性文件是单行值，读一次即 EOF |
 | `/lib/modules/<version>/` | 内核模块目录：`.ko` 模块 + 纯文本 `manifest` + `modules.alias` |
 | `/lib/systemd/system/` | 厂商单元文件（`.service` `.target` `.timer` `.mount`） |
@@ -86,6 +86,52 @@ Linux `lp(4)` 风格的**字符设备**：写入的字节流 = 交给打印机�
   （已写入内容仍成页打印，不留悬挂页），退出码 130。
 - 真机实测的打印机原始语义（`write` 不折行、`\n` 是普通字符、开页即扣 1 纸 + 1 墨、`endPage` 出纸盘满即失败）
   记录在 `scripts/printer_probe.lua` 的输出里。
+
+### 随机数（`/dev/zero`、`/dev/random`、`/dev/urandom`）
+
+| 节点 | 语义 |
+|---|---|
+| `/dev/zero` | 读 = 无限 NUL 字节（`read(n)` 给 n 个），写丢弃（POSIX/Linux） |
+| `/dev/urandom` | 读 = ChaCha20 CRNG 输出，**永不阻塞** |
+| `/dev/random` | 同 urandom，但**只在 CRNG 未初始化时阻塞**（Linux 5.6+ 语义） |
+
+内核 `src/kernel/random.lua` 是熵池 + CRNG，`src/kernel/chacha20.lua` 是密码学核心（纯 Lua 的
+ChaCha20，RFC 8439 的 IETF 变体：32 位计数器 + 96 位 nonce）。结构对齐 Linux 的两层
+（输入池 + CRNG）；ChaCha20 核心对着 **OpenSSL 生成的向量**核对过（`hosttest` 里锁着，
+向量与生成命令都写在用例注释里）。
+
+- **熵源 = 所有系统事件**：`scheduler` 拿到事件（`os.pullEventRaw`，唯一的事件入口）就调用
+  `random.feedEvent`，样本 = 事件名 + 参数（`char`/`paste` 的输入内容、外设名、红石面、
+  `modem_message` 的消息、`timer` 的 id…）+ 到达时刻 + 与上一个事件的间隔 + 事件序号；
+  间隔用**两种时基**各算一次（毫秒 `os.epoch` 与 CPU 微秒 `os.clock`）。真正不可预测的是
+  **事件参数**（人按键、别的电脑发消息），间隔抖动是其次。
+  钩子由 boot 用 `scheduler.setEventHook(random.feedEvent)` 注入 —— 与 `setDiskHook` 同一做法，
+  调度器因此**不依赖** random（宿主测试台能单独装载它）。
+- **输入池**：512 字节 = 4096 bit，混合用 Linux primary pool 的**同一个多项式**
+  `x^128 + x^103 + x^76 + x^51 + x^25 + x + 1`（逐字节、池子反向滚动、每掺一字节多转 7 bit、
+  池首那一次多转 7 bit），即 `_mix_pool_bytes` 的移植。引导时的初始混合（时刻 / CPU 时间 /
+  电脑 ID / CraftOS 版本 / 几个表地址）**不记账** —— 与 Linux 一样只是"先搅进池子"。
+- **熵估计**：`add_timer_randomness` 那一档 —— 间隔的二阶/三阶差分取绝对值后取最小，
+  `min == 1` 记 1 bit，否则记 `ilog2(min)`；`min == 0`（间隔完全可预测）记 0 bit，上限 4096 bit。
+  攒到 128 bit 就**重新播种** CRNG（提取消耗掉这部分记账，与 Linux 提取熵的语义一致）。
+- **CRNG**：ChaCha20，密钥从池子提取（自造的键控吸收 hash）；每次输出后**立即换钥** ——
+  Linux 的 fast key erasure：计数/nonce 全零，每块 64 字节的**头 32 字节**当即成为下一次的
+  密钥，其余才是给出去的随机数据（因此泄一次输出推不出更早的输出）。
+  初始化判据 = Linux 的 fast-load 偏置（未就绪时事件样本按**每字节 1 bit** 记账，满 128 bit
+  算完成），完成时内核日志打 Linux 那句 `random: crng init done`，之后 `/dev/random` 不再阻塞。
+  **为什么不学 5.6 之前"按熵估计阻塞"**：CC 的事件间隔被服务器 tick 量化（20Hz 心跳），
+  毫秒时基的估计涨不上去，`cat /dev/random` 会长时间挂住 —— 那不是现在的 Linux 行为。
+- **`/proc/sys/kernel/random/`**（procfs，见下）：`entropy_avail`（bit）、`poolsize`（4096）、
+  `uuid`（每次读一个新 RFC 4122 v4，Linux 同此）。
+- **用法**：`dd status=none if=/dev/urandom bs=16 count=1 | od -An -tx1`、
+  `cat /proc/sys/kernel/random/entropy_avail`。
+- **已知偏离**：池子提取用 ChaCha20 自造的键控 hash（Linux 用 BLAKE2s）；熵估计只做
+  `delta3/ilog2` 这一档，没有它的分组采样/中断合并策略；`/dev/random`、`/dev/urandom`
+  **只读**（Linux 允许写入并把写入内容当熵来源），写打开按只读设备报错；
+  字节流设备没有"行"，`readLine` 一律等价于一次 `read(4096)`，所以 `cat /dev/zero`
+  与 Linux 一样是无限输出（要收尾用 `dd count=` / `^C`）。
+- **`/etc/shadow` 的盐也走这里**：`user.makeSalt` 取 `random.hex`（从前是 `math.random` ——
+  CC 进程里没播种，序列可预测，等于没有盐）。
 
 ### 红石（`redstone.ko`）
 
@@ -187,6 +233,7 @@ uid/gid 从 1000 起分配（无 `login.defs`，`UID_MIN` 写死在 `user.lua`�
 | `/proc/mounts` | 挂载表：`<device> <mountpoint> <fstype> <options> 0 0` |
 | `/proc/uptime` | 自引导起的秒数（Linux 还有第二个 idle 字段，Delin 不统计 idle，不提供） |
 | `/proc/version` | `Delin OS <版本> (CraftOS <os.version>, Lua <_VERSION>)` |
+| `/proc/sys/kernel/random/{entropy_avail,poolsize,uuid}` | 随机数子系统状态（见「随机数」一节；`uuid` 每次读取新值） |
 
 - `stat` = Linux 字段 **1..8**：`pid (comm) state ppid pgrp session tty tpgid`。
   `state` 是 `R`（当前正在跑的那个进程）/`S`（存活但阻塞在事件上——Delin 无真正并发）/`T`（停止）；
@@ -461,7 +508,9 @@ Linux 的 exec 一样传给子进程（`process.setHandler` 认 `"ignore"`/`"def
 替换区用 `&`=整串匹配、`\1..\9`=捕获组、`\n/\t`，不支持 BRE 风格 `\(...\)` 与模式内逆引用。
 注意 Lua pattern 里 `-` 是量词（非贪婪），要匹配字面连字符需 `%-`，与 GNU grep 的 `-`（字面）不同。
 不支持 **here-doc `<<`**（遇到即语法错误）；命令替换 `$()`/反引号、算术 `$(( ))` 与通配符已实现
-（见「词展开」一节）。
+（见「词展开」一节）。也**不支持带 fd 前缀的重定向**（`2>f`/`2>>f`/`>&`）：`2>>f` 会被切成
+操作数 `2` + `>>f`（实测：`dd ... 2>>log` 报 `unrecognized operand '2'`）—— 脚本里要收 stderr
+就得靠命令自己的 `status=`/`-s` 之类开关，别指望 `2>`。
 `&` 的子 shell 是重新执行的进程（无 fork）：父 shell 的变量、函数定义与别名经赋值/定义语句注入，
 但 `$?` 在子 shell 里从 0 开始（不继承父 shell 的最后状态）；子 shell 的**起始 cwd** 由内核继承
 （`sh` 从 `/proc/self/cwd` 取自己的 cwd，不按 `$HOME` 猜）。`VAR=value cmd` 的赋值在命令词
@@ -474,7 +523,8 @@ Linux 的 exec 一样传给子进程（`process.setHandler` 认 `"ignore"`/`"def
 子 shell 的 `$PPID` 取内核给的父 pid（不继承环境里的 `PPID`）；`.` 的参数按 bash 语义临时替换位置参数
 （dash 忽略它们）；未实现 `export -f`（函数导出）、`readonly`；**没有 `( list )` 子 shell 分组语法**
 （`$(( ))` 与 `$( (cmd) )` 里那个是算术/命令替换，不是分组），`${name:-default}` 一类参数默认值展开也未实现。
-因 CC 5.2 无位运算，`/etc/shadow` 哈希用盐+密码的 32 位滚动哈希（djb2）替代传统 `crypt`。
+因 CC 5.2 无位运算，`/etc/shadow` 哈希用盐+密码的 32 位滚动哈希（djb2）替代传统 `crypt`；
+盐由内核 CSPRNG 生成（`user.makeSalt` → `random.hex`，见「随机数」一节），不再用 `math.random`。
 
 ### init（systemd 风格服务管理器）
 
