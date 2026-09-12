@@ -15,6 +15,8 @@
 --   status=LVL  none(全抑制) | noxfer(只留两行 records) | progress(另加周期性进度行)
 -- 结束统计(stderr): "A+B records in" / "A+B records out" /
 --   "N bytes[ (SI[, IEC])] copied, T s, R/s" (A=整块数, B=部分块数; 格式对齐 GNU dd)
+-- ^C(SIGINT): 停止拷贝 -> 把未满的输出块冲出去 -> 打印上面的统计 -> 退出码 130
+--   (GNU dd 收到 SIGINT 同样先打统计)。见下面"中断"一节: 信号的投递依赖循环让出。
 --
 -- 已知偏离(全部与宿主 GNU coreutils dd 9.7 实测对照过):
 --   1) (已对齐) bs= 一律覆盖 ibs=/obs=, 与命令行顺序无关 —— 实测 GNU dd 9.7:
@@ -82,6 +84,27 @@ local function ioeMsg(err)
     if err and err:lower():find("no such file") then return "No such file or directory" end
     if err and err:find("directory") then return "Is a directory" end
     return "No such file or directory"
+end
+
+-- ================= 中断(^C / SIGINT) =================
+-- 信号只在进程被 **resume** 时投递(调度器在 resume 前跑 applySignals), 而拷贝循环
+-- (inH:read -> outH:write) 全程不让出 —— 于是 dd 从一个 7s 不让出的死循环里既收不到
+-- ^C 也永远不会自己退出(真机症状: dd 读数据时 ^C 完全无效)。这里与 cat/lp 同一套做法:
+-- ① 装 SIGINT handler(默认处置会终止进程, 但也要等 resume 才生效, 同样会晚到);
+-- ② 每累计 ~50ms CPU 时间让出一次(os.msleep(0)), 让调度器有机会把信号送进来。
+-- 收到 ^C 后与 GNU dd 一样: 打完 records/bytes 统计再以 130 退出。
+local _msleep = os.msleep or function(ms) os.sleep(math.max((ms or 0) / 1000, 0.05)) end
+local _sliceAt = os.epoch("utc")
+local function yieldCheck()
+    local now = os.epoch("utc")
+    if now - _sliceAt >= 50 then
+        _sliceAt = now
+        _msleep(0)
+    end
+end
+local _interrupted = false
+if syscalls and syscalls["signal.install"] then
+    syscalls["signal.install"](2, function() _interrupted = true end)
 end
 
 -- ================= 操作数解析 =================
@@ -389,7 +412,7 @@ local t0 = os.clock()
 -- skip: 逐输入块读取丢弃(按 ibs 计; 跳过末尾与 GNU 一样只警告并继续)
 if skip > 0 then
     local left = skip * ibs
-    while left > 0 do
+    while left > 0 and not _interrupted do
         local d, derr = inH:read(math.min(left, ibs))
         if d == nil then
             if derr then
@@ -400,8 +423,9 @@ if skip > 0 then
         end
         if d == "" then break end
         left = left - #d
+        yieldCheck()
     end
-    if left > 0 then stderr("dd: " .. inName .. ": cannot skip to specified offset\n") end
+    if left > 0 and not _interrupted then stderr("dd: " .. inName .. ": cannot skip to specified offset\n") end
 end
 
 -- 整块快路径: ibs == obs 且没有任何会改变字节/长度的转换与定位时, 一次 read(bs) 一次 write
@@ -409,6 +433,7 @@ local fast = (ibs == obs) and not (cSync or cSwab or cUcase or cLcase) and skip 
 local lastProg = 0
 
 while true do
+    if _interrupted then break end
     if count and (inFull + inPartial) >= count then break end
     local d, derr = inH:read(ibs)
     if d == nil then
@@ -444,6 +469,7 @@ while true do
             stderr(xferLine(bytes, el))
         end
     end
+    yieldCheck() -- 见"中断"一节: 不让出就永远收不到 ^C
 end
 
 if not fast then outFlushTail() end
@@ -463,3 +489,6 @@ if status ~= "none" then
     stderr(string.format("%d+%d records out\n", outFull, outPartial))
     if status ~= "noxfer" then stderr(xferLine(bytes, os.clock() - t0)) end
 end
+
+-- ^C: 统计已经打完(与 GNU dd 收到 SIGINT 一样), 退出码 130。
+if _interrupted then return 130 end

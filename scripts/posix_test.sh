@@ -133,6 +133,20 @@ cat "$T/b.txt" > "$T/catout.txt"
 grep "^beta$" "$T/catout.txt" > "$T/c1.txt"
 chk tool_cat [ -s "$T/c1.txt" ]
 
+# cat 默认模式必须**按字节**拷贝: 有 \r 且末行没有换行时也要逐字节相同。
+# (曾经的实现一律走 readLine: \r 被丢掉、末行被补一个 \n —— 文本文件看不出来,
+#  块设备/二进制文件就是数据损坏; `cat /dev/sda1` 要的正是镜像原始字节。)
+printf 'A\r\nB' > "$T/bin.in"
+cat "$T/bin.in" > "$T/bin.file"
+cmp -s "$T/bin.in" "$T/bin.file"
+chk cat_binary_file_exact [ "$?" = "0" ]
+cat < "$T/bin.in" > "$T/bin.stdin"
+cmp -s "$T/bin.in" "$T/bin.stdin"
+chk cat_binary_stdin_exact [ "$?" = "0" ]
+cat "$T/bin.in" | cat > "$T/bin.pipe"
+cmp -s "$T/bin.in" "$T/bin.pipe"
+chk cat_binary_pipe_exact [ "$?" = "0" ]
+
 # head / tail（读 b.txt）
 head -n 1 "$T/b.txt" > "$T/headout.txt"
 grep "^beta$" "$T/headout.txt" > "$T/h1.txt"

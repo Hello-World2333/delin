@@ -122,6 +122,39 @@ if [ -s /tmp/uuidhit ]; then echo "ok uuid_v4_format" >> $LOG; else echo "ng uui
 # 注意本脚本前面的 logrotate 段已经把 kern.log 轮转过一次(所以也查 .1)。
 grep 'crng init done' /var/log/kern.log /var/log/kern.log.1 > /tmp/crnghit
 if [ -s /tmp/crnghit ]; then echo "ok crng_init_done_logged" >> $LOG; else echo "ng crng_init_done_logged" >> $LOG; fi
+echo "-- 块设备节点当字节流读: cat 必须逐字节输出镜像 --" >> $LOG
+# 曾经的 bug: `cat /dev/sdbN` 报 "bad argument #1 (boolean expected, got table)" —— 内核
+# devdisk 的句柄包装把**句柄自己**当成 withTrailing 传给了 CC 的 handle.readLine
+# (CC 的 readLine 第一个参数是 boolean)。
+# /dev/sdb2 = 磁盘 0 的 data 分区(/parts/data.img): 本机只读它, 不会改写, 所以宿主在取回
+# 日志后对同一个文件跑 POSIX cksum, 必须与下面这行逐字节一致(门禁在 tools/realmachine.py)。
+echo -n "cat_dev2_cksum=" >> $LOG
+cat /dev/sdb2 | cksum >> $LOG
+cat /dev/sdb1 > /dev/null
+if [ "$?" = "0" ]; then echo "ok cat_blockdev_root_part" >> $LOG; else echo "ng cat_blockdev_root_part" >> $LOG; fi
+# cat 默认模式按**字节**拷贝: 含 \r、末行没有换行时必须逐字节相同
+# (曾经一律走 readLine: \r 被丢掉、末行被补一个 \n —— 对块设备/二进制就是数据损坏)。
+printf 'A\r\nB' > /tmp/catbin
+cat /tmp/catbin > /tmp/catbin.out
+if cmp -s /tmp/catbin /tmp/catbin.out; then echo "ok cat_binary_exact" >> $LOG; else echo "ng cat_binary_exact" >> $LOG; fi
+echo -n "cat_bin_A_output=" >> $LOG
+cat -A /tmp/catbin >> $LOG
+echo "-- dd 能被 SIGINT(^C) 中断: 拷贝循环必须让出调度器 --" >> $LOG
+# 不让出的话信号永远投不进来(信号只在 resume 前投递) —— 真机上表现为 ^C 完全无效(本次修的 bug)。
+# 注意: Delin 的 `&` 是"起一个子 shell 跑这条命令"(无 fork), 所以 $! 是那个**子 shell** 的 pid,
+# 朝它发 SIGINT 只会杀掉子 shell、dd 变成孤儿继续跑; 而真机 ^C 是 tty 把 SIGINT 投给**前台
+# 进程组**(dd 自己在内)。所以这里按进程名直接给 dd 发信号 —— 与 ^C 打中的是同一个进程。
+# dd 退出码经子 shell 传出来(status 会等于 130)。
+dd status=none if=/dev/zero of=/dev/null bs=512 &
+ddjob=$!
+sleep 1
+pkill -INT -x dd
+sleep 1
+pgrep -x dd > /tmp/ddstills
+if [ -s /tmp/ddstills ]; then echo "ng dd_sigint_interrupt" >> $LOG; pkill -KILL -x dd; else echo "ok dd_sigint_interrupt" >> $LOG; fi
+wait $ddjob
+echo "dd_sigint_rc=$?" >> $LOG
+pkill -KILL -x dd > /dev/null
 echo "-- ps --" >> $LOG
 ps -e >> $LOG
 ps -ef >> $LOG

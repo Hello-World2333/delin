@@ -9,6 +9,8 @@
 --   -v, --show-nonprinting 以 ^ 与 M- 记号显示不可打印字符
 --   -u                    忽略(无缓冲)
 -- FILE 为 "-" 或缺省时读 stdin。支持组合短选项与 --。
+-- 不给任何行选项时按字节拷贝(块设备/二进制逐字节输出); 终端句柄与行选项下按行处理。
+-- 退出码: 0 成功; 1 某个操作数失败; 130 被 ^C 中断。
 -- 让出调度器: 防止长输出/长计算饿死事件循环(CC 的 ~7s no-yield 限制)。
 -- 时间片式: 每累计 ~50ms CPU 时间让出一次, 不按字节让出 —— HSE 已改拉模式(waitNextTick),
 -- 每次让出都是一次事件往返, 高频让出会淹没事件队列并拖死键盘。50ms 时间片同时保证
@@ -110,6 +112,22 @@ end
 
 local nLine, nNb, blankRun = 0, 0, 0
 
+-- 默认模式(没有 -n/-b/-s/-E/-T/-v/-A)按**字节**拷贝: POSIX/GNU cat 就是字节搬运工。
+-- 为什么不能一律走 readLine: ① CC 的 readLine 把 \r\n 折成 \n(\r 丢掉); ② 末行没有换行时
+-- 它返回整行、cat 再补一个 \n。文本文件上看不出来, 对块设备/二进制文件就是**数据损坏**
+-- (`cat /dev/sda1` 要的是镜像的原始字节, 长度必须与 fs.getSize 一致)。
+local rawMode = not (optNum or optNumNb or optSqueeze or optEnds or optTabs or optNonprint)
+local CHUNK = 4096
+
+local function copyBytes(fh)
+    while not _interrupted do
+        local chunk = fh:read(CHUNK)
+        if chunk == nil or chunk == "" then break end -- EOF 契约: nil(见 ext2/CC 句柄)
+        io.write(chunk)
+        yieldCheck()
+    end
+end
+
 local function emit(fh)
     while not _interrupted do
         local line = fh:readLine()
@@ -141,10 +159,15 @@ local function emit(fh)
     end
 end
 
+-- 终端句柄是行规程的(read 也只给一整行), 按行处理才符合交互习惯; 其余走字节拷贝。
+local function copy(fh)
+    if rawMode and fh.isTTY ~= true then copyBytes(fh) else emit(fh) end
+end
+
 local function catFile(p)
     if p == "-" then
         local stdin = io.stdin()
-        if stdin then emit(stdin) else return true end
+        if stdin then copy(stdin) else return true end
         return true
     end
     p = resolve(p)
@@ -159,7 +182,7 @@ local function catFile(p)
         stderr("cat: " .. p .. ": " .. msg .. "\n")
         return false
     end
-    emit(f)
+    copy(f)
     f:close()
     return true
 end

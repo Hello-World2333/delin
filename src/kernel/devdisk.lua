@@ -147,16 +147,30 @@ function devdisk.scan()
     return out
 end
 
+--- 取"实参": 第一个实参是本句柄自己(冒号调用)时用后一个, 否则就是这个实参(点号调用)。
+--- **不能**写成 `(type(a) == "table") and b or a`: `a` 是句柄而 `b` 是 nil 时(冒号调用
+--- `h:readLine()`), `true and nil` 是 nil, 于是 `nil or a` 又把**句柄自己**传给了 CC。
+--- 真机症状: `cat /dev/sdb1` 报 `bad argument #1 (boolean expected, got table)` ——
+--- CC 的 `handle.readLine` 第一个参数是 boolean(`Optional<Boolean>`), 收到表就炸。
+local function selfArg(a, b)
+    if type(a) == "table" then return b end
+    return a
+end
+
 --- 分区节点的原始字节句柄(分区就是盘上的 .img 文件)。
 local function openRaw(e, mode)
-    local h, err = fs.open(e.img, (mode and mode:find("w")) and "r+" or "r")
+    -- "w" 是截断写、"r+"/"w+"/"a" 是不截断的可写方式 —— CC 只有 "r+" 一种续写模式,
+    -- 所以除了纯读一律用 "r+" 打开(少了 "+" 这一支, `dd of=/dev/sda1 conv=notrunc`
+    -- 会拿到只读句柄, 到写的时候才在 CC 句柄上炸)。
+    local writable = mode and (mode:find("w", 1, true) or mode:find("+", 1, true))
+    local h, err = fs.open(e.img, writable and "r+" or "r")
     if not h then return nil, err end
-    -- CC 原生句柄是点号调用; 这里同时容忍冒号(与 ext2 后端句柄一致)。
+    -- CC 原生句柄是点号调用; 这里同时容忍冒号(与 ext2 后端句柄一致)。见 selfArg 的注释。
     return {
-        read = function(a, b) return h.read((type(a) == "table") and b or a) end,
-        readLine = function(a) return h.readLine((type(a) == "table") and nil or a) end,
+        read = function(a, b) return h.read(selfArg(a, b)) end,
+        readLine = function(a, b) return h.readLine(selfArg(a, b)) end,
         readAll = function() return h.readAll() end,
-        write = function(a, b) return h.write((type(a) == "table") and b or a) end,
+        write = function(a, b) return h.write(selfArg(a, b)) end,
         close = function() return h.close() end,
     }
 end

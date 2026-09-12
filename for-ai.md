@@ -57,8 +57,14 @@ CC 没有裸块 API：一块存储（**电脑自带存储**，或磁盘驱动器
   **根挂载也对上设备节点**：根 = 自带存储本身（CC-fs 引导）时是 `/dev/sda`，根 = 镜像文件
   （`rootfs`/`bootdisk`）时是其所在存储的 `/dev/sdXN`——只有镜像没写进该存储的 `/parts/manifest`
   时才退回虚拟设备名 `rootfs`（并打日志）。
-- **原始字节**：分区节点可当字节设备打开（`fs.open("/dev/sda1","r")` 读镜像原始字节）；整盘是 CC 原生
-  文件系统（目录树，不是字节流），打开会被拒绝，只能挂载。
+- **原始字节**：分区节点可当字节设备打开（`fs.open("/dev/sda1","r")` 读镜像原始字节，`cat /dev/sda1`、
+  `dd if=/dev/sda1` 读出的就是镜像逐字节内容，与宿主 `cksum` 该 `.img` 的结果一致——真机锁在
+  `scripts/realmachine_verify.sh` 里）；整盘是 CC 原生文件系统（目录树，不是字节流），打开会被拒绝，只能挂载。
+  `devdisk` 的字节句柄**点号与冒号都收**（点号是 CC 原生句柄的写法、冒号是 Delin 句柄的写法），
+  判据是"第一个实参是不是句柄自己"——**不能**写成 `(type(a) == "table") and b or a`：冒号调用
+  `h:readLine()` 时 `b` 是 nil，`true and nil or a` 会把**句柄自己**当参数传给 CC，而 CC 的
+  `handle.readLine` 第一个参数是 boolean（`Optional<Boolean>`），于是真机上 `cat /dev/sdb1` 报
+  `bad argument #1 (boolean expected, got table)`（曾经的 bug，`hosttest` 里锁着）。
 - 磁盘插入/弹出（CC `disk` / `disk_eject` 事件）时内核重新扫描并刷新 `/dev` 节点。
   自带存储的 LABEL 取 `os.getComputerLabel()`。
 
@@ -355,8 +361,10 @@ CC 原生文件系统没有这些概念、`ext2` 驱动里有 inode 类型却没
 粗体（`1`）因 CC 无粗体字形而渲染成亮色。`$TERM` 固定为 `linux`（login 设置并随环境导出），
 `login` 每次显示登录提示前写 `ESC[0m ESC[2J ESC[H` 清屏（agetty 语义）。
 
-**工具**：`ls`、`cat`、`mkdir (-p)`、`rm (-r|-f)`、`cp (-r)`、`mv`、`touch`、`head (-n)`、`tail (-n)`、
+**工具**：`ls`、`cat`（默认按字节拷贝，见「设计要点」；`-n/-b/-s/-E/-T/-v/-A` 才按行）、
+`mkdir (-p)`、`rm (-r|-f)`、`cp (-r)`、`mv`、`touch`、`head (-n)`、`tail (-n)`、
 `sleep`（GNU 风格：小数秒 + `s/m/h/d` 后缀 + 多操作数求和；50ms 分片睡眠，信号可及时打断）、
+`dd`（POSIX 子集；拷贝循环 50ms 让出，`^C` 打完统计后退出 130，见「设计要点」的信号那一节）、
 `wc (-l|-w|-c)`、`grep (-n|-i|-v)`、`sed`（GNU 子集：`s/y/d/p/q/a/i/c/=`、行号/`$`/正则地址与区间、
 `!` 取反、`-n -s -e -f -i`）、`ed`（POSIX 子集：`a/i/c/d/p/n/l/s/t/m/r/w/q/u/g/v/=`、地址 `.` `$` n `/re/` `+n` `-n`、输入模式以 `.` 结束）、`kill`、
 `ps`/`pgrep`/`pkill`/`killall`（进程管理，见上文「procfs 与进程管理」）、`login`、
@@ -611,7 +619,7 @@ PID 1 现在是**用户态服务管理器**（`src/init/unit.lua` 单元解析 +
 用户态 `/dev/log`、`syslogd` 按 `/etc/syslog.conf` 写 `/var/log/*`（SIGHUP 重开、游标续读不重放）、
 `logrotate` + `logrotate.timer` 轮转、`logger`/`dmesg`。`/etc/fstab` 由 init 生成 mount 单元
 （`local-fs.target`），`mount -a` 复用同一解析器。init 里的自检代码已全部删除，验证改为
-宿主测试台 `tools/hosttest.lua`（547 项）与真机脚本 `tools/realmachine.py` +
+宿主测试台 `tools/hosttest.lua`（603 项）与真机脚本 `tools/realmachine.py` +
 `scripts/realmachine_verify.sh`。
 
 `src/bin/sh` 已升级为 POSIX 核心子集（变量/引号/if/for/while/case/函数/test/[ ]/&&/|| /文件重定向/管道
@@ -627,7 +635,7 @@ UUID 用 ID 加前缀模拟（`d<磁盘ID>`/`c<电脑ID>`），存储不随启�
 终端侧：tty 层解释 ANSI 转义（SGR 16 色/ED-EL 清屏/CUP 定位/光标显隐与保存恢复，见上文
 「终端（ANSI / `$TERM=linux`）」），`$TERM=linux` 随环境导出，`echo` 支持 `-n`/`-e`，新增 `/bin/clear`，
 `login` 每次提示前清屏。
-`scripts/posix_test.sh`(125 项)与 `scripts/jobctl_test.sh` 在宿主与 Delin 上各跑一次逐项比对，
+`scripts/posix_test.sh`(128 项, 含 cat 的字节保真)与 `scripts/jobctl_test.sh` 在宿主与 Delin 上各跑一次逐项比对，
 `scripts/sysinfo.sh` 演示实用用法。
 
 打印机经 `ccprinter` 模块抽象成 `/dev/lpN` 字符设备（`cat f > /dev/lp0` / `lp f` 即打印，折行与
@@ -701,7 +709,9 @@ sysfs 也从 display 专用泛化成 class 注册表（模块用 `kapi.registerS
 真机流程：`tools/realmachine.py`（**先关机** → 打包 → `tools/deploy.py` 重建 ext2 根镜像 → 注入第二个 ext2 分区
 供 fstab 测试 + `verify.service` → `e2fsck -fn` 门禁 → 写**磁盘 CC-fs 的引导配置**（`/.boot` = `/boot/dlub.lua`
 与 `/dlub.cfg` = `bootdisk left`，缺一不可）→ 装盘并按 md5 校验 → 开机 → **引导门禁**（`/var/log/verify.log`
-必须与本轮部署时不同且跑完）→ 用 `debugfs` 从镜像取回 `/var/log/*` → 再停机 fsck 一次）；
+必须与本轮部署时不同且跑完）→ **块设备/dd 门禁**（真机 `cat /dev/sdb2 | cksum` 必须等于宿主的
+`cksum /parts/data.img`；`cat_blockdev_root_part`/`cat_binary_exact`/`dd_sigint_interrupt` 三条必须 ok，
+且 `dd_sigint_rc=130`）→ 用 `debugfs` 从镜像取回 `/var/log/*` → 再停机 fsck 一次）；
 `scripts/realmachine_verify.sh` 是它在真机上跑的验证脚本。
 
 **真机踩过的两个坑（别改回去）**：
@@ -754,6 +764,21 @@ sysfs 也从 display 专用泛化成 class 注册表（模块用 `kapi.registerS
   输出期间的按键（字符/切 tty/`^C`）就是这样被丢掉的。`os.msleep(0)` 是一次按需 tick 让出
   （≥2ms，`ms>=50` 走 CC 定时器），工具与 `sh` 只在 ~50ms 时间片边界让出；内核另有 0.05s 调度
   心跳，保证裸让出（`filter=nil`，如 `tty.readLine`）的进程在空闲期也能推进。
+- **信号只在进程被 resume 时投递**：调度器在 resume 前跑 `process.applySignals`，所以**任何长时间
+  不让出的循环都收不到 `^C`/`^Z`，也不会被 `kill` 停掉** —— 它自己就把调度器霸住了。因此"会长时间
+  搬运数据的工具"必须照 `cat`/`lp`/`dd` 那套三件套写：① 装 SIGINT handler
+  （`syscalls["signal.install"](2, ...)`，只置一个标志，别在里面做事）；② 每累计 ~50ms CPU 时间
+  （`os.epoch("utc")` 取差）`os.msleep(0)` 让出一次，**不是按字节让出**（每次让出都是一次事件往返，
+  高频让出会淹没事件队列）；③ 循环条件里查标志，收尾时按 GNU 的退出码返回（`^C` → 130）。
+  真机症状（曾经的 bug）：`dd` 读数据时 `^C` 完全无效 —— 拷贝循环从头到尾不让出，信号投不进来。
+  `scripts/realmachine_verify.sh` 用 `pkill -INT -x dd` + `pgrep` + `wait`（130）锁着这条；
+  注意 `&` 在 Delin 里是"起一个子 shell 跑这条命令"，`$!` 是**子 shell** 的 pid，朝它发信号只杀得掉
+  子 shell（dd 变孤儿继续跑），而真机 `^C` 是 tty 投给**前台进程组**（dd 自己在内）。
+- **`cat` 默认按字节拷贝**（没有 `-n/-b/-s/-E/-T/-v/-A` 时，且句柄不是终端）：POSIX/GNU cat 就是字节
+  搬运工。走 `readLine` 会①把 CC 原生句柄的 `\r\n` 折成 `\n`（`\r` 丢掉，ext2 句柄不折），
+  ②给末行没有换行的文件补一个 `\n` —— 文本看不出来，对块设备/二进制就是数据损坏
+  （`cat /dev/sda1` 要的就是镜像原始字节）。行选项下、以及 `isTTY` 的句柄（行规程，读一次给一整行）
+  仍按行处理。自检：`scripts/posix_test.sh` 的 `cat_binary_{file,stdin,pipe}_exact`（宿主与真机各跑一次）。
 - **隔离环境（白名单）**：每个进程有自己的 `_ENV`（`load(src, name, "t", env)`），注入内核上下文
   `spawn`/`pid`/`ppid`/`uid`/`gid`/`syscalls`。环境**没有 `__index = _G` 兜底** —— 只给
   `src/kernel/procenv.lua` 列出的名字：Lua 标准库（`string/table/math/coroutine/os` 子集，且都是
@@ -820,7 +845,7 @@ sysfs 也从 display 专用泛化成 class 注册表（模块用 `kapi.registerS
 
 ```bash
 lua5.1 tools/build.lua             # 构建 dist/: 压缩内核/DLUB/BIOS/工具/模块/配置 + manifest
-lua5.1 tools/build.lua --check     # 构建 + 压缩等价性门禁(hosttest 547 项 + 7 个自检脚本差分)
+lua5.1 tools/build.lua --check     # 构建 + 压缩等价性门禁(hosttest 603 项 + 7 个自检脚本差分)
 lua5.1 tools/build.lua --release   # 构建 + 生成 dist/release/<版本>/ 发布树(安装布局的 payload)
 sh tools/serve.sh                  # 开发期: 把发布树挂在 10568 端口(游戏侧 wget 安装用)
 ```
@@ -993,7 +1018,7 @@ key/char 事件**来驱动向导。喂按键的时机靠 `wait` 盯 `/delin-inst
 验证：
 
 ```bash
-lua5.1 tools/hosttest.lua        # 宿主测试: init 引擎/fstab/syslogd/logrotate/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone/devdisk (547 项)
+lua5.1 tools/hosttest.lua        # 宿主测试: init 引擎/fstab/syslogd/logrotate/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone/devdisk (603 项)
 DELIN_REPO=<压缩后的源码树> lua5.1 tools/hosttest.lua         # 压缩器等价性: 同一套测试跑在压缩产物上
 DELIN_SRCBIN=<压缩后的 bin> lua5.1 tools/harness.lua /bin/sh # 同上, 工具级差分比对
 lua5.4 tools/hosttest.lua        # 同上用 5.4 跑一遍(CC 是 5.2 语义, 不能只在 5.1 上验;
@@ -1070,7 +1095,7 @@ src/kernel/boot.lua        入口: 引导日志->kprint->setupVfs/设备/模块-
 src/init/unit.lua          init 内部模块: 单元文件解析/模板 %i 替换/字段归一化
 src/init/service.lua       init 内部模块: 依赖图+拓扑排序/服务启停/重启策略/timer/mount 单元
 src/init/init.lua          PID 1 主程序: fstab->mount 单元, getty 实例化, init.* 控制接口, rescue, 主循环
-src/bin/cat                连接文件到 stdout
+src/bin/cat                连接文件到 stdout (默认按字节拷贝, 行选项/终端下按行; ^C -> 130)
 src/bin/ls                 列目录
 src/bin/mkdir              建目录 (-p 递归建父)
 src/bin/rm                 删文件/目录 (-r|-R 递归, -f 忽略不存在)
@@ -1123,7 +1148,7 @@ src/modules/*.ko           内核模块: ccdisk(ccdisk fstype) ccmonitor(CC 显�
                            void(Void 全息驱动)
 src/modules/modules.alias  驱动别名(modprobe 风格): tm_gpu->tom hologram->void monitor->ccmonitor printer->ccprinter
 src/modules/manifest       默认装载模块清单: demo ext2 ccdisk redstone
-scripts/posix_test.sh      可移植 POSIX 自检(host 与 Delin 各跑一次比对, 125 项全过)
+scripts/posix_test.sh      可移植 POSIX 自检(host 与 Delin 各跑一次比对, 128 项全过; 含 cat 字节保真)
 scripts/sh_expand_test.sh  sh 展开自检(通配符 * ? [ ]/命令替换 $( ) 与反引号/算术 $(( )), 95 项;
                            host harness 与真机各跑一次比对, 期望值逐条对过 bash/dash)
 scripts/jobctl_test.sh     作业控制自检(& / $! / jobs / fg / bg / wait / kill %job, host 与真机各跑一次)
@@ -1186,7 +1211,7 @@ tools/harness.lua          host 测试台: 用真实 Delin 工具源码在宿主
                            (`ls -A <文件>` 会把文件路径自己打印出来, 直接照搬会让宿主上的
                            fs.list(file) 返回一条路径 —— 工具的"列目录失败"分支在宿主上永远
                            走不到, 真机才炸)
-tools/hosttest.lua         宿主测试: init 单元引擎/fstab 生成/syslogd 规则/logrotate 轮转/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone/devdisk(547 项)
+tools/hosttest.lua         宿主测试: init 单元引擎/fstab 生成/syslogd 规则/logrotate 轮转/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone/devdisk(603 项)
 tools/installertest.lua    安装器宿主回归: 假 CraftOS(fs/term/os/http/disk/peripheral + 脚本化事件队列)
                            + 假终端格子(含 fg/bg), 用 loadfile 跑 dist/install.lua, 按键序列驱动向导
                            并断言落盘文件/镜像/日志; 失败时 dump 每一屏(含反色行标记)

@@ -2018,8 +2018,21 @@ do
     }
     local capacity = { ["/"] = 1000000, ["disk"] = 128000, ["disk2"] = 128000, ["disk3"] = 128000 }
 
+    -- 分区节点的字节句柄: 记录 CC 句柄收到的真实参数。CC 的 handle.readLine 第一个参数是
+    -- **boolean**(withTrailing), 于是这里的桩也照真机来 —— 拿到表/别的类型就是 bug。
+    local byteCalls = {}
     local fsStub = {
-        open = function(path)
+        open = function(path, mode)
+            if path:match("%.img$") then
+                byteCalls.mode = mode
+                return {
+                    read     = function(a) byteCalls.read = (a == nil) and "nil" or type(a); return nil end,
+                    readLine = function(a) byteCalls.readline = (a == nil) and "nil" or type(a); return nil end,
+                    readAll  = function() return "" end,
+                    write    = function() return true end,
+                    close    = function() return true end,
+                }
+            end
             local mp = path:match("^(.*)/parts/manifest$") or ""
             if not manifests[mp] then return nil end
             return { readAll = function() return manifests[mp] end, close = function() end }
@@ -2110,6 +2123,32 @@ do
     eq(devdisk.byMountPath("").name, "sda", "devdisk: byMountPath(\"\") = 自带存储")
     eq(devdisk.byMountPath("disk2").name, "sdc", "devdisk: byMountPath 找驱动器里的盘")
     eq(devdisk.byMountPath("missing"), nil, "devdisk: byMountPath 找不到即 nil")
+
+    -- 分区节点的原始字节句柄: 点号与冒号两种调用都得把**实参**传给 CC 句柄, 不能把句柄自己
+    -- 传进去。旧的 `(type(a) == "table") and nil or a` 在 b 为 nil 时算出 a, 于是冒号调用
+    -- `h:readLine()` 把句柄表当成 withTrailing 传给了 CC —— 真机上 `cat /dev/sdb1` 报
+    -- "bad argument #1 (boolean expected, got table)"(CC 的 readLine 第一参数是 boolean)。
+    do
+        local vfs = require("kernel.vfs")
+        vfs_api.mountDev() -- boot 里也是先挂 /dev 再由 devdisk 注册节点
+        local bh = assert(vfs_api.fs.open("/dev/sdb1", "r"), "devdisk: /dev/sdb1 可打开为字节设备")
+        eq(byteCalls.mode, "r", "devdisk: 只读打开 -> CC 句柄 mode=r")
+        bh:readLine()
+        eq(byteCalls.readline, "nil", "devdisk: 冒号 readLine() 传给 CC 的是 nil(不是句柄自己)")
+        bh:read(4)
+        eq(byteCalls.read, "number", "devdisk: 冒号 read(n) 把 n 传给 CC")
+        bh.readLine(true)
+        eq(byteCalls.readline, "boolean", "devdisk: 冒号 readLine(true) 传的是那个 boolean")
+        bh.close()
+        -- 不截断的可写方式(r+): 必须真以 "r+" 打开 .img, 否则 dd of=/dev/sdX conv=notrunc 拿到只读句柄
+        local wh = assert(vfs_api.fs.open("/dev/sdb1", "r+"), "devdisk: /dev/sdb1 可以 r+ 打开")
+        eq(byteCalls.mode, "r+", "devdisk: r+ 打开 -> CC 句柄 mode=r+(不是 r)")
+        wh:write("x")
+        wh.close()
+        local tr, terr = vfs_api.fs.open("/dev/sda", "r")
+        ok(tr == nil and tostring(terr):find("ccdisk") ~= nil, "devdisk: 整盘(ccdisk)不是字节流设备")
+        vfs.unmount("/dev") -- 后面的随机数用例会自己 mountDev, 不留下重复挂载
+    end
 end
 
 -- ===============================================================

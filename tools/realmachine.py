@@ -21,7 +21,7 @@
 只对全新电脑有意义; CC-fs 引导路径无法在此环境用真机验证(由 tools/hosttest.lua 的 init 端到端
 用例覆盖)。
 """
-import hashlib, os, shutil, subprocess, sys, time
+import hashlib, os, re, shutil, subprocess, sys, time
 
 REPO = "/home/worker/delin"
 DBG = "/usr/sbin/debugfs"
@@ -377,6 +377,27 @@ def reboot_and_collect(printer=False):
     if "=== verify done ===" not in fresh:
         raise RuntimeError("失效验证: verify.log 变了但没有跑完(缺 '=== verify done ==='):\n" + fresh[-2000:])
     print("   boot guard ok: 磁盘根已引导, verify.log 是本轮写的")
+
+    # 5a2) cat 块设备 / dd 可中断: 这两条是本轮修的 bug, 单独设门禁(其余 ok/ng 行由人读日志)。
+    #      cksum 口径: /dev/sdb2 = /parts/data.img, 本机只读不改写它, 因此宿主的 POSIX cksum
+    #      必须与真机 `cat /dev/sdb2 | cksum` 的输出完全一致(即逐字节相同)。
+    data_img_path = os.path.join(DISK, "parts/data.img")
+    want = " ".join(run("cksum", data_img_path).split()[:2])  # "crc size /path" -> "crc size"
+    m = re.search(r"^cat_dev2_cksum=(\d+ \d+)", fresh, re.M)
+    got = m.group(1) if m else "(missing)"
+    if got != want:
+        raise RuntimeError("cat 块设备输出与宿主镜像不一致: 真机 %s, 宿主 %s (%s)"
+                           % (got, want, data_img_path))
+    print("   ok cat /dev/sdb2 == 宿主 %s (cksum %s)" % (data_img_path, got))
+    for name in ("cat_blockdev_root_part", "cat_binary_exact", "dd_sigint_interrupt"):
+        if ("ok " + name) not in fresh:
+            raise RuntimeError("真机自检未通过: %s(verify.log 里没有 'ok %s')" % (name, name))
+        print("   ok %s" % name)
+    m = re.search(r"^dd_sigint_rc=(\d+)", fresh, re.M)
+    if not m or m.group(1) != "130":
+        raise RuntimeError("dd 被 SIGINT 中断后的退出码不是 130: %s"
+                           % (m.group(1) if m else "(missing)"))
+    print("   ok dd_sigint_rc=130")
     logs = ["/var/log/verify.log", "/var/log/sh_verify.log", "/var/log/posix_verify.log", "/var/log/messages", "/var/log/messages.1",
             "/var/log/secure", "/var/log/kern.log", "/var/log/redstone_verify.log", "/delin.log"]
     if printer:
