@@ -242,6 +242,14 @@ def main():
         # oneshot 自检服务, 既刷屏又抢 tty0(rawtty/intrtest 会往登录会话里注入按键)。
         if clean:
             print('--clean: 跳过验证载荷注入(镜像里只有 dist 产物 + fstab/data 分区)')
+            # --clean + --desh-probe: 干净系统上只注入诊断载荷 —— 量让出/渲染这类
+            # "会被别的进程干扰"的东西时, 需要一台没有自检服务的机器(噪声源)。
+            if desh_probe:
+                pv = re.search(r'^\s*return\s+"([^"]+)"',
+                               open(os.path.join(REPO, "src/kernel/version.lua")).read(), re.M).group(1)
+                pmoddir = "/lib/modules/" + pv
+                df_write(out, os.path.join(REPO, "scripts/desh_probe.ko"), pmoddir + "/deshprobe.ko")
+                add_module(out, pmoddir, "deshprobe")
         else:
             if desh_probe:
                 pv = re.search(r'^\s*return\s+"([^"]+)"',

@@ -197,13 +197,64 @@ f:close()
 ]]
             local bf = vfs_api.fs.open("/tmp/yield_bench.lua", "w")
             if bf then bf:write(bench); bf:close() end
-            log("run bench + seq to force scrolling (" .. state() .. ")")
+            -- 并发让出 bench: N 个进程同时各调 K 次 os.msleep(0) —— 用来回答
+            -- "多个协程同时在等 HSE 拍会互相偷唤醒事件吗"(拉模式下等待方与事件泵抢事件)。
+            local conc = [[
+-- 让出成本的关键对照: **同一次运行里**, 先量"第一轮"(HSE 累加器可能是满的), 再连排 N 次
+-- 把累加器排空, 再量一轮。两轮之差就是"累加器效应"; 剩下来的才是真实等待成本。
+local id = tostring((arg and arg[1]) or "?")
+local drain = tonumber((arg and arg[2]) or "0") or 0
+local k = 20
+local function timed()
+    local t0 = os.epoch("utc")
+    for _ = 1, k do os.msleep(0) end
+    return (os.epoch("utc") - t0) / k
+end
+local f = fs.open("/tmp/ybench_" .. id .. ".log", "w")
+f:write("started " .. id .. "\n"); f:flush()
+local first = timed()
+for _ = 1, drain do os.msleep(0) end
+local after = timed()
+local pumps, ticks, maxE = "?", "?", "?"
+if os.hseStat then pumps, ticks, maxE = os.hseStat() end
+f:write(string.format("id=%s drain=%d  first20=%.1f ms/call  after%dx=%.1f ms/call  clock=%s pumps=%s ticks=%s maxElapsed=%s\n",
+    id, drain, first, drain, after, tostring(os.hseClockMs and os.hseClockMs() or "?"),
+    tostring(pumps), tostring(ticks), tostring(maxE)))
+f:close()
+]]
+            local cf = vfs_api.fs.open("/tmp/ybench.lua", "w")
+            if cf then cf:write(conc); cf:close() end
+            log("run bench + concurrency bench + seq (" .. state() .. ")")
             send("lua /tmp/yield_bench.lua\n")
+            -- 先单独跑一个(基线), 再三个同时跑(并发)
+            -- 对照序列(干净镜像上跑, 系统里没有别的服务在动):
+            --   idle1/idle2  : 单进程独自调 msleep(0) —— 基准
+            --   underSleep   : 后台挂一个 /bin/sleep(它在做**过滤拉取** os.pullEvent("timer"))
+            --                  再单进程调 msleep(0) —— 验证"别人的过滤拉取会不会吃掉唤醒事件"
+            --   n2/n3        : 2 个 / 3 个进程同时调 msleep(0) —— 验证"并发等待者互相偷事件"
+            --   bear*        : 同样 3 个进程但纯忙等 —— 排除"3 个进程本身变慢"
+            -- ① 开机后**第一个**用它的人(累加器满): 单进程
+            send("lua /tmp/ybench.lua solo 100\n")
+            -- ② 三个进程**同时**各排空 100 次再量: 看并发是否互相偷拍
+            send("lua /tmp/ybench.lua n3a 100 & lua /tmp/ybench.lua n3b 100 & lua /tmp/ybench.lua n3c 100 &\n")
+            -- ③ 并发都结束后再单进程量一次: 并发有没有留下"粘性"退化(整机让出变慢)
+            send("lua /tmp/ybench.lua after3 100\n")
+            send("lua /tmp/ybench.lua bearsolo 100\n")
             send("seq 1 40\n")
             phase, phaseAt = 3, now
         elseif phase == 3 then
-            if now - phaseAt > 4000 then
-                log("after 4s: " .. state() .. ") procs " .. proclist())
+            if now - phaseAt > 20000 then
+                log("after 20s: " .. state() .. ") procs " .. proclist())
+                do
+                    for _, n in ipairs({ "ybench_solo.log", "ybench_n3a.log", "ybench_n3b.log",
+                                         "ybench_n3c.log", "ybench_after3.log" }) do
+                        local yf = vfs_api.fs.open("/tmp/" .. n, "r")
+                        if yf then
+                            log("CONC " .. n .. ": " .. ((yf:readAll() or ""):gsub("%s+$", "")))
+                            yf:close()
+                        end
+                    end
+                end
                 do
                     local bf = vfs_api.fs.open("/tmp/yield_bench.log", "r")
                     if bf then
