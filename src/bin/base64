@@ -1,0 +1,251 @@
+-- Delin base64: base64 编解码 (GNU coreutils base64)。
+-- 用法: base64 [OPTION]... [FILE]
+--   -d, --decode            解码(缺省是编码)
+--   -i, --ignore-garbage    解码时忽略字母表之外的字符
+--   -w, --wrap=COLS         每 COLS 列折行(缺省 76; 0 = 不折行)
+-- 语义(与宿主 GNU 逐项实测对齐):
+--   - 编码: 每 3 字节 -> 4 个字符, 末尾用 '=' 补; 每 COLS 个字符换一行; 有输出时末尾恒有换行;
+--     输入为空时**没有任何输出**。
+--   - 解码: 换行一律忽略; 其它非字母表字符按 -i 决定(不给 -i 就报 "base64: invalid input" 并退出 1);
+--     末尾的 '=' 补齐可以缺(7 个字符的末组照样解出来); 长度不是 4 的倍数的残缺组报 invalid input。
+--   - 二进制安全: 一律按字节处理, 不碰 locale。
+-- 已知偏离:
+--   - 不实现 --help/--version(与本项目其它工具一致)。
+--   - `-w` 给的列数不是 4 的倍数时按 GNU 一样接受并按该值折行(GNU 只在 0 与非 0 上分派)。
+--   - 文件读不进来时 GNU 报 "cannot open ... for reading"; 这里报
+--     "base64: FILE: No such file or directory" 并继续处理其余操作数, 最终退出 1。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+local function ioeMsg(err)
+    if err and (err:find("permission") or err:find("denied")) then return "Permission denied" end
+    if err and err:lower():find("no such file") then return "No such file or directory" end
+    if err and err:find("directory") then return "Is a directory" end
+    return "No such file or directory"
+end
+
+local _msleep = os.msleep or function(ms) os.sleep(math.max((ms or 0) / 1000, 0.05)) end
+local _sliceAt = os.epoch("utc")
+local function yieldCheck()
+    local now = os.epoch("utc")
+    if now - _sliceAt >= 50 then
+        _sliceAt = now
+        _msleep(0)
+    end
+end
+
+local ALPHA = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+local DECODE = {}
+for idx = 1, #ALPHA do DECODE[ALPHA:sub(idx, idx)] = idx - 1 end
+
+local decode, ignoreGarbage, wrap = false, false, 76
+local files, noMoreOpts = {}, false
+
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if noMoreOpts then
+        files[#files + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "-d" or a == "--decode" then
+        decode = true
+    elseif a == "-i" or a == "--ignore-garbage" then
+        ignoreGarbage = true
+    elseif a == "-w" or a == "--wrap" then
+        i = i + 1
+        if not args[i] then stderr("base64: option requires an argument -- 'w'\n"); return 1 end
+        local n = tonumber(args[i])
+        if not n or n < 0 then
+            stderr("base64: invalid wrap size: '" .. args[i] .. "'\n"); return 1
+        end
+        wrap = math.floor(n)
+    elseif a:match("^%-%-wrap=") then
+        local v = a:sub(8)
+        local n = tonumber(v)
+        if not n or n < 0 then stderr("base64: invalid wrap size: '" .. v .. "'\n"); return 1 end
+        wrap = math.floor(n)
+    elseif a:match("^%-w%d") then
+        local v = a:sub(3)
+        local n = tonumber(v)
+        if not n or n < 0 then stderr("base64: invalid wrap size: '" .. v .. "'\n"); return 1 end
+        wrap = math.floor(n)
+    elseif a:sub(1, 2) == "--" then
+        stderr("base64: unrecognized option '" .. a .. "'\n")
+        return 1
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        stderr("base64: invalid option -- '" .. a:sub(2, 2) .. "'\n")
+        return 1
+    else
+        files[#files + 1] = a
+    end
+    i = i + 1
+end
+
+local function slurp(h)
+    if h.readAll then return h:readAll() end
+    local parts = {}
+    while true do
+        local chunk = h:read(4096)
+        if not chunk or chunk == "" then break end
+        parts[#parts + 1] = chunk
+    end
+    return table.concat(parts)
+end
+
+--- 编码: 3 字节 -> 4 字符; 有 wrap 就每 wrap 列换行; 有输出时末尾补换行。
+local function encode(text)
+    local out = {}
+    local col = 0
+    local function put(s)
+        out[#out + 1] = s
+        col = col + #s
+        if wrap > 0 and col >= wrap then
+            out[#out + 1] = "\n"
+            col = 0
+        end
+    end
+    local n = #text
+    local k = 1
+    while k <= n do
+        local b1 = text:byte(k)
+        local b2 = text:byte(k + 1)
+        local b3 = text:byte(k + 2)
+        local c1 = math.floor(b1 / 4)
+        local c2 = (b1 % 4) * 16 + (b2 and math.floor(b2 / 16) or 0)
+        local c3, c4, pad
+        if b2 then
+            c3 = (b2 % 16) * 4 + (b3 and math.floor(b3 / 64) or 0)
+        end
+        if b3 then c4 = b3 % 64 end
+        local quartet = ALPHA:sub(c1 + 1, c1 + 1) .. ALPHA:sub(c2 + 1, c2 + 1)
+        if b2 then quartet = quartet .. ALPHA:sub((c3 or 0) + 1, (c3 or 0) + 1)
+        else quartet = quartet .. "=" end
+        if b3 then quartet = quartet .. ALPHA:sub((c4 or 0) + 1, (c4 or 0) + 1)
+        else quartet = quartet .. "=" end
+        put(quartet)
+        k = k + 3
+        if (k % 3000) == 1 then yieldCheck() end
+    end
+    -- -w 0 = 完全不折行: 连末尾那个换行也不打(GNU 的 wrap_write 在 wrap=0 时直接写出,
+    -- 收尾的 "current_column 不为 0 就补换行" 那条因此不会触发)。
+    if wrap > 0 and col > 0 then out[#out + 1] = "\n" end
+    return table.concat(out)
+end
+
+--- 解码: 按 4 个字符一组(quantum)解, 与 GNU 完全同构。
+--- 规则(逐条对宿主 GNU 实测):
+---   - 换行恒忽略; 其余非字母表字符按 -i 决定(不给 -i 就报 invalid input)。
+---   - 完整组必须是 `4 个数据` / `3 个数据 + 1 个 =` / `2 个数据 + 2 个 =`, 别的(如 1 个数据 + 3 个 =、
+---     全是 =)都算 invalid input。
+---   - 文件末尾允许**没有补齐**的残组, 但残组只能是 2 或 3 个**数据**字符(1 个字符凑不出字节);
+---     残组里出现 `=` 同样是 invalid input(所以 `YQ=` 报错而 `YQ` 与 `YQ==` 都行)。
+---   - 与 GNU 一样**边解边写**: 出错前已经解出来的字节留在 stdout。
+local function decodeText(text)
+    local out = {}
+    local q = {}          -- 当前组: 每项是 6 bit 的值, 或 "=" 表示补齐
+    local bad = false
+    local function flush()
+        if #out > 0 then
+            io.write(table.concat(out))
+            out = {}
+            yieldCheck()
+        end
+    end
+    --- 一个完整组 -> 1..3 字节
+    local function emitGroup(g)
+        local n = 0
+        for _, v in ipairs(g) do if v ~= "=" then n = n + 1 end end
+        local bytes = (n == 4 and 3) or (n == 3 and 2) or (n == 2 and 1) or nil
+        if not bytes or (n == 3 and g[4] ~= "=") or (n == 2 and (g[3] ~= "=" or g[4] ~= "=")) then
+            return false
+        end
+        local acc = 0
+        for i = 1, n do acc = acc * 64 + g[i] end
+        acc = acc * (2 ^ (24 - 6 * n)) -- 补齐到 24 bit
+        out[#out + 1] = string.char(math.floor(acc / 65536) % 256)
+        if bytes >= 2 then out[#out + 1] = string.char(math.floor(acc / 256) % 256) end
+        if bytes >= 3 then out[#out + 1] = string.char(acc % 256) end
+        return true
+    end
+    for k = 1, #text do
+        local ch = text:sub(k, k)
+        local v = DECODE[ch]
+        if v then
+            q[#q + 1] = v
+        elseif ch == "=" then
+            q[#q + 1] = "="
+        elseif ch == "\n" or ch == "\r" then
+            -- 换行恒被忽略
+        elseif not ignoreGarbage then
+            bad = true; break
+        end
+        if #q == 4 then
+            if not emitGroup(q) then bad = true; break end
+            q = {}
+        end
+        if (k % 4096) == 0 then flush() end
+    end
+    if not bad and #q > 0 then
+        -- 末尾残组: 数据字符照解并**先写出去**, 再判合法性(GNU 就是先写后报:
+        -- `printf 'YQ=' | base64 -d` 在 GNU 上先输出 "a" 再报 invalid input)。
+        -- 合法形态只有"2 或 3 个纯数据字符"; 出现 `=` 或只剩 1 个字符都算 invalid input。
+        local n = 0
+        local acc = 0
+        local hasPad = false
+        for _, v in ipairs(q) do
+            if v == "=" then hasPad = true else n = n + 1; acc = acc * 64 + v end
+        end
+        if n >= 2 then
+            acc = acc * (2 ^ (24 - 6 * n))
+            out[#out + 1] = string.char(math.floor(acc / 65536) % 256)
+            if n >= 3 then out[#out + 1] = string.char(math.floor(acc / 256) % 256) end
+        end
+        if hasPad or #q == 1 then bad = true end
+    end
+    flush()
+    return not bad
+end
+
+if #files == 0 then files[1] = "-" end
+local rc = 0
+for _, f in ipairs(files) do
+    local text
+    if f == "-" then
+        text = slurp(io.stdin()) or ""
+    else
+        local h, err = fs.open(resolve(f), "r")
+        if not h then
+            stderr("base64: " .. f .. ": " .. ioeMsg(err) .. "\n")
+            rc = 1
+            text = nil
+        else
+            text = slurp(h)
+            h:close()
+        end
+    end
+    if text then
+        if decode then
+            if not decodeText(text) then
+                stderr("base64: invalid input\n")
+                rc = 1
+            end
+        else
+            io.write(encode(text))
+        end
+    end
+end
+return rc

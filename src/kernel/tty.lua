@@ -143,6 +143,16 @@ local function newCtx(dev)
     ctx.bold = false
     ctx.reverse = false
     ctx.saved = nil -- 保存的光标/属性(ESC 7 / CSI s)
+    -- 原始模式(cbreak, Linux termios 的 ICANON|ECHO 关、ISIG 开): 字符不经过行规程,
+    -- 直接按字节进 keyBuf; 特殊键按 ANSI 序列进 keyBuf —— 于是分页器(more/less)这类
+    -- 全屏程序拿到的是"终端字节流", 与 Linux 上 read(1) 的契约一致。见下面的 rawPush。
+    ctx.raw = false
+    ctx.rawEcho = true -- 进原始模式前的回显状态, 退出时恢复
+    ctx.keyBuf = ""    -- 待读的输入字节(原始模式)
+    -- 去重闩锁: CC 对 enter/backspace/tab 与 Ctrl+字母可能**同时**发 key 与 char 事件
+    -- (GLFW 的 char 回调), 两种都处理就会"按一次删两个字符/出一空行"。置上期望的字节,
+    -- 让紧随其后、值相同的那个 char 事件被丢掉(见 feedInput)。canonical 模式同样需要它。
+    ctx.dupChar = nil
     return ctx
 end
 
@@ -531,9 +541,53 @@ local function abortLine(ctx)
     if ctx.reading then ctx.intr = true end
 end
 
+-- ---------------------------------------------------------------
+-- 原始模式(cbreak)输入: 非规范模式下终端给的是**字节流**, 特殊键给 ANSI 转义序列。
+-- ---------------------------------------------------------------
+-- CC 的按键名 -> 终端发出的字节(与 xterm/vt100 一致, 于是"终端程序看到的字节"
+-- 和 Linux 上跑 less 时一样)。只列"不产生 char 事件"的键: 能产生字符的键(字母/数字/
+-- 空格/Tab/Enter/Backspace)走 char 事件那条路, 免得同一按键被记两次。
+local KEY_SEQ = {
+    ["up"] = "\27[A", ["down"] = "\27[B", ["right"] = "\27[C", ["left"] = "\27[D",
+    ["home"] = "\27[H", ["end"] = "\27[F",
+    ["pageUp"] = "\27[5~", ["pageDown"] = "\27[6~",
+    ["insert"] = "\27[2~", ["delete"] = "\27[3~",
+    ["f1"] = "\27OP", ["f2"] = "\27OQ", ["f3"] = "\27OR", ["f4"] = "\27OS",
+    ["f5"] = "\27[15~", ["f6"] = "\27[17~", ["f7"] = "\27[18~", ["f8"] = "\27[19~",
+    ["f9"] = "\27[20~", ["f10"] = "\27[21~", ["f11"] = "\27[23~", ["f12"] = "\27[24~",
+}
+
+--- key 事件中"同时也会产生 char 事件"的键 -> 该 char 事件的字节。CC 两条都发时用来去重。
+local KEY_CHAR = {
+    ["enter"] = "\n", ["return"] = "\n", ["keypadenter"] = "\n", ["keypad_enter"] = "\n",
+    ["backspace"] = "\b", ["tab"] = "\t",
+}
+
+--- 把字节追加到原始输入缓冲。
+local function rawPush(ctx, bytes)
+    if bytes and bytes ~= "" then ctx.keyBuf = ctx.keyBuf .. bytes end
+end
+
+--- 喂一个按键(原始模式): 特殊键变成 ANSI 序列, 其余(方向键之外的修饰键)忽略。
+local function rawFeedKey(ctx, keycode, isHeld)
+    local name = _G.keys and keys.getName and keys.getName(keycode) or nil
+    if not name then return end
+    local seq = KEY_SEQ[name]
+    if seq then
+        rawPush(ctx, seq)
+    elseif not isHeld and KEY_CHAR[name] then
+        -- 该键也可能产生 char 事件: 先按 key 处理, 并把 char 事件记成"要丢掉的重复"。
+        -- 版本 A: CC 只发 key 事件 -> 字节已在这里发出, dupChar 不会被用到;
+        -- 版本 B: CC 两条都发 -> 紧随的那个 char 事件被丢掉, 不会发两遍。
+        rawPush(ctx, KEY_CHAR[name])
+        ctx.dupChar = KEY_CHAR[name]
+    end
+end
+
 --- 喂一个字符(可打印 / 换行 / 退格)。无回显(echo=false)时缓冲但不绘制。
 --- 原始控制字符(如 ^C 的 \3)不入行缓冲(控制组合由 routeKey 处理)。
 local function feedChar(ctx, ch)
+    if ctx.raw then rawPush(ctx, ch) return end
     local b = string.byte(ch or "", 1)
     if b and b < 0x20 and b ~= 0x0A and b ~= 0x0D and b ~= 0x08 and b ~= 0x09 then
         return
@@ -552,6 +606,9 @@ end
 local function feedKey(ctx, keycode, isHeld)
     if isHeld then return end
     local name = keys.getName(keycode)
+    -- CC 可能对这个键**同时**发 key 与 char 事件(见 ctx.dupChar 的说明): 记下期望的字节,
+    -- 让紧随其后那个重复的 char 事件被丢掉。
+    if KEY_CHAR[name] then ctx.dupChar = KEY_CHAR[name] end
     if name == "backspace" then
         backspaceChar(ctx)
     elseif name == "enter" or name == "return" or name == "keypadenter" or name == "keypad_enter" then
@@ -592,14 +649,25 @@ function tty.routeKey(event)
     end
     -- 控制字符: ctrl + c/d/z (无 alt) -> 信号 / EOF / 停止。其余 ctrl+键忽略(不入行)。
     if ctrlDown and not altDown then
+        local ctx = focus and devices[focus]
         if name == "c" then
-            if focus and devices[focus] then tty.ctrlC(devices[focus]) end
-            return
-        elseif name == "d" then
-            if focus and devices[focus] then tty.ctrlD(devices[focus]) end
+            if ctx then tty.ctrlC(ctx) end
             return
         elseif name == "z" then
-            if focus and devices[focus] then tty.ctrlZ(devices[focus]) end
+            if ctx then tty.ctrlZ(ctx) end
+            return
+        elseif ctx and ctx.raw then
+            -- 原始模式(cbreak)下 ISIG 仍然开着(^C/^Z 照旧是信号, 见上), 但 ICANON 关了:
+            -- ^D/^L/^U/^W 这些是**普通字节**, 不再由行规程解释。Ctrl+A..Z = \1..\26。
+            local b = name:match("^%a$") and (string.byte(name:lower()) - 96) or nil
+            if b then
+                local byte = string.char(b)
+                rawPush(ctx, byte)
+                ctx.dupChar = byte -- CC 多半还会补一个 char 事件, 丢掉它
+            end
+            return
+        elseif name == "d" then
+            if ctx then tty.ctrlD(ctx) end
             return
         else
             return
@@ -609,7 +677,7 @@ function tty.routeKey(event)
     if ctx then feedKey(ctx, key, event[3] or false) end
 end
 
---- 调度器把键盘事件路由给前台 tty(canonical 行规程)。
+--- 调度器把键盘事件路由给前台 tty(canonical 行规程 / 原始模式字节流)。
 ---@param event table CC 事件表 {name, ...}
 function tty.feedInput(event)
     local ctx = focus and devices[focus]
@@ -617,13 +685,21 @@ function tty.feedInput(event)
     local ev = event[1]
     if ev == "char" then
         -- Ctrl(+Alt) 组合(如 ^C/^D/^Z/tty 切换)期间抑制字符落屏。
+        -- 原始模式下 Ctrl 组合是普通字节, 已由 routeKey 送进 keyBuf(见那里), 这里同样抑制。
         if ctrlDown then return end
-        feedChar(ctx, tostring(event[2] or ""))
+        local ch = tostring(event[2] or "")
+        -- 同一按键的重复事件(key 已处理过): 丢掉它, 否则会"删两个字符/出两个空行"。
+        if ctx.dupChar then
+            local dup = ctx.dupChar
+            ctx.dupChar = nil
+            if ch == dup then return end
+        end
+        feedChar(ctx, ch)
     elseif ev == "key" then
-        feedKey(ctx, event[2], event[3])
+        if ctx.raw then rawFeedKey(ctx, event[2], event[3]) else feedKey(ctx, event[2], event[3]) end
     elseif ev == "paste" then
         local text = tostring(event[2] or "")
-        for i = 1, #text do feedChar(ctx, text:sub(i, i)) end
+        if ctx.raw then rawPush(ctx, text) else for i = 1, #text do feedChar(ctx, text:sub(i, i)) end end
     end
 end
 
@@ -668,6 +744,48 @@ end
 
 function tty.getFocus()
     return focus
+end
+
+--- 原始模式下的 read(2): 阻塞到**至少有一个字节**, 返回至多 n 字节(n 缺省 1)。
+--- 与 Linux 一致: 被信号打断返回 (nil, "interrupted"); 后台进程组读控制终端前先投 SIGTTIN。
+local function rawRead(ctx, n)
+    n = tonumber(n) or 1
+    if n <= 0 then n = 1 end
+    while true do
+        if ctx.closed then return nil, "device closed" end
+        if tty.readGuard and tty.readGuard(ctx.name) then
+            os.pullEvent() -- 投递 SIGTTIN 后阻塞(与 readLine 同一套)
+        elseif #ctx.keyBuf > 0 then
+            local take = math.min(n, #ctx.keyBuf)
+            local out = ctx.keyBuf:sub(1, take)
+            ctx.keyBuf = ctx.keyBuf:sub(take + 1)
+            return out
+        elseif ctx.intr then
+            ctx.intr = false
+            return nil, "interrupted"
+        elseif ctx.eof then
+            ctx.eof = false
+            return nil
+        else
+            os.pullEvent()
+        end
+    end
+end
+
+--- 原始模式下的 readLine: 一直读到换行(回车也收, 与 canonical 一样对 \r 与 \n 一视同仁)。
+--- 无回显 —— 行编辑(退格等)由调用者自己负责。
+local function rawReadLine(ctx)
+    local buf = {}
+    while true do
+        local b, err = rawRead(ctx, 1)
+        if b == nil then
+            if err then return nil, err end
+            if #buf == 0 then return nil end
+            return table.concat(buf)
+        end
+        if b == "\n" or b == "\r" then return table.concat(buf) end
+        buf[#buf + 1] = b
+    end
 end
 
 --- 打开句柄(绑定共享 ctx)。
@@ -721,6 +839,7 @@ local function openHandle(ctx, mode)
     --- 后台进程组读控制终端: 经 readGuard 投 SIGTTIN 后阻塞(被 SIGCONT/`fg` 恢复后重查)。
     handle.readLine = function()
         if ctx.closed then return nil, "device closed" end
+        if ctx.raw then return rawReadLine(ctx) end
         ctx.reading = true
         while true do
             if tty.readGuard and tty.readGuard(ctx.name) then
@@ -747,10 +866,35 @@ local function openHandle(ctx, mode)
     end
 
     --- 通用 read: 默认给一整行。
-    handle.read = function()
+    handle.read = function(self, n)
         if ctx.closed then return nil, "device closed" end
+        if ctx.raw then return rawRead(ctx, n) end
         return handle.readLine()
     end
+
+    --- 原始模式开关(Linux termios 的 ICANON|ECHO 位): 开 = 不回显、不缓冲成行,
+    --- 读到的是一段**终端字节流**(特殊键是 ANSI 序列, 见 KEY_SEQ)。ISIG 保持打开,
+    --- 因此 ^C/^Z 照旧变成信号。分页器(more/less)靠它做"按一下键就走一步"。
+    handle.setRaw = function(self, enable)
+        if ctx.closed then return nil, "device closed" end
+        enable = (enable ~= false)
+        if enable == ctx.raw then return true end
+        if enable then
+            ctx.rawEcho = ctx.echo
+            ctx.raw = true
+            ctx.echo = false
+            ctx.inputBuffer = "" -- 行规程缓冲里那半截输入作废(不再有"整行"这个概念)
+            ctx.keyBuf = ""
+            ctx.dupChar = nil
+        else
+            ctx.raw = false
+            ctx.echo = ctx.rawEcho
+            ctx.keyBuf = ""
+            ctx.dupChar = nil
+        end
+        return true
+    end
+    handle.isRaw = function() return ctx.raw end
 
     return handle
 end

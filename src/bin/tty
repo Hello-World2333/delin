@@ -1,0 +1,40 @@
+-- Delin tty: 打印连接到标准输入的终端名 (POSIX tty(1) + GNU -s/--silent/--quiet)。
+-- 用法: tty [-s]
+--   -s, --silent, --quiet   什么都不打印, 只用退出码表示是不是终端
+-- 语义(GNU):
+--   - 标准输入是终端 -> 打印它的**设备文件路径**(如 /dev/tty0)并退出 0。
+--   - 不是终端 -> 打印 "not a tty"(GNU 打在 **stdout**, 不是 stderr) 并退出 1。
+--   - 无法确定时 GNU 的措辞是 "not a tty"; 退出码同为 1。
+-- 已知偏离:
+--   - 不实现 --help/--version(与本项目其它工具一致)。
+--   - GNU 认不出选项时退出 **2**(coreutils 里 tty 用 EXIT_FAILURE 之外的那档), 这里照抄。
+--   - 设备名来自内核句柄的 getDeviceName(); 管道/文件句柄没有它, 于是判为"不是终端"。
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+local silent = false
+for _, a in ipairs(args) do
+    if a == "-s" or a == "--silent" or a == "--quiet" then
+        silent = true
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        stderr("tty: unrecognized option '" .. a .. "'\n")
+        return 2
+    else
+        -- POSIX tty 不收操作数; GNU 报 "extra operand" 并退出 2。
+        stderr("tty: extra operand '" .. a .. "'\n")
+        return 2
+    end
+end
+
+local h = io.stdin()
+local name = h and h.getDeviceName and h:getDeviceName()
+if h and h.isTTY == true and name then
+    if not silent then io.write("/dev/" .. name .. "\n") end
+    return 0
+end
+if not silent then io.write("not a tty\n") end
+return 1

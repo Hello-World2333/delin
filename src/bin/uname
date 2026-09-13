@@ -1,0 +1,129 @@
+-- Delin uname: 打印系统信息 (POSIX uname(1) + GNU 的全部选项)。
+-- 用法: uname [OPTION]...
+--   -a, --all                  除了 -p/-i 之外全部信息(与 GNU 一样按固定顺序一行)
+--   -s, --kernel-name          系统名(缺省只打这一项)
+--   -n, --nodename             主机名(/etc/hostname)
+--   -r, --kernel-release       内核发行版(Delin 版本号)
+--   -v, --kernel-version       内核版本串(/proc/version 的括号部分)
+--   -m, --machine              "机器硬件名"
+--   -p, --processor            "处理器类型"
+--   -i, --hardware-platform    "硬件平台"
+--   -o, --operating-system     操作系统名
+--   --help/--version 不实现(与本项目其它工具一致)。多项时按 GNU 的顺序打印, 空格分隔。
+-- 取值(Delin 上真实存在的量; 取不到的照 GNU 打印 "unknown", 不编造):
+--   -s Delin    -r <内核版本(如 0.0.4), 取自 /proc/version>    -n <hostname>
+--   -v /proc/version 括号内的那一串(CraftOS <版本>, Lua <版本>)
+--   -m cc-tweaked(这是一台 CC: Tweaked 电脑)  -p lua  -i lua(Lua 虚拟机就是"处理器/平台")
+--   -o Delin
+-- 退出码: 0 成功; 1 选项错(GNU uname 用 1)。
+-- 已知偏离: 不实现 --help/--version; 没有 -p/-i 的"真值"(Linux 上它们是 CPU 型号,
+--   Delin 跑在 Lua 虚拟机里, 报虚拟机名比编一个型号诚实)。
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+local function readAll(path)
+    local f, err = fs.open(path, "r")
+    if not f then return nil, err end
+    local s = f.readAll and f:readAll() or nil
+    if not s then
+        local parts = {}
+        while true do
+            local chunk = f:read(4096)
+            if not chunk or chunk == "" then break end
+            parts[#parts + 1] = chunk
+        end
+        s = table.concat(parts)
+    end
+    f:close()
+    return s
+end
+
+-- /proc/version: `Delin OS <版本> (CraftOS <os.version>, Lua <_VERSION>)`
+local procVersion = readAll("/proc/version") or ""
+local sysname, release, kversion = "Delin", "unknown", "unknown"
+do
+    local name, ver, rest = procVersion:match("^(%S+)%s+%S+%s+(%S+)%s*(.*)$")
+    if ver then
+        release = ver
+        local inner = rest:match("^%((.-)%)%s*$")
+        if inner then kversion = inner end
+    end
+    if name and name ~= "" then sysname = name end
+end
+local nodename = "unknown"
+do
+    local host = readAll("/etc/hostname")
+    if host then
+        host = host:match("^([^\n]*)"):gsub("%s+$", "")
+        if host ~= "" then nodename = host end
+    end
+end
+
+local FLAGS = {
+    { short = "s", long = "kernel-name",       value = function() return sysname end },
+    { short = "n", long = "nodename",          value = function() return nodename end },
+    { short = "r", long = "kernel-release",    value = function() return release end },
+    { short = "v", long = "kernel-version",    value = function() return kversion end },
+    { short = "m", long = "machine",           value = function() return "cc-tweaked" end },
+    { short = "p", long = "processor",         value = function() return "lua" end },
+    { short = "i", long = "hardware-platform", value = function() return "lua" end },
+    { short = "o", long = "operating-system",  value = function() return "Delin" end },
+}
+
+local byShort = {}
+for _, f in ipairs(FLAGS) do byShort[f.short] = f end
+
+local chosen = {}
+local function pick(f)
+    if not chosen[f] then chosen[f] = true; chosen[#chosen + 1] = f end
+end
+
+-- -a 的固定顺序(GNU 源码里的 print顺序): 与 FLAGS 的排列一致。
+local all = false
+for _, a in ipairs(args) do
+    if a == "-a" or a == "--all" then
+        all = true
+    elseif a:sub(1, 2) == "--" then
+        local name = a:sub(3)
+        local found = nil
+        for _, f in ipairs(FLAGS) do if f.long == name then found = f end end
+        if not found then
+            stderr("uname: unrecognized option '" .. a .. "'\n")
+            return 1
+        end
+        pick(found)
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        -- 组合短选项 (-sn 与 -s -n 等价, GNU getopt 同)
+        for i = 2, #a do
+            local ch = a:sub(i, i)
+            local f = byShort[ch]
+            if not f then
+                stderr("uname: invalid option -- '" .. ch .. "'\n")
+                return 1
+            end
+            pick(f)
+        end
+    else
+        stderr("uname: extra operand '" .. a .. "'\n")
+        return 1
+    end
+end
+
+if all then
+    chosen = {}
+    for _, f in ipairs(FLAGS) do
+        -- GNU: -a 包含除 -p/-i 之外的全部(它们要额外探测 CPU, 历史上被认为是"可能不准")
+        if f.short ~= "p" and f.short ~= "i" then pick(f) end
+    end
+elseif #chosen == 0 then
+    pick(byShort.s)
+end
+
+local out = {}
+for _, f in ipairs(chosen) do out[#out + 1] = f.value() end
+io.write(table.concat(out, " ") .. "\n")
+return 0

@@ -1,0 +1,247 @@
+-- Delin env: 在修改过的环境里运行程序 (GNU coreutils env 子集)。
+-- 用法: env [OPTION]... [-] [NAME=VALUE]... [COMMAND [ARG]...]
+--   -i, --ignore-environment   清空环境(等价于第一个参数是 "-")
+--   -u, --unset=NAME           删掉一个变量(可多次)
+--   -0, --null                 输出用 NUL 而不是换行分隔(只在没有 COMMAND 时有用)
+--   -C, --chdir=DIR            先切到 DIR 再运行 COMMAND
+--   -S, --split-string=STRING  按 shell 风格把 STRING 拆成参数再插到命令行里
+--   --ignore-signal[=SIG]      让子进程忽略信号(不给 SIG = 全部可忽略的)
+--   --                      结束选项(之后的第一个参数就是 COMMAND)
+-- 语义(GNU):
+--   - 没有 COMMAND 时**打印当前环境**(NAME=VALUE, 每行一个; -0 用 NUL 分隔)。
+--   - 有 COMMAND 时在修改后的环境里执行它, 并把它的退出码原样返回(被信号杀死 = 128+信号号)。
+--     命令找不到 -> 127; 找到但不可执行 -> 126; env 自己用法错 -> 125(GNU 的 EXIT_CANCELED)。
+--   - `NAME=VALUE` 里的 NAME 可以为空(表示"不导出"? GNU 允许 `=x`):
+--     POSIX 把 `=x` 里的空名字当合法, 这里照 GNU 收下并设一个空名变量。
+--   - `-S` 是 GNU 扩展: 拆串规则是 POSIX shell 的简单版 —— 空白分词、单引号原样、
+--     双引号里认 ${VAR} 展开(用**当前**环境的值)、反斜杠转义、`#` 起注释、`\c` 截断。
+-- 已知偏离:
+--   - 不实现 --default-signal/--block-signal/--list-signal-handling/--debug 与 --help/--version
+--     (Delin 没有"阻塞信号"这一层), 给了就 fail-fast 退出 125。
+--   - 环境变量表的顺序是 Delin 内部表的顺序, 这里**排序输出**(GNU 按 environ 的顺序, 无保证)。
+--   - Delin 的 `-C` 直接改子进程的 cwd(内核 spawn 的 opts.cwd), 与 GNU 的 chdir 等价。
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+-- 环境表(进程环境是白名单表, env/getenv 由内核提供)
+local envVars = {}
+for k, v in pairs(env or {}) do envVars[k] = tostring(v) end
+
+local ignoreAll = false
+local nullSep = false
+local unset = {}
+local chdir = nil
+local splitStrings = {}
+local ignoreSignals = {}
+
+--- POSIX shell 风格的拆串(GNU env -S 的简化版, 见头注释)。
+local function splitString(str)
+    local out, cur, i = {}, {}, 1
+    local function push()
+        if #cur > 0 then out[#out + 1] = table.concat(cur); cur = {} end
+    end
+    while i <= #str do
+        local c = str:sub(i, i)
+        if c == " " or c == "\t" or c == "\n" then
+            push()
+            i = i + 1
+        elseif c == "#" then
+            break -- 注释到行尾
+        elseif c == "'" then
+            local j = str:find("'", i + 1, true)
+            if not j then stderr("env: invalid argument '" .. str .. "' (unterminated quote)\n"); return nil end
+            cur[#cur + 1] = str:sub(i + 1, j - 1)
+            i = j + 1
+        elseif c == '"' then
+            local j = i + 1
+            while j <= #str do
+                local d = str:sub(j, j)
+                if d == '"' then break end
+                if d == "\\" then
+                    local nxt = str:sub(j + 1, j + 1)
+                    if nxt == "c" then i = #str + 1; break end
+                    cur[#cur + 1] = nxt
+                    j = j + 2
+                elseif d == "$" then
+                    local name, rest = str:match("^%${([%w_]+)}(.*)$", j)
+                    if name then
+                        cur[#cur + 1] = envVars[name] or ""
+                        j = #str - #rest + 1
+                    else
+                        cur[#cur + 1] = "$"
+                        j = j + 1
+                    end
+                else
+                    cur[#cur + 1] = d
+                    j = j + 1
+                end
+            end
+            if j > #str then stderr("env: invalid argument '" .. str .. "' (unterminated quote)\n"); return nil end
+            i = j + 1
+        elseif c == "\\" then
+            local nxt = str:sub(i + 1, i + 1)
+            if nxt == "c" then break end
+            if nxt == "f" then cur[#cur + 1] = "\f"
+            elseif nxt == "n" then cur[#cur + 1] = "\n"
+            elseif nxt == "r" then cur[#cur + 1] = "\r"
+            elseif nxt == "t" then cur[#cur + 1] = "\t"
+            elseif nxt == "v" then cur[#cur + 1] = "\v"
+            elseif nxt == "" then cur[#cur + 1] = "\\"
+            else cur[#cur + 1] = nxt end
+            i = i + 2
+        else
+            cur[#cur + 1] = c
+            i = i + 1
+        end
+    end
+    push()
+    return out
+end
+
+local operands = {}
+local noMoreOpts = false
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if noMoreOpts then
+        operands[#operands + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "-" and not noMoreOpts then
+        -- 第一个 "-" = -i(GNU/POSIX)
+        ignoreAll = true
+    elseif a == "-i" or a == "--ignore-environment" then
+        ignoreAll = true
+    elseif a == "-0" or a == "--null" then
+        nullSep = true
+    elseif a == "-u" or a == "--unset" then
+        i = i + 1
+        if not args[i] then stderr("env: option requires an argument -- 'u'\n"); return 125 end
+        unset[#unset + 1] = args[i]
+    elseif a:match("^%-%-unset=") then
+        unset[#unset + 1] = a:sub(9)
+    elseif a:match("^%-u.") then
+        unset[#unset + 1] = a:sub(3)
+    elseif a == "-C" or a == "--chdir" then
+        i = i + 1
+        if not args[i] then stderr("env: option requires an argument -- 'C'\n"); return 125 end
+        chdir = args[i]
+    elseif a:match("^%-%-chdir=") then
+        chdir = a:sub(9)
+    elseif a:match("^%-C.") then
+        chdir = a:sub(3)
+    elseif a == "-S" or a == "--split-string" then
+        i = i + 1
+        if not args[i] then stderr("env: option requires an argument -- 'S'\n"); return 125 end
+        splitStrings[#splitStrings + 1] = args[i]
+    elseif a:match("^%-%-split%-string=") then
+        splitStrings[#splitStrings + 1] = a:sub(15)
+    elseif a:match("^%-S.") then
+        splitStrings[#splitStrings + 1] = a:sub(3)
+    elseif a == "--ignore-signal" then
+        ignoreSignals[#ignoreSignals + 1] = "ALL"
+    elseif a:match("^%-%-ignore%-signal=") then
+        ignoreSignals[#ignoreSignals + 1] = a:sub(17)
+    elseif a:match("^%-%-default%-signal") or a:match("^%-%-block%-signal")
+        or a == "--list-signal-handling" or a == "-v" or a == "--debug" then
+        stderr("env: option '" .. a .. "' is not supported\n")
+        return 125
+    elseif a:sub(1, 2) == "--" then
+        stderr("env: unrecognized option '" .. a .. "'\n")
+        return 125
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        stderr("env: invalid option -- '" .. a:sub(2, 2) .. "'\n")
+        return 125
+    else
+        -- 第一个非选项参数之后一律是操作数(GNU env 的 getopt 用 "+": 见到第一个
+        -- 非选项就停止解析选项, 于是 `env FOO=x sh -c '...'` 里的 -c 归 COMMAND)。
+        for k = i, #args do operands[#operands + 1] = args[k] end
+        break
+    end
+    i = i + 1
+end
+
+if ignoreAll then envVars = {} end
+for _, name in ipairs(unset) do envVars[name] = nil end
+
+-- -S 拆出来的参数插在最前面(GNU: 拆串的结果等同于直接写在命令行上)
+local expanded = {}
+for _, str in ipairs(splitStrings) do
+    local parts = splitString(str)
+    if not parts then return 125 end
+    for _, p in ipairs(parts) do expanded[#expanded + 1] = p end
+end
+for _, op in ipairs(operands) do expanded[#expanded + 1] = op end
+operands = expanded
+
+-- NAME=VALUE 前缀
+local cmd, argv = nil, {}
+for idx, op in ipairs(operands) do
+    local name, val = op:match("^([^=]*)=(.*)$")
+    if name and not cmd then
+        envVars[name] = val
+    else
+        cmd = op
+        for k = idx + 1, #operands do argv[#argv + 1] = operands[k] end
+        break
+    end
+end
+
+if not cmd then
+    local names = {}
+    for k in pairs(envVars) do names[#names + 1] = k end
+    table.sort(names)
+    local sep = nullSep and "\0" or "\n"
+    local out = {}
+    for _, k in ipairs(names) do out[#out + 1] = k .. "=" .. tostring(envVars[k]) end
+    if #out > 0 then io.write(table.concat(out, sep) .. sep) end
+    return 0
+end
+
+-- 组装 opts: env 走"整表覆盖"(值为 nil 即删除), cwd 走内核 spawn 的 opts.cwd
+-- 交给内核的是一张**完整**的环境表, 并置 envClear(不继承父进程的环境块):
+-- 只有这样 "-i" 才是真的清空、"-u NAME" 才是真的删掉(Lua 表里存不下 nil, 内核侧的
+-- "值为 nil 即删除" 是遍历不到的, 见 kernel/process.lua 的注释)。
+local childEnv = {}
+for k, v in pairs(envVars) do childEnv[k] = v end
+
+local opts = { env = childEnv, envClear = true }
+if chdir then opts.cwd = chdir end
+if #ignoreSignals > 0 then
+    local sigIgnore = {}
+    local siglist = syscalls and syscalls["signal.list"] and syscalls["signal.list"]() or {}
+    for _, spec in ipairs(ignoreSignals) do
+        if spec == "ALL" or spec == "" then
+            for _, num in ipairs(siglist) do sigIgnore[num] = true end
+        else
+            local num = tonumber(spec)
+            if not num and syscalls and syscalls["signal.number"] then num = syscalls["signal.number"](spec) end
+            if not num then
+                stderr("env: invalid signal '" .. spec .. "'\n")
+                return 125
+            end
+            sigIgnore[num] = true
+        end
+    end
+    opts.sigIgnore = sigIgnore
+end
+
+local pid, err = syscalls["proc.exec"](cmd, argv, opts)
+if not pid then
+    local code = 126
+    local reason = tostring(err)
+    if reason:find("command not found") then
+        code, reason = 127, "No such file or directory"
+    elseif reason:find("permission denied") then
+        reason = "Permission denied"
+    end
+    stderr("env: '" .. cmd .. "': " .. reason .. "\n")
+    return code
+end
+local rc = syscalls["proc.wait"](pid)
+if rc and rc < 0 then return 128 + (-rc) end
+return rc or 0

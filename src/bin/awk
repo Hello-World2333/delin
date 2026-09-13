@@ -1,0 +1,2183 @@
+-- Delin awk: 模式扫描与文本处理语言 (POSIX awk, 见头注释的覆盖范围)。
+-- 用法: awk [-F fs] [-v var=value] [-f progfile | 'program'] [var=value] [file ...]
+--   -F fs            字段分隔符(等价于 -v FS=fs; 支持 "\t" 这种转义与单字符)
+--   -v var=value     进入 BEGIN 之前赋值(支持转义)
+--   -f progfile      从文件读程序(可多次, 依次拼接)
+--   --               结束选项
+-- 语言覆盖(POSIX awk 的全部主要构造):
+--   - 模式: BEGIN / END / 表达式 / 正则 / 模式1,模式2(范围); 只有模式时缺省动作是 print $0
+--   - 动作: { } if/else while do-while for for-in break continue next nextfile exit return
+--           delete print printf getline 表达式语句 空语句
+--   - 表达式: 赋值(= += -= *= /= %= ^=) 三元 ?: || && in ~ !~ 比较 < <= > >= == !=
+--             字符串连接(并置) + - * / % 一元 + - ! 幂 ^(右结合) ++ -- $ 字段
+--             分组 ( ) 函数调用 数组下标 正则字面量 /re/
+--   - 内建: length substr index split sub gsub match sprintf sin cos atan2 exp log
+--           sqrt int rand srand tolower toupper system close fflush
+--   - 特殊变量: NR NF FNR FS OFS ORS RS FILENAME SUBSEP RSTART RLENGTH CONVFMT OFMT ENVIRON
+--   - 输入: 主输入(命令行文件或 stdin)、getline [var] [< file]、cmd | getline [var]
+--   - 输出: print/printf 到 stdout、> file、>> file、| cmd; close() 关闭并等待
+--   - 用户函数: function f(a, b,   local1) { ... }, 数组参数按引用传递
+-- 数值/字符串语义(POSIX):
+--   - 未初始化的变量按 ""(字符串上下文)与 0(数值上下文)算;
+--   - 比较时两边"看起来都是数"就按数值比, 否则按字符串比(与 gawk 的做法一致);
+--   - 数值转字符串用 CONVFMT(缺省 "%.6g"), print 用 OFMT(缺省 "%.6g"), 整数不带小数。
+-- 已知偏离(明确记录, 不静默):
+--   - 字符串比较按**字节序**(C locale), 没有 locale 折叠。
+--   - RS 只支持: 单个字符、""(段落模式)、以及多字符时按 **ERE** 处理(gawk 扩展);
+--     POSIX 的多字符 RS 是未定义行为。
+--   - 无 locale: tolower/toupper 只折叠 ASCII。
+--   - 不实现 gawk 专有扩展(gensub/strtonum/asort/RS 正则以外/ENVIRON 之外), 用到就报错。
+--   - 数值一律是 IEEE double(|v| > 2^53 的整数不再逐位精确); 没有任意精度。
+--   - 没有 --help/--version(与本项目其它工具一致)与 --posix/--lint 之类的开关。
+--   - 动作体外面包了 pcall(为了接住 exit/next/return 的展开), 而 **Lua 5.1 不允许跨 pcall 让出**:
+--     在宿主测试台的 5.1 上, 动作里的 system()/管道/读 stdin 会报
+--     "attempt to yield across metamethod/C-call boundary"。真机是 Lua 5.2(pcall 可让出),
+--     宿主上请用 lua5.4 跑带 I/O 的 awk 用例(见 scripts/awk_test.sh)。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+local function ioeMsg(err)
+    if err and (err:find("permission") or err:find("denied")) then return "Permission denied" end
+    if err and err:lower():find("no such file") then return "No such file or directory" end
+    if err and err:find("directory") then return "Is a directory" end
+    return "No such file or directory"
+end
+
+-- 让出调度器(长循环里必须让, 否则收不到 ^C 且整个系统卡住)
+local _msleep = os.msleep or function(ms) os.sleep(math.max((ms or 0) / 1000, 0.05)) end
+local _sliceAt = os.epoch("utc")
+local function yieldCheck()
+    local now = os.epoch("utc")
+    if now - _sliceAt >= 50 then
+        _sliceAt = now
+        _msleep(0)
+    end
+end
+
+-- ===============================================================
+-- 一、值: Lua number | Lua string
+-- ===============================================================
+local NUMERIC_RE = "^[ \t]*[%+%-]?%d*%.?%d+[ \t]*$"
+local NUMERIC_EXP_RE = "^[ \t]*[%+%-]?%d*%.?%d+[eE][%+%-]?%d+[ \t]*$"
+
+--- 字符串是否"看起来是个数"(POSIX 的 numeric string 判定)。
+local function looksNumeric(s)
+    if type(s) ~= "string" then return false end
+    if s:match(NUMERIC_RE) then return true end
+    -- 指数形式需要至少一位数字(避免 "e" 这种被当成数)
+    if s:match(NUMERIC_EXP_RE) then return true end
+    if s:match("^[ \t]*[%+%-]?%d+[ \t]*$") then return true end
+    return false
+end
+
+local function toNum(v)
+    if type(v) == "number" then return v end
+    if type(v) == "string" then
+        local n = tonumber(v)
+        if n then return n end
+        return 0
+    end
+    return 0
+end
+
+--- 数值 -> 字符串(整数值不带小数点, 与 awk 一致)。
+local function numToStr(n, fmt)
+    if n ~= n then return "nan" end
+    if n == math.huge then return "inf" end
+    if n == -math.huge then return "-inf" end
+    if n == math.floor(n) and math.abs(n) < 1e16 then
+        return string.format("%d", n)
+    end
+    local ok, s = pcall(string.format, fmt or "%.6g", n)
+    return ok and s or tostring(n)
+end
+
+local function toStr(v, fmt)
+    if type(v) == "string" then return v end
+    return numToStr(v, fmt)
+end
+
+-- 忽略大小写/字符串比较辅助
+local function strCompare(a, b)
+    if a == b then return 0 end
+    return a < b and -1 or 1
+end
+
+--- POSIX 的比较: 两边都是数(或看起来是数)就按数值比。
+local function compareValues(a, b)
+    local an = (type(a) == "number") or looksNumeric(a)
+    local bn = (type(b) == "number") or looksNumeric(b)
+    if an and bn then
+        local x, y = toNum(a), toNum(b)
+        if x == y then return 0 end
+        return x < y and -1 or 1
+    end
+    return strCompare(tostring(a), tostring(b))
+end
+
+local function truthy(v)
+    if type(v) == "number" then return v ~= 0 end
+    if type(v) == "string" then
+        if v == "" then return false end
+        if looksNumeric(v) then return toNum(v) ~= 0 end
+        return true
+    end
+    return false
+end
+
+-- ===============================================================
+-- 二、词法
+-- ===============================================================
+local KEYWORDS = {
+    ["BEGIN"] = true, ["END"] = true, ["function"] = true, ["if"] = true, ["else"] = true,
+    ["while"] = true, ["do"] = true, ["for"] = true, ["in"] = true, ["break"] = true,
+    ["continue"] = true, ["next"] = true, ["nextfile"] = true, ["exit"] = true,
+    ["return"] = true, ["delete"] = true, ["print"] = true, ["printf"] = true,
+    ["getline"] = true,
+}
+local BUILTINS = {
+    length = true, substr = true, index = true, split = true, sub = true, gsub = true,
+    match = true, sprintf = true, sin = true, cos = true, atan2 = true, exp = true, log = true,
+    sqrt = true, int = true, rand = true, srand = true, tolower = true, toupper = true,
+    system = true, ["close"] = true, fflush = true,
+}
+
+--- 词法: 把源码变成记号表。正则字面量靠"前一个记号能不能结束表达式"来区分 `/` 与除法。
+local function lex(src)
+    local toks = {}
+    local i, line = 1, 1
+    local n = #src
+    local prevSignificant = nil
+
+    local function add(t, v)
+        toks[#toks + 1] = { t = t, v = v, line = line }
+        if t ~= "nl" then prevSignificant = toks[#toks] end
+    end
+
+    local function decodeEscape()
+        -- 处理 \n \t \r \\ \" \/ \a \b \f \v \0.. 与 \ddd
+        local c = src:sub(i, i)
+        i = i + 1
+        if c == "n" then return "\n" end
+        if c == "t" then return "\t" end
+        if c == "r" then return "\r" end
+        if c == "\\" then return "\\" end
+        if c == '"' then return '"' end
+        if c == "/" then return "/" end
+        if c == "a" then return "\a" end
+        if c == "b" then return "\b" end
+        if c == "f" then return "\f" end
+        if c == "v" then return "\v" end
+        if c:match("%d") then
+            local d = c
+            while #d < 3 and src:sub(i, i):match("%d") do d = d .. src:sub(i, i); i = i + 1 end
+            return string.char(tonumber(d) % 256)
+        end
+        return c -- 未知转义: 原样(awk 的行为)
+    end
+
+    while i <= n do
+        local c = src:sub(i, i)
+        if c == "\n" then
+            add("nl", "\n")
+            line = line + 1
+            i = i + 1
+        elseif c == " " or c == "\t" or c == "\r" then
+            i = i + 1
+        elseif c == "\\" and src:sub(i + 1, i + 1) == "\n" then
+            line = line + 1
+            i = i + 2
+        elseif c == "#" then
+            while i <= n and src:sub(i, i) ~= "\n" do i = i + 1 end
+        elseif c:match("%d") or (c == "." and src:sub(i + 1, i + 1):match("%d")) then
+            local st = i
+            while i <= n and src:sub(i, i):match("[%d%.]") do i = i + 1 end
+            if src:sub(i, i):match("[eE]") then
+                local save = i
+                i = i + 1
+                if src:sub(i, i):match("[%+%-]") then i = i + 1 end
+                if src:sub(i, i):match("%d") then
+                    while i <= n and src:sub(i, i):match("%d") do i = i + 1 end
+                else
+                    i = save
+                end
+            end
+            add("num", tonumber(src:sub(st, i - 1)))
+        elseif c:match("[%a_]") then
+            local st = i
+            while i <= n and src:sub(i, i):match("[%w_]") do i = i + 1 end
+            local word = src:sub(st, i - 1)
+            if KEYWORDS[word] then add(word, word)
+            else add("name", word) end
+        elseif c == '"' then
+            i = i + 1
+            local buf = {}
+            while i <= n and src:sub(i, i) ~= '"' do
+                if src:sub(i, i) == "\\" then
+                    i = i + 1
+                    buf[#buf + 1] = decodeEscape()
+                else
+                    buf[#buf + 1] = src:sub(i, i)
+                    i = i + 1
+                end
+            end
+            if i > n then return nil, "(" .. line .. ") unterminated string" end
+            i = i + 1
+            add("str", table.concat(buf))
+        elseif c == "/" then
+            -- 正则字面量 vs 除号: 上一个记号不能结束表达式时才是正则
+            local canEndExpr = false
+            if prevSignificant then
+                local pt = prevSignificant.t
+                if pt == "num" or pt == "str" or pt == "name" or pt == ")" or pt == "]" or pt == "$" then
+                    canEndExpr = true
+                end
+                if pt == "getline" then canEndExpr = true end
+            end
+            if canEndExpr and src:sub(i + 1, i + 1) == "=" then
+                add("op", "/=")
+                i = i + 2
+            elseif not canEndExpr then
+                i = i + 1
+                local buf = {}
+                while i <= n and src:sub(i, i) ~= "/" do
+                    if src:sub(i, i) == "\\" then
+                        local nxt = src:sub(i + 1, i + 1)
+                        if nxt == "/" then buf[#buf + 1] = "/"; i = i + 2
+                        else buf[#buf + 1] = "\\" .. nxt; i = i + 2 end
+                    else
+                        if src:sub(i, i) == "\n" then return nil, "(" .. line .. ") unterminated regex" end
+                        buf[#buf + 1] = src:sub(i, i)
+                        i = i + 1
+                    end
+                end
+                if i > n then return nil, "(" .. line .. ") unterminated regex" end
+                i = i + 1
+                add("regex", table.concat(buf))
+            else
+                add("op", "/")
+                i = i + 1
+            end
+        elseif c == "+" or c == "-" or c == "*" or c == "%" or c == "^" or c == "=" or c == "<"
+            or c == ">" or c == "!" or c == "~" or c == "&" or c == "|" or c == "?" or c == ":" then
+            local two = src:sub(i, i + 1)
+            local four = src:sub(i, i + 2)
+            if two == "++" or two == "--" or two == "+=" or two == "-=" or two == "*=" or two == "/="
+                or two == "%=" or two == "^=" or two == "==" or two == "!=" or two == "<="
+                or two == ">=" or two == "&&" or two == "||" or two == "!~" or two == ">>" then
+                add("op", two)
+                i = i + 2
+            elseif four == "**=" then
+                add("op", "^=")
+                i = i + 3
+            elseif two == "**" then
+                add("op", "^")
+                i = i + 2
+            else
+                add("op", c)
+                i = i + 1
+            end
+        elseif c == "(" or c == ")" or c == "{" or c == "}" or c == "[" or c == "]" or c == ","
+            or c == ";" or c == "$" then
+            add("op", c)
+            i = i + 1
+        else
+            return nil, "(" .. line .. ") unexpected character '" .. c .. "'"
+        end
+    end
+    add("eof", nil)
+    return toks
+end
+
+-- ===============================================================
+-- 三、语法分析
+-- ===============================================================
+local Parser = {}
+Parser.__index = Parser
+local function newParser(toks) return setmetatable({ toks = toks, pos = 1 }, Parser) end
+
+function Parser:peek(o) return self.toks[self.pos + (o or 0)] or { t = "eof" } end
+function Parser:next() local t = self.toks[self.pos]; self.pos = self.pos + 1; return t end
+function Parser:accept(t, v)
+    local tok = self:peek()
+    if tok.t == t and (v == nil or tok.v == v) then self.pos = self.pos + 1; return tok end
+    return nil
+end
+function Parser:acceptOp(v) return self:accept("op", v) end
+function Parser:expect(t, v, what)
+    local tok = self:accept(t, v)
+    if not tok then
+        error("syntax error at line " .. tostring(self:peek().line) .. ": expected "
+            .. (what or v or t) .. " near '" .. tostring(self:peek().v or self:peek().t) .. "'", 0)
+    end
+    return tok
+end
+function Parser:skipNl() while self:peek().t == "nl" or self:acceptOp(";") do end end
+function Parser:skipTerminators()
+    while self:peek().t == "nl" or (self:peek().t == "op" and self:peek().v == ";") do
+        self.pos = self.pos + 1
+    end
+end
+
+local parseExpr
+local parseConcat
+
+--- 表达式能否紧接 `{`(判断"模式 {动作}"还是"表达式里的数组/连接")
+local function parsePrimary(p)
+    local tok = p:peek()
+    if tok.t == "num" then p:next(); return { k = "num", v = tok.v } end
+    if tok.t == "str" then p:next(); return { k = "str", v = tok.v } end
+    if tok.t == "regex" then p:next(); return { k = "regex", v = tok.v } end
+    if tok.t == "op" and tok.v == "(" then
+        p:next()
+        local savedNoGreater = p.noGreater
+        p.noGreater = false -- 括号里的 > 又是普通比较了
+        local first = parseExpr(p)
+        p.noGreater = savedNoGreater
+        if p:acceptOp(",") then
+            -- `(i, j)` 只是 `(i,j) in a` 与多维下标的写法(awk 的"下标列表")
+            local items = { first }
+            repeat
+                items[#items + 1] = parseExpr(p)
+            until not p:acceptOp(",")
+            p:expect("op", ")", "')'")
+            return { k = "list", items = items }
+        end
+        p:expect("op", ")", "')'")
+        return first
+    end
+    if tok.t == "op" and tok.v == "$" then
+        p:next()
+        local e = parsePrimary(p)
+        return { k = "field", e = e }
+    end
+    if tok.t == "op" and (tok.v == "++" or tok.v == "--") then
+        p:next()
+        local e = parsePrimary(p)
+        return { k = "preinc", op = tok.v, e = e }
+    end
+    if tok.t == "op" and (tok.v == "+" or tok.v == "-" or tok.v == "!") then
+        p:next()
+        local e = parsePrimary(p)
+        return { k = "unary", op = tok.v, e = e }
+    end
+    if tok.t == "getline" then
+        p:next()
+        local target = nil
+        local t2 = p:peek()
+        if (t2.t == "name") then
+            -- getline var | getline var < file
+            local save = p.pos
+            local name = p:next().v
+            local node = { k = "var", name = name }
+            if p:acceptOp("[") then
+                local idx = parseExpr(p)
+                p:expect("op", "]", "']'")
+                node = { k = "array", name = name, idx = idx }
+            end
+            if p:peek().t == "name" or p:peek().t == "num" or p:peek().t == "str"
+                or p:peek().t == "op" and (p:peek().v == "(" or p:peek().v == "$") then
+                p.pos = save -- 其实是连接: getline 没有目标
+            else
+                target = node
+            end
+        end
+        if p:acceptOp("<") then
+            local file = parseConcat(p)
+            return { k = "getline", target = target, file = file }
+        end
+        return { k = "getline", target = target }
+    end
+    if tok.t == "name" then
+        p:next()
+        if p:acceptOp("(") then
+            local fargs = {}
+            if not p:acceptOp(")") then
+                repeat
+                    fargs[#fargs + 1] = parseExpr(p)
+                until not p:acceptOp(",")
+                p:expect("op", ")", "')'")
+            end
+            return { k = "call", name = tok.v, args = fargs }
+        end
+        if p:acceptOp("[") then
+            local idx = {}
+            repeat
+                idx[#idx + 1] = parseExpr(p)
+            until not p:acceptOp(",")
+            p:expect("op", "]", "']'")
+            if #idx == 1 then return { k = "array", name = tok.v, idx = idx[1] } end
+            return { k = "array", name = tok.v, indices = idx }
+        end
+        return { k = "var", name = tok.v }
+    end
+    error("syntax error at line " .. tostring(tok.line) .. ": unexpected '"
+        .. tostring(tok.v or tok.t) .. "'", 0)
+end
+
+local function parsePostfix(p)
+    local e = parsePrimary(p)
+    while true do
+        local tok = p:peek()
+        if tok.t == "op" and (tok.v == "++" or tok.v == "--") then
+            p:next()
+            e = { k = "postinc", op = tok.v, e = e }
+        else
+            break
+        end
+    end
+    return e
+end
+
+local function parsePow(p)
+    local base = parsePostfix(p)
+    if p:peek().t == "op" and p:peek().v == "^" then
+        p:next()
+        -- 幂的右操作数允许一元 +/- 与幂(右结合)
+        local tok = p:peek()
+        local rhs
+        if tok.t == "op" and (tok.v == "-" or tok.v == "+") then
+            p:next()
+            rhs = { k = "unary", op = tok.v, e = parsePow(p) }
+        else
+            rhs = parsePow(p)
+        end
+        return { k = "bin", op = "^", l = base, r = rhs }
+    end
+    return base
+end
+
+local function parseMul(p)
+    local e = parsePow(p)
+    while true do
+        local tok = p:peek()
+        if tok.t == "op" and (tok.v == "*" or tok.v == "/" or tok.v == "%") then
+            p:next()
+            e = { k = "bin", op = tok.v, l = e, r = parsePow(p) }
+        else
+            break
+        end
+    end
+    return e
+end
+
+local function parseAdd(p)
+    local e = parseMul(p)
+    while true do
+        local tok = p:peek()
+        if tok.t == "op" and (tok.v == "+" or tok.v == "-") then
+            p:next()
+            e = { k = "bin", op = tok.v, l = e, r = parseMul(p) }
+        else
+            break
+        end
+    end
+    return e
+end
+
+--- 并置(字符串连接)优先级在加减之下、比较之上, 且**不跨越换行**(换行是语句分隔)。
+local function startsOperand(p)
+    local tok = p:peek()
+    if tok.t == "nl" or tok.t == "eof" then return false end
+    if tok.t == "num" or tok.t == "str" or tok.t == "name" or tok.t == "regex"
+        or tok.t == "getline" then return true end
+    if tok.t == "op" then
+        local v = tok.v
+        if v == "(" or v == "$" or v == "!" then return true end
+        if v == "+" or v == "-" then return true end -- 一元
+    end
+    return false
+end
+
+local function parseConcatImpl(p)
+    local e = parseAdd(p)
+    while startsOperand(p) do
+        -- `print a > b` 里的 > 不是比较: 由调用方(print)处理
+        local r = parseAdd(p)
+        e = { k = "concat", l = e, r = r }
+    end
+    return e
+end
+parseConcat = parseConcatImpl
+
+local function parseCompare(p)
+    local e = parseConcat(p)
+    while true do
+        local tok = p:peek()
+        if tok.t == "op" and tok.v == ">" and p.noGreater then break end
+        if tok.t == "op" and (tok.v == "<" or tok.v == "<=" or tok.v == ">" or tok.v == ">="
+            or tok.v == "==" or tok.v == "!=") then
+            p:next()
+            e = { k = "bin", op = tok.v, l = e, r = parseConcat(p) }
+        else
+            break
+        end
+    end
+    return e
+end
+
+local function parseMatch(p)
+    local e = parseCompare(p)
+    while true do
+        local tok = p:peek()
+        if tok.t == "op" and (tok.v == "~" or tok.v == "!~") then
+            p:next()
+            e = { k = "bin", op = tok.v, l = e, r = parseCompare(p) }
+        else
+            break
+        end
+    end
+    return e
+end
+
+--- cmd | getline [var]
+local function parsePipe(p)
+    local e = parseMatch(p)
+    while p:peek().t == "op" and p:peek().v == "|" and p:peek(1).t == "getline" do
+        p:next() -- |
+        p:next() -- getline
+        local target = nil
+        local t2 = p:peek()
+        if t2.t == "name" and not (p:peek(1).t == "op" and p:peek(1).v == "(") then
+            local name = p:next().v
+            if p:acceptOp("[") then
+                local idx = {}
+                repeat idx[#idx + 1] = parseExpr(p) until not p:acceptOp(",")
+                p:expect("op", "]", "']'")
+                target = (idx[1] and #idx == 1) and { k = "array", name = name, idx = idx[1] }
+                    or { k = "array", name = name, indices = idx }
+            else
+                target = { k = "var", name = name }
+            end
+        elseif t2.t == "op" and t2.v == "$" then
+            p:next()
+            target = { k = "field", e = parsePrimary(p) }
+        end
+        e = { k = "pipegetline", cmd = e, target = target }
+    end
+    return e
+end
+
+local function parseIn(p)
+    local e = parsePipe(p)
+    while p:peek().t == "in" do
+        p:next()
+        local name = p:expect("name", nil, "array name").v
+        e = { k = "in", l = e, arr = name }
+    end
+    return e
+end
+
+local function parseAnd(p)
+    local e = parseIn(p)
+    while p:acceptOp("&&") do e = { k = "and", l = e, r = parseIn(p) } end
+    return e
+end
+
+local function parseOr(p)
+    local e = parseAnd(p)
+    while p:acceptOp("||") do e = { k = "or", l = e, r = parseAnd(p) } end
+    return e
+end
+
+local function parseTernary(p)
+    local c = parseOr(p)
+    if p:acceptOp("?") then
+        local a = parseTernary(p)
+        p:expect("op", ":", "':'")
+        local b = parseTernary(p)
+        return { k = "ternary", c = c, a = a, b = b }
+    end
+    return c
+end
+
+--- 赋值(右结合)。左值必须是 var/field/array。
+local function isLvalue(e)
+    return e.k == "var" or e.k == "field" or e.k == "array"
+end
+
+local function parseAssign(p)
+    local e = parseTernary(p)
+    local tok = p:peek()
+    if tok.t == "op" and (tok.v == "=" or tok.v == "+=" or tok.v == "-=" or tok.v == "*="
+        or tok.v == "/=" or tok.v == "%=" or tok.v == "^=") then
+        if not isLvalue(e) then
+            error("syntax error at line " .. tostring(tok.line) .. ": assignment to a non-lvalue", 0)
+        end
+        p:next()
+        return { k = "assign", op = tok.v, l = e, r = parseAssign(p) }
+    end
+    return e
+end
+
+parseExpr = parseAssign
+
+-- 语句
+local parseStmt
+
+local function parseBlock(p)
+    p:expect("op", "{", "'{'")
+    local stmts = {}
+    p:skipTerminators()
+    while not p:acceptOp("}") do
+        if p:peek().t == "eof" then error("syntax error: '}' missing", 0) end
+        local s = parseStmt(p)
+        if s then stmts[#stmts + 1] = s end
+        p:skipTerminators()
+    end
+    return { k = "block", stmts = stmts }
+end
+
+--- 取语句体: 单条语句或块
+local function parseBody(p)
+    p:skipTerminators()
+    if p:peek().t == "op" and p:peek().v == "{" then return parseBlock(p) end
+    return parseStmt(p)
+end
+
+--- print/printf 的参数列表与重定向(> >> |)
+local function parseOutputList(p)
+    local items = {}
+    local kind, dest = nil, nil
+    -- print/printf 里的顶层 `>` 是**重定向**(POSIX: 要比大小得加括号), 所以解析参数时
+    -- 关掉大于号(noGreater), 括号里再打开(见 parsePrimary 的 "(" 分支)
+    local savedNoGreater = p.noGreater
+    p.noGreater = true
+    if p:peek().t ~= "nl" and p:peek().t ~= "eof" and not (p:peek().t == "op"
+        and (p:peek().v == "}" or p:peek().v == ";" or p:peek().v == ">" or p:peek().v == ">>"
+        or p:peek().v == "|")) then
+        repeat
+            items[#items + 1] = parseTernary(p)
+        until not p:acceptOp(",")
+    end
+    p.noGreater = savedNoGreater
+    local tok = p:peek()
+    if tok.t == "op" and (tok.v == ">" or tok.v == ">>" or tok.v == "|") then
+        p:next()
+        kind = tok.v
+        dest = parseConcat(p) -- 目标里不能再出现 > 之类
+    end
+    return items, kind, dest
+end
+
+parseStmt = function(p)
+    local tok = p:peek()
+    if tok.t == "op" and tok.v == ";" then p:next(); return nil end
+    if tok.t == "nl" then p:next(); return nil end
+    if tok.t == "op" and tok.v == "{" then return parseBlock(p) end
+    if tok.t == "if" then
+        p:next()
+        p:expect("op", "(", "'('")
+        local cond = parseExpr(p)
+        p:expect("op", ")", "')'")
+        local thenS = parseBody(p)
+        local save = p.pos
+        p:skipTerminators()
+        local elseS = nil
+        if p:accept("else") then elseS = parseBody(p) else p.pos = save end
+        return { k = "if", cond = cond, thenS = thenS, elseS = elseS }
+    end
+    if tok.t == "while" then
+        p:next()
+        p:expect("op", "(", "'('")
+        local cond = parseExpr(p)
+        p:expect("op", ")", "')'")
+        return { k = "while", cond = cond, body = parseBody(p) }
+    end
+    if tok.t == "do" then
+        p:next()
+        local body = parseBody(p)
+        p:skipTerminators()
+        p:expect("while", nil, "'while'")
+        p:expect("op", "(", "'('")
+        local cond = parseExpr(p)
+        p:expect("op", ")", "')'")
+        return { k = "dowhile", body = body, cond = cond }
+    end
+    if tok.t == "for" then
+        p:next()
+        p:expect("op", "(", "'('")
+        -- for (var in array) 形式
+        if p:peek().t == "name" and p:peek(1).t == "in" then
+            local v = p:next().v
+            p:next()
+            local arr = p:expect("name", nil, "array name").v
+            p:expect("op", ")", "')'")
+            return { k = "forin", var = v, arr = arr, body = parseBody(p) }
+        end
+        local init = nil
+        if not (p:peek().t == "op" and p:peek().v == ";") then init = parseExpr(p) end
+        p:expect("op", ";", "';'")
+        local cond = nil
+        if not (p:peek().t == "op" and p:peek().v == ";") then cond = parseExpr(p) end
+        p:expect("op", ";", "';'")
+        local incr = nil
+        if not (p:peek().t == "op" and p:peek().v == ")") then incr = parseExpr(p) end
+        p:expect("op", ")", "')'")
+        return { k = "for", init = init, cond = cond, incr = incr, body = parseBody(p) }
+    end
+    if tok.t == "break" then p:next(); return { k = "break" } end
+    if tok.t == "continue" then p:next(); return { k = "continue" } end
+    if tok.t == "next" then p:next(); return { k = "next" } end
+    if tok.t == "nextfile" then p:next(); return { k = "nextfile" } end
+    if tok.t == "exit" then
+        p:next()
+        local e = nil
+        local t2 = p:peek()
+        if t2.t ~= "nl" and t2.t ~= "eof" and not (t2.t == "op" and (t2.v == "}" or t2.v == ";")) then
+            e = parseExpr(p)
+        end
+        return { k = "exit", e = e }
+    end
+    if tok.t == "return" then
+        p:next()
+        local e = nil
+        local t2 = p:peek()
+        if t2.t ~= "nl" and t2.t ~= "eof" and not (t2.t == "op" and (t2.v == "}" or t2.v == ";")) then
+            e = parseExpr(p)
+        end
+        return { k = "return", e = e }
+    end
+    if tok.t == "delete" then
+        p:next()
+        local name = p:expect("name", nil, "array name").v
+        if p:acceptOp("[") then
+            local idx = {}
+            repeat
+                idx[#idx + 1] = parseExpr(p)
+            until not p:acceptOp(",")
+            p:expect("op", "]", "']'")
+            return { k = "delete", arr = name, indices = idx }
+        end
+        return { k = "delete", arr = name }
+    end
+    if tok.t == "print" or tok.t == "printf" then
+        p:next()
+        local items, kind, dest = parseOutputList(p)
+        if tok.t == "printf" and #items == 0 then
+            error("syntax error: printf needs a format", 0)
+        end
+        return { k = tok.t, items = items, redirect = kind, dest = dest }
+    end
+    local e = parseExpr(p)
+    return { k = "exprstmt", e = e }
+end
+
+--- 程序 = item 列表
+local function parseProgram(p)
+    local items = {}
+    p:skipTerminators()
+    while p:peek().t ~= "eof" do
+        local tok = p:peek()
+        if tok.t == "function" then
+            p:next()
+            local name = p:expect("name", nil, "function name").v
+            p:expect("op", "(", "'('")
+            local params = {}
+            if not p:acceptOp(")") then
+                repeat
+                    params[#params + 1] = p:expect("name", nil, "parameter name").v
+                until not p:acceptOp(",")
+                p:expect("op", ")", "')'")
+            end
+            p:skipTerminators()
+            local body = parseBlock(p)
+            items[#items + 1] = { k = "func", name = name, params = params, body = body }
+        elseif tok.t == "BEGIN" or tok.t == "END" then
+            p:next()
+            p:skipTerminators()
+            local body = parseBlock(p)
+            items[#items + 1] = { k = (tok.t == "BEGIN") and "begin" or "end", body = body }
+        elseif tok.t == "op" and tok.v == "{" then
+            items[#items + 1] = { k = "rule", pattern = nil, action = parseBlock(p) }
+        else
+            local pat = parseExpr(p)
+            local pat2 = nil
+            if p:acceptOp(",") then pat2 = parseExpr(p) end
+            local action = nil
+            local save = p.pos
+            p:skipTerminators()
+            if p:peek().t == "op" and p:peek().v == "{" then
+                action = parseBlock(p)
+            else
+                p.pos = save
+            end
+            items[#items + 1] = { k = "rule", pattern = pat, pattern2 = pat2, action = action }
+        end
+        p:skipTerminators()
+    end
+    return items
+end
+
+-- ===============================================================
+-- 四、运行时
+-- ===============================================================
+local rt
+
+local NEXTREC, NEXTFILE = {}, {}
+
+--- 正则编译(带缓存)。awk 的 /re/ 是 ERE。
+local reCache
+local function compileRegex(pat)
+    if reCache[pat] then return reCache[pat] end
+    local compileRegexFn = syscalls and syscalls["regex.compile"]
+    if not compileRegexFn then error("awk: regex syscall not available", 0) end
+    local re, err = compileRegexFn(pat, "ere")
+    if not re then error("awk: invalid regular expression (" .. tostring(err) .. "): " .. pat, 0) end
+    reCache[pat] = re
+    return re
+end
+
+local function reMatch(pat, s, from)
+    local re = compileRegex(pat)
+    local m = re:find(s, from or 1)
+    if not m then return nil end
+    return m
+end
+
+--- 字段与记录
+local function splitFields(record, fs, stripLeading)
+    local fields = {}
+    if fs == " " then
+        -- 缺省: 空白串分隔, 行首空白忽略
+        for f in record:gmatch("%S+") do fields[#fields + 1] = f end
+        return fields
+    end
+    if #fs == 0 then
+        -- FS="" : 每个字符一段(gawk 扩展, POSIX 未定义; 这里按字符拆)
+        for k = 1, #record do fields[#fields + 1] = record:sub(k, k) end
+        return fields
+    end
+    local sep = fs
+    if fs == "\t" then sep = "\t" end
+    if #fs > 1 then
+        -- 多字符 FS: 按 ERE 切(POSIX: 只有单字符 FS 是字面; 多字符按正则)
+        local re = compileRegex(fs)
+        local pos = 1
+        local all = re:findall(record)
+        for _, m in ipairs(all) do
+            if m.s > pos then
+                fields[#fields + 1] = record:sub(pos, m.s - 1)
+            elseif m.s == pos and m.e >= m.s then
+                fields[#fields + 1] = ""
+            end
+            pos = m.e + 1
+        end
+        fields[#fields + 1] = record:sub(pos)
+        if stripLeading then
+            while #fields > 0 and fields[1] == "" do table.remove(fields, 1) end
+        end
+        return fields
+    end
+    local pos = 1
+    while true do
+        local at = record:find(sep, pos, true)
+        if not at then
+            fields[#fields + 1] = record:sub(pos)
+            break
+        end
+        fields[#fields + 1] = record:sub(pos, at - 1)
+        pos = at + 1
+    end
+    return fields
+end
+
+local function rebuildRecord(fields, ofs)
+    local parts = {}
+    for k = 1, rt.NF do parts[k] = tostring(fields[k] or "") end
+    return table.concat(parts, ofs)
+end
+
+local function setRecord(rec)
+    rt.record = rec
+    local fields = splitFields(rec, rt.FS)
+    if rt.RS == "" then
+        -- 段落模式: 除 FS 之外换行也是分隔符(POSIX)
+        local merged = {}
+        for _, f in ipairs(fields) do
+            for part in f:gmatch("[^\n]+") do merged[#merged + 1] = part end
+        end
+        fields = merged
+    end
+    for k = 1, 40 do rt.fields[k] = nil end
+    for k, v in ipairs(fields) do rt.fields[k] = v end
+    rt.NF = #fields
+end
+
+local function getField(n)
+    if n == 0 then return rt.record end
+    if n < 0 then error("awk: attempt to access field " .. n, 0) end
+    local v = rt.fields[n]
+    if v == nil then return "" end
+    return v
+end
+
+local function setField(n, value)
+    if n == 0 then
+        setRecord(toStr(value, rt.CONVFMT))
+        return
+    end
+    if n < 0 then error("awk: attempt to assign to field " .. n, 0) end
+    local s = toStr(value, rt.CONVFMT)
+    if n > rt.NF then
+        for k = rt.NF + 1, n do rt.fields[k] = "" end
+        rt.NF = n
+    end
+    rt.fields[n] = s
+    rt.record = rebuildRecord(rt.fields, rt.OFS)
+end
+
+local function setNF(n)
+    n = math.floor(toNum(n))
+    if n < 0 then error("awk: NF set to a negative value", 0) end
+    for k = n + 1, 40 do rt.fields[k] = nil end
+    rt.NF = n
+    rt.record = rebuildRecord(rt.fields, rt.OFS)
+end
+
+--- 读一行(可指定 RS 的语义)。返回记录(不含 RS)或 nil(EOF)。
+local function nextRecordFromBuffer(state)
+    if state.pos > #state.text then return nil end
+    local rs = rt.RS
+    if rs == "\n" then
+        local at = state.text:find("\n", state.pos, true)
+        if not at then
+            local rec = state.text:sub(state.pos)
+            state.pos = #state.text + 1
+            return rec
+        end
+        local rec = state.text:sub(state.pos, at - 1)
+        state.pos = at + 1
+        return rec
+    elseif rs == "" then
+        -- 段落模式: 记录之间隔着**一个或多个空行**; 记录不会包含首尾的空行。
+        local text = state.text
+        -- 跳过前导空行
+        while true do
+            local nl = text:find("\n", state.pos, true)
+            if nl and text:sub(state.pos, nl - 1):match("^[ \t]*$") then
+                state.pos = nl + 1
+            else
+                break
+            end
+        end
+        if state.pos > #text then return nil end
+        local startPos = state.pos
+        local recEnd = #text
+        local i = state.pos
+        while true do
+            local nl = text:find("\n", i, true)
+            if not nl then break end
+            local nextNl = text:find("\n", nl + 1, true)
+            if nextNl then
+                if text:sub(nl + 1, nextNl - 1):match("^[ \t]*$") then
+                    recEnd = nl - 1
+                    state.pos = nextNl + 1
+                    break
+                end
+            else
+                -- 最后一个换行: 若它后面只剩空白, 记录到此为止
+                if text:sub(nl + 1):match("^[ \t]*$") then
+                    recEnd = nl - 1
+                else
+                    recEnd = #text
+                end
+                state.pos = #text + 1
+                break
+            end
+            i = nl + 1
+        end
+        if recEnd < startPos then recEnd = startPos - 1 end
+        return text:sub(startPos, recEnd)
+    else
+        -- 单字符: 字面切分; 多字符: 按 ERE(POSIX 未定义, gawk 扩展)
+        if #rs == 1 then
+            local at = state.text:find(rs, state.pos, true)
+            if not at then
+                local rec = state.text:sub(state.pos)
+                state.pos = #state.text + 1
+                return rec
+            end
+            local rec = state.text:sub(state.pos, at - 1)
+            state.pos = at + 1
+            return rec
+        end
+        local re = compileRegex(rs)
+        local m = re:find(state.text, state.pos)
+        if not m then
+            local rec = state.text:sub(state.pos)
+            state.pos = #state.text + 1
+            return rec
+        end
+        local rec = state.text:sub(state.pos, m.s - 1)
+        state.pos = m.e + 1
+        return rec
+    end
+end
+
+--- 解析 -v/命令行里的 var=value(转义与 -F 相同)
+local function decodeAssignValue(s)
+    return (s:gsub("\\(.)", function(c)
+        if c == "n" then return "\n" end
+        if c == "t" then return "\t" end
+        if c == "r" then return "\r" end
+        if c == "\\" then return "\\" end
+        if c == '"' then return '"' end
+        if c == "/" then return "/" end
+        if c:match("%d") then return c end
+        return c
+    end))
+end
+
+--- 主输入: 按 POSIX 的模型走 ARGV[1..ARGC-1](程序可以改 ARGV/ARGC 来增删输入)。
+--- 轮到某个 `var=value` 操作数时**当场**赋值(gawk/POSIX 的顺序语义)。
+local function mainInputOpen()
+    while true do
+        rt.inputIndex = rt.inputIndex + 1
+        if rt.inputIndex >= rt.ARGC then return nil end
+        -- 下标一律按字符串取(awk 的数组键都是字符串, "1" 与 1 在 Lua 表里是两个键)
+        local name = rt.ARGV[tostring(rt.inputIndex)]
+        if name == nil then name = "" end
+        name = tostring(name)
+        if name == "" then
+            -- 空串(GNU: 忽略; 程序 delete ARGV[i] 就是靠这个跳过)
+        elseif name:match("^[%w_]+=") then
+            local vname, val = name:match("^([%w_]+)=(.*)$")
+            rt.vars[vname] = decodeAssignValue(val)
+            if vname == "FS" then rt.FS = rt.vars[vname]
+            elseif vname == "OFS" then rt.OFS = rt.vars[vname]
+            elseif vname == "ORS" then rt.ORS = rt.vars[vname]
+            elseif vname == "RS" then rt.RS = rt.vars[vname]
+            elseif vname == "NF" then setNF(toNum(rt.vars[vname]))
+            elseif vname == "NR" then rt.NR = toNum(rt.vars[vname]) end
+        elseif name == "-" then
+            local text = rt.stdinReader and rt.stdinReader() or nil
+            return { name = "", text = text or "" }
+        else
+            local h, err = fs.open(resolve(name), "r")
+            if not h then
+                stderr("awk: can't open file " .. name .. " (" .. ioeMsg(err) .. ")\n")
+                rt.exitCode = 2
+            else
+                local text = h.readAll and h:readAll() or ""
+                h:close()
+                return { name = name, text = text }
+            end
+        end
+    end
+end
+
+--- 取下一整条主输入记录(处理 FILENAME/FNR/NR)。返回 false 表示没有更多输入。
+local function mainGetRecord()
+    while true do
+        if not rt.inputState then
+            -- 段落模式下 FS 也要把换行算作分隔符
+            local st = mainInputOpen()
+            if not st then return false end
+            rt.inputState = { name = st.name, text = st.text, pos = 1 }
+            rt.FILENAME = st.name
+            rt.FNR = 0
+        end
+        local before = rt.RS
+        if before == "" then rt.FS = rt.paragraphFS or rt.FS end
+        local rec = nextRecordFromBuffer(rt.inputState)
+        if rec == nil then
+            rt.inputState = nil
+        else
+            rt.NR = rt.NR + 1
+            rt.FNR = rt.FNR + 1
+            setRecord(rec)
+            return true
+        end
+        yieldCheck()
+    end
+end
+
+--- 从"流"里取一条记录: 缓冲不够就再读一行(管道用; 文件是一次读完的)
+local function streamRecord(state)
+    while true do
+        local rec = nextRecordFromBuffer(state)
+        if rec ~= nil then return rec end
+        if state.eof then return nil end
+        local line = state.h and state.h.readLine and state.h:readLine()
+        if line == nil then
+            state.eof = true
+            -- 缓冲区里可能还剩"最后一条不带分隔符的记录"
+            return nextRecordFromBuffer(state)
+        end
+        state.text = state.text .. line .. "\n"
+        yieldCheck()
+    end
+end
+
+--- 直接读输入流(绕过主输入): getline < file 与 cmd | getline
+local function readRecordFromState(state)
+    if #rt.RS == 0 then
+        -- 段落模式在 getline < file 里同样生效
+    end
+    return nextRecordFromBuffer(state)
+end
+
+-- 输出目标管理: stdout / 文件 / 管道
+local function openOutput(dest, kind)
+    if kind == "|" then
+        local key = "|" .. dest
+        if rt.pipes[key] then return rt.pipes[key] end
+        local r, w = syscalls["pipe.create"]()
+        -- 子进程必须拿一份**独立**的读端引用(ref): 管道的句柄对象在父子进程间是共享的,
+        -- 父进程随后 close 自己那份时, 共享对象会把子进程那份也标成已关(真机上 xargs 踩过)。
+        local childIn = r.ref and r:ref() or r
+        -- stdio 必须**两端都给**: 内核 spawn 拿到 opts.stdio 就整张表覆盖(不合并),
+        -- 少给一端会让子进程的那一端变成 nil(输出绕过当前 stdout)。
+        local pid, err = syscalls["proc.exec"]("sh", { "-c", dest },
+            { stdio = { input = childIn, output = io.stdout() } })
+        if not pid then error("awk: cannot open pipe '" .. dest .. "': " .. tostring(err), 0) end
+        -- 关掉父进程这份读端: 之后写端全关(close())时子进程就读到 EOF
+        r:close()
+        rt.pipes[key] = { w = w, pid = pid }
+        return rt.pipes[key]
+    end
+    local append = (kind == ">>")
+    local key = dest
+    if rt.files[key] then return rt.files[key] end
+    local h, err = fs.open(resolve(dest), append and "a" or "w")
+    if not h then error("awk: cannot open '" .. dest .. "' for writing: " .. ioeMsg(err), 0) end
+    rt.files[key] = { h = h, pid = nil, name = dest }
+    return rt.files[key]
+end
+
+local function writeOut(s)
+    io.write(s)
+end
+
+local function writeTo(redirect, destNode, s)
+    if not redirect then
+        writeOut(s)
+        return
+    end
+    local dest = toStr(rt.eval(destNode), rt.CONVFMT)
+    local target = openOutput(dest, redirect)
+    if target.h then
+        target.h:write(s)
+    else
+        local ok, err = target.w:write(s)
+        if not ok and err and tostring(err):find("broken pipe") then
+            error("awk: broken pipe on '" .. dest .. "'", 0)
+        end
+    end
+end
+
+local function closeTarget(name)
+    local ret = 0
+    if rt.files[name] then
+        local ok, err = rt.files[name].h:close()
+        rt.files[name] = nil
+        if ok == false then ret = -1 end
+        return ret
+    end
+    if rt.pipes["|" .. name] then
+        local p = rt.pipes["|" .. name]
+        if p.w.flush then p.w:flush() end
+        p.w:close()
+        rt.pipes["|" .. name] = nil
+        local rc = syscalls["proc.wait"](p.pid)
+        if rc and rc < 0 then return rc end
+        return rc or 0
+    end
+    if rt.readFiles[name] then
+        rt.readFiles[name].h:close()
+        rt.readFiles[name] = nil
+        return 0
+    end
+    if rt.readPipes[name] then
+        local p = rt.readPipes[name]
+        p.h:close()
+        rt.readPipes[name] = nil
+        local rc = syscalls["proc.wait"](p.pid)
+        if rc and rc < 0 then return rc end
+        return rc or 0
+    end
+    return -1 -- 没有这个流(awk 对未打开的流返回 -1)
+end
+
+-- ===============================================================
+-- 五、求值
+-- ===============================================================
+local execStmt
+
+--- 取出数组(全 Lua 表, 键为字符串)
+local function getArray(name)
+    if rt.arrays[name] then return rt.arrays[name] end
+    if rt.vars[name] ~= nil then error("awk: '" .. name .. "' is not an array", 0) end
+    rt.arrays[name] = {}
+    return rt.arrays[name]
+end
+
+local function arrayKey(indices)
+    local parts = {}
+    for k, v in ipairs(indices) do
+        parts[k] = toStr(rt.eval(v), rt.CONVFMT)
+    end
+    if #parts == 1 then return parts[1] end
+    return table.concat(parts, rt.SUBSEP)
+end
+
+--- 特殊变量的读: 真源是 rt.* (rt.vars 里那份只是给 for-in/ENVIRON 之类用的影子)
+local function readVar(name)
+    if name == "ARGC" then return rt.ARGC end
+    if name == "NF" then return rt.NF end
+    if name == "NR" then return rt.NR end
+    if name == "FNR" then return rt.FNR end
+    if name == "FS" then return rt.FS end
+    if name == "OFS" then return rt.OFS end
+    if name == "ORS" then return rt.ORS end
+    if name == "RS" then return rt.RS end
+    if name == "FILENAME" then return rt.FILENAME end
+    if name == "SUBSEP" then return rt.SUBSEP end
+    if name == "RSTART" then return rt.RSTART end
+    if name == "RLENGTH" then return rt.RLENGTH end
+    if name == "CONVFMT" then return rt.CONVFMT end
+    if name == "OFMT" then return rt.OFMT end
+    local v = rt.vars[name]
+    if v == nil then return "" end
+    return v
+end
+
+local function lvalueGet(node)
+    if node.k == "var" then
+        return readVar(node.name)
+    end
+    if node.k == "field" then
+        return getField(math.floor(toNum(rt.eval(node.e))))
+    end
+    if node.k == "array" then
+        local arr = getArray(node.name)
+        local key
+        if node.indices then key = arrayKey(node.indices) else key = toStr(rt.eval(node.idx), rt.CONVFMT) end
+        local v = arr[key]
+        if v == nil then return "" end
+        return v
+    end
+    error("awk: not an lvalue", 0)
+end
+
+local function lvalueSet(node, value)
+    if node.k == "var" then
+        local name = node.name
+        if name == "NF" then setNF(value); return end
+        if name == "ARGC" then rt.ARGC = math.floor(toNum(value)); return end
+        rt.vars[name] = value
+        -- 特殊变量同步
+        if name == "FS" then rt.FS = toStr(value, rt.CONVFMT)
+        elseif name == "OFS" then rt.OFS = toStr(value, rt.CONVFMT)
+        elseif name == "ORS" then rt.ORS = toStr(value, rt.CONVFMT)
+        elseif name == "RS" then rt.RS = toStr(value, rt.CONVFMT)
+        elseif name == "NR" then rt.NR = toNum(value)
+        elseif name == "FNR" then rt.FNR = toNum(value)
+        elseif name == "SUBSEP" then rt.SUBSEP = toStr(value, rt.CONVFMT)
+        elseif name == "RSTART" then rt.RSTART = toNum(value)
+        elseif name == "RLENGTH" then rt.RLENGTH = toNum(value)
+        elseif name == "CONVFMT" then rt.CONVFMT = toStr(value, rt.CONVFMT)
+        elseif name == "OFMT" then rt.OFMT = toStr(value, rt.CONVFMT)
+        end
+        return
+    end
+    if node.k == "field" then
+        setField(math.floor(toNum(rt.eval(node.e))), value)
+        return
+    end
+    if node.k == "array" then
+        local arr = getArray(node.name)
+        local key
+        if node.indices then key = arrayKey(node.indices) else key = toStr(rt.eval(node.idx), rt.CONVFMT) end
+        arr[key] = value
+        return
+    end
+    error("awk: not an lvalue", 0)
+end
+
+--- printf/sprintf 的实现
+local function formatValue(fmt, args, argIdx)
+    local out = {}
+    local i = 1
+    while i <= #fmt do
+        local c = fmt:sub(i, i)
+        if c ~= "%" then
+            out[#out + 1] = c
+            i = i + 1
+        else
+            local j = i + 1
+            local spec = "%"
+            -- 标志
+            while fmt:sub(j, j):match("[%-%+ #0]") do spec = spec .. fmt:sub(j, j); j = j + 1 end
+            -- 宽度(可为 *)
+            if fmt:sub(j, j) == "*" then
+                argIdx = argIdx + 1
+                spec = spec .. tostring(math.floor(toNum(args[argIdx])))
+                j = j + 1
+            else
+                while fmt:sub(j, j):match("%d") do spec = spec .. fmt:sub(j, j); j = j + 1 end
+            end
+            -- 精度
+            if fmt:sub(j, j) == "." then
+                spec = spec .. "."
+                j = j + 1
+                if fmt:sub(j, j) == "*" then
+                    argIdx = argIdx + 1
+                    spec = spec .. tostring(math.floor(toNum(args[argIdx])))
+                    j = j + 1
+                else
+                    while fmt:sub(j, j):match("%d") do spec = spec .. fmt:sub(j, j); j = j + 1 end
+                end
+            end
+            local conv = fmt:sub(j, j)
+            j = j + 1
+            if conv == "%" then
+                out[#out + 1] = "%"
+            elseif conv == "" then
+                out[#out + 1] = "%"
+            else
+                argIdx = argIdx + 1
+                local a = args[argIdx]
+                if conv == "s" then
+                    out[#out + 1] = string.format(spec .. "s", toStr(a, rt.CONVFMT))
+                elseif conv == "c" then
+                    local s
+                    if type(a) == "number" then s = string.char(math.floor(a) % 256)
+                    else s = tostring(a):sub(1, 1) end
+                    out[#out + 1] = string.format(spec .. "s", s)
+                elseif conv == "d" or conv == "i" then
+                    out[#out + 1] = string.format(spec .. "d", math.floor(toNum(a)))
+                elseif conv == "u" then
+                    local v = math.floor(toNum(a))
+                    if v < 0 then v = v + 2 ^ 32 end
+                    out[#out + 1] = string.format(spec .. "d", v)
+                elseif conv == "o" then
+                    out[#out + 1] = string.format(spec .. "o", math.floor(toNum(a)))
+                elseif conv == "x" or conv == "X" then
+                    out[#out + 1] = string.format(spec .. conv, math.floor(toNum(a)))
+                elseif conv == "e" or conv == "E" or conv == "f" or conv == "g" or conv == "G" then
+                    out[#out + 1] = string.format(spec .. conv, toNum(a))
+                else
+                    error("awk: unknown printf conversion '%" .. conv .. "'", 0)
+                end
+            end
+            i = j
+        end
+    end
+    return table.concat(out), argIdx
+end
+
+--- sub/gsub: 替换时 & 表示匹配串, \& 表示字面 &
+local function buildReplacement(repl, matched)
+    local out = {}
+    local i = 1
+    while i <= #repl do
+        local c = repl:sub(i, i)
+        if c == "\\" and repl:sub(i + 1, i + 1) == "&" then
+            out[#out + 1] = "&"
+            i = i + 2
+        elseif c == "\\" and repl:sub(i + 1, i + 1) == "\\" then
+            out[#out + 1] = "\\"
+            i = i + 2
+        elseif c == "&" then
+            out[#out + 1] = matched
+            i = i + 1
+        else
+            out[#out + 1] = c
+            i = i + 1
+        end
+    end
+    return table.concat(out)
+end
+
+--- 把 awk 的替换语义套在 ERE 引擎上(引擎的 sub 用 \1 风格, 这里自己按匹配位置拼)。
+local function substitute(re, text, repl, globalScope)
+    local out = {}
+    local pos = 1
+    local count = 0
+    while pos <= #text + 1 do
+        local m = re:find(text, pos)
+        if not m then break end
+        if m.e < m.s then -- 空匹配: 防原地打转
+            if m.s > #text then break end
+            out[#out + 1] = text:sub(pos, m.s)
+            pos = m.s + 1
+        else
+            out[#out + 1] = text:sub(pos, m.s - 1)
+            out[#out + 1] = buildReplacement(repl, text:sub(m.s, m.e))
+            pos = m.e + 1
+        end
+        count = count + 1
+        if not globalScope then break end
+    end
+    if pos <= #text then out[#out + 1] = text:sub(pos) end
+    return table.concat(out), count
+end
+
+local BUILTIN_IMPL
+local regexOf
+
+--- 用户函数调用(POSIX: 标量按值、数组按引用; 多余的参数是局部变量)
+local function callFunction(name, argNodes)
+    local f = rt.funcs[name]
+    if not f then
+        if BUILTIN_IMPL[name] then return BUILTIN_IMPL[name](argNodes) end
+        error("awk: function '" .. name .. "' is not defined", 0)
+    end
+    local savedVars, savedArrays = rt.vars, rt.arrays
+    local newVars, newArrays = {}, {}
+    -- 参数
+    for idx, pname in ipairs(f.params) do
+        local node = argNodes[idx]
+        if node == nil then
+            newVars[pname] = ""
+        elseif node.k == "var" and rt.arrays[node.name] then
+            newArrays[pname] = rt.arrays[node.name] -- 数组按引用
+        elseif node.k == "var" and rt.vars[node.name] == nil and not rt.arrays[node.name] then
+            newVars[pname] = ""
+        else
+            newVars[pname] = rt.eval(node)
+        end
+    end
+    rt.vars, rt.arrays = newVars, newArrays
+    local savedRet = rt.retval
+    rt.retval = ""
+    local ok, err = pcall(function()
+        local ctl = execStmt(f.body)
+        if ctl == NEXTREC or ctl == NEXTFILE then error(ctl, 0) end
+    end)
+    local result = rt.retval
+    rt.retval = savedRet
+    rt.vars, rt.arrays = savedVars, savedArrays
+    if not ok and err ~= "__awk_return__" then
+        error(err, 0)
+    end
+    return result
+end
+
+--- 主输入 getline
+local function doGetline(target)
+    local had = mainGetRecord()
+    if not had then return 0 end
+    if target then
+        lvalueSet(target, rt.record)
+        -- 赋值给变量时 NF/NR 之外的特殊变量照旧更新
+        if target.k == "var" and target.name == "NF" then setNF(rt.record) end
+        return 1
+    end
+    return 1
+end
+
+BUILTIN_IMPL = {
+    length = function(a)
+        if #a == 0 then return #rt.record end
+        if a[1].k == "var" and rt.arrays[a[1].name] then
+            local n = 0
+            for _ in pairs(rt.arrays[a[1].name]) do n = n + 1 end
+            return n
+        end
+        return #toStr(rt.eval(a[1]), rt.CONVFMT)
+    end,
+    substr = function(a)
+        local s = toStr(rt.eval(a[1]), rt.CONVFMT)
+        local start = math.floor(toNum(rt.eval(a[2])))
+        if start < 1 then start = 1 end
+        if start > #s then return "" end
+        if a[3] == nil then return s:sub(start) end
+        local len = toNum(rt.eval(a[3]))
+        if len <= 0 then return "" end
+        return s:sub(start, start + math.floor(len) - 1)
+    end,
+    index = function(a)
+        local s = toStr(rt.eval(a[1]), rt.CONVFMT)
+        local t = toStr(rt.eval(a[2]), rt.CONVFMT)
+        if t == "" then return 1 end
+        local at = s:find(t, 1, true)
+        return at or 0
+    end,
+    split = function(a)
+        local s = toStr(rt.eval(a[1]), rt.CONVFMT)
+        local arrName = a[2].name
+        if not arrName then error("awk: split() needs an array as its second argument", 0) end
+        local sep
+        if a[3] then
+            local sv = rt.eval(a[3])
+            sep = toStr(sv, rt.CONVFMT)
+            if type(sv) == "number" or #sep == 0 then
+                -- 数值/空: 按单字符处理(awk: 单个字符的字符串就是分隔符)
+            end
+        else
+            sep = rt.FS
+        end
+        local arr = {}
+        rt.arrays[arrName] = arr
+        local fields = splitFields(s, sep)
+        for i, v in ipairs(fields) do arr[tostring(i)] = v end
+        return #fields
+    end,
+    sub = function(a)
+        local pat = regexOf(a[1])
+        local repl = toStr(rt.eval(a[2]), rt.CONVFMT)
+        local target = a[3]
+        local text
+        if target then text = toStr(rt.eval(target), rt.CONVFMT) else text = rt.record end
+        local newText, n = substitute(compileRegex(pat), text, repl, false)
+        if n > 0 then
+            if target then lvalueSet(target, newText) else setRecord(newText) end
+        end
+        return n
+    end,
+    gsub = function(a)
+        local pat = regexOf(a[1])
+        local repl = toStr(rt.eval(a[2]), rt.CONVFMT)
+        local target = a[3]
+        local text
+        if target then text = toStr(rt.eval(target), rt.CONVFMT) else text = rt.record end
+        local newText, n = substitute(compileRegex(pat), text, repl, true)
+        if n > 0 then
+            if target then lvalueSet(target, newText) else setRecord(newText) end
+        end
+        return n
+    end,
+    match = function(a)
+        local s = toStr(rt.eval(a[1]), rt.CONVFMT)
+        local pat = regexOf(a[2])
+        local m = reMatch(pat, s)
+        if not m then
+            rt.RSTART = 0
+            rt.RLENGTH = -1
+            rt.vars.RSTART = 0
+            rt.vars.RLENGTH = -1
+            return 0
+        end
+        rt.RSTART = m.s
+        rt.RLENGTH = m.e - m.s + 1
+        rt.vars.RSTART = m.s
+        rt.vars.RLENGTH = rt.RLENGTH
+        return m.s
+    end,
+    sprintf = function(a)
+        local fmt = toStr(rt.eval(a[1]), rt.CONVFMT)
+        local vals = {}
+        for i = 2, #a do vals[#vals + 1] = rt.eval(a[i]) end
+        local out = formatValue(fmt, vals, 0)
+        return out
+    end,
+    sin = function(a) return math.sin(toNum(rt.eval(a[1]))) end,
+    cos = function(a) return math.cos(toNum(rt.eval(a[1]))) end,
+    atan2 = function(a) return math.atan2(toNum(rt.eval(a[1])), toNum(rt.eval(a[2]))) end,
+    exp = function(a) return math.exp(toNum(rt.eval(a[1]))) end,
+    log = function(a) return math.log(toNum(rt.eval(a[1]))) end,
+    sqrt = function(a) return math.sqrt(toNum(rt.eval(a[1]))) end,
+    int = function(a)
+        local v = toNum(rt.eval(a[1]))
+        return v >= 0 and math.floor(v) or -math.floor(-v)
+    end,
+    rand = function() return rt.random() end,
+    srand = function(a)
+        local old = rt.seed
+        if a[1] then
+            rt.seed = math.floor(toNum(rt.eval(a[1])))
+        else
+            rt.seed = os.time() or 1
+        end
+        rt.random = makeRandom(rt.seed)
+        return old
+    end,
+    tolower = function(a)
+        local s = toStr(rt.eval(a[1]), rt.CONVFMT)
+        return (s:gsub("%u", function(c) return c:lower() end))
+    end,
+    toupper = function(a)
+        local s = toStr(rt.eval(a[1]), rt.CONVFMT)
+        return (s:gsub("%l", function(c) return c:upper() end))
+    end,
+    system = function(a)
+        local cmd = toStr(rt.eval(a[1]), rt.CONVFMT)
+        -- 先把所有缓冲的输出刷出去, 免得子进程的输出与 awk 的输出交错错位
+        io.flush()
+        -- POSIX: system() 与管道里的都是一条**命令语言**(可以带重定向/分号), 交给 sh -c
+        local pid, err = syscalls["proc.exec"]("sh", { "-c", cmd }, {})
+        if not pid then
+            stderr("awk: cannot run '" .. cmd .. "': " .. tostring(err) .. "\n")
+            return 127
+        end
+        local rc = syscalls["proc.wait"](pid)
+        if rc and rc < 0 then return -1 end
+        return rc or 0
+    end,
+    ["close"] = function(a)
+        local name = toStr(rt.eval(a[1]), rt.CONVFMT)
+        return closeTarget(name)
+    end,
+    fflush = function(a)
+        if #a == 0 then
+            io.flush()
+            return 0
+        end
+        local name = toStr(rt.eval(a[1]), rt.CONVFMT)
+        if name == "" then io.flush(); return 0 end
+        if rt.files[name] and rt.files[name].h.flush then rt.files[name].h:flush() end
+        if rt.pipes["|" .. name] and rt.pipes["|" .. name].w.flush then rt.pipes["|" .. name].w:flush() end
+        return 0
+    end,
+}
+
+--- /re/ 字面量或字符串都可能是正则
+regexOf = function(node)
+    if node.k == "regex" then return node.v end
+    local v = rt.eval(node)
+    return toStr(v, rt.CONVFMT)
+end
+
+local function makeRandom(seed)
+    local s = seed % 2147483647
+    if s <= 0 then s = s + 2147483646 end
+    return function()
+        s = (s * 16807) % 2147483647
+        return (s - 1) / 2147483646
+    end
+end
+
+--- 表达式求值
+local function evalExpr(node)
+    local k = node.k
+    if k == "num" or k == "str" then return node.v end
+    if k == "regex" then
+        -- 正则字面量在布尔上下文里 = "是否匹配当前记录"
+        local m = reMatch(node.v, rt.record)
+        return m and 1 or 0
+    end
+    if k == "var" then return readVar(node.name) end
+    if k == "field" then return getField(math.floor(toNum(evalExpr(node.e)))) end
+    if k == "array" then return lvalueGet(node) end
+    if k == "assign" then
+        local rhs = evalExpr(node.r)
+        if node.op ~= "=" then
+            local cur = lvalueGet(node.l)
+            local a, b = cur, rhs
+            if node.op == "+=" then rhs = toNum(a) + toNum(b)
+            elseif node.op == "-=" then rhs = toNum(a) - toNum(b)
+            elseif node.op == "*=" then rhs = toNum(a) * toNum(b)
+            elseif node.op == "/=" then rhs = toNum(a) / toNum(b)
+            elseif node.op == "%=" then
+                local x, y = toNum(a), toNum(b)
+                if y == 0 then error("awk: division by zero in %=", 0) end
+                local q = (x < 0) ~= (y < 0) and math.ceil(x / y) or math.floor(x / y)
+                rhs = x - q * y
+            elseif node.op == "^=" then rhs = toNum(a) ^ toNum(b) end
+        end
+        lvalueSet(node.l, rhs)
+        return rhs
+    end
+    if k == "preinc" or k == "postinc" then
+        local cur = toNum(lvalueGet(node.e))
+        local nv = (node.op == "++") and cur + 1 or cur - 1
+        lvalueSet(node.e, nv)
+        return (k == "preinc") and nv or cur
+    end
+    if k == "unary" then
+        if node.op == "-" then return -toNum(evalExpr(node.e)) end
+        if node.op == "+" then return toNum(evalExpr(node.e)) end
+        return truthy(evalExpr(node.e)) and 0 or 1
+    end
+    if k == "concat" then
+        local l, r = evalExpr(node.l), evalExpr(node.r)
+        return toStr(l, rt.CONVFMT) .. toStr(r, rt.CONVFMT)
+    end
+    if k == "and" then
+        if not truthy(evalExpr(node.l)) then return 0 end
+        return truthy(evalExpr(node.r)) and 1 or 0
+    end
+    if k == "or" then
+        if truthy(evalExpr(node.l)) then return 1 end
+        return truthy(evalExpr(node.r)) and 1 or 0
+    end
+    if k == "ternary" then
+        if truthy(evalExpr(node.c)) then return evalExpr(node.a) end
+        return evalExpr(node.b)
+    end
+    if k == "in" then
+        local arr = getArray(node.arr)
+        local key
+        if node.l.k == "list" then
+            local parts = {}
+            for i, sub in ipairs(node.l.items) do parts[i] = toStr(evalExpr(sub), rt.CONVFMT) end
+            key = table.concat(parts, rt.SUBSEP)
+        else
+            key = toStr(evalExpr(node.l), rt.CONVFMT)
+        end
+        return arr[key] ~= nil and 1 or 0
+    end
+    if k == "list" then
+        local parts = {}
+        for i, sub in ipairs(node.items) do parts[i] = toStr(evalExpr(sub), rt.CONVFMT) end
+        return table.concat(parts, rt.SUBSEP)
+    end
+    if k == "bin" then
+        local op = node.op
+        local a, b = evalExpr(node.l), evalExpr(node.r)
+        if op == "+" then return toNum(a) + toNum(b) end
+        if op == "-" then return toNum(a) - toNum(b) end
+        if op == "*" then return toNum(a) * toNum(b) end
+        if op == "/" then
+            if toNum(b) == 0 then error("awk: division by zero", 0) end
+            return toNum(a) / toNum(b)
+        end
+        if op == "%" then
+            local x, y = toNum(a), toNum(b)
+            if y == 0 then error("awk: division by zero in %", 0) end
+            -- C/awk 的 % 是"截断除法"的余数(-5 % 2 = -1), 不是 Lua 的取模
+            local q = (x < 0) ~= (y < 0) and math.ceil(x / y) or math.floor(x / y)
+            return x - q * y
+        end
+        if op == "^" then return toNum(a) ^ toNum(b) end
+        if op == "~" or op == "!~" then
+            local pat = toStr(b, rt.CONVFMT)
+            local m = reMatch(pat, toStr(a, rt.CONVFMT))
+            local res = m and 1 or 0
+            return (op == "~") and res or (1 - res)
+        end
+        local c = compareValues(a, b)
+        if op == "<" then return c < 0 and 1 or 0 end
+        if op == "<=" then return c <= 0 and 1 or 0 end
+        if op == ">" then return c > 0 and 1 or 0 end
+        if op == ">=" then return c >= 0 and 1 or 0 end
+        if op == "==" then return c == 0 and 1 or 0 end
+        if op == "!=" then return c ~= 0 and 1 or 0 end
+    end
+    if k == "pipegetline" then
+        local cmd = toStr(evalExpr(node.cmd), rt.CONVFMT)
+        local state = rt.readPipes[cmd]
+        if not state then
+            io.flush()
+            local r, w = syscalls["pipe.create"]()
+            local childOut = w.ref and w:ref() or w
+            local pid, err = syscalls["proc.exec"]("sh", { "-c", cmd },
+                { stdio = { output = childOut, input = io.stdin() } })
+            if not pid then
+                error("awk: cannot open pipe '" .. cmd .. "': " .. tostring(err), 0)
+            end
+            w:close() -- 父进程不再持有写端: 子进程退出后读端才能见 EOF
+            state = { h = r, text = "", pos = 1, eof = false, pid = pid }
+            rt.readPipes[cmd] = state
+        end
+        local rec = streamRecord(state)
+        if rec == nil then return 0 end
+        if node.target then lvalueSet(node.target, rec) else setRecord(rec) end
+        return 1
+    end
+    if k == "call" then return callFunction(node.name, node.args) end
+    if k == "getline" then
+        if node.file then
+            -- getline [var] < file
+            local fname = toStr(evalExpr(node.file), rt.CONVFMT)
+            local state = rt.readFiles[fname]
+            if not state then
+                local h, err = fs.open(resolve(fname), "r")
+                if not h then
+                    stderr("awk: cannot open " .. fname .. " for reading (" .. ioeMsg(err) .. ")\n")
+                    return -1
+                end
+                local text = h.readAll and h:readAll() or ""
+                state = { h = h, text = text, pos = 1 }
+                rt.readFiles[fname] = state
+            end
+            local rec = readRecordFromState(state)
+            if rec == nil then return 0 end
+            if node.target then lvalueSet(node.target, rec) else setRecord(rec) end
+            return 1
+        end
+        return doGetline(node.target)
+    end
+    error("awk: cannot evaluate node " .. tostring(k), 0)
+end
+
+rt = {
+    vars = {}, arrays = {}, funcs = {},
+    record = "", fields = {}, NF = 0,
+    FS = " ", OFS = " ", ORS = "\n", RS = "\n", SUBSEP = "\034",
+    NR = 0, FNR = 0, FILENAME = "",
+    RSTART = 0, RLENGTH = -1,
+    CONVFMT = "%.6g", OFMT = "%.6g",
+    files = {}, pipes = {}, readFiles = {}, readPipes = {},
+    inputFiles = {}, inputIndex = 0, inputState = nil, ARGV = {}, ARGC = 1,
+    exitCode = 0,
+    random = makeRandom(1), seed = 1,
+    retval = "",
+}
+rt.eval = evalExpr
+
+--- 语句执行
+execStmt = function(st)
+    local k = st.k
+    if k == "block" then
+        for _, s in ipairs(st.stmts) do
+            local ctl = execStmt(s)
+            if ctl then return ctl end
+        end
+        return nil
+    elseif k == "exprstmt" then
+        evalExpr(st.e)
+        return nil
+    elseif k == "print" then
+        local parts = {}
+        local vals = {}
+        if #st.items == 0 then vals[1] = rt.record end
+        for _, item in ipairs(st.items) do vals[#vals + 1] = evalExpr(item) end
+        for i, v in ipairs(vals) do
+            if type(v) == "number" then parts[i] = numToStr(v, rt.OFMT) else parts[i] = tostring(v) end
+        end
+        writeTo(st.redirect, st.dest, table.concat(parts, rt.OFS) .. rt.ORS)
+        return nil
+    elseif k == "printf" then
+        local fmt = toStr(evalExpr(st.items[1]), rt.CONVFMT)
+        local vals = {}
+        for i = 2, #st.items do vals[#vals + 1] = evalExpr(st.items[i]) end
+        local s = formatValue(fmt, vals, 0)
+        writeTo(st.redirect, st.dest, s)
+        return nil
+    elseif k == "if" then
+        if truthy(evalExpr(st.cond)) then return execStmt(st.thenS) end
+        if st.elseS then return execStmt(st.elseS) end
+        return nil
+    elseif k == "while" then
+        while truthy(evalExpr(st.cond)) do
+            local ctl = execStmt(st.body)
+            if ctl == "break" then break end
+            if ctl and ctl ~= "continue" then return ctl end
+            yieldCheck()
+        end
+        return nil
+    elseif k == "dowhile" then
+        repeat
+            local ctl = execStmt(st.body)
+            if ctl == "break" then break end
+            if ctl and ctl ~= "continue" then return ctl end
+        until not truthy(evalExpr(st.cond))
+        return nil
+    elseif k == "for" then
+        if st.init then evalExpr(st.init) end
+        while true do
+            if st.cond and not truthy(evalExpr(st.cond)) then break end
+            local ctl = execStmt(st.body)
+            if ctl == "break" then break end
+            if ctl and ctl ~= "continue" then return ctl end
+            if st.incr then evalExpr(st.incr) end
+            yieldCheck()
+        end
+        return nil
+    elseif k == "forin" then
+        local arr = getArray(st.arr)
+        local keys = {}
+        for key in pairs(arr) do keys[#keys + 1] = key end
+        for _, key in ipairs(keys) do
+            lvalueSet({ k = "var", name = st.var }, key)
+            local ctl = execStmt(st.body)
+            if ctl == "break" then break end
+            if ctl and ctl ~= "continue" then return ctl end
+        end
+        return nil
+    elseif k == "break" then
+        return "break"
+    elseif k == "continue" then
+        return "continue"
+    elseif k == "next" then
+        return NEXTREC
+    elseif k == "nextfile" then
+        return NEXTFILE
+    elseif k == "exit" then
+        if st.e then rt.exitCode = math.floor(toNum(evalExpr(st.e))) end
+        error("__awk_exit__", 0)
+    elseif k == "return" then
+        rt.retval = st.e and evalExpr(st.e) or ""
+        error("__awk_return__", 0)
+    elseif k == "delete" then
+        local arr = rt.arrays[st.arr]
+        if st.indices then
+            if arr then
+                local key = arrayKey(st.indices)
+                arr[key] = nil
+            end
+        else
+            rt.arrays[st.arr] = {} -- delete a: 清空整个数组
+        end
+        return nil
+    end
+    error("awk: cannot execute statement " .. tostring(k), 0)
+end
+
+-- ===============================================================
+-- 六、驱动
+-- ===============================================================
+local function readAll(h)
+    if h.readAll then return h:readAll() end
+    local parts = {}
+    while true do
+        local chunk = h.read and h:read(4096)
+        if not chunk or chunk == "" then break end
+        parts[#parts + 1] = chunk
+    end
+    return table.concat(parts)
+end
+
+local programParts = {}
+local fsOption = nil
+local assignments = {}
+local inputFiles = {}
+local noMoreOpts = false
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if noMoreOpts then
+        if #programParts == 0 then
+            programParts[#programParts + 1] = { text = a }
+        else
+            -- 命令行的 NAME=VALUE 是**输入流上的操作数**(POSIX: 轮到它时才赋值),
+            -- 所以它进 ARGV, 由 mainInputOpen 在轮到它时应用 —— 不能在这里直接赋值。
+            inputFiles[#inputFiles + 1] = a
+        end
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "-F" then
+        i = i + 1
+        if not args[i] then stderr("awk: option requires an argument -- 'F'\n"); return 2 end
+        fsOption = args[i]
+    elseif a:match("^%-F.") then
+        fsOption = a:sub(3)
+    elseif a == "-v" then
+        i = i + 1
+        if not args[i] then stderr("awk: option requires an argument -- 'v'\n"); return 2 end
+        local name, val = args[i]:match("^([%w_]+)=(.*)$")
+        if not name then stderr("awk: invalid -v argument: " .. args[i] .. "\n"); return 2 end
+        assignments[#assignments + 1] = { name = name, value = decodeAssignValue(val) }
+    elseif a:match("^%-v.") then
+        local name, val = a:sub(3):match("^([%w_]+)=(.*)$")
+        if not name then stderr("awk: invalid -v argument: " .. a:sub(3) .. "\n"); return 2 end
+        assignments[#assignments + 1] = { name = name, value = decodeAssignValue(val) }
+    elseif a == "-f" then
+        i = i + 1
+        if not args[i] then stderr("awk: option requires an argument -- 'f'\n"); return 2 end
+        programParts[#programParts + 1] = { file = args[i] }
+    elseif a:match("^%-f.") then
+        programParts[#programParts + 1] = { file = a:sub(3) }
+    elseif a == "-" then
+        if #programParts == 0 then
+            programParts[#programParts + 1] = { text = readAll(io.stdin()) or "" }
+        else
+            inputFiles[#inputFiles + 1] = a
+        end
+    elseif a:sub(1, 1) == "-" and #a > 1 and #programParts > 0 then
+        stderr("awk: unrecognized option '" .. a .. "'\n")
+        return 2
+    else
+        if #programParts == 0 then
+            programParts[#programParts + 1] = { text = a }
+        else
+            -- 命令行上的 var=value 是输入文件之前的赋值
+            -- 命令行的 NAME=VALUE 是**输入流上的操作数**(POSIX: 轮到它时才赋值),
+            -- 所以它进 ARGV, 由 mainInputOpen 在轮到它时应用 —— 不能在这里直接赋值。
+            inputFiles[#inputFiles + 1] = a
+        end
+    end
+    i = i + 1
+end
+
+if #programParts == 0 then
+    stderr("awk: no program text given (usage: awk [-F fs] [-v var=value] 'program' [file ...])\n")
+    return 2
+end
+
+local source = {}
+for _, part in ipairs(programParts) do
+    if part.file then
+        local h, err = fs.open(resolve(part.file), "r")
+        if not h then
+            stderr("awk: can't open file " .. part.file .. " (" .. ioeMsg(err) .. ")\n")
+            return 2
+        end
+        source[#source + 1] = readAll(h)
+        h:close()
+    else
+        source[#source + 1] = part.text
+    end
+end
+local programText = table.concat(source, "\n")
+
+local toks, lexErr = lex(programText)
+if not toks then
+    stderr("awk: " .. tostring(lexErr) .. "\n")
+    return 2
+end
+local parser = newParser(toks)
+local program
+local ok, perr = pcall(parseProgram, parser)
+if not ok then
+    stderr("awk: " .. tostring(perr) .. "\n")
+    return 2
+end
+program = perr
+
+rt.funcs = {}
+for _, item in ipairs(program) do
+    if item.k == "func" then
+        if BUILTINS[item.name] then
+            stderr("awk: cannot redefine built-in function '" .. item.name .. "'\n")
+            return 2
+        end
+        rt.funcs[item.name] = item
+    end
+end
+
+reCache = {}
+-- POSIX 的输入模型: ARGV[1..ARGC-1] 逐个来。只有 var=value 而没有文件操作数时,
+-- 仍然要读 stdin(与 mawk/gawk 一致: 赋值项不是文件)。
+do
+    local haveFile = false
+    for _, name in ipairs(inputFiles) do
+        if not name:match("^[%w_]+=") then haveFile = true end
+    end
+    if not haveFile then inputFiles[#inputFiles + 1] = "-" end
+end
+rt.ARGV = {}
+for idx, name in ipairs(inputFiles) do rt.ARGV[tostring(idx)] = name end
+rt.ARGC = #inputFiles + 1
+rt.arrays.ARGV = rt.ARGV
+rt.stdinReader = function() return readAll(io.stdin()) end
+
+-- -v 赋值(进入 BEGIN 之前)
+if fsOption then
+    rt.FS = decodeAssignValue(fsOption)
+    rt.vars.FS = rt.FS
+end
+for _, asg in ipairs(assignments) do
+    if true then
+        rt.vars[asg.name] = asg.value
+        if asg.name == "FS" then rt.FS = asg.value end
+        if asg.name == "OFS" then rt.OFS = asg.value end
+        if asg.name == "ORS" then rt.ORS = asg.value end
+        if asg.name == "RS" then rt.RS = asg.value end
+        if asg.name == "SUBSEP" then rt.SUBSEP = asg.value end
+        if asg.name == "CONVFMT" then rt.CONVFMT = asg.value end
+        if asg.name == "OFMT" then rt.OFMT = asg.value end
+        if asg.name == "NR" then rt.NR = toNum(asg.value) end
+        if asg.name == "NF" then setNF(toNum(asg.value)) end
+    end
+end
+-- ENVIRON
+local environ = {}
+for k, v in pairs(env or {}) do environ[k] = tostring(v) end
+rt.arrays.ENVIRON = environ
+
+--- 一条规则是否匹配当前记录(range 模式要记状态)
+local function ruleMatches(item)
+    if item.pattern == nil then return true end
+    if item.pattern2 then
+        rt.rangeActive = rt.rangeActive or {}
+        if rt.rangeActive[item] then
+            if truthy(evalExpr(item.pattern2)) then rt.rangeActive[item] = nil end
+            return true
+        end
+        if truthy(evalExpr(item.pattern)) then
+            rt.rangeActive[item] = true
+            return true
+        end
+        return false
+    end
+    return truthy(evalExpr(item.pattern))
+end
+
+--- 执行一条动作; 把 next/nextfile/exit/return 归一成控制值返回。
+--- 用户函数里的 next 是用 error() 抛出来的(表达式求值没法返回控制值), 这里接住。
+local function runAction(action)
+    local ok, ctl = pcall(execStmt, action)
+    if ok then return ctl end
+    if ctl == NEXTREC or ctl == NEXTFILE then return ctl end
+    error(ctl, 0)
+end
+
+local EXIT = setmetatable({}, { __tostring = function() return "exit" end })
+
+local function runProgram()
+    local beginItems, mainItems, endItems = {}, {}, {}
+    for _, item in ipairs(program) do
+        if item.k == "begin" then beginItems[#beginItems + 1] = item
+        elseif item.k == "end" then endItems[#endItems + 1] = item
+        elseif item.k == "rule" then mainItems[#mainItems + 1] = item end
+    end
+
+    local exited = false
+    local function phase(fn)
+        local ok, err = pcall(fn)
+        if ok then return true end
+        if err == "__awk_exit__" then exited = true; return false end
+        error(err, 0)
+    end
+
+    -- BEGIN
+    phase(function()
+        for _, item in ipairs(beginItems) do execStmt(item.body) end
+    end)
+
+    -- 主输入: 只有 "程序里只有 BEGIN" 才不读输入(POSIX), 只有 END 也要读完
+    if not exited and (#mainItems > 0 or #endItems > 0) then
+        while true do
+            local ok, got = pcall(mainGetRecord)
+            if not ok then
+                if got == "__awk_exit__" then exited = true; break end
+                error(got, 0)
+            end
+            if not got then break end
+            for _, item in ipairs(mainItems) do
+                if ruleMatches(item) then
+                    if item.action then
+                        local ctl = runAction(item.action)
+                        if ctl == NEXTREC then break end
+                        if ctl == NEXTFILE then rt.inputState = nil; break end
+                    else
+                        writeOut(rt.record .. rt.ORS)
+                    end
+                end
+            end
+            yieldCheck()
+        end
+    end
+
+    -- END(exit 也要跑)
+    phase(function()
+        for _, item in ipairs(endItems) do execStmt(item.body) end
+    end)
+end
+
+local okRun, runErr = pcall(runProgram)
+-- 关掉所有流(awk 退出时自动 close)。注意管道的键是 "|" .. 命令, 要剥掉前缀再交给 closeTarget。
+for name in pairs(rt.files) do closeTarget(name) end
+for key in pairs(rt.pipes) do closeTarget(key:sub(2)) end
+for name in pairs(rt.readFiles) do closeTarget(name) end
+
+if not okRun then
+    if runErr == "__awk_exit__" then
+        return rt.exitCode
+    end
+    if tostring(runErr):find("^awk:") then
+        stderr(tostring(runErr) .. "\n")
+    else
+        stderr("awk: " .. tostring(runErr) .. "\n")
+    end
+    return 2
+end
+return rt.exitCode

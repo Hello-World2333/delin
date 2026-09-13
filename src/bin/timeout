@@ -1,0 +1,207 @@
+-- Delin timeout: 限时运行一条命令 (GNU coreutils timeout 子集)。
+-- 用法: timeout [OPTION] DURATION COMMAND [ARG]...
+--   -k, --kill-after=DURATION   发出信号后 DURATION 秒还不退, 再补一个 SIGKILL
+--   -s, --signal=SIGNAL         超时发什么信号(缺省 TERM; 名字或编号都收)
+--       --preserve-status       退出码用**命令的**而不是 timeout 的 124
+--   -v, --verbose               超时时把"发了什么信号给谁"打到 stderr
+--       --foreground            只给命令本身发信号, 不给它所在的进程组
+-- DURATION: 十进制数(可带小数)+ 可选后缀 s/m/h/d(缺省 s)。
+-- 退出码(GNU 同):
+--   命令正常退出 -> 命令的退出码; 被信号杀死 -> 128+信号号;
+--   超时 -> 124(给了 --preserve-status 则是命令的退出码);
+--   命令找不到 -> 127; 找到但起不来 -> 126; timeout 自己用法错 -> 125。
+-- 实现要点(Delin 的取舍):
+--   - 子进程先用 syscalls["job.setpgid"](pid, pid) 自立进程组, 超时对**整个进程组**
+--     signal.killpg(缺省行为, 与 GNU 一致); --foreground 时只 kill 那一个 pid。
+--     Delin 的进程是协作式协程, spawn 之后、子进程真正跑起来之前父进程不会让出,
+--     所以 "spawn 完立刻 setpgid" 不存在竞态(与 Linux 上必须父子同时 setpgid 不同)。
+--   - 通过轮询 proc.info 判断存活(不能直接 proc.wait, 那样就没法计时了), 间隔 50ms。
+-- 已知偏离:
+--   - 不实现 --help/--version(与本项目其它工具一致)。
+--   - 时间分辨率是轮询间隔(50ms): 设 0.01s 之类的时限会被拖到 ~50ms 才处理。
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+local function isInt(s) return tostring(s):match("^[%+%-]?%d+$") ~= nil end
+
+--- 解析 DURATION: 数字 + 可选单位后缀。
+local function parseDuration(s)
+    local num, unit = tostring(s):match("^([%d%.]+)([smhd]?)$")
+    if not num then return nil end
+    local n = tonumber(num)
+    if not n then return nil end
+    if unit == "m" then n = n * 60
+    elseif unit == "h" then n = n * 3600
+    elseif unit == "d" then n = n * 86400 end
+    return n
+end
+
+--- 解析信号规格(名字或编号)。
+local function parseSignal(spec)
+    local num = tonumber(spec)
+    if num then return math.floor(num) end
+    if syscalls and syscalls["signal.number"] then
+        local n = syscalls["signal.number"](spec)
+        if n then return n end
+        -- "SIGTERM" 这种带前缀的写法
+        n = syscalls["signal.number"]((spec:gsub("^SIG", "")))
+        if n then return n end
+    end
+    return nil
+end
+
+local timeout, killAfter, signal = nil, nil, nil
+local preserveStatus, verbose, foreground = false, false, false
+local i = 1
+local operands = {}
+while i <= #args do
+    local a = args[i]
+    if a == "-v" or a == "--verbose" then
+        verbose = true
+    elseif a == "--preserve-status" then
+        preserveStatus = true
+    elseif a == "--foreground" then
+        foreground = true
+    elseif a == "-s" or a == "--signal" then
+        i = i + 1
+        if not args[i] then stderr("timeout: option requires an argument -- 's'\n"); return 125 end
+        signal = args[i]
+    elseif a:match("^%-%-signal=") then
+        signal = a:sub(10)
+    elseif a:match("^%-s.") then
+        signal = a:sub(3)
+    elseif a == "-k" or a == "--kill-after" then
+        i = i + 1
+        if not args[i] then stderr("timeout: option requires an argument -- 'k'\n"); return 125 end
+        killAfter = args[i]
+    elseif a:match("^%-%-kill%-after=") then
+        killAfter = a:sub(14)
+    elseif a:match("^%-k.") then
+        killAfter = a:sub(3)
+    elseif a == "--" then
+        i = i + 1
+        for k = i, #args do operands[#operands + 1] = args[k] end
+        break
+    elseif a:sub(1, 2) == "--" then
+        stderr("timeout: unrecognized option '" .. a .. "'\n")
+        return 125
+    elseif a:sub(1, 1) == "-" and a ~= "-" and not isInt(a) then
+        stderr("timeout: invalid option -- '" .. a:sub(2, 2) .. "'\n")
+        return 125
+    else
+        -- 第一个非选项参数是 DURATION, 再往后都是要跑的命令
+        for k = i, #args do operands[#operands + 1] = args[k] end
+        break
+    end
+    i = i + 1
+end
+
+if #operands == 0 then
+    stderr("timeout: missing operand\n")
+    return 125
+end
+local durSec = parseDuration(operands[1])
+if not durSec then
+    stderr("timeout: invalid time interval '" .. operands[1] .. "'\n")
+    return 125
+end
+if #operands < 2 then
+    stderr("timeout: missing operand\n")
+    return 125
+end
+local killSec = nil
+if killAfter then
+    killSec = parseDuration(killAfter)
+    if not killSec then
+        stderr("timeout: invalid time interval '" .. killAfter .. "'\n")
+        return 125
+    end
+end
+local sigNum = 15 -- SIGTERM
+if signal then
+    sigNum = parseSignal(signal)
+    if not sigNum then
+        stderr("timeout: invalid signal '" .. signal .. "'\n")
+        return 125
+    end
+end
+
+local cmd = operands[2]
+local argv = {}
+for k = 3, #operands do argv[#argv + 1] = operands[k] end
+
+local pid, err = syscalls["proc.exec"](cmd, argv, {})
+if not pid then
+    local code = 126
+    local reason = tostring(err)
+    if reason:find("command not found") then
+        code, reason = 127, "No such file or directory"
+    elseif reason:find("permission denied") then
+        reason = "Permission denied"
+    end
+    stderr("timeout: failed to run command '" .. cmd .. "': " .. reason .. "\n")
+    return code
+end
+
+-- 让子进程自立进程组(超时要打整组)。它是新协程, 还没跑起来, 这里没有竞态。
+if not foreground and syscalls["job.setpgid"] then
+    syscalls["job.setpgid"](pid, pid)
+end
+
+local function alive()
+    local p = syscalls["proc.info"] and syscalls["proc.info"](pid)
+    if not p then return false end
+    return p.status ~= "dead" and p.status ~= "error"
+end
+
+local function sendSignal(sig)
+    if verbose then
+        local name = syscalls["signal.name"] and syscalls["signal.name"](sig) or tostring(sig)
+        stderr("timeout: sending signal " .. name .. " to command '" .. cmd .. "'\n")
+    end
+    if not foreground and syscalls["signal.killpg"] then
+        local ok, err2 = syscalls["signal.killpg"](pid, sig)
+        if ok then return true end
+        -- 进程组不成立(比如子进程是会话首进程)时退回给单个进程发
+        if err2 and not err2:find("no such process") and not err2:find("no process group") then
+            return false
+        end
+    end
+    return syscalls["signal.kill"](pid, sig)
+end
+
+--- 等到进程退出或超时; 返回 "exited" / "timeout"。
+local function waitFor(seconds)
+    local deadline = os.epoch("utc") + seconds * 1000
+    while true do
+        if not alive() then return "exited" end
+        if os.epoch("utc") >= deadline then return "timeout" end
+        os.sleep(0.05)
+    end
+end
+
+local state = waitFor(durSec)
+if state == "exited" then
+    local rc = syscalls["proc.wait"](pid)
+    if rc and rc < 0 then return 128 + (-rc) end
+    return rc or 0
+end
+
+-- 超时: 发信号
+sendSignal(sigNum)
+local killedByUs = true
+if killSec and killSec > 0 then
+    if waitFor(killSec) == "timeout" then
+        sendSignal(9) -- SIGKILL
+    end
+end
+local rc = syscalls["proc.wait"](pid)
+if preserveStatus then
+    if rc and rc < 0 then return 128 + (-rc) end
+    return rc or 0
+end
+return 124

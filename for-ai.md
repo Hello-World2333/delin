@@ -14,7 +14,7 @@
 
 | 路径 | 作用 |
 |---|---|
-| `/bin/` | 用户工具（POSIX 强制命令已补齐，见「POSIX 命令覆盖」一节）：`basename cat chgrp chmod chown cksum clear cmp comm cp csplit cut dd df diff dirname du echo ed expand expr file find fold grep head id join kill killall ln ls mkdir mkfifo mount mv nohup od passwd paste patch pathchk pr printf ps readlink realpath rm rmdir sed sh sleep sort split strings tail tee touch tr umount unexpand uniq uudecode uuencode wc whoami xargs`；系统/服务类：`blkid dmesg fsck.ext2 logger login logrotate lp lsblk lua mdadm mkfs.ext2 pgrep pkill syslogd systemctl`；用户管理：`groupadd groupdel groups useradd userdel usermod` |
+| `/bin/` | 用户工具（POSIX 强制命令已补齐，见「POSIX 命令覆盖」一节）：`awk base64 basename bc cat chgrp chmod chown cksum clear cmp column comm cp csplit cut date dd df diff dirname du echo ed env expand expr file find fold grep head id join kill killall less ln logname ls mkdir mkfifo more mount mv nl nohup od passwd paste patch pathchk pr printf ps readlink realpath rev rm rmdir sed seq sh sleep sort split strings tac tail tee timeout touch tr tsort tty umount uname unexpand uniq uudecode uuencode wc which whoami xargs yes`（分页器 `less more`、任意精度计算器 `bc`、文本处理语言 `awk` 等 19 个是「批次 3」补齐的，见下文）；系统/服务类：`blkid dmesg fsck.ext2 logger login logrotate lp lsblk lua mdadm mkfs.ext2 pgrep pkill syslogd systemctl`；用户管理：`groupadd groupdel groups useradd userdel usermod` |
 | `/dev/` | 设备文件：`/dev/ttyN`（字符终端）、`/dev/fbN`（像素帧缓冲）、`/dev/sdX`（磁盘，见下）、`/dev/lpN`（打印机字符设备，只写，见下）、`/dev/null`（读 EOF/写丢弃）、`/dev/zero`（读 = 无限 NUL）、`/dev/random`、`/dev/urandom`（随机字节，见下）、`/dev/console`（系统控制台 = 控制台 tty）、`/dev/kmsg`（内核 ring buffer 只读流）、`/dev/log`（用户态 syslog 输入）、`/dev/mdN`（软RAID 阵列的块设备，见下） |
 | `/etc/` | 系统配置：`passwd` `shadow`（0600 root:root）`group`、`fstab`、`mdadm.conf`（软RAID 阵列清单，开机自动组装，见下）、`syslog.conf`、`logrotate.conf`、`systemd/system/`（管理员单元与 enable 标记） |
 | `/proc/` | 虚拟进程/系统信息 fs（procfs，内核提供，见下）：`/proc/<pid>/{cmdline,comm,cwd,stat,status}`、`/proc/self`、`/proc/{mounts,mdstat,uptime,version}`、`/proc/sys/kernel/random/{entropy_avail,poolsize,uuid}` |
@@ -573,6 +573,32 @@ entry"` —— 于是目录一旦跨块（>1KB 后每块第一条各中一次）
 粗体（`1`）因 CC 无粗体字形而渲染成亮色。`$TERM` 固定为 `linux`（login 设置并随环境导出），
 `login` 每次显示登录提示前写 `ESC[0m ESC[2J ESC[H` 清屏（agetty 语义）。
 
+**终端的原始模式（`setRaw`）与按键字节流**：句柄上有 `setRaw(enable)`（Linux termios 的
+`ICANON|ECHO` 位）：开了之后不回显、不按行缓冲，`read(n)` 拿到的是**终端字节流**，特殊键是
+ANSI 序列 —— 与 Linux 上 raw 终端 + `read(2)` 的契约完全一致，`more`/`less` 就建立在这条契约上。
+
+| CC 按键 | 发出的字节 |
+|---|---|
+| 方向键 | `ESC [ A/B/C/D` |
+| `Home`/`End` | `ESC [ H` / `ESC [ F` |
+| `PgUp`/`PgDn` | `ESC [ 5~` / `ESC [ 6~` |
+| `Insert`/`Delete` | `ESC [ 2~` / `ESC [ 3~` |
+| `F1..F4` | `ESC O P/Q/R/S` |
+| `F5..F12` | `ESC [ 15~ 17~ 18~ 19~ 20~ 21~ 23~ 24~` |
+| 能产生字符的键 | 走 `char` 事件的字节（`Enter`→`\r`→`\n`、`Backspace`→`\b`、`Tab`→`\t`） |
+| `Ctrl+A..Z` | `\1..\26`（`^C`/`^Z` **例外**：ISIG 保持打开，仍然是信号） |
+
+- **ISIG 保持打开**（与 Linux 的 cbreak 一致）：`^C`/`^Z` 照旧变成 SIGINT/SIGTSTP，
+  所以分页器里 `^C` 是被信号杀掉的（退出码 130）、`^Z` 能挂起；而 `^D`/`^L`/`^U`/`^W`
+  在原始模式下是**普通字节**（行规程不再解释它们）。
+- **按键去重闩锁（`ctx.dupChar`）**：CC 对 `Enter`/`Backspace`/`Tab` 与 `Ctrl+字母`可能
+  **同时**发 `key` 与 `char` 两个事件（GLFW 的 char 回调）。两种都处理就会"按一次删两个字符/
+  出一个空行"，所以 key 事件处理完会把期望的字节记在 `ctx.dupChar` 上，紧随其后、值相同的
+  那个 char 事件被丢掉。canonical 模式同样吃这条（否则真机上按一次回车会空两行）。
+- 真机验证：`scripts/rawtty_test.ko`（内核态注入按键）+ `scripts/rawtty_verify.lua`
+  （在 `/dev/tty0` 上 `setRaw` 并读回字节），由 `tools/realmachine.py` 断言
+  `/tmp/rawtty.hex` 恰好是 `78201b5b41370a04`（`x`、空格、↑、`7`、只出现一次的 enter、`^D`）。
+
 **工具**：`ls`、`cat`（默认按字节拷贝，见「设计要点」；`-n/-b/-s/-E/-T/-v/-A` 才按行）、
 `mkdir (-p)`、`rm (-r|-f)`、`cp (-r)`、`mv`、`touch`、`head (-n)`、`tail (-n)`、
 `sleep`（GNU 风格：小数秒 + `s/m/h/d` 后缀 + 多操作数求和；50ms 分片睡眠，信号可及时打断）、
@@ -871,6 +897,57 @@ find . -exec echo {} \; | wc -l                 # 同理
 目标写的是 Delin 的路径，本来就不存在）。另外：工具**裸 `return`**（内核当 0）在宿主测试台里读到的是
 `nil`，`sort -C`/`du`/`dd` 因此把结尾补成了显式 `return 0`。
 
+#### 批次 3：新命令（19 个）与分页器、awk、bc
+
+用户态新增 19 个 `/bin` 命令。**共同约定**：选项一律照宿主 GNU 逐项实测对齐（`newtools_test.sh`
+与 `less`/`more` 的宿主自检都是逐字节比），未实现的选项 **fail-fast 退出 2**（不静默半套），
+诊断走英文/ASCII（装到 CC 上的产物全 ASCII 是构建期门禁）。
+
+| 命令 | 覆盖范围与已知偏离（详见各源码头注释） |
+|---|---|
+| `awk` | **完整 POSIX awk**：模式/动作、BEGIN/END/范围模式、字段与 `$0/$NF`、关联数组与 `(i,j) in a`、`if/while/do/for/for-in/break/continue/next/nextfile/exit/return/delete/print/printf`、赋值与复合赋值、三元、`~ !~`、并置、内建函数全套（`length substr index split sub gsub match sprintf sin cos atan2 exp log sqrt int rand srand tolower toupper system close fflush`）、`getline` 的四种形态、`print > file`/`>> file`/`| cmd`、用户函数（数组按引用）、`-F/-v/-f/--` 与 `var=value` 操作数、`ARGV/ARGC/ENVIRON/SUBSEP/RSTART/RLENGTH/CONVFMT/OFMT/NR/FNR/NF/FILENAME/FS/OFS/ORS/RS`。正则走内核 ERE 引擎。**偏离**：字符串比较按字节序；`/dev/stdout` 不存在（Delin 没有这个别名）；`RS` 多字符按 ERE（gawk 扩展）；无 locale，`tolower/toupper` 只折叠 ASCII；动作体外面包了 pcall（接住 `exit/next/return` 的展开），而 **Lua 5.1 不允许跨 pcall 让出**，所以宿主测试台（5.1）跑不了 awk 的 `system()`/管道 —— 真机（Lua 5.2）可以，宿主上请用 `lua5.4`（`scripts/pager_test.sh` 就是这么做宿主自检的） |
+| `bc` | 任意精度十进制（字符串大数：加/减/乘/长除/取余/整数幂/整数平方根）与 POSIX bc 语言子集：表达式、赋值与复合赋值、`if/while/for/break/continue/return/print/quit/halt`、`define ... { auto ... }`、数组（含数组参数）、`ibase/obase/scale/last`、`-l` 数学库（`s c a l e j`）。**偏离**：数学库用级数展开（scale+4 保护位后截断），末位可能与 GNU 差 1；`read()` 从 stdin（或程序文本剩下的行）读；`limits` 与 `-e/-f` fail-fast |
+| `more` | POSIX more：`-d -f -l -p -c -s -u -n`、`+行号`/`+/模式`/`+命令`；命令 `空格/f/b/d/u/q/=/／/n/s/!/:f/^L/.`。**偏离**：输入一次读入内存；终端不折行（CC 终端本来就截断超宽） |
+| `less` | `-e -E -f -F -g -G -i -I -m -M -n -N -p PAT -P PROMPT -q -Q -R -s -S -X -x N -z N -c -C -d -j N -k -K -?/-h/-V`；命令 `空格/b/d/u/j/k/回车/g/G/PgUp/PgDn//pat/?pat/n/N/F/=/:n :p :e/-选项/q/h`。**偏离**：`-o/-O/-t/-T/-b/-B/-u/-U/-w/-a` fail-fast；没有过滤器(`&`)/标记(`m '`)/编辑(`v`)/反显高亮 |
+| `date` | `-u -d STR -f FILE -r FILE -R -I[FMT] --rfc-3339=FMT` 与 GNU 的**全部** FORMAT 转换符（`%% %a..%Z %:z %::z %:::z`）；`-d` 认 `@epoch`、`now/today/yesterday/tomorrow/noon`、`YYYY-MM-DD[ T ]HH:MM[:SS][Z±HH:MM]`、`MM/DD/YYYY`、`HH:MM[:SS]`、相对表达（`N unit[s] [ago]`、`next/last/this unit`，含按历法的月/年、绝对+相对混写）。**偏离**：没有时区（一律 UTC，`%Z`=UTC、`%z`=+0000，TZ 不生效）；**不能设置时钟**（`-s` 报 Operation not permitted）；秒精度（`%N` 恒 0） |
+| `env` | `-i -u NAME -0 -C DIR -S STRING --ignore-signal`；无 COMMAND 时打印环境，有则执行并原样返回退出码（127/126/125）。`-S` 是 POSIX shell 风格拆串（引号/转义/`${VAR}`/`#` 注释）。**偏离**：`--default-signal/--block-signal/--list-signal-handling/--debug` fail-fast；环境表按名字排序输出 |
+| `timeout` | `-k -s/--signal --preserve-status -v --foreground`；`DURATION` 支持 `s/m/h/d` 与小数；退出码 124/125/126/127 与 GNU 一致。子进程先自立进程组（`job.setpgid`），超时对整组发信号（协作式协程下 spawn 后立刻 setpgid 无竞态）。**偏离**：时间分辨率是 50ms 轮询间隔 |
+| `uname` | POSIX + GNU 全部选项（`-a -s -n -r -v -m -p -i -o` 与长选项）；值取自 `/proc/version`、`/etc/hostname`：`-s`=Delin、`-r`=内核版本、`-v`=`CraftOS <版本>, Lua <版本>`、`-m`=cc-tweaked、`-p/-i`=lua、`-o`=Delin |
+| `seq` | `-f FORMAT -s SEP -w`；缺省格式由操作数小数位数决定（`1e2` 是 0 位），`-w` 零填充，末位容差用半个末位。**偏离**：IEEE double（`>2^53` 末位不精确）；不支持 `inf` |
+| `yes` | 无选项（任何参数都是要重复的串，GNU 同）；写失败（内核管道返 broken pipe）时**静默**以 141 退出（Linux 上它就是被 SIGPIPE 杀死的（128+13）） |
+| `which` | `-a -s --skip-dot --skip-tilde --show-dot --show-tilde --tty-only`；带 `/` 的名字不查 PATH，空 PATH 项按 `.` 处理，退出码 0/1/2。**偏离**：`-i/--read-alias` 与 `--read-functions` fail-fast（别名活在 sh 进程里） |
+| `tty` | `-s/--silent/--quiet`；是终端打 `/dev/ttyN`，否则打 `not a tty`（stdout）并退 1；选项错退 2 |
+| `logname` | 打 `$LOGNAME`，没有则 `logname: no login name` 退 1。**偏离**：没有 utmp，不做"这个名字还是不是当前登录"的复核 |
+| `rev` | `-0`（NUL 分隔）；逐行按**字节**倒序，末尾无分隔符就不补。**偏离**：宿主 util-linux 的 rev 在 C locale 下遇多字节会报错，Delin 按字节处理二进制也能用 |
+| `tac` | `-b -r -s SEP`（`-r` 用内核 BRE）；输出记录倒序、分隔符跟着它所属的记录走 |
+| `nl` | POSIX nl：`-b -h -f`（`a/t/n/pBRE`）、`-d CC`、`-i`、`-l`、`-n ln/rn/rz`、`-p`、`-s`、`-v`、`-w`；段分隔符（3/2/1 个）切换页眉/正文/页脚并**重置行号**，不编号的行打等宽空白。逐条对照 coreutils `nl.c` |
+| `column` | `-t` 表格（`-s` 输入分隔、`-o` 输出分隔、`-N` 列名、`-n` 表名、`-J` JSON、`-L` 保空行）与两种填充模式（缺省按列填、`-x` 按行填，`-c` 宽度、`-S N` 用空格），算法照 util-linux 的 `columnate_fill*`。**偏离**：libsmartcols 那一族（`-C/-O/-H/-R/-T/-W/-E/-l/-d/-m/-e/-K/--color/-r/-i/-p`）fail-fast |
+| `base64` | `-d -i -w COLS`；编码按 4 字符组、`-w 0` 连末尾换行都不打；解码按 **quantum** 校验（`YQ==` 行、`YQ=`/`===`/`YWJj=` 报 invalid input），与 GNU 一样**边解边写**（出错前已解出的字节留在 stdout） |
+| `tsort` | POSIX tsort：Knuth Algorithm T 的逐条移植（零前驱按字节序入队、后继按输入倒序递减计数、队列空了就找环、打印环并**删一条边继续**），自环丢弃。与宿主 GNU 在 500 个随机图上逐字节一致（`tools/bintest` 之外的一次性对照） |
+
+**分页器与终端**：`more`/`less` 用内核 tty 的**原始模式**（见「终端的原始模式」）读单个按键；
+stdout 不是终端时**直接照抄输入**（与 Linux 一致）。两个工具都一次读入整个输入（CC 的文件很小，
+换来任意往回翻）；`less` 的 `F` 会重读文件以跟踪追加的内容。
+
+#### `spawn` 的 `opts.stdio` 是**整表覆盖**、`opts.envClear` 才是清空
+
+- `opts.stdio` 一旦给出，input/output **两端都按它设**（没给的端就是 nil），不会与父进程的
+  stdio 合并。所以给子进程只重定向一端时**另一端也要显式传**（`xargs`/`awk` 都这么写：
+  `{ input = childIn, output = io.stdout() }`）。
+- `opts.envClear = true` 表示"不继承父进程的环境块，只用 `opts.env` 这张表"（`env -i` 的语义）。
+  光靠"值为 nil 即删除"是**做不到**的：Lua 表里存不下 nil，`pairs` 也遍历不到它，删除项在
+  spawn 侧根本看不见（`env` 因此改成总是传一张完整环境表 + `envClear`）。
+- **管道端要 `ref()`**：`/bin/sh` 的父子进程共享同一个管道端对象，父进程 `close()` 会把子进程
+  那份也标成关闭。给子进程的端必须用 `h:ref()` 复制一份独立引用（`awk` 的 `print | cmd` 与
+  `cmd | getline` 都这么做；`xargs`/`find -exec` 的那个已知缺口见上文「管道端是共享句柄对象」）。
+
+#### `sh` 把继承来的环境变量都变成已导出的 shell 变量
+
+POSIX：继承的环境变量一律成为**已导出**的 shell 变量，`env FOO=bar sh -c 'echo $FOO'` 必须打印
+`bar`。老代码只认表里那 8 个（PATH/HOME/USER/LOGNAME/SHELL/PWD/PPID/TERM），别的名字既不进
+`vars` 也不导出 —— `env` 于是只对这几个名字有用。现在 `sh` 启动时把父进程给的所有名字补进
+`vars` 并置 `exported`，但**不覆盖** shell 自己维护的名字（IFS/PS1/PWD…）。
+
 #### POSIX 命令覆盖与 `proc.exec`
 
 按 Wikipedia 的 [List of POSIX commands](https://en.wikipedia.org/wiki/List_of_POSIX_commands)
@@ -1084,6 +1161,17 @@ CEE:CC(CEECC)平台落地：`kernel/platform.lua` 认平台(`_G.cee`)、`modules
 按 CC 挂载路径去重补进 `/dev/sdX`，电缆/枢纽设备的晚到由 `peripheral` 事件触发重扫。
 真机验证在**电脑 #6**（台式 CEECC，自带存储 10MB）：`tools/ceecc_realmachine.py` + `scripts/ceecc_verify.lua`，
 装机走 CCFS 根、36 项断言全绿；详见「CEE:CC 平台」一节。机架式（4096 字节存储）不在范围内。
+
+命令批 3 落地（19 个新命令 + 终端的原始模式）：`awk`（完整 POSIX awk）、`bc`（任意精度十进制）、
+分页器 `more`/`less`（建在内核 tty 的**原始模式**上：`setRaw` 之后 `read(n)` 是终端字节流，
+特殊键是 ANSI 序列，见「终端的原始模式」）、`date env timeout uname seq yes which tty logname
+rev tac nl column base64 tsort`（POSIX/GNU 子集，选项与退出码逐项对照宿主 GNU）。
+配套：`process.spawn` 的 `opts.envClear`（`env -i` 的语义）、`sh` 把继承来的环境变量都变成
+已导出的 shell 变量（`env FOO=bar sh -c 'echo $FOO'` 现在对任何名字都成立）。
+宿主回归：`scripts/newtools_test.sh`（宿主与真机跑同一份，已进 `build.lua --check`）、
+`scripts/pager_test.sh`（分页器的交互，宿主专用 —— 测试台的假终端支持 `setRaw` 与按键字节流）；
+真机：`posix_tools_verify.sh` 的新命令段 + `scripts/rawtty_test.ko`/`rawtty_verify.lua`
+（`tools/realmachine.py` 断言 `/tmp/rawtty.hex`）。
 
 红石经 `redstone` 模块摊成 sysfs 属性文件 `/sys/class/redstone/<side>/{digital,analog,bundled}`
 （六个面恒定存在），`cat`/`echo` 即读写；读 = 该面输入、写 = 该面输出，

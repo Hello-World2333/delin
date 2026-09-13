@@ -1,0 +1,139 @@
+-- Delin which: 在 PATH 里查找命令的位置 (debianutils which 的子集)。
+-- 用法: which [-a] [-s] [--skip-dot] [--skip-tilde] [--show-dot] [--show-tilde]
+--             [--tty-only] NAME...
+--   -a, --all          列出 PATH 里**每一个**匹配(缺省只列第一个)
+--   -s, --silent       什么都不打印, 只看退出码
+--   --skip-dot         跳过 PATH 里以 "." 开头的目录
+--   --skip-tilde       跳过 PATH 里以 "~" 开头的目录
+--   --show-dot         目录就是 "." 时打印 "./name"(缺省行为)
+--   --show-tilde       $HOME 换成 "~"($HOME 为 "/" 时无效)
+--   --tty-only         不在终端上时, 停止处理右边的选项(Debian 同)
+--   --                结束选项
+-- 语义(debianutils which 实测对齐):
+--   - NAME 里带 "/" 时**不查 PATH**, 直接测试该路径(GNU/bash 的 which 同)。
+--   - PATH 里的空目录项按当前目录(".", POSIX)处理。
+--   - 命中的条件: 路径存在、不是目录、且可执行(内核 canExecute: 至少一个 x 位;
+--     CC 原生文件系统的文件一律视为可执行)。
+--   - 一个 NAME 都没找到(或找到的不足)即退出 1; 全部找到退出 0; 用法错退出 2。
+-- 已知偏离:
+--   - 不实现 -i/--read-alias 与 --read-functions/--skip-functions/--skip-aliases
+--     (要从 stdin 读别名表; Delin 的别名活在 sh 进程里, 外部命令拿不到) —— 给了就 fail-fast。
+--   - 不实现 --version/--help(与本项目其它工具一致)。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+local all, silent = false, false
+local skipDot, skipTilde, showTilde = false, false, false
+local ttyOnly = false
+local names, noMoreOpts = {}, false
+
+local function isTTY(h)
+    return h ~= nil and h.isTTY == true
+end
+
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if noMoreOpts then
+        names[#names + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "-a" or a == "--all" then
+        all = true
+    elseif a == "-s" or a == "--silent" then
+        silent = true
+    elseif a == "--skip-dot" then
+        skipDot = true
+    elseif a == "--skip-tilde" then
+        skipTilde = true
+    elseif a == "--show-dot" then
+        -- 缺省就显示 "./name"; 收下这个开关只为与 Debian 的命令行兼容。
+        showTilde = false
+    elseif a == "--show-tilde" then
+        showTilde = true
+    elseif a == "--tty-only" then
+        ttyOnly = true
+    elseif a == "-i" or a == "--read-alias" or a == "--skip-alias"
+        or a == "--read-functions" or a == "--skip-functions" or a == "--skip-aliases" then
+        stderr("which: option '" .. a .. "' is not supported (aliases live inside the shell)\n")
+        return 2
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        stderr("which: illegal option -- " .. a:sub(2, 2) .. "\n")
+        return 2
+    else
+        names[#names + 1] = a
+        -- --tty-only 之后, 不在终端上就不再解析剩下的选项(Debian 语义)。
+        if ttyOnly and not isTTY(io.stdout()) then noMoreOpts = true end
+    end
+    i = i + 1
+end
+
+if #names == 0 then
+    io.write("Usage: which [-as] program ...\n")
+    return 2
+end
+
+local function executable(path)
+    local a = fs.attributes(path)
+    if not a then return false end
+    if a.isDir then return false end
+    if fs.canExecute and not fs.canExecute(path) then return false end
+    return true
+end
+
+--- 按 Debian which 的换写规则给出显示路径。
+local function display(dir, name)
+    if dir == "." then return "./" .. name end
+    if showTilde then
+        local home = getenv("HOME")
+        if home and home ~= "/" and dir == home then return "~" end
+        if home and home ~= "/" and dir:sub(1, #home + 1) == home .. "/" then
+            return "~" .. dir:sub(#home + 1)
+        end
+    end
+    return dir .. "/" .. name
+end
+
+local pathEnv = getenv("PATH") or "/bin"
+local failure = false
+for _, name in ipairs(names) do
+    local found = false
+    if name:find("/", 1, true) then
+        -- 带斜杠的名字不查 PATH, 直接测这个路径(Debian/GNU 同)。
+        if executable(resolve(name)) then
+            if not silent then io.write(name .. "\n") end
+            found = true
+        end
+    else
+        for dir in (pathEnv .. ":"):gmatch("([^:]*):") do
+            if dir == "" then dir = "." end
+            local skip = (skipDot and dir:sub(1, 1) == "." and dir ~= ".")
+                or (skipTilde and dir:sub(1, 1) == "~")
+            if not skip then
+                local cand = resolve((dir == "/" and "" or dir) .. "/" .. name)
+                if executable(cand) then
+                    if not silent then io.write(display(dir, name) .. "\n") end
+                    found = true
+                    if not all then break end
+                end
+            end
+        end
+    end
+    if not found then failure = true end
+end
+return failure and 1 or 0

@@ -1,0 +1,380 @@
+-- Delin nl: 给行编号 (POSIX nl(1) + GNU 的全部选项)。
+-- 用法: nl [OPTION]... [FILE]...
+--   -b, --body-numbering=STYLE     正文段编号方式(缺省 t)
+--   -h, --header-numbering=STYLE   页眉段(缺省 n)
+--   -f, --footer-numbering=STYLE   页脚段(缺省 n)
+--   -d, --section-delimiter=CC     段分隔符(缺省 `\:`; 给 1 个字符时第二个字符按 `:` 补;
+--                                  给空串 = 关闭分段识别, GNU 扩展)
+--   -i, --line-increment=NUMBER    每个编号的增量(缺省 1)
+--   -l, --join-blank-lines=NUMBER  NUMBER 个连续空行算一个(缺省 1)
+--   -n, --number-format=FORMAT     ln 左对齐无前导零 / rn 右对齐无前导零 / rz 右对齐补零(缺省 rn)
+--   -p, --no-renumber              换段不重置行号
+--   -s, --number-separator=STRING  编号后面的分隔串(缺省 TAB)
+--   -v, --starting-line-number=N   每段第一个编号(缺省 1)
+--   -w, --number-width=NUMBER      编号占的列数(缺省 6)
+-- STYLE: a 全部行 / t 非空行 / n 不编号 / pBRE 匹配 BRE 的行
+-- 语义(逐条对照 coreutils nl.c):
+--   - 一开始处于**正文段**(所以文件开头到第一个分隔符之间的行按 -b 处理);
+--     分隔符行本身不输出, 取而代之输出一个空行, 并切到对应的段(3 个 = 页眉, 2 个 = 正文, 1 个 = 页脚);
+--     切段时把行号重置为 -v(给了 -p 则不重置)。
+--   - 不编号的行输出与编号等宽的**空白 + 分隔串**(GNU 的 print_no_line_fmt)。
+--   - -l NUMBER 只对 `a` 生效(GNU 的实现如此): 每 NUMBER 个连续空行里只有最后一个被编号。
+--   - 多个 FILE 依次处理, 段状态与行号**跨文件延续**(GNU 同); 某个文件打不开时继续处理其余,
+--     最终退出 1。
+-- 已知偏离:
+--   - 不实现 --help/--version(与本项目其它工具一致)。
+--   - pBRE 用内核的标准正则引擎(BRE), 语义与 GNU 的 glibc BRE 一致。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+local function ioeMsg(err)
+    if err and (err:find("permission") or err:find("denied")) then return "Permission denied" end
+    if err and err:lower():find("no such file") then return "No such file or directory" end
+    if err and err:find("directory") then return "Is a directory" end
+    return "No such file or directory"
+end
+
+local _msleep = os.msleep or function(ms) os.sleep(math.max((ms or 0) / 1000, 0.05)) end
+local _sliceAt = os.epoch("utc")
+local function yieldCheck()
+    local now = os.epoch("utc")
+    if now - _sliceAt >= 50 then
+        _sliceAt = now
+        _msleep(0)
+    end
+end
+
+local function isInt(s)
+    return tostring(s):match("^[%+%-]?%d+$") ~= nil
+end
+local function intOf(s)
+    if not isInt(s) then return nil end
+    local n = tonumber(s)
+    if not n then return nil end
+    return math.floor(n)
+end
+
+local headers = { header = "n", body = "t", footer = "n" } -- 三段各自的 STYLE
+local types = {} -- 段名 -> {style="a"|"t"|"n"|"p", re=已编译正则}
+local sectionDelim = "\\:"
+local increment, blankJoin, startNo, width = 1, 1, 1, 6
+local numberFormat = "rn"
+local separator = "\t"
+local resetNumbers = true
+local files, noMoreOpts = {}, false
+
+local function setStyle(seg, arg)
+    local ch = arg:sub(1, 1)
+    if ch == "a" or ch == "t" or ch == "n" then
+        headers[seg] = arg
+        types[seg] = { style = ch }
+        return true
+    elseif ch == "p" then
+        headers[seg] = arg
+        local pat = arg:sub(2)
+        local compileRegex = syscalls and syscalls["regex.compile"]
+        if not compileRegex then
+            stderr("nl: regex syscall not available\n")
+            return false
+        end
+        local re, err = compileRegex(pat, "bre")
+        if not re then
+            stderr("nl: invalid regular expression (" .. tostring(err) .. "): " .. pat .. "\n")
+            return false
+        end
+        types[seg] = { style = "p", re = re }
+        return true
+    end
+    stderr("nl: invalid numbering style: '" .. arg .. "'\n")
+    return false
+end
+
+local i = 1 -- 选项扫描位置(needArg/longOption 都要用, 必须先声明)
+
+local function needArg(optName)
+    i = i + 1
+    if not args[i] then
+        stderr("nl: option requires an argument -- '" .. optName .. "'\n")
+        return nil
+    end
+    return args[i]
+end
+
+local function badInt(what, v)
+    stderr("nl: invalid " .. what .. ": '" .. tostring(v) .. "'\n")
+    return 1
+end
+
+--- 处理一个长选项(名字不含 "--" 前缀, 值可能为 nil = 该选项不接受 --x=y 形式)。
+--- 返回: true 已处理 / false 未识别 / 数字 = 退出码。
+local function longOption(name, val)
+    local needs = {
+        ["body-numbering"] = true, ["header-numbering"] = true, ["footer-numbering"] = true,
+        ["section-delimiter"] = true, ["line-increment"] = true, ["join-blank-lines"] = true,
+        ["number-format"] = true, ["number-separator"] = true, ["starting-line-number"] = true,
+        ["number-width"] = true,
+    }
+    if needs[name] then
+        if val == nil then return false end -- "--opt" 不带 =: 由短选项分支或报错处理
+        if name == "body-numbering" then return setStyle("body", val) or 1 end
+        if name == "header-numbering" then return setStyle("header", val) or 1 end
+        if name == "footer-numbering" then return setStyle("footer", val) or 1 end
+        if name == "section-delimiter" then
+            sectionDelim = (#val == 1) and (val .. ":") or val
+            return true
+        end
+        if name == "line-increment" then
+            local n = intOf(val)
+            if not n then return badInt("line number increment", val) end
+            increment = n; return true
+        end
+        if name == "join-blank-lines" then
+            local n = intOf(val)
+            if not n or n < 1 then return badInt("number of blank lines", val) end
+            blankJoin = n; return true
+        end
+        if name == "number-format" then
+            if val ~= "ln" and val ~= "rn" and val ~= "rz" then
+                stderr("nl: invalid line numbering format: '" .. val .. "'\n"); return 1
+            end
+            numberFormat = val; return true
+        end
+        if name == "number-separator" then separator = val; return true end
+        if name == "starting-line-number" then
+            local n = intOf(val)
+            if not n then return badInt("starting line number", val) end
+            startNo = n; return true
+        end
+        if name == "number-width" then
+            local n = intOf(val)
+            if not n or n < 1 then return badInt("line number field width", val) end
+            width = n; return true
+        end
+    end
+    if name == "no-renumber" then resetNumbers = false; return true end
+    return false
+end
+
+while i <= #args do
+    local a = args[i]
+    if noMoreOpts then
+        files[#files + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a:sub(1, 2) == "--" then
+        local name, val = a:match("^%-%-([^=]+)=(.*)$")
+        if name then
+            local r = longOption(name, val)
+            if r == false then stderr("nl: unrecognized option '" .. a .. "'\n"); return 1 end
+            if r ~= true then return r end
+        else
+            name = a:sub(3)
+            local r = longOption(name, nil)
+            if r == false then stderr("nl: unrecognized option '" .. a .. "'\n"); return 1 end
+            if r ~= true then return r end
+        end
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        local ch = a:sub(2, 2)
+        local rest = a:sub(3)
+        local function value(optName)
+            if rest ~= "" then return rest end
+            return needArg(optName)
+        end
+        if ch == "b" or ch == "h" or ch == "f" then
+            local v = value(ch)
+            if not v then return 1 end
+            local seg = (ch == "b") and "body" or ((ch == "h") and "header" or "footer")
+            if not setStyle(seg, v) then return 1 end
+        elseif ch == "d" then
+            local v = value("d"); if not v then return 1 end
+            sectionDelim = (#v == 1) and (v .. ":") or v
+        elseif ch == "i" then
+            local v = value("i"); local n = v and intOf(v)
+            if not n then return badInt("line number increment", v) end
+            increment = n
+        elseif ch == "l" then
+            local v = value("l"); local n = v and intOf(v)
+            if not n or n < 1 then return badInt("number of blank lines", v) end
+            blankJoin = n
+        elseif ch == "n" then
+            local v = value("n")
+            if v ~= "ln" and v ~= "rn" and v ~= "rz" then
+                stderr("nl: invalid line numbering format: '" .. tostring(v) .. "'\n"); return 1
+            end
+            numberFormat = v
+        elseif ch == "p" and rest == "" then
+            resetNumbers = false
+        elseif ch == "s" then
+            local v = value("s"); if not v then return 1 end
+            separator = v
+        elseif ch == "v" then
+            local v = value("v"); local n = v and intOf(v)
+            if not n then return badInt("starting line number", v) end
+            startNo = n
+        elseif ch == "w" then
+            local v = value("w"); local n = v and intOf(v)
+            if not n or n < 1 then return badInt("line number field width", v) end
+            width = n
+        else
+            stderr("nl: invalid option -- '" .. ch .. "'\n")
+            return 1
+        end
+    else
+        files[#files + 1] = a
+    end
+    i = i + 1
+end
+
+
+-- 分隔符: 页眉 = 3 次重复, 正文 = 2 次, 页脚 = 1 次(GNU 同)。
+local headerDel = sectionDelim:rep(3)
+local bodyDel = sectionDelim:rep(2)
+local footerDel = sectionDelim
+
+local noLineFmt = string.rep(" ", width + #separator)
+local lineNo = startNo
+local curSeg = "body"
+local blankLines = 0
+
+local function formatNumber(n)
+    local s
+    if numberFormat == "ln" then
+        s = tostring(n)
+        if #s < width then s = s .. string.rep(" ", width - #s) end
+        return s .. separator
+    elseif numberFormat == "rz" then
+        local neg = n < 0
+        local digits = tostring(math.abs(n))
+        local w = neg and (width - 1) or width
+        if #digits < w then digits = string.rep("0", w - #digits) .. digits end
+        return (neg and "-" or "") .. digits .. separator
+    end
+    local s = tostring(n)
+    if #s < width then s = string.rep(" ", width - #s) .. s end
+    return s .. separator
+end
+
+local out = {}
+local function emit(s)
+    out[#out + 1] = s
+    if #out >= 256 then
+        io.write(table.concat(out)); out = {}; yieldCheck()
+    end
+end
+
+local function printLineno()
+    emit(formatNumber(lineNo))
+    lineNo = lineNo + increment
+end
+
+local function resetLineno()
+    if resetNumbers then lineNo = startNo end
+end
+
+local function switchSection(seg)
+    curSeg = seg
+    resetLineno()
+    emit("\n") -- 分隔符行本身换成空行
+end
+
+local function processLine(line)
+    local style = types[curSeg]
+    if style.style == "a" then
+        if blankJoin > 1 then
+            if #line > 0 or (function() blankLines = blankLines + 1; return blankLines == blankJoin end)() then
+                printLineno()
+                blankLines = 0
+            else
+                emit(noLineFmt)
+            end
+        else
+            printLineno()
+        end
+    elseif style.style == "t" then
+        if #line > 0 then printLineno() else emit(noLineFmt) end
+    elseif style.style == "n" then
+        emit(noLineFmt)
+    else -- "p"
+        if style.re:find(line) then printLineno() else emit(noLineFmt) end
+    end
+    emit(line .. "\n")
+end
+
+local function processText(text)
+    local pos = 1
+    while true do
+        local at = text:find("\n", pos, true)
+        local line
+        if at then
+            line = text:sub(pos, at - 1)
+            pos = at + 1
+        else
+            line = text:sub(pos)
+            if line == "" then break end
+            pos = #text + 1
+        end
+        -- 分隔符判定: 整行恰好等于某个分隔符(check_section 的语义)
+        if #sectionDelim > 0 and line == headerDel then
+            switchSection("header")
+        elseif #sectionDelim > 0 and line == bodyDel then
+            switchSection("body")
+        elseif #sectionDelim > 0 and line == footerDel then
+            switchSection("footer")
+        else
+            processLine(line)
+        end
+        if at == nil then break end
+    end
+end
+
+local function slurp(h)
+    if h.readAll then return h:readAll() end
+    local parts = {}
+    while true do
+        local chunk = h:read(4096)
+        if not chunk or chunk == "" then break end
+        parts[#parts + 1] = chunk
+    end
+    return table.concat(parts)
+end
+
+-- 初始化三段的 STYLE(命令行解析期间存的是字符串, 这里统一编译一次)。
+local saved = {}
+for seg, v in pairs(headers) do saved[seg] = v end
+for seg, v in pairs(saved) do
+    if not types[seg] then
+        if not setStyle(seg, v) then return 1 end
+    end
+end
+
+if #files == 0 then files[1] = "-" end
+local rc = 0
+for _, f in ipairs(files) do
+    if f == "-" then
+        processText(slurp(io.stdin()) or "")
+    else
+        local h, err = fs.open(resolve(f), "r")
+        if not h then
+            stderr("nl: " .. f .. ": " .. ioeMsg(err) .. "\n")
+            rc = 1
+        else
+            processText(slurp(h))
+            h:close()
+        end
+    end
+end
+io.write(table.concat(out))
+return rc

@@ -500,6 +500,40 @@ out_chk wc_files0_out 1 sh -c "wc --files0-from=$T/o3/list0 | grep -c o3"
 out_chk dev_tty_node 1 sh -c "ls /dev | grep -cx tty"
 
 # ---------------------------------------------------------------
+# 新命令批(awk/bc/date/env/timeout/seq/yes/rev/tac/nl/column/base64/tsort/
+#          uname/tty/logname/which 与分页器 more/less)
+#   共享的断言在 scripts/newtools_test.sh(宿主与真机跑同一份, 期望值对着宿主 GNU 核过);
+#   下面只补**真机独有**的几条:
+#     - awk 的管道/system(): 宿主测试台是 Lua 5.1, 跨 pcall 不让出(见 awk 头注释),
+#       只有真机(Lua 5.2)能跑;
+#     - timeout 真的掐进程: 宿主测试台的时间不推进(os.epoch 是 CPU 时间), 掐不出来。
+# ---------------------------------------------------------------
+echo "-- new commands (shared) --" >> $LOG
+if [ -f /root/newtools_test.sh ]; then
+    sh /root/newtools_test.sh "$T/newtools" >> $LOG
+    _rc="$?"
+    if [ "$_rc" = "0" ]; then echo "ok   newtools_test" >> $LOG
+    else echo "ng   newtools_test (rc=$_rc)" >> $LOG; ng=1; fi
+else
+    echo "SKIP: /root/newtools_test.sh not deployed" >> $LOG
+fi
+
+echo "-- new commands (real machine only) --" >> $LOG
+N=$T/new
+mkdir -p $N
+printf 'a 1\nb 2\n' > $N/in1
+awk 'BEGIN{"echo pipe-ok" | getline l; print l}' > $N/got; printf 'pipe-ok\n' > $N/want
+file_eq awk_pipe_in $N/got $N/want
+awk 'BEGIN{print "z" | "cat"; close("cat")}' > $N/got; printf 'z\n' > $N/want
+file_eq awk_pipe_out $N/got $N/want
+awk 'BEGIN{print system("echo sys-ok")}' > $N/got; printf 'sys-ok\n0\n' > $N/want
+file_eq awk_system $N/got $N/want
+timeout 1 sleep 30 > $N/got 2> $N/err
+[ "$?" = "124" ] && echo "ok   timeout_kill" >> $LOG || { echo "ng   timeout_kill" >> $LOG; ng=1; }
+timeout 1 nosuchcommand > $N/got 2> $N/err
+[ "$?" = "127" ] && echo "ok   timeout_missing" >> $LOG || { echo "ng   timeout_missing" >> $LOG; ng=1; }
+
+# ---------------------------------------------------------------
 # 标准正则(grep/sed/ed/expr/csplit 的 BRE/ERE 方言与退出码)
 # 独立的 scripts/regex_test.sh: 宿主与真机跑同一份, 期望值对着宿主 GNU 核过。
 # ---------------------------------------------------------------

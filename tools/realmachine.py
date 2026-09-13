@@ -94,6 +94,14 @@ def install_verified(src, dst):
 def payload_fingerprint():
     """payload 指纹: dist/ 产物 + 要注入的 scripts/ 内容哈希(只看内容, 不看时间戳)。"""
     h = hashlib.sha256()
+    # 本文件也进指纹: 改**注入清单**(往镜像里铺哪些文件)同样会让旧镜像失效 ——
+    # 只看 dist/ 与 scripts/ 的话, 加了新 payload 却指纹没变, 会静默复用上一轮的镜像
+    # (本轮踩过: newtools_test.sh 加进清单后跑出来仍是 "not deployed")。
+    try:
+        with open(os.path.abspath(__file__), "rb") as f:
+            h.update(f.read())
+    except OSError:
+        pass
     for root in (os.path.join(REPO, "dist"), os.path.join(REPO, "scripts")):
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames.sort()
@@ -282,7 +290,10 @@ def main():
         #      符号链接/硬链接/命名管道/umask/seek) -> /var/log/posix_verify.log
         #      内核那部分用 /bin/lua 跑 —— 见 scripts/posix_kernel_verify.lua 的头注释: 这里要验的是
         #      **内核语义本身**, 不该依赖某个工具的包装(而且部分能力当时还没有命令行入口)。
+        #      newtools_test.sh 是新命令批(awk/bc/分页器/date/...)的自检主体 —— 宿主与真机
+        #      跑同一份(build.lua --check 里也跑), 由 posix_tools_verify.sh 调它。
         for src, dst in (("scripts/posix_tools_verify.sh", "/root/posix_tools_verify.sh"),
+                         ("scripts/newtools_test.sh", "/root/newtools_test.sh"),
                          ("scripts/posix_kernel_verify.lua", "/root/posix_kernel_verify.lua"),
                          ("scripts/tee_verify.lua", "/root/tee_verify.lua")):
             df_write(out, os.path.join(REPO, src), dst)
@@ -314,6 +325,27 @@ def main():
             mfile = os.path.join(work, "module-manifest")
             with open(mfile, "w") as f:
                 f.write(cur_manifest.strip("\n") + "\nintrtest\n")
+            df_write(out, mfile, moddir + "/manifest")
+
+        # 3f5) tty 原始模式自检(scripts/rawtty_test.ko + scripts/rawtty_verify.lua):
+        #      分页器 more/less 建在"原始模式 + 终端字节流"这条契约上, 而键盘事件只有内核态
+        #      能注入 —— 模块喂按键, Lua 脚本在 /dev/tty0 上 setRaw 并读回字节。
+        df_write(out, os.path.join(REPO, "scripts/rawtty_verify.lua"), "/root/rawtty_verify.lua")
+        df(out, "set_inode_field /root/rawtty_verify.lua mode 0100755")
+        unit_raw = os.path.join(work, "rawtty-verify.service")
+        with open(unit_raw, "w") as f:
+            f.write("[Unit]\nDescription=Real-machine tty raw mode verification\n"
+                    "After=syslogd.service\n\n"
+                    "[Service]\nType=oneshot\nTimeoutStartSec=120\n"
+                    "ExecStart=/bin/lua /root/rawtty_verify.lua\n\n"
+                    "[Install]\nWantedBy=multi-user.target\n")
+        df_write(out, unit_raw, "/lib/systemd/system/rawtty-verify.service")
+        df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/rawtty-verify.service")
+        df_write(out, os.path.join(REPO, "scripts/rawtty_test.ko"), moddir + "/rawtty.ko")
+        if "rawtty" not in cur_manifest.split():
+            mfile = os.path.join(work, "module-manifest")
+            with open(mfile, "w") as f:
+                f.write(cur_manifest.strip("\n") + "\nrawtty\n")
             df_write(out, mfile, moddir + "/manifest")
 
         # 3g) 门禁: 注入后镜像仍必须干净, 不把坏镜像带上真机
@@ -580,6 +612,25 @@ def reboot_and_collect(printer=False):
         raise RuntimeError("交互式 ^C 门禁失败: /tmp/intr.after=%r —— ^C 之后的第一条命令没有执行"
                            "(残留的 SIGINT 把它杀了; 见 src/bin/sh 交互循环)" % after)
     print("   ok regression: the command right after ^C ran")
+
+    # 6a2) tty **原始模式**门禁(载荷 = scripts/rawtty_test.ko + /root/rawtty_verify.lua):
+    #      分页器 more/less 全靠这条契约(setRaw 之后 read(n) = 终端字节流, 特殊键是 ANSI 序列),
+    #      而它只有真机的内核 tty 层能验。判据是 /tmp/rawtty.hex 逐字节等于期望序列:
+    #        x | 空格 | ↑(1b 5b 41) | 7 | enter(只一次, 去重闩锁生效) | ^D(普通字节)
+    print("\n===== tty 原始模式门禁(rawtty 注入按键) =====")
+    for name in ("/var/log/rawtty_verify.log", "/var/log/messages", "/var/log/messages.1"):
+        if "Inode:" not in df(img, "stat " + name):
+            continue
+        for line in df(img, "cat " + name).splitlines():
+            if "rawtty" in line:
+                print("   | " + line.strip())
+    raw_hex = img_file("/tmp/rawtty.hex")
+    want_hex = "78201b5b41370a04"
+    if raw_hex != want_hex:
+        raise RuntimeError("tty 原始模式门禁失败: /tmp/rawtty.hex=%r, 期望 %r"
+                           "(见上面打印的 [rawtty] 进度; 元凶通常是 setRaw 的字节语义或按键映射)"
+                           % (raw_hex, want_hex))
+    print("   ok raw tty: setRaw + read(n) returned " + raw_hex)
 
     p = subprocess.run([FSCK, "-fn", os.path.join(DISK, "parts/root.img")], capture_output=True, text=True)
     out = (p.stdout + p.stderr).strip()

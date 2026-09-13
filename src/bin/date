@@ -1,0 +1,590 @@
+-- Delin date: 显示日期时间 (GNU coreutils date 子集)。
+-- 用法: date [OPTION]... [+FORMAT]
+--       date [-u] [-d STRING] [-f FILE] [-r FILE] [-R] [-I[FMT]] [--rfc-3339=FMT]
+--   -d, --date=STRING        按 STRING 描述的时刻显示(GNU 风格的一部分, 见下)
+--   -f, --file=DATEFILE      每一行都当成 -d 的 STRING, 每行输出一条
+--   -r, --reference=FILE     用 FILE 的修改时间
+--   -u, --utc, --universal   按 UTC 显示(显式写出而已, 见"已知偏离")
+--   -R, --rfc-email          RFC 2822/5322 格式, 如 "Thu, 11 Sep 2026 12:00:00 +0000"
+--   -I[FMT], --iso-8601[=FMT] ISO 8601: 缺省 date(YYYY-MM-DD); hours/minutes/seconds/ns 更精确
+--   --rfc-3339=FMT           date/hours/minutes/seconds/ns 精度
+--   -s, --set=STRING         设置时钟 —— **Delin 不支持**(CC 没有设置系统时钟的接口), fail-fast
+-- FORMAT(GNU 的全部转换, 少数的写法与 C 的 strftime 相同):
+--   %% %a %A %b %B %c %C %d %D %e %F %g %G %h %H %I %j %k %l %m %M %n %N %p %P %q %r %R
+--   %s %S %t %T %u %U %V %w %W %x %X %y %Y %z %:z %::z %:::z %Z
+--   (缺省格式与 GNU 一致: "%a %b %e %H:%M:%S %Z %Y")
+-- -d STRING 支持的写法(超出范围的一律报 "date: invalid date 'STRING'" 并退出 1, 不猜):
+--   @<epoch 秒> | now | today | yesterday | tomorrow | noon
+--   YYYY-MM-DD [HH:MM[:SS]] | YYYY-MM-DDTHH:MM:SS | 上面两种后面可跟 Z 或 +HH[:MM]/-HH[:MM]
+--   HH:MM[:SS](今天) | MM/DD/YYYY [HH:MM[:SS]]
+--   相对: [+-]N unit... | N unit... ago | next unit | last unit | this unit
+--     unit = second/sec/s, minute/min, hour, day, week, month, year(可复合, 如 "1 day 2 hours ago")
+--   "TZ" 前缀/后缀(如 "UTC ...") 接受但忽略(Delin 只有 UTC, 见下)。
+-- 已知偏离:
+--   - **没有时区概念**: 电脑的时钟就是 UTC, 输入输出一律按 UTC 处理; 因此 `-u` 与不给 -u 结果相同,
+--     %Z 恒为 "UTC", %z 恒为 "+0000"。TZ 环境变量不生效。
+--   - **不能设置时钟**: -s 与 MMDDhhmm[[CC]YY][.ss] 操作数一律报
+--     "date: cannot set date: Operation not permitted" 并退出 1(CC 没有设置系统时间的 API)。
+--   - 时间精度是**秒**(ext2 的时间戳就是秒); %N 恒为九个 0, --rfc-3339=ns 与 -Ins 同 seconds。
+--   - 不实现 --help/--version 与 --debug(与本项目其它工具一致)。
+--   - -d 的语言比 GNU 小得多(见上面的清单): 认不出来的写法报错, 不按近似解释。
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+-- ---------------------------------------------------------------
+-- 历法计算(与 glibc 的 mktime/gmtime 同构)
+-- ---------------------------------------------------------------
+local function isLeap(y)
+    return (y % 4 == 0 and y % 100 ~= 0) or y % 400 == 0
+end
+local MDAYS = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 }
+local function daysInMonth(y, m)
+    if m == 2 and isLeap(y) then return 29 end
+    return MDAYS[m]
+end
+
+--- 公历 -> 1970-01-01 起的天数(Hinnant 的 days_from_civil)。
+local function daysFromCivil(y, m, d)
+    y = y - (m <= 2 and 1 or 0)
+    local era = math.floor((y >= 0 and y or (y - 399)) / 400)
+    local yoe = y - era * 400
+    local doy = math.floor((153 * (m + (m > 2 and -3 or 9)) + 2) / 5) + d - 1
+    local doe = yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy
+    return era * 146097 + doe - 719468
+end
+
+--- 天数 -> 公历(Hinnant 的 civil_from_days)。
+local function civilFromDays(z)
+    z = z + 719468
+    local era = math.floor((z >= 0 and z or (z - 146096)) / 146097)
+    local doe = z - era * 146097
+    local yoe = math.floor((doe - math.floor(doe / 1460) + math.floor(doe / 36524) - math.floor(doe / 146096)) / 365)
+    local y = yoe + era * 400
+    local doy = doe - (365 * yoe + math.floor(yoe / 4) - math.floor(yoe / 100))
+    local mp = math.floor((5 * doy + 2) / 153)
+    local d = doy - math.floor((153 * mp + 2) / 5) + 1
+    local m = mp + (mp < 10 and 3 or -9)
+    return y + (m <= 2 and 1 or 0), m, d
+end
+
+--- epoch 秒 -> UTC 分解表(isdst 恒 false)。
+local function gmtimeOf(t)
+    local days = math.floor(t / 86400)
+    local rem = t - days * 86400
+    local y, m, d = civilFromDays(days)
+    local wday = (days + 4) % 7 -- 1970-01-01 是星期四(0=周日)
+    local yday = days - daysFromCivil(y, 1, 1) + 1
+    return {
+        year = y, month = m, day = d,
+        hour = math.floor(rem / 3600),
+        min = math.floor(rem % 3600 / 60),
+        sec = rem % 60,
+        wday = wday, yday = yday,
+        isdst = false,
+    }
+end
+
+local function timeOf(y, m, d, hh, mm, ss)
+    return daysFromCivil(y, m, d) * 86400 + (hh or 0) * 3600 + (mm or 0) * 60 + (ss or 0)
+end
+
+local WDAY_ABBR = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" }
+local WDAY_FULL = { "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" }
+local MON_ABBR = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" }
+local MON_FULL = { "January", "February", "March", "April", "May", "June",
+                   "July", "August", "September", "October", "November", "December" }
+
+--- ISO 8601 的周数与周所属年(%V / %G)。
+local function isoWeek(tm)
+    -- 算法照 glibc: 取本年的 1/1 与目标日的"周四"比较。
+    local y = tm.year
+    local yday = tm.yday
+    local wday = (tm.wday == 0) and 7 or tm.wday -- 1=周一..7=周日
+    local week = math.floor((yday - wday + 10) / 7)
+    local year = y
+    if week < 1 then
+        year = y - 1
+        local prevYday = yday + (isLeap(year) and 366 or 365)
+        local prevWday = ((wday - 1 - (isLeap(year) and 2 or 1)) % 7) + 1
+        week = math.floor((prevYday - prevWday + 10) / 7)
+    elseif week > 52 then
+        local daysInYear = isLeap(y) and 366 or 365
+        if yday - (daysInYear - 52 * 7) >= 1 then
+            local nextWday = ((wday - 1 + 1) % 7) + 1
+            if nextWday <= 3 then week = 1; year = y + 1 end
+        end
+    end
+    return week, year
+end
+
+--- 一年中的第几周(%U = 周日为首日, %W = 周一为首日)。
+local function weekNumber(tm, mondayFirst)
+    local yday = tm.yday
+    local wday = tm.wday -- 0=周日
+    if mondayFirst then
+        local wd = (wday == 0) and 6 or (wday - 1)
+        return math.floor((yday - 1 - wd + 7) / 7)
+    end
+    return math.floor((yday - 1 - wday + 7) / 7)
+end
+
+--- GNU 的 %e / %k / %l: 空格补齐的十进制。
+local function spacePad2(n) return string.format("%2d", n) end
+
+--- 按 GNU 的转换表格式化。tm 是 gmtime 表, fmt 是 +FORMAT 的内容。
+local function formatTime(tm, fmt, epoch)
+    local out = {}
+    local i = 1
+    while i <= #fmt do
+        local ch = fmt:sub(i, i)
+        if ch == "%" then
+            local j = i + 1
+            local mod = ""
+            if fmt:sub(j, j) == ":" then -- %:z %::z %:::z
+                while fmt:sub(j, j) == ":" do mod = mod .. ":"; j = j + 1 end
+            end
+            local c = fmt:sub(j, j)
+            if c == "" then
+                stderr("date: invalid format '%'; conversion specifier cannot be empty\n")
+                return nil
+            end
+            local rep
+            if c == "%" then rep = "%"
+            elseif c == "n" then rep = "\n"
+            elseif c == "t" then rep = "\t"
+            elseif c == "a" then rep = WDAY_ABBR[tm.wday + 1]
+            elseif c == "A" then rep = WDAY_FULL[tm.wday + 1]
+            elseif c == "b" or c == "h" then rep = MON_ABBR[tm.month]
+            elseif c == "B" then rep = MON_FULL[tm.month]
+            elseif c == "c" then rep = string.format("%s %s %2d %02d:%02d:%02d %d",
+                WDAY_ABBR[tm.wday + 1], MON_ABBR[tm.month], tm.day, tm.hour, tm.min, tm.sec, tm.year)
+            elseif c == "C" then rep = string.format("%02d", math.floor(tm.year / 100))
+            elseif c == "d" then rep = string.format("%02d", tm.day)
+            elseif c == "D" then rep = string.format("%02d/%02d/%02d", tm.month, tm.day, tm.year % 100)
+            elseif c == "e" then rep = spacePad2(tm.day)
+            elseif c == "F" then rep = string.format("%04d-%02d-%02d", tm.year, tm.month, tm.day)
+            elseif c == "g" then local _, iy = isoWeek(tm); rep = string.format("%02d", iy % 100)
+            elseif c == "G" then local _, y = isoWeek(tm); rep = string.format("%04d", y)
+            elseif c == "H" then rep = string.format("%02d", tm.hour)
+            elseif c == "I" then rep = string.format("%02d", ((tm.hour + 11) % 12) + 1)
+            elseif c == "j" then rep = string.format("%03d", tm.yday)
+            elseif c == "k" then rep = spacePad2(tm.hour)
+            elseif c == "l" then rep = spacePad2(((tm.hour + 11) % 12) + 1)
+            elseif c == "m" then rep = string.format("%02d", tm.month)
+            elseif c == "M" then rep = string.format("%02d", tm.min)
+            elseif c == "N" then rep = "000000000" -- 时间精度是秒(见"已知偏离")
+            elseif c == "p" then rep = (tm.hour < 12) and "AM" or "PM"
+            elseif c == "P" then rep = (tm.hour < 12) and "am" or "pm"
+            elseif c == "q" then rep = string.format("%d", math.floor((tm.month - 1) / 3) + 1)
+            elseif c == "r" then
+                rep = string.format("%02d:%02d:%02d %s", ((tm.hour + 11) % 12) + 1, tm.min, tm.sec,
+                    (tm.hour < 12) and "AM" or "PM")
+            elseif c == "R" then rep = string.format("%02d:%02d", tm.hour, tm.min)
+            elseif c == "s" then rep = string.format("%d", epoch)
+            elseif c == "S" then rep = string.format("%02d", tm.sec)
+            elseif c == "T" then rep = string.format("%02d:%02d:%02d", tm.hour, tm.min, tm.sec)
+            elseif c == "u" then rep = string.format("%d", tm.wday == 0 and 7 or tm.wday)
+            elseif c == "U" then rep = string.format("%02d", weekNumber(tm, false))
+            elseif c == "V" then rep = string.format("%02d", isoWeek(tm))
+            elseif c == "w" then rep = string.format("%d", tm.wday)
+            elseif c == "W" then rep = string.format("%02d", weekNumber(tm, true))
+            elseif c == "x" then rep = string.format("%02d/%02d/%02d", tm.month, tm.day, tm.year % 100)
+            elseif c == "X" then rep = string.format("%02d:%02d:%02d", tm.hour, tm.min, tm.sec)
+            elseif c == "y" then rep = string.format("%02d", tm.year % 100)
+            elseif c == "Y" then rep = string.format("%d", tm.year)
+            elseif c == "z" then
+                rep = (mod == ":::") and "+00" or "+0000"
+            elseif c == "Z" then rep = "UTC"
+            else
+                stderr("date: invalid format '%" .. c .. "'\n")
+                return nil
+            end
+            out[#out + 1] = rep
+            i = j + 1
+        else
+            out[#out + 1] = ch
+            i = i + 1
+        end
+    end
+    return table.concat(out)
+end
+
+-- ---------------------------------------------------------------
+-- -d 的字符串解析
+-- ---------------------------------------------------------------
+local UNIT_SECONDS = {
+    ["second"] = 1, ["seconds"] = 1, ["sec"] = 1, ["secs"] = 1, ["s"] = 1,
+    ["minute"] = 60, ["minutes"] = 60, ["min"] = 60, ["mins"] = 60,
+    ["hour"] = 3600, ["hours"] = 3600,
+    ["day"] = 86400, ["days"] = 86400,
+    ["week"] = 604800, ["weeks"] = 604800,
+}
+
+--- 相对表达 -> 相对 baseEpoch 的**秒差**; 认不出来返回 nil。
+--- 单位: second/sec/s minute/min hour day week(定长) 与 month/year(按历法, 且与 GNU 一样
+--- **不夹到月末**: "2026-01-31 1 month" 在 GNU 上是 2026-03-03(2 月 31 日归一化到 3 月 3 日))。
+local function parseRelative(lower, baseEpoch)
+    local r = lower
+    local ago = false
+    if r:match("ago$") then ago = true; r = r:gsub("%s*ago%s*$", "") end
+    r = r:gsub("^next%s+", "+1 "):gsub("^last%s+", "-1 "):gsub("^this%s+", "+0 ")
+    local total, pos, n = 0, 1, 0
+    -- "ago" 要对**每一项**取反(不是最后把总秒数取反): 月/年是历法运算,
+    -- "+1 month 再取反" 与 "-1 month" 不是同一天(6-15 加一个月是 7-15, 退 30 天却是 5-16)。
+    local flip = ago and -1 or 1
+    while pos <= #r do
+        local sp, ep, sign, digits, unit = r:find("^([%+%-]?)(%d+)%s*([%a]+)%s*", pos)
+        if not sp then break end
+        local num = tonumber(digits) * flip
+        if sign == "-" then num = -num end
+        local sec = UNIT_SECONDS[unit]
+        if sec then
+            total = total + num * sec
+        elseif unit == "month" or unit == "months" or unit == "year" or unit == "years" then
+            local months = num
+            if unit:sub(1, 1) == "y" then months = months * 12 end
+            local tm = gmtimeOf(baseEpoch + total)
+            local nm = tm.month - 1 + months
+            local ny = tm.year + math.floor(nm / 12)
+            local nmo = nm % 12 + 1
+            -- 天数不夹: 直接按"该月 1 日 + (day-1) 天"归一化(与 mktime 的行为一致)
+            total = timeOf(ny, nmo, 1, tm.hour, tm.min, tm.sec)
+                + (tm.day - 1) * 86400 - baseEpoch
+        else
+            return nil -- 未知单位: 不猜
+        end
+        pos = ep + 1
+        n = n + 1
+    end
+    if n > 0 and pos > #r then return total end
+    return nil
+end
+
+--- 解析一条 -d 字符串, 返回 epoch 秒; 失败返回 nil。
+local function parseDate(str, baseEpoch)
+    local s = str:gsub("^%s+", ""):gsub("%s+$", "")
+    if s == "" then return nil end
+    -- "UTC"/"GMT" 前缀/后缀: 接受但忽略(只有 UTC)
+    s = s:gsub("^[Uu][Tt][Cc]%s+", ""):gsub("^[Gg][Mm][Tt]%s+", "")
+    s = s:gsub("%s+[Uu][Tt][Cc]$", ""):gsub("%s+[Gg][Mm][Tt]$", "")
+    if s:match("^@[%+%-]?%d+$") then return tonumber(s:sub(2)) end
+
+    local base = gmtimeOf(baseEpoch)
+
+    -- 关键词
+    local lower = s:lower()
+    if lower == "now" then return baseEpoch end
+    if lower == "today" or lower == "midnight" then return timeOf(base.year, base.month, base.day, 0, 0, 0) end
+    if lower == "noon" then return timeOf(base.year, base.month, base.day, 12, 0, 0) end
+    if lower == "yesterday" or lower == "tomorrow" then
+        local t = baseEpoch + ((lower == "yesterday") and -86400 or 86400)
+        local tm = gmtimeOf(t)
+        return timeOf(tm.year, tm.month, tm.day, base.hour, base.min, base.sec)
+    end
+
+    -- 绝对日期: YYYY-MM-DD 或 MM/DD/YYYY, 后面可跟时间与 Z/±HH[:MM]
+    local y, mo, d, rest
+    do
+        local a, b, c, r = s:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)(.*)$")
+        if a then
+            y, mo, d, rest = tonumber(a), tonumber(b), tonumber(c), r
+        else
+            local m2, d2, y2, r2 = s:match("^(%d%d?)/(%d%d?)/(%d%d%d%d)(.*)$")
+            if m2 then y, mo, d, rest = tonumber(y2), tonumber(m2), tonumber(d2), r2 end
+        end
+    end
+    if y then
+        rest = (rest or ""):gsub("^[Tt%s]+", "")
+        local hh, mi, ss = 0, 0, 0
+        -- 只有"看起来像时间"(带冒号)才按时间解析; 否则留给下面的相对表达
+        if rest ~= "" and rest:match("^%d%d?%s*:") then
+            local h, m, sec = rest:match("^(%d%d?):(%d%d):(%d%d)")
+            if not h then h, m = rest:match("^(%d%d?):(%d%d)") end
+            if not h then return nil end
+            hh, mi, ss = tonumber(h), tonumber(m), tonumber(sec or 0)
+            rest = rest:gsub("^%d%d?:%d%d:?%d*", "")
+        end
+        rest = rest:gsub("%s", "")
+        local off = 0
+        if rest == "Z" or rest == "z" then
+            rest = ""
+        elseif rest:match("^[%+%-]%d%d:?%d%d$") then
+            local sign = (rest:sub(1, 1) == "-") and -1 or 1
+            local oh, om = rest:sub(2):match("^(%d%d):?(%d%d)$")
+            off = sign * (tonumber(oh) * 3600 + tonumber(om or 0) * 60)
+            rest = ""
+        end
+        local t = timeOf(y, mo, d, hh, mi, ss) - off
+        if rest ~= "" then
+            -- "2026-09-11 12:00 1 day ago" 这种"绝对 + 相对"的写法 GNU 也认。
+            local delta = parseRelative(rest:lower(), t)
+            if not delta then return nil end
+            t = t + delta
+        end
+        return t
+    end
+
+    -- 只有时间: HH:MM[:SS](今天)
+    do
+        local h, m, sec = s:match("^(%d%d?):(%d%d):(%d%d)$")
+        if not h then h, m = s:match("^(%d%d?):(%d%d)$") end
+        if h then
+            return timeOf(base.year, base.month, base.day, tonumber(h), tonumber(m), tonumber(sec or 0))
+        end
+    end
+
+    -- 相对表达: [+-]N unit ... [ago] / next unit / last unit / this unit
+    local delta = parseRelative(lower, baseEpoch)
+    if delta then return baseEpoch + delta end
+
+    return nil
+end
+
+-- ---------------------------------------------------------------
+-- 选项解析
+-- ---------------------------------------------------------------
+local utc = false
+local dateStr, dateFile, refFile = nil, nil, nil
+local isoFmt, rfc3339 = nil, nil
+local rfcEmail = false
+local setStr = nil
+local operands = {}
+
+local function isInt(v) return tostring(v):match("^[%+%-]?%d+$") ~= nil end
+
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if a == "-u" or a == "--utc" or a == "--universal" then
+        utc = true
+    elseif a == "-R" or a == "--rfc-email" then
+        rfcEmail = true
+    elseif a == "-Ru" or a == "-uR" then
+        rfcEmail, utc = true, true
+    elseif a == "-d" or a == "--date" then
+        i = i + 1
+        if not args[i] then stderr("date: option requires an argument -- 'd'\n"); return 1 end
+        dateStr = args[i]
+    elseif a:match("^%-%-date=") then
+        dateStr = a:sub(8)
+    elseif a:match("^%-d.") then
+        dateStr = a:sub(3)
+    elseif a == "-f" or a == "--file" then
+        i = i + 1
+        if not args[i] then stderr("date: option requires an argument -- 'f'\n"); return 1 end
+        dateFile = args[i]
+    elseif a:match("^%-%-file=") then
+        dateFile = a:sub(8)
+    elseif a:match("^%-f.") then
+        dateFile = a:sub(3)
+    elseif a == "-r" or a == "--reference" then
+        i = i + 1
+        if not args[i] then stderr("date: option requires an argument -- 'r'\n"); return 1 end
+        refFile = args[i]
+    elseif a:match("^%-%-reference=") then
+        refFile = a:sub(13)
+    elseif a:match("^%-r.") then
+        refFile = a:sub(3)
+    elseif a == "-s" or a == "--set" then
+        i = i + 1
+        if not args[i] then stderr("date: option requires an argument -- 's'\n"); return 1 end
+        setStr = args[i]
+    elseif a:match("^%-%-set=") then
+        setStr = a:sub(7)
+    elseif a:match("^%-s.") then
+        setStr = a:sub(3)
+    elseif a == "-I" or a == "--iso-8601" then
+        isoFmt = "date"
+    elseif a:match("^%-%-iso%-8601=") then
+        isoFmt = a:sub(13)
+    elseif a:match("^%-I.") then
+        isoFmt = a:sub(3)
+    elseif a:match("^%-%-rfc%-3339=") then
+        rfc3339 = a:sub(12)
+    elseif a == "--rfc-3339" then
+        stderr("date: option '--rfc-3339' requires an argument\n")
+        return 1
+    elseif a:sub(1, 2) == "--" then
+        stderr("date: unrecognized option '" .. a .. "'\n")
+        return 1
+    elseif a:sub(1, 1) == "-" and a ~= "-" and not isInt(a) then
+        stderr("date: invalid option -- '" .. a:sub(2, 2) .. "'\n")
+        return 1
+    else
+        operands[#operands + 1] = a
+    end
+    i = i + 1
+end
+
+if setStr then
+    stderr("date: cannot set date: Operation not permitted\n")
+    return 1
+end
+local fmtStr = nil
+for _, op in ipairs(operands) do
+    if op:sub(1, 1) == "+" then
+        if fmtStr then
+            stderr("date: extra operand '" .. op .. "'\n")
+            return 1
+        end
+        fmtStr = op:sub(2)
+    else
+        -- MMDDhhmm[[CC]YY][.ss] 这类操作数在 GNU 上是"设置时钟", Delin 不支持。
+        stderr("date: cannot set date: Operation not permitted\n")
+        return 1
+    end
+end
+
+if isoFmt or rfc3339 then
+    local want = isoFmt or rfc3339
+    if want ~= "date" and want ~= "hours" and want ~= "minutes" and want ~= "seconds" and want ~= "ns" then
+        stderr("date: invalid argument '" .. want .. "' for date format\n")
+        return 1
+    end
+    if rfc3339 and want == "date" then
+        stderr("date: invalid argument 'date' for --rfc-3339\n")
+        return 1
+    end
+end
+
+if rfcEmail and isoFmt then
+    stderr("date: the options to specify date format are mutually exclusive\n")
+    return 1
+end
+if rfcEmail and rfc3339 then
+    stderr("date: the options to specify date format are mutually exclusive\n")
+    return 1
+end
+if (isoFmt or rfc3339) and fmtStr then
+    stderr("date: the options to specify date format are mutually exclusive\n")
+    return 1
+end
+
+-- 时间源
+local function readAll(path, what)
+    local h, err = fs.open(resolve(path), "r")
+    if not h then return nil, err end
+    local s = h.readAll and h:readAll() or ""
+    if not h.readAll then
+        local parts = {}
+        while true do
+            local chunk = h:read(4096)
+            if not chunk or chunk == "" then break end
+            parts[#parts + 1] = chunk
+        end
+        s = table.concat(parts)
+    end
+    h:close()
+    return s
+end
+
+local now = os.time()
+local baseEpoch = now
+-- -u(utc) 在 Delin 上是**默认行为**(没有别的时区); 收下这个开关只为命令行兼容。
+local _ = utc
+if refFile then
+    local a = fs.attributes(resolve(refFile))
+    if not a then
+        stderr("date: " .. refFile .. ": No such file or directory\n")
+        return 1
+    end
+    baseEpoch = a.mtime or a.modification or now
+end
+if dateStr then
+    local t = parseDate(dateStr, baseEpoch)
+    if not t then
+        stderr("date: invalid date '" .. dateStr .. "'\n")
+        return 1
+    end
+    baseEpoch = t
+end
+
+-- 输出格式
+local function defaultFormat(tm, t)
+    return formatTime(tm, "%a %b %e %H:%M:%S %Z %Y", t)
+end
+
+local function outOne(t)
+    local tm = gmtimeOf(t)
+    if fmtStr then
+        local s = formatTime(tm, fmtStr, t)
+        if not s then return false end
+        -- GNU: +FORMAT 的输出**恒以一个换行收尾**(即使格式里已经有 %n)
+        io.write(s .. "\n")
+        return true
+    end
+    if rfcEmail then
+        io.write(formatTime(tm, "%a, %d %b %Y %H:%M:%S +0000", t) .. "\n")
+        return true
+    end
+    if isoFmt then
+        local f
+        if isoFmt == "date" then f = "%Y-%m-%d"
+        elseif isoFmt == "hours" then f = "%Y-%m-%dT%H+00:00"
+        elseif isoFmt == "minutes" then f = "%Y-%m-%dT%H:%M+00:00"
+        else f = "%Y-%m-%dT%H:%M:%S+00:00" end
+        io.write(formatTime(tm, f, t) .. "\n")
+        return true
+    end
+    if rfc3339 then
+        local f
+        if rfc3339 == "hours" then f = "%Y-%m-%d %H+00:00"
+        elseif rfc3339 == "minutes" then f = "%Y-%m-%d %H:%M+00:00"
+        else f = "%Y-%m-%d %H:%M:%S+00:00" end
+        io.write(formatTime(tm, f, t) .. "\n")
+        return true
+    end
+    io.write(defaultFormat(tm, t) .. "\n")
+    return true
+end
+
+if dateFile then
+    local text, err = readAll(dateFile)
+    if not text then
+        stderr("date: " .. dateFile .. ": " .. tostring(err) .. "\n")
+        return 1
+    end
+    local pos = 1
+    while true do
+        local at = text:find("\n", pos, true)
+        local line
+        if at then line = text:sub(pos, at - 1); pos = at + 1
+        else line = text:sub(pos); if line == "" then break end; pos = #text + 1 end
+        if line ~= "" then
+            local t = parseDate(line, now)
+            if not t then
+                stderr("date: invalid date '" .. line .. "'\n")
+                return 1
+            end
+            local tm = gmtimeOf(t)
+            local s = fmtStr and formatTime(tm, fmtStr, t) or nil
+            if fmtStr then
+                if not s then return 1 end
+                io.write(s .. "\n")
+            else
+                io.write(defaultFormat(tm, t) .. "\n")
+            end
+        end
+        if at == nil then break end
+    end
+    return 0
+end
+
+if not outOne(baseEpoch) then return 1 end
+return 0

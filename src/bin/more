@@ -1,0 +1,503 @@
+-- Delin more: 分页显示 (POSIX more(1) + GNU/more 的常用选项)。
+-- 用法: more [-dflpsuc] [-n N] [+行号] [+/模式] [+命令] [FILE...]
+--   -d        提示行改成 "[Press space to continue, 'q' to quit.]", 并在非法键时提示
+--   -f        按**逻辑行**计数(不做折行计数; Delin 的终端不折行, 因此这是缺省行为)
+--   -l        不把 ^L(换页)当特殊字符
+--   -p        不滚屏, 而是清屏从头显示(等价 -c)
+--   -c        同 -p(清屏重画而不是滚屏)
+--   -s        把连续空行压成一行
+--   -u        不处理退格/下划线(CC 终端没有下划线, 收下但无效果)
+--   -N / -nN  N 是每屏行数(缺省按终端高度 - 1)
+--   +行号     从第 N 行开始显示
+--   +/模式    从第一个匹配该 POSIX 正则(BRE)的行开始
+--   +命令     从该命令开始执行(`+/re` 之外的写法, 同 more 的交互命令)
+-- 交互命令(与 more(1) 一致):
+--   空格 / f        下一屏           回车 / j        下一行
+--   b / ^B          上一屏           d / ^D          下移半屏
+--   u / ^U          上移半屏         q / Q           退出
+--   =               显示当前行号     /模式           向后搜索
+--   n               重复上一次搜索   h / ?           帮助
+--   !命令           执行 shell 命令  :f              显示文件名与行号
+--   s N             向后跳过 N 行    ^L              重画
+--   .               重复上一个命令
+-- 语义要点:
+--   - stdout **不是终端**时不分页: 直接把输入照抄到 stdout(管道/重定向下与 Linux 上的 more 一致)。
+--   - 输入是终端时用**原始模式**(内核 tty 的 setRaw: 关回显与行规程, ISIG 保持打开),
+--     所以按一下键就走一步, 不必回车; ^C 仍然是 SIGINT(由内核投给前台进程组, 退出码 130)。
+--   - 整个输入一次读入内存(GNU more 是流式的): CC 上的文件很小, 这个取舍换来"能往回翻页"。
+-- 已知偏离:
+--   - 不实现 --help/--version 与 --no-... 一族(GNU 的开关), 未知选项一律 fail-fast 退出 2。
+--   - 终端**不折行**: 长行按终端宽度截断显示并在行尾放一个标记? —— 不, 按 more 的做法原样输出,
+--     由终端自己处理(CC 终端会在行尾自动不换行地裁掉超出部分)。
+--   - 空行压缩只做连续两行以上(-s), 与 GNU 相同。
+--   - 不支持多字节字符的宽度计算(无 locale, 一律按字节)。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+local function ioeMsg(err)
+    if err and (err:find("permission") or err:find("denied")) then return "Permission denied" end
+    if err and err:lower():find("no such file") then return "No such file or directory" end
+    if err and err:find("directory") then return "Is a directory" end
+    return "No such file or directory"
+end
+
+local _msleep = os.msleep or function(ms) os.sleep(math.max((ms or 0) / 1000, 0.05)) end
+
+-- ===============================================================
+-- 选项
+-- ===============================================================
+local optD, optSqueeze, optClear, optNoScroll = false, false, false, false
+local linesPerScreen = nil
+local startLine, startPattern, startCommand = nil, nil, nil
+local files = {}
+
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if a == "--" then
+        i = i + 1
+        while i <= #args do files[#files + 1] = args[i]; i = i + 1 end
+        break
+    elseif a:sub(1, 1) == "+" then
+        local rest = a:sub(2)
+        local num = tonumber(rest)
+        if num then
+            startLine = math.floor(num)
+        elseif rest:sub(1, 1) == "/" then
+            startPattern = rest:sub(2)
+        else
+            startCommand = rest
+        end
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        local body = a:sub(2)
+        if body:match("^%d+$") then
+            linesPerScreen = tonumber(body)
+        else
+            for k = 1, #body do
+                local c = body:sub(k, k)
+                if c == "d" then optD = true
+                elseif c == "f" then -- 按逻辑行计数: Delin 终端不折行, 缺省即如此
+                elseif c == "l" then -- 不把 ^L 当特殊字符: 输入里的 ^L 原样输出
+                elseif c == "p" then optClear, optNoScroll = true, true
+                elseif c == "c" then optClear = true
+                elseif c == "s" then optSqueeze = true
+                elseif c == "u" then -- 退格/下划线: CC 终端无下划线, 无效果
+                elseif c == "n" then
+                    k = k + 1
+                    local digits = body:sub(k):match("^(%d+)")
+                    if not digits then
+                        stderr("more: option requires an argument -- 'n'\n")
+                        return 2
+                    end
+                    linesPerScreen = tonumber(digits)
+                    k = k + #digits
+                else
+                    stderr("more: invalid option -- '" .. c .. "'\n")
+                    return 2
+                end
+            end
+        end
+    else
+        files[#files + 1] = a
+    end
+    i = i + 1
+end
+
+-- ===============================================================
+-- 终端
+-- ===============================================================
+local ESC = "\27"
+
+--- 取终端输入句柄: stdin 是终端就用它, 否则用 /dev/tty(与 more 一致)。
+local function ttyInput()
+    local h = io.stdin()
+    if h and h.isTTY and h.setRaw and h.read then return h end
+    local t = fs.open("/dev/tty", "r")
+    if t then return t end
+    return nil
+end
+
+--- 屏幕尺寸(cols, rows)。拿不到就 80x24(Linux 上 more 的缺省)。
+local function screenSize(h)
+    if h and h.getSize then
+        local c, r = h:getSize()
+        if c and r and c > 0 and r > 0 then return c, r end
+    end
+    return 80, 24
+end
+
+local function outputIsTTY()
+    local o = io.stdout()
+    return o ~= nil and o.isTTY == true
+end
+
+local function write(s) io.write(s) end
+
+--- 按键 -> 命令名。原始模式下读到的是字节流(特殊键是 ANSI 序列)。
+local KEYSEQ = {
+    ["\27[A"] = "up", ["\27[B"] = "down", ["\27[C"] = "right", ["\27[D"] = "left",
+    ["\27[H"] = "home", ["\27[F"] = "end", ["\27[5~"] = "pageup", ["\27[6~"] = "pagedown",
+}
+local function readKey(t)
+    local b = t:read(1)
+    if not b then return nil end
+    if b == ESC then
+        -- 尽量把整条转义序列读全(最多 4 个字节); 读不到就用单个 ESC
+        local seq = ESC
+        for _ = 1, 3 do
+            local more = t:read(1)
+            if not more then break end
+            seq = seq .. more
+            if KEYSEQ[seq] then return KEYSEQ[seq], seq end
+        end
+        return KEYSEQ[seq] or "escape", seq
+    end
+    if b == "\r" or b == "\n" then return "enter", b end
+    if b == "\3" then return "ctrl-c", b end -- ISIG 开着时一般到不了这里
+    if b == "\4" then return "ctrl-d", b end
+    if b == "\12" then return "ctrl-l", b end
+    if b == "\8" or b == "\127" then return "backspace", b end
+    if b == " " then return "space", b end
+    return b, b
+end
+
+--- 读一行(用于 / 搜索、! 命令、:f 之后等)。原始模式下自己收字符直到回车。
+local function readLineRaw(t, prompt)
+    local buf = {}
+    write(prompt)
+    while true do
+        local k, raw = readKey(t)
+        if k == nil then return nil end
+        if k == "enter" then
+            write("\n")
+            return table.concat(buf)
+        elseif k == "backspace" then
+            if #buf > 0 then
+                buf[#buf] = nil
+                write("\b \b")
+            end
+        elseif k == "ctrl-c" then
+            write("\n")
+            return ""
+        elseif raw and #raw == 1 and raw:byte() >= 32 then
+            buf[#buf + 1] = raw
+            write(raw)
+        end
+    end
+end
+
+-- ===============================================================
+-- 读入
+-- ===============================================================
+local function readAll(h)
+    if h.readAll then return h:readAll() end
+    local parts = {}
+    while true do
+        local chunk = h.read and h:read(4096)
+        if not chunk or chunk == "" then break end
+        parts[#parts + 1] = chunk
+    end
+    return table.concat(parts)
+end
+
+--- 把文本切成行数组(末尾不带换行的最后一行也算一行)。
+local function splitLines(text)
+    local out = {}
+    local pos = 1
+    while true do
+        local at = text:find("\n", pos, true)
+        if not at then
+            if pos <= #text then out[#out + 1] = text:sub(pos) end
+            break
+        end
+        out[#out + 1] = text:sub(pos, at - 1)
+        pos = at + 1
+    end
+    return out
+end
+
+local chunks = {} -- { name = 文件名, lines = {...} }
+if #files == 0 then files[1] = "-" end
+for _, f in ipairs(files) do
+    if f == "-" then
+        chunks[#chunks + 1] = { name = "", lines = splitLines(readAll(io.stdin()) or "") }
+    else
+        local h, err = fs.open(resolve(f), "r")
+        if not h then
+            stderr("more: " .. f .. ": " .. ioeMsg(err) .. "\n")
+            return 1
+        end
+        local text = readAll(h)
+        h:close()
+        chunks[#chunks + 1] = { name = f, lines = splitLines(text) }
+    end
+end
+
+--- 所有文件的行拼成一张表(记录每行属于哪个文件, 供 :f 用)
+local allLines = {}
+for _, ch in ipairs(chunks) do
+    for _, l in ipairs(ch.lines) do allLines[#allLines + 1] = l end
+    if #ch.lines == 0 then
+        -- 空文件: 不贡献行
+    end
+end
+
+-- -s: 连续空行压成一行
+if optSqueeze then
+    local squeezed = {}
+    local prevBlank = false
+    for _, l in ipairs(allLines) do
+        local blank = (l == "")
+        if not (blank and prevBlank) then squeezed[#squeezed + 1] = l end
+        prevBlank = blank
+    end
+    allLines = squeezed
+end
+
+-- ===============================================================
+-- 不分页: stdout 不是终端 -> 直接照抄
+-- ===============================================================
+if not outputIsTTY() then
+    local tc = ttyInput()
+    if tc and tc.setRaw then tc:setRaw(false) end
+    for _, l in ipairs(allLines) do write(l .. "\n") end
+    return 0
+end
+
+local tty = ttyInput()
+if not tty then
+    stderr("more: cannot open terminal\n")
+    return 1
+end
+local cols, rows = screenSize(tty)
+local perScreen = linesPerScreen or (rows - 1)
+if perScreen < 1 then perScreen = 1 end
+
+-- ===============================================================
+-- 显示
+-- ===============================================================
+local function regexCompile(pat)
+    local cf = syscalls and syscalls["regex.compile"]
+    if not cf then return nil, "regex syscall not available" end
+    return cf(pat, "bre")
+end
+
+local cur = 1 -- 当前屏**首行**的行号(1 起)
+local lastCommand, lastPattern = nil, nil
+local quit = false
+
+local function total()
+    return #allLines
+end
+
+--- 显示一屏(从 cur 开始, perScreen 行), 返回是否显示到了文件末尾。
+local function drawScreen()
+    local n = total()
+    if optClear then
+        write("\27[H\27[2J") -- 清屏回左上(less/more -c 的做法)
+    end
+    local shownFrom = cur
+    local last = math.min(n, cur + perScreen - 1)
+    local out = {}
+    for k = cur, last do
+        out[#out + 1] = allLines[k]
+        out[#out + 1] = "\n"
+    end
+    if #out > 0 then write(table.concat(out)) end
+    if last < shownFrom then last = shownFrom - 1 end
+    -- 空行补齐: -c 时把剩余屏幕清掉
+    if optClear then
+        for _ = last - shownFrom + 1, perScreen - 1 do write("\27[K\n") end
+    end
+    return last
+end
+
+local function percent()
+    local n = total()
+    if n == 0 then return 100 end
+    local shown = math.min(n, cur + perScreen - 1)
+    return math.floor(shown * 100 / n)
+end
+
+local function prompt(extra)
+    if optD then
+        write("--More--(" .. percent() .. "%)" .. (extra or "") .. " [Press space to continue, 'q' to quit.]")
+    else
+        write("--More--" .. (extra or "") .. "(" .. percent() .. "%)")
+    end
+end
+
+local function clearPrompt()
+    write("\r\27[K")
+end
+
+do
+    -- 初始位置: +行号 / +/模式 / +命令
+    if startLine then
+        cur = math.max(1, math.min(startLine, math.max(1, total())))
+    end
+    if startPattern then
+        local re, err = regexCompile(startPattern)
+        if not re then
+            stderr("more: invalid regular expression: " .. startPattern .. " (" .. tostring(err) .. ")\n")
+            return 2
+        end
+        local found = nil
+        for k = 1, total() do
+            if re:find(allLines[k]) then found = k; break end
+        end
+        if found then cur = found end
+    end
+    if startCommand and startCommand ~= "" then
+        lastCommand = startCommand
+    end
+end
+
+tty:setRaw(true)
+local okRun, runErr = pcall(function()
+    while not quit do
+        local lastShown = drawScreen()
+        if lastShown >= total() then
+            -- 到末尾: 显示提示后等待(POSIX: 文件末尾也显示 --More--, 但按空格就是退出)
+        end
+        prompt()
+        local cmd
+        if lastCommand then
+            cmd = lastCommand
+            lastCommand = nil
+            clearPrompt()
+        else
+            local k, raw = readKey(tty)
+            clearPrompt()
+            cmd = k
+            if k == nil then quit = true; break end
+            if raw and #raw > 1 and not (k == "up" or k == "down" or k == "pageup"
+                or k == "pagedown" or k == "home" or k == "end" or k == "left"
+                or k == "right" or k == "escape") then
+                cmd = raw -- 转义序列原样当命令(不认识就忽略)
+            end
+        end
+
+        if cmd == "space" or cmd == "f" or cmd == "pagedown" then
+            if lastShown >= total() then quit = true else cur = lastShown + 1 end
+        elseif cmd == "enter" or cmd == "j" or cmd == "down" or cmd == "\n" then
+            if cur + perScreen > total() then
+                if lastShown >= total() then quit = true else cur = cur + 1 end
+            else
+                cur = cur + 1
+            end
+        elseif cmd == "b" or cmd == "pageup" or cmd == "up" then
+            cur = math.max(1, cur - perScreen)
+        elseif cmd == "d" or cmd == "ctrl-d" then
+            cur = math.min(math.max(1, total()), cur + math.floor(perScreen / 2))
+        elseif cmd == "u" then
+            cur = math.max(1, cur - math.floor(perScreen / 2))
+        elseif cmd == "ctrl-l" then
+            write("\27[H\27[2J")
+        elseif cmd == "=" then
+            prompt(" [line " .. cur .. "/" .. total() .. "]")
+            readKey(tty)
+        elseif cmd == "/" or cmd == "n" then
+            local pat
+            if cmd == "/" then
+                pat = readLineRaw(tty, "/")
+                if pat == nil then quit = true; break end
+                if pat == "" then pat = lastPattern end
+                lastPattern = pat
+            else
+                pat = lastPattern
+            end
+            if pat and pat ~= "" then
+                local re, err = regexCompile(pat)
+                if not re then
+                    stderr("more: invalid regular expression: " .. pat .. " (" .. tostring(err) .. ")\n")
+                else
+                    local from = (cmd == "n") and (cur + 1) or cur
+                    local found = nil
+                    for k = from, total() do
+                        if re:find(allLines[k]) then found = k; break end
+                    end
+                    if not found and cmd == "n" then
+                        for k = 1, total() do
+                            if re:find(allLines[k]) then found = k; break end
+                        end
+                    end
+                    if found then
+                        cur = found
+                    else
+                        stderr("more: pattern not found: " .. pat .. "\n")
+                    end
+                end
+            end
+        elseif cmd == "s" then
+            local s = readLineRaw(tty, "skip ")
+            local n = tonumber(s) or 1
+            cur = math.min(math.max(1, total()), cur + n)
+        elseif cmd == ":f" or cmd == ":" then
+            local name = chunks[1] and chunks[1].name or ""
+            if cmd == ":" then
+                readLineRaw(tty, ":")
+            end
+            if name == "" then name = "(standard input)" end
+            prompt(" [" .. name .. ", line " .. cur .. "/" .. total() .. "]")
+            readKey(tty)
+        elseif cmd == "!" then
+            local c = readLineRaw(tty, "!")
+            if c and c ~= "" then
+                write("\27[H\27[2J")
+                io.flush()
+                local pid = syscalls and syscalls["proc.exec"] and syscalls["proc.exec"]("sh", { "-c", c }, {})
+                if not pid then
+                    stderr("more: cannot run shell\n")
+                else
+                    syscalls["proc.wait"](pid)
+                end
+                write("![Press RETURN]")
+                readKey(tty)
+                write("\27[H\27[2J")
+            end
+        elseif cmd == "h" or cmd == "?" then
+            write("\27[H\27[2J")
+            write("more: commands -- space/f: next screen, enter/j: next line, b: back screen,\n")
+            write("      d/^D: half screen down, u/^U: half screen up, q: quit, =: line number,\n")
+            write("      /pat: search, n: next match, s N: skip N lines, !cmd: shell, f: file info,\n")
+            write("      ^L: redraw, .: repeat last command\n")
+            write("--More--(help) [Press space to continue]")
+            readKey(tty)
+        elseif cmd == "." then
+            lastCommand = lastCommand
+        elseif cmd == "q" or cmd == "Q" or cmd == "ctrl-c" then
+            quit = true
+        elseif cmd == "escape" then
+            quit = true
+        elseif cmd == "left" or cmd == "right" or cmd == "home" or cmd == "end" or cmd == "backspace" then
+            -- 忽略
+        else
+            if optD then
+                prompt(" [Press 'h' for instructions.]")
+                readKey(tty)
+            end
+        end
+    end
+end)
+tty:setRaw(false)
+if not okRun then
+    -- 出错也要把终端还原(与 ^C 一样)
+    stderr("more: " .. tostring(runErr) .. "\n")
+    return 1
+end
+write("\r\27[K\n")
+return 0

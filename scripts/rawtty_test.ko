@@ -1,0 +1,124 @@
+--@name rawtty
+--@version 0.0.1
+--@deps
+--@description real-machine raw-mode key injection payload (test image only, never shipped in dist/)
+--[[ Real-machine payload for the tty **raw mode** (kernel/tty.lua setRaw + KEY_SEQ).
+
+     Why a kernel module: a real key press reaches the line discipline through
+     tty.routeKey/tty.feedInput, and the kernel is the only context that may drive it without going
+     through the CC event queue (queued events are eaten by filtered pulls inside other processes'
+     os.sleep -- measured, see scripts/intr_test.ko).  Modules are loaded before the scheduler
+     starts, so init() can wrap os.pullEventRaw and feed keys from inside that loop.
+
+     Companion: scripts/rawtty_verify.lua runs as /root/rawtty_verify.lua (via /bin/lua) and does
+     the other half -- it opens /dev/tty0, calls setRaw(true), writes /tmp/rawtty.ready, reads the
+     bytes back and writes them as hex to /tmp/rawtty.hex.  This module waits for that flag, feeds
+     the key sequence below, and stops once the script reports /tmp/rawtty.done.
+
+     Sequence -> expected bytes (POSIX/Linux raw terminal contract):
+       char "x"                    -> 78
+       char " "                    -> 20
+       key  up                     -> 1b 5b 41   (CSI A, the same bytes xterm sends)
+       char "7"                    -> 37
+       key  enter *and* char "\n"  -> 0a         (only once: the duplicate char is dropped)
+       Ctrl+D (key ctrl + key d)   -> 04         (ICANON off, so ^D is an ordinary byte)
+     so /tmp/rawtty.hex must read 78201b5b41370a04.
+
+     Platform guard: plain CC only (see scripts/intr_test.ko).
+     ASCII only: this file is copied onto the CC computer. ]]
+
+local EXPECTED = 8 -- 需要喂进去的字节数(与 rawtty_verify.lua 读的字节数一致)
+
+local function initModule()
+    local klog = require("kernel.klog")
+    local vfs_api = require("kernel.vfs_api")
+    local platform = require("kernel.platform")
+    local PRI = klog.makePri(klog.FACILITIES.kern, klog.SEVERITIES.info)
+    local function log(s) klog.write(PRI, "[rawtty] " .. s) end
+
+    if platform.detect() ~= "cc" then
+        log("skip: not a plain CC computer")
+        return
+    end
+
+    local tty = require("kernel.tty")
+    local keys = _G.keys
+    local function exists(p) return vfs_api.fs.exists(p) == true end
+    local function stale()
+        for _, p in ipairs({ "/tmp/rawtty.ready", "/tmp/rawtty.hex", "/tmp/rawtty.done" }) do
+            if exists(p) then vfs_api.fs.delete(p) end
+        end
+    end
+    stale()
+
+    -- 按键序列: 每个元素是喂给 tty.feedInput 的事件表
+    local events = {
+        { "char", "x" },
+        { "char", " " },
+        { "key", keys.up, false },
+        { "char", "7" },
+        -- enter 同时发 key 与 char: 去重闩锁(ctx.dupChar)只应产出一个 \n
+        { "key", keys.enter, false },
+        { "char", "\n" },
+    }
+    local function pressCtrlD()
+        -- routeKey 跟踪修饰键状态: Ctrl 按下 -> d 按下 -> 释放
+        return {
+            { "key", keys.leftCtrl, false },
+            { "key", keys.d, false },
+            { "key_up", keys.d },
+            { "key_up", keys.leftCtrl },
+        }
+    end
+
+    local pull = os.pullEventRaw
+    local phase, phaseAt, lastPoll = 1, os.epoch("utc"), 0
+    local function step()
+        local now = os.epoch("utc")
+        if phase == 1 then
+            if exists("/tmp/rawtty.ready") then
+                log("raw mode armed by the verifier, feeding " .. #events .. " events + Ctrl-D")
+                for _, ev in ipairs(events) do tty.feedInput(ev) end
+                for _, ev in ipairs(pressCtrlD()) do tty.routeKey(ev) end
+                phase, phaseAt = 2, now
+                return
+            end
+        elseif phase == 2 then
+            if exists("/tmp/rawtty.done") then
+                log("done, payload hands pullEventRaw back")
+                os.pullEventRaw = pull
+                phase = 3
+                return
+            end
+        else
+            return
+        end
+        -- 耐心必须够: rawtty-verify.service 是最晚起来的那批(要等 syslogd/posix-verify 让出
+        -- CPU), 实测它在开机后 **55-60s** 才把 /tmp/rawtty.ready 写出来 —— 60s 的期限会
+        -- 卡在边界上(踩过: 模块 03:12:53 armed, 03:13:53 放弃, 脚本恰好晚一步)。
+        if now - phaseAt > 240000 then
+            log("stuck in phase " .. phase .. " for 240s (ready=" .. tostring(exists("/tmp/rawtty.ready"))
+                .. " done=" .. tostring(exists("/tmp/rawtty.done")) .. "), giving up")
+            os.pullEventRaw = pull
+            phase = 3
+        end
+    end
+
+    os.pullEventRaw = function(...)
+        if phase < 3 then
+            local now = os.epoch("utc")
+            if now - lastPoll < 500 then return pull(...) end
+            lastPoll = now
+            local ok, err = pcall(step)
+            if not ok then
+                log("step error (injector stopped): " .. tostring(err))
+                os.pullEventRaw = pull
+                phase = 3
+            end
+        end
+        return pull(...)
+    end
+    log("armed (expects " .. EXPECTED .. " bytes)")
+end
+
+return { init = initModule }

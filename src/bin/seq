@@ -1,0 +1,191 @@
+-- Delin seq: 打印等差数列 (GNU coreutils seq 子集)。
+-- 用法: seq [OPTION]... LAST
+--       seq [OPTION]... FIRST LAST
+--       seq [OPTION]... FIRST INCREMENT LAST
+--   -f, --format=FORMAT     用 printf 风格的格式输出(只认 %a %e %f %g, 与 GNU 同)
+--   -s, --separator=STRING  数字之间的分隔串(缺省换行; 末尾恒定一个换行)
+--   -w, --equal-width       用前导 0 补齐到等宽(用 first/last 的显示宽度)
+-- 语义(与宿主 GNU 逐项实测对齐):
+--   - 缺省格式由操作数的**小数位数**决定: `seq 1 3` 出整数, `seq 1 0.25 2` 出两位小数
+--     (1.00 1.25 1.50 1.75 2.00); 带指数的写法按 `小数位 - 指数` 折算(`1e2` 是 0 位)。
+--   - 空区间(如 `seq 3 1`)什么都不输出、退出 0; 增量为 0 报错退出 1(与 GNU 同)。
+--   - 走不动就报错: 操作数不是数 -> "seq: invalid floating point argument: 'x'" 退出 1;
+--     -f 里没有 % 或 % 类型不认识 -> 报错退出 1。
+-- 已知偏离:
+--   - 不实现 --help/--version(与本项目其它工具一致)。
+--   - 用 IEEE double 而不是 C 的 long double: 极大数(>2^53)的末几位可能与 GNU 不同。
+--   - 不实现 GNU 的 "inf" 之类的无穷字面量。
+--   - 选项与操作数的先后次序按 GNU getopt 处理(选项可以夹在操作数之间, 但 `-` 开头且不是
+--     选项的操作数要用 `--` 或者写成一个明确的负数, 与 GNU 一致)。
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+-- 让出调度器: 防止长输出饿死事件循环(CC 的 ~7s no-yield 限制)。
+local _msleep = os.msleep or function(ms) os.sleep(math.max((ms or 0) / 1000, 0.05)) end
+local _sliceAt = os.epoch("utc")
+local function yieldCheck()
+    local now = os.epoch("utc")
+    if now - _sliceAt >= 50 then
+        _sliceAt = now
+        _msleep(0)
+    end
+end
+
+local format, separator, equalWidth = nil, "\n", false
+local operands, noMoreOpts = {}, false
+
+-- 从字面量取"小数点后有效位数"(GNU seq 的 scan_arg 同一套: 指数为负时补位数, 为正时减)。
+local function precision(s)
+    s = tostring(s)
+    local mant, exp = s:match("^[%+%-]?%d*%.?(%d*)[eE]([%+%-]?%d+)$")
+    if mant then
+        return math.max(0, #mant - (tonumber(exp) or 0))
+    end
+    local frac = s:match("^[%+%-]?%d*%.(%d*)$")
+    return frac and #frac or 0
+end
+
+local function parseNum(s)
+    -- GNU 认 0x / inf / nan; Delin 只按十进制(含指数)解析, 别的直接报错不猜。
+    local n = tonumber(s)
+    if not n then
+        stderr("seq: invalid floating point argument: '" .. s .. "'\n")
+        return nil
+    end
+    return n
+end
+
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if noMoreOpts then
+        operands[#operands + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "-w" or a == "--equal-width" then
+        equalWidth = true
+    elseif a == "-s" or a == "--separator" then
+        i = i + 1
+        if not args[i] then stderr("seq: option requires an argument -- 's'\n"); return 1 end
+        separator = args[i]
+    elseif a:match("^%-%-separator=") then
+        separator = a:sub(13)
+    elseif a:match("^%-s.") then
+        separator = a:sub(3)
+    elseif a == "-f" or a == "--format" then
+        i = i + 1
+        if not args[i] then stderr("seq: option requires an argument -- 'f'\n"); return 1 end
+        format = args[i]
+    elseif a:match("^%-%-format=") then
+        format = a:sub(10)
+    elseif a:match("^%-f.") then
+        format = a:sub(3)
+    elseif a:sub(1, 2) == "--" then
+        stderr("seq: unrecognized option '" .. a .. "'\n")
+        return 1
+    elseif a:sub(1, 1) == "-" and a ~= "-" and not a:match("^%-%d") and not a:match("^%-%.") then
+        stderr("seq: invalid option -- '" .. a:sub(2, 2) .. "'\n")
+        return 1
+    else
+        operands[#operands + 1] = a
+    end
+    i = i + 1
+end
+
+if #operands < 1 then
+    stderr("seq: missing operand\n")
+    return 1
+elseif #operands > 3 then
+    stderr("seq: extra operand '" .. operands[4] .. "'\n")
+    return 1
+end
+
+local first, step, last
+local prec = 0
+if #operands == 1 then
+    first, step, last = 1, 1, parseNum(operands[1])
+    if not last then return 1 end
+    prec = precision(operands[1])
+elseif #operands == 2 then
+    first, last = parseNum(operands[1]), parseNum(operands[2])
+    step = 1
+    if not first or not last then return 1 end
+    prec = math.max(precision(operands[1]), precision(operands[2]))
+else
+    first, step, last = parseNum(operands[1]), parseNum(operands[2]), parseNum(operands[3])
+    if not first or not step or not last then return 1 end
+    prec = math.max(precision(operands[1]), precision(operands[2]), precision(operands[3]))
+end
+
+if step == 0 then
+    stderr("seq: invalid Zero increment value: '0'\n")
+    return 1
+end
+
+-- 格式串: -f 优先(GNU 只认 a/e/f/g 四种转换), 否则按小数位数生成。
+local fmt
+if format then
+    local spec = format:match("%%[%-%+ #0-9%.]*([a-zA-Z%%])")
+    if not spec then
+        stderr("seq: format '" .. format .. "' has no % directive\n")
+        return 1
+    end
+    if spec ~= "%" and not ("aefg"):find(spec, 1, true) and not ("AEFG"):find(spec, 1, true) then
+        stderr("seq: format '" .. format .. "' has unknown %" .. spec .. " directive\n")
+        return 1
+    end
+    fmt = format
+else
+    fmt = string.format("%%.%df", prec)
+end
+
+local function render(v)
+    -- 单值: 走 -f 的格式串(可能没有转换符之外的内容, 可能有前缀后缀)。
+    local ok, s = pcall(string.format, fmt, v)
+    if not ok then
+        stderr("seq: invalid format string: '" .. tostring(fmt) .. "'\n")
+        return nil
+    end
+    return s
+end
+
+-- -w: 先量 first/last 的显示宽度, 再把缺省格式换成零填充(与 GNU 一致: -f 与 -w 并存时
+-- GNU 也用 -f, 宽度由 -f 决定 —— 这里同此)。
+if equalWidth and not format then
+    local a = render(first)
+    local b = render(last)
+    if not a or not b then return 1 end
+    local width = math.max(#a, #b)
+    fmt = string.format("%%0%d.%df", width, prec)
+end
+
+-- 容差: 半个末位(GNU 靠 long double + 调整量解决同一个问题: 0.3 这种值不能被
+-- 浮点误差判成"已经越过 last")。
+local eps = 0.5 * (10 ^ -prec)
+local out = {}
+local count = 0
+local idx = 0
+while true do
+    local v = first + idx * step
+    if step > 0 and v > last + eps then break end
+    if step < 0 and v < last - eps then break end
+    local s = render(v)
+    if s == nil then return 1 end
+    -- GNU 的分隔语义: 分隔串只出现在**数字之间**, 末尾恒定一个换行
+    -- (`seq -s, 1 3` = "1,2,3\n", `seq -s '' 1 3` = "123\n")。
+    if count > 0 then out[#out + 1] = separator end
+    out[#out + 1] = s
+    count = count + 1
+    idx = idx + 1
+    if #out >= 512 then
+        io.write(table.concat(out))
+        out = {}
+        yieldCheck()
+    end
+end
+io.write(table.concat(out) .. "\n")
+return 0

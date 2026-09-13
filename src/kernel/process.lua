@@ -66,16 +66,17 @@ local function buildEnv(pid, ppid, uid, gid, argv, opts)
     for i = 1, #argv do args[i] = argv[i] end
     -- 继承父进程 cwd(或默认 "/")。调用方(sh)用 opts.cwd 传自己的当前目录。
     local parentCwd = registry[ppid] and registry[ppid].cwd or "/"
-    -- 环境块: 子进程继承父进程导出的变量, opts.env 覆盖/追加(值为 nil 即删除)。
+    -- 环境块: 子进程继承父进程导出的变量, opts.env 覆盖/追加。
+    -- opts.envClear = true 表示"不继承, 只用 opts.env 这张表"(env -i 的语义, 见 src/bin/env):
+    -- 光靠 "值为 nil 即删除" 是不行的 —— Lua 的表里根本存不下 nil, pairs 也遍历不到它,
+    -- 于是删除项在 spawn 侧是**看不见**的。
     local envvars = {}
     local parentEnvProc = registry[ppid]
-    if parentEnvProc and parentEnvProc.envvars then
+    if not opts.envClear and parentEnvProc and parentEnvProc.envvars then
         for k, v in pairs(parentEnvProc.envvars) do envvars[k] = v end
     end
     if opts.env then
-        for k, v in pairs(opts.env) do
-            if v == nil then envvars[k] = nil else envvars[k] = tostring(v) end
-        end
+        for k, v in pairs(opts.env) do envvars[k] = tostring(v) end
     end
     ---@type table
     local env = {

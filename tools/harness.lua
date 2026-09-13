@@ -54,6 +54,10 @@ local function cmd(...) return { ... } end
 
 -- 文件系统门面(基于 HOST 真实文件)。
 local F = {}
+-- 假终端开关与句柄: 在下面(F.open 用到)之前声明, 之后才赋值 ——
+-- Lua 的 local 作用域从**声明语句之后**才开始, 声明晚了的话 F.open 里读到的是全局 nil。
+local ttyMode = os.getenv("DELIN_HARNESS_TTY") == "1"
+local inputHandle
 local function norm(p)
     if p == nil or p == "" then return "/" end
     if p:sub(1, 1) ~= "/" then p = "/" .. p end
@@ -373,6 +377,9 @@ local NULL_HANDLE = {
 function F.open(p, mode)
     p = norm(p)
     if p == "/dev/null" then return NULL_HANDLE end
+    -- /dev/tty = 调用者自己的控制终端(真机由 boot 注册, 见 kernel/boot.lua);
+    -- 测试台上它就是那把假终端句柄, 分页器的宿主自检靠它拿到按键。
+    if p == "/dev/tty" and ttyMode then return inputHandle end
     local m = mode or "r"
     local hostp = host(p)
     if m == "r" then
@@ -577,13 +584,14 @@ local function spawn(src, name, ppid, uid, gid, argv, opts)
     -- 用管道/重定向跑 `find -exec`、`xargs` 时宿主与真机对不上。
     local parent = procs[ppid]
     local stdio = (opts and opts.stdio) or (parent and parent.stdio) or curStdio
-    -- 环境块(与内核 process.spawn 一致): 继承父进程, opts.env 覆盖/追加(值为 nil 删除)。
+    -- 环境块(与内核 process.spawn 一致): 继承父进程, opts.env 覆盖/追加;
+    -- opts.envClear = true 表示不继承(env -i 的语义, 见 src/bin/env 与 kernel/process.lua)。
     local envvars = {}
-    if parent and parent.envvars then for k, v in pairs(parent.envvars) do envvars[k] = v end end
+    if not (opts and opts.envClear) and parent and parent.envvars then
+        for k, v in pairs(parent.envvars) do envvars[k] = v end
+    end
     if opts and opts.env then
-        for k, v in pairs(opts.env) do
-            if v == nil then envvars[k] = nil else envvars[k] = tostring(v) end
-        end
+        for k, v in pairs(opts.env) do envvars[k] = tostring(v) end
     end
     local env = {
         pid = pid, ppid = ppid or 0, uid = uid or 0, gid = gid or 0,
@@ -719,6 +727,13 @@ local function setupRoot()
     os.execute("mkdir -p " .. ROOT .. "/root && cp -f " .. REPO .. "/scripts/user_helper.lua " .. ROOT .. "/root/user_helper.lua")
     w("/etc/hostname", "delin-host\n")
     w("/pub", "public data\n"); w("/secret", "top secret content\n"); w("/readonly", "ro\n")
+    -- /long: 40 行的"长文件", 给分页器(more/less)的宿主自检当输入(它们要跨屏才算真跑)
+    do
+        local t = {}
+        for k = 1, 40 do t[k] = string.format("line %02d", k) end
+        t[12] = t[12] .. " needle"
+        w("/long", table.concat(t, "\n") .. "\n")
+    end
     w("/home/alice/x.txt", "alice file\n")
     -- /dev 占位
     os.execute("mkdir -p " .. ROOT .. "/dev " .. ROOT .. "/proc " .. ROOT .. "/sys/class/display")
@@ -1087,10 +1102,19 @@ local stdinPos = 1
 local ttyMode = os.getenv("DELIN_HARNESS_TTY") == "1"
 -- 由下面的引导代码填: 把 SIGINT 投给 tty 前台进程组(此时即顶层 sh 那一组)。
 local ttyForegroundIntr = function() end
-local inputHandle = {
+local ttyRaw = false -- 原始模式(分页器 more/less 用; 见下面 inputHandle.setRaw)
+inputHandle = {
     isTTY = ttyMode,
     -- 真 tty 句柄有 getDeviceName(见 kernel/tty.lua 的 openHandle): sh 靠它判断"有没有作业控制"。
     getDeviceName = ttyMode and function() return "tty0" end or nil,
+    -- 原始模式(内核 tty 的 setRaw 的等价物): 进了原始模式后, read(n) 就是"读 n 个字节",
+    -- 测试脚本里直接写空格/q 这类按键即可驱动分页器(不必回车)。
+    setRaw = function(_, enable)
+        ttyRaw = (enable ~= false)
+        return true
+    end,
+    isRaw = function() return ttyRaw end,
+    getSize = function() return 51, 19 end, -- CC 缺省终端尺寸(与 kernel tty 的缺省一致)
 }
 local function rawStdinLine()
     if stdinPos > #stdinData then return nil end
@@ -1151,6 +1175,13 @@ outputHandle.write = function(self, s)
     return #s
 end
 outputHandle.writeLine = function(self, s) return outputHandle:write(tostring(s or "") .. "\n") end
+-- 假终端模式下 stdout 也是"终端"(分页器 more/less 靠 isTTY 判断要不要分页;
+-- 真机上 stdout 是 tty 字符设备, isTTY 由 kernel/tty.lua 给)。
+if ttyMode then
+    outputHandle.isTTY = true
+    outputHandle.getSize = function() return 51, 19 end
+    outputHandle.setRaw = function() return true end
+end
 
 curStdio = { input = inputHandle, output = outputHandle }
 

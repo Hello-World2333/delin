@@ -1,0 +1,34 @@
+-- Delin logname: 打印当前登录名 (POSIX logname(1), GNU 同)。
+-- 用法: logname
+-- 语义:
+--   - 输出 **$LOGNAME** 并换行; 变量为空(没人登录: 服务/无终端进程)时报
+--     "logname: no login name" 到 stderr 并退出 1 —— 与 GNU 拿不到 getlogin(3) 时的表现一致。
+--   - login(1) 在登录成功时导出 LOGNAME/USER(见 src/bin/login), 子进程一律继承, 所以
+--     `logname` 在登录会话里给的就是登录名, 而不是 `id -un`(那是**当前**有效用户名)。
+-- 已知偏离:
+--   - Delin 没有 utmp/wtmp, 因此不做 GNU 那层"这个名字还是不是当前登录用户"的复核;
+--     名字只可能来自环境(与 `login` 导出的一致, 但用户可以自己改 LOGNAME)。
+--   - 不接受任何选项(GNU 只有 --help/--version, 本项目不实现); 给了选项报错退出 1。
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+for _, a in ipairs(args) do
+    if a:sub(1, 1) == "-" and a ~= "-" then
+        stderr("logname: unrecognized option '" .. a .. "'\n")
+        return 1
+    end
+    stderr("logname: extra operand '" .. a .. "'\n")
+    return 1
+end
+
+local name = getenv and getenv("LOGNAME") or nil
+if not name or name == "" then
+    stderr("logname: no login name\n")
+    return 1
+end
+io.write(name .. "\n")
+return 0

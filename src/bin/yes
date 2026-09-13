@@ -1,0 +1,48 @@
+-- Delin yes: 反复输出一行相同的文本 (GNU coreutils yes)。
+-- 用法: yes [STRING]...
+-- 语义(与 GNU 一致):
+--   - 输出 STRING...(缺省 "y"), 多个参数用空格连接, 每行一个, 无限循环。
+--   - **没有选项**: `yes -x` 输出的是字面串 "-x"(GNU 的 yes 就是这么定义的;
+--     getopt 只认 --help/--version, 本项目不实现, 于是任何参数都当字符串)。
+--   - 写 stdout 失败(典型: 管道对端已关, 内核管道返回 "broken pipe")时停止并以 141 退出 ——
+--     Linux 上这个进程是被 SIGPIPE 杀死的, 141 = 128+13 正是它在 shell 里留下的退出码。
+--     Delin 内核不投 SIGPIPE(管道写只返错), 所以这里手工对齐同一个可观察结果,
+--     且**不打诊断**: `yes | head -1` 在 Linux 上也不会打印任何错误。
+--   - 一行一次 write 太浪费, 这里按块攒(每块 64KB 左右), 与 `cat`/`tee` 的写法一致。
+-- 已知偏离: 不实现 --help/--version(与本项目其它工具一致)。
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+-- 让出调度器: 无限循环里必须让, 否则 ^C 投不进来、整个系统也跟着卡住。
+local _msleep = os.msleep or function(ms) os.sleep(math.max((ms or 0) / 1000, 0.05)) end
+local _sliceAt = os.epoch("utc")
+local function yieldCheck()
+    local now = os.epoch("utc")
+    if now - _sliceAt >= 50 then
+        _sliceAt = now
+        _msleep(0)
+    end
+end
+
+local line = (#args > 0) and (table.concat(args, " ") .. "\n") or "y\n"
+-- 攒一块: 至少 8 行、至多 64KB(太长的行不切, 保证一次 write 是整数行)。
+local reps = math.max(8, math.floor(65536 / #line))
+local block = string.rep(line, reps)
+
+local function fail(msg)
+    if tostring(msg):find("broken pipe") then return 141 end
+    stderr("yes: standard output: " .. tostring(msg) .. "\n")
+    return 1
+end
+
+while true do
+    -- 真机句柄写失败返回 (nil, err); 宿主测试台的桩会抛异常 —— 两条都接住。
+    local ok, res, werr = pcall(io.write, block)
+    if not ok then return fail(res) end
+    if res == nil then return fail(werr or "write error") end
+    yieldCheck()
+end

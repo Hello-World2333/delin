@@ -1,0 +1,124 @@
+-- Delin rev: 逐行反转字符 (util-linux rev；GNU 没有 rev, 这里对齐宿主 util-linux 的 rev)。
+-- 用法: rev [-0] [FILE]...
+--   -0, --zero    用 NUL(0x00) 而不是换行作为行分隔符
+-- 语义:
+--   - 每个"记录"内部的字节倒序输出, 记录之间的分隔符**原样保留**;
+--     输入末尾没有分隔符时, 输出末尾也没有(`printf 'abc\ndef' | rev` 得到 "cba\nfed")。
+--   - FILE 缺省或 "-" 读 stdin; 打不开的操作数照样报
+--     "rev: FILE: No such file or directory" 并继续处理其余操作数, 最终退出 1。
+-- 已知偏离:
+--   - 不实现 -h/--help 与 -V/--version(与本项目其它工具一致)。
+--   - 按**字节**反转, 不做多字节字符(UTF-8)处理 —— Delin 没有 locale(与 C locale 的
+--     `rev` 一致: 在 UTF-8 终端上, 多字节字符会被拆开, 与宿主 LC_ALL=C rev 的行为相同)。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+local function ioeMsg(err)
+    if err and (err:find("permission") or err:find("denied")) then return "Permission denied" end
+    if err and err:lower():find("no such file") then return "No such file or directory" end
+    if err and err:find("directory") then return "Is a directory" end
+    return "No such file or directory"
+end
+
+local _msleep = os.msleep or function(ms) os.sleep(math.max((ms or 0) / 1000, 0.05)) end
+local _sliceAt = os.epoch("utc")
+local function yieldCheck()
+    local now = os.epoch("utc")
+    if now - _sliceAt >= 50 then
+        _sliceAt = now
+        _msleep(0)
+    end
+end
+
+local sep = "\n"
+local files, noMoreOpts = {}, false
+for _, a in ipairs(args) do
+    if noMoreOpts then
+        files[#files + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "-0" or a == "--zero" then
+        sep = "\0"
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        stderr("rev: invalid option -- '" .. a:sub(2, 2) .. "'\n")
+        return 1
+    else
+        files[#files + 1] = a
+    end
+end
+
+local function reverseLine(s)
+    local out = {}
+    for i = #s, 1, -1 do out[#out + 1] = s:sub(i, i) end
+    return table.concat(out)
+end
+
+--- 处理一段完整输入: 按 SEP 切开, 每段倒序, 分隔符原样保留。
+--- 末尾没分隔符的那段不加分隔符(与 rev 一致)。
+local function process(text)
+    local first = true
+    local pos = 1
+    local out = {}
+    while true do
+        local at = text:find(sep, pos, true)
+        if not at then
+            local rest = text:sub(pos)
+            if rest ~= "" or not first then
+                out[#out + 1] = reverseLine(rest)
+            end
+            break
+        end
+        out[#out + 1] = reverseLine(text:sub(pos, at - 1))
+        out[#out + 1] = sep
+        pos = at + #sep
+        first = false
+        if #out >= 256 then
+            io.write(table.concat(out))
+            out = {}
+            yieldCheck()
+        end
+    end
+    io.write(table.concat(out))
+end
+
+local function slurp(h)
+    if h.readAll then return h:readAll() end
+    local parts = {}
+    while true do
+        local chunk = h:read(4096)
+        if not chunk or chunk == "" then break end
+        parts[#parts + 1] = chunk
+    end
+    return table.concat(parts)
+end
+
+if #files == 0 then files[1] = "-" end
+local rc = 0
+for _, f in ipairs(files) do
+    if f == "-" then
+        process(slurp(io.stdin()) or "")
+    else
+        local h, err = fs.open(resolve(f), "r")
+        if not h then
+            stderr("rev: " .. f .. ": " .. ioeMsg(err) .. "\n")
+            rc = 1
+        else
+            process(slurp(h))
+            h:close()
+        end
+    end
+end
+return rc

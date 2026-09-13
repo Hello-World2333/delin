@@ -83,6 +83,13 @@ local exported = {
     PATH = true, HOME = true, USER = true, LOGNAME = true, SHELL = true, PWD = true, PPID = true,
     TERM = true, -- $TERM 必须传给程序(终端能力协商), 与真实 shell 一致
 }
+-- POSIX: 继承来的环境变量一律成为**已导出的 shell 变量**(`env FOO=bar sh -c 'echo $FOO'` 必须
+-- 打印 bar)。上面那张表只是"缺省值", 这里把父进程给的其余名字补进 vars —— 已经存在的名字
+-- (IFS/PS1/PWD... 由本 shell 自己维护)不改, 免得环境里的同名值把 shell 的内部状态顶掉。
+for name, v in pairs(inherited) do
+    if vars[name] == nil then vars[name] = tostring(v) end
+    exported[name] = true
+end
 -- 导出给子进程的环境块(内核 env 表): 只有 export 标记过且已赋值的变量。
 local function exportEnv()
     local out = {}

@@ -1,0 +1,1529 @@
+-- Delin bc: 任意精度计算器 (POSIX bc + GNU 的常用扩展)。
+-- 用法: bc [-l] [-q] [-s] [-w] [-i] [FILE...]
+--   -l, --mathlib      载入数学库并把 scale 设成 20(s/c/a/l/e/j 六个函数)
+--   -q, --quiet        不打印欢迎行
+--   -s, --standard     POSIX 标准模式(标准之外的写法报错)
+--   -w, --warn         对非标准用法告警
+--   -i, --interactive  强制交互(打印欢迎行)
+-- 语言(POSIX bc + GNU 常用扩展):
+--   表达式: + - * / % ^ 前缀/后缀 ++ -- 赋值 = += -= *= /= %= ^= 比较 < <= > >= == !=
+--           && || ! ( ) 变量 数组 a[i] 函数调用
+--   语句:   if (c) s [else s] / while (c) s / for (i;c;u) s / break / continue /
+--           return [(e)] / print 列表 / quit / halt(GNU) / { ... } /
+--           define f(a,b[]) { auto x; ... }
+--   内建:   length(e) scale(e) sqrt(e) read() abs(e)(GNU 扩展, -s 下报错)
+--   数学库: s(x) c(x) a(x) l(x) e(x) j(n,x)(-l 才有)
+--   特殊变量: ibase(2..16) obase(>=2) scale last
+--   注释: /* ... */ 与 # 到行尾; 反斜杠续行; 语句之间用 ; 或换行分隔
+-- 数值语义(POSIX bc 的规定; 宿主没装 bc, 无法逐字节对照):
+--   +,- 结果 scale = max(s1,s2);  * 结果 scale = min(s1+s2, max(scale,s1,s2));
+--   / 结果 scale = scale(全局);   % = a - 整数商(a/b)*b;
+--   ^ 指数必须是非负整数, 结果 scale = min(s1*指数, max(scale,s1));  sqrt 结果 scale = max(scale,s1)。
+-- 输出: 按 obase 打印; obase>16 时每一位用空格分开的十进制数(GNU 同); 一行超过 70 列时以
+--   `\` + 换行续行(POSIX 要求); scale 为 0 时不打印小数点。顶层**非赋值表达式**会打印结果。
+-- 已知偏离:
+--   - 不实现 --help/--version(与本项目其它工具一致); GNU 的 -e/-f 与 limits 语句也 fail-fast。
+--   - 数学库用级数展开算到 scale+保护位, 末位可能与 GNU 差 1(宿主没有 bc 可对照, 未做逐位比对)。
+--   - read() 从 stdin 读一行(程序本身来自 stdin 时, 从程序文本剩下的行里读, 与 GNU 的
+--     "同一个输入流"语义近似但不完全相同)。
+--   - 数组参数按值传递(bc 的标准语义), 但不支持多维数组(报错)。
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+
+local warnEnabled, standardMode, mathlib, quiet, interactive = false, false, false, false, false
+local files = {}
+do
+    local i = 1
+    while i <= #args do
+        local a = args[i]
+        if a == "-l" or a == "--mathlib" then mathlib = true
+        elseif a == "-q" or a == "--quiet" then quiet = true
+        elseif a == "-s" or a == "--standard" then standardMode = true
+        elseif a == "-w" or a == "--warn" then warnEnabled = true
+        elseif a == "-i" or a == "--interactive" then interactive = true
+        elseif a == "-e" or a == "--expression" or a == "-f" or a == "--file" then
+            stderr("bc: option '" .. a .. "' is not supported\n")
+            return 1
+        elseif a == "-h" or a == "--help" or a == "-v" or a == "--version" then
+            stderr("bc: option '" .. a .. "' is not supported\n")
+            return 1
+        elseif a:sub(1, 1) == "-" and a ~= "-" then
+            stderr("bc: invalid option -- '" .. a:sub(2, 2) .. "'\n")
+            return 1
+        else
+            files[#files + 1] = a
+        end
+        i = i + 1
+    end
+end
+
+-- ===============================================================
+-- 一、十进制大数
+--   数 = { d = 无前导零的数字串, s = 小数位数, neg = 是否负 }
+-- ===============================================================
+local NUM = {}
+
+local function trimZeros(s)
+    local t = s:gsub("^0+", "")
+    return t == "" and "0" or t
+end
+
+local function num(digits, scale, neg)
+    digits = trimZeros(digits or "0")
+    if scale < 0 then scale = 0 end
+    local n = { d = digits, s = scale, neg = neg and true or false }
+    if n.d == "0" then n.neg = false end
+    return n
+end
+
+local function isZero(n)
+    return n.d == "0"
+end
+
+local function isNegN(n)
+    return n.neg and n.d ~= "0"
+end
+
+--- 数字串(无小数点)左补零到 scale 位
+local function scaled(n, scale)
+    if n.s >= scale then return n.d end
+    return n.d .. string.rep("0", scale - n.s)
+end
+
+--- |a| 与 |b| 比较(先把小数位对齐成整数串)
+local function cmpAbs(a, b)
+    local pad = math.max(a.s, b.s)
+    local da, db = scaled(a, pad), scaled(b, pad)
+    da, db = trimZeros(da), trimZeros(db)
+    if #da ~= #db then return #da < #db and -1 or 1 end
+    if da == db then return 0 end
+    return da < db and -1 or 1
+end
+
+local function strAdd(a, b)
+    local out = {}
+    local la, lb = #a, #b
+    local n = math.max(la, lb)
+    local carry = 0
+    for k = 1, n do
+        local da = (la - k + 1 > 0) and tonumber(a:sub(la - k + 1, la - k + 1)) or 0
+        local db = (lb - k + 1 > 0) and tonumber(b:sub(lb - k + 1, lb - k + 1)) or 0
+        local s = da + db + carry
+        out[n - k + 1] = tostring(s % 10)
+        carry = math.floor(s / 10)
+    end
+    if carry > 0 then table.insert(out, 1, tostring(carry)) end
+    return table.concat(out)
+end
+
+local function strSub(a, b) -- a >= b
+    local out = {}
+    local la, lb = #a, #b
+    local borrow = 0
+    for k = 1, la do
+        local da = tonumber(a:sub(la - k + 1, la - k + 1))
+        local db = (lb - k + 1 > 0) and tonumber(b:sub(lb - k + 1, lb - k + 1)) or 0
+        local s = da - db - borrow
+        if s < 0 then s = s + 10; borrow = 1 else borrow = 0 end
+        out[la - k + 1] = tostring(s)
+    end
+    return trimZeros(table.concat(out))
+end
+
+local function strMul(a, b)
+    a, b = trimZeros(a), trimZeros(b)
+    if a == "0" or b == "0" then return "0" end
+    local la, lb = #a, #b
+    local res = {}
+    for k = 1, la + lb do res[k] = 0 end
+    for ka = la, 1, -1 do
+        local da = tonumber(a:sub(ka, ka))
+        if da ~= 0 then
+            local carry = 0
+            for kb = lb, 1, -1 do
+                local db = tonumber(b:sub(kb, kb))
+                local cur = res[ka + kb] + da * db + carry
+                res[ka + kb] = cur % 10
+                carry = math.floor(cur / 10)
+            end
+            local pos = ka
+            while carry > 0 do
+                local cur = res[pos] + carry
+                res[pos] = cur % 10
+                carry = math.floor(cur / 10)
+                pos = pos - 1
+            end
+        end
+    end
+    local out = {}
+    for k = 1, la + lb do out[#out + 1] = tostring(res[k]) end
+    return trimZeros(table.concat(out))
+end
+
+--- 整数除法: 返回 (商, 余数)
+local function strDivMod(a, b)
+    a, b = trimZeros(a), trimZeros(b)
+    if b == "0" then return nil, nil end
+    if a == "0" then return "0", "0" end
+    if #a < #b or (#a == #b and a < b) then return "0", a end
+    local q = {}
+    local rem = "0"
+    for k = 1, #a do
+        rem = trimZeros(rem .. a:sub(k, k))
+        local digit = 0
+        while not (#rem < #b or (#rem == #b and rem < b)) do
+            rem = strSub(rem, b)
+            digit = digit + 1
+        end
+        q[#q + 1] = tostring(digit)
+    end
+    return trimZeros(table.concat(q)), rem
+end
+
+-- 全局 scale(bc 的 scale 变量), 供乘除取整调用
+local scaleVar = 0
+
+local function addNum(a, b, subtract)
+    local pad = math.max(a.s, b.s)
+    local da, db = scaled(a, pad), scaled(b, pad)
+    local na, nb = isNegN(a), isNegN(b)
+    if subtract then nb = not nb end
+    if na == nb then
+        return num(strAdd(da, db), pad, na)
+    end
+    local c = cmpAbs({ d = da, s = 0 }, { d = db, s = 0 })
+    if c == 0 then return num("0", pad, false) end
+    if c > 0 then return num(strSub(da, db), pad, na) end
+    return num(strSub(db, da), pad, nb)
+end
+
+--- 截断到给定小数位(不四舍五入, bc 就是截断)
+local function truncate(n, wantScale)
+    if n.s <= wantScale then
+        -- 需要补零保持 scale 记账? bc 的值按 scale 记账, 这里只是补足位数
+        if n.s < wantScale then
+            return num(n.d .. string.rep("0", wantScale - n.s), wantScale, n.neg)
+        end
+        return n
+    end
+    local raw = scaled(n, n.s)
+    local drop = n.s - wantScale
+    if #raw <= drop then raw = "0" else raw = raw:sub(1, #raw - drop) end
+    return num(raw, wantScale, n.neg)
+end
+
+local function mulNum(a, b)
+    local raw = strMul(scaled(a, a.s), scaled(b, b.s))
+    local s = a.s + b.s
+    local cap = math.max(scaleVar, a.s, b.s)
+    if s > cap then
+        local drop = s - cap
+        if #raw <= drop then raw = "0" else raw = raw:sub(1, #raw - drop) end
+        s = cap
+    end
+    return num(raw, s, isNegN(a) ~= isNegN(b))
+end
+
+--- 除法: 结果 scale = 全局 scale
+local function divNum(a, b)
+    if isZero(b) then return nil end
+    local s = scaleVar
+    local na, nb = scaled(a, a.s), scaled(b, b.s)
+    -- (a/b) 保留 s 位小数: 分子放大 10^(s + b.s - a.s)
+    local shift = s + b.s - a.s
+    if shift >= 0 then
+        na = na .. string.rep("0", shift)
+    else
+        local drop = -shift
+        if #na <= drop then na = "0" else na = na:sub(1, #na - drop) end
+    end
+    local q = strDivMod(na, nb)
+    return num(q or "0", s, isNegN(a) ~= isNegN(b))
+end
+
+--- 取整数部分(bc 的 % 用整数商)
+local function intPart(n)
+    if n.s == 0 then return n end
+    local raw = scaled(n, n.s)
+    local drop = n.s
+    if #raw <= drop then raw = "0" else raw = raw:sub(1, #raw - drop) end
+    return num(raw, 0, n.neg)
+end
+
+local function modNum(a, b)
+    if isZero(b) then return nil end
+    local q = divNum(a, b)
+    if not q then return nil end
+    local prod = mulNum(intPart(q), b)
+    return addNum(a, prod, true)
+end
+
+--- 幂: 指数必须是非负整数
+local function powNum(a, e)
+    if isNegN(e) then return nil, "negative exponent" end
+    local ei = intPart(e)
+    if e.s > 0 then
+        local raw = scaled(e, e.s)
+        local frac = raw:sub(#raw - e.s + 1)
+        if frac:gsub("0", "") ~= "" then return nil, "non-integer exponent" end
+    end
+    local es = ei.d
+    if #es > 9 then return nil, "exponent too large" end
+    local exp = tonumber(es)
+    if not exp then return nil, "exponent too large" end
+    local result = num("1", 0, false)
+    local base = a
+    local k = exp
+    while k > 0 do
+        if k % 2 == 1 then result = mulNum(result, base) end
+        k = math.floor(k / 2)
+        if k > 0 then base = mulNum(base, base) end
+    end
+    local want = math.min(a.s * exp, math.max(scaleVar, a.s))
+    return truncate(result, want)
+end
+
+--- 整数平方根(逐位试商)
+local function intSqrt(v)
+    v = trimZeros(v)
+    if v == "0" then return "0" end
+    local len = #v
+    local root = {}
+    local rem = "0"
+    local pos = 1
+    local first = (len % 2 == 1) and 1 or 2
+    while pos <= len do
+        local take = (pos == 1) and first or 2
+        rem = trimZeros(rem .. v:sub(pos, pos + take - 1))
+        pos = pos + take
+        local base = strMul(table.concat(root) == "" and "0" or table.concat(root), "20")
+        local chosen, sub = 0, "0"
+        for cand = 9, 0, -1 do
+            local trial = strAdd(base, tostring(cand))
+            local t2 = strMul(trial, tostring(cand))
+            if #t2 < #rem or (#t2 == #rem and t2 <= rem) then
+                chosen, sub = cand, t2
+                break
+            end
+        end
+        root[#root + 1] = tostring(chosen)
+        rem = strSub(rem, sub)
+    end
+    return trimZeros(table.concat(root))
+end
+
+--- 平方根: 结果 scale = max(全局 scale, a.s)
+local function sqrtNum(a)
+    if isNegN(a) then return nil, "square root of a negative number" end
+    local s = math.max(scaleVar, a.s)
+    if isZero(a) then return num("0", s, false) end
+    local base = scaled(a, a.s)
+    local shift = 2 * s - a.s
+    if shift >= 0 then base = base .. string.rep("0", shift)
+    else
+        local drop = -shift
+        if #base <= drop then base = "0" else base = base:sub(1, #base - drop) end
+    end
+    return num(intSqrt(base), s, false)
+end
+
+--- 数字 -> 字符串(按 obase; bc 的输出规则见头注释)
+local function numToStr(n, obase)
+    local digits = trimZeros(scaled(n, n.s))
+    local scale = n.s
+    local intPart, fracPart
+    if scale == 0 then
+        intPart, fracPart = digits, ""
+    elseif #digits <= scale then
+        intPart, fracPart = "0", string.rep("0", scale - #digits) .. digits
+    else
+        intPart = digits:sub(1, #digits - scale)
+        fracPart = digits:sub(#digits - scale + 1)
+    end
+    local out
+    if obase == 10 then
+        out = intPart .. (scale > 0 and ("." .. fracPart) or "")
+    else
+        local D = "0123456789ABCDEF"
+        local sep = (obase > 16) and " " or ""
+        local function digitOf(v)
+            if obase <= 16 then return D:sub(tonumber(v) + 1, tonumber(v) + 1) end
+            return tostring(tonumber(v))
+        end
+        local function toBase(intStr)
+            local res = {}
+            local cur = trimZeros(intStr)
+            while cur ~= "0" do
+                local q, r = strDivMod(cur, tostring(obase))
+                res[#res + 1] = digitOf(r)
+                cur = q
+            end
+            if #res == 0 then return "0" end
+            local flipped = {}
+            for k = #res, 1, -1 do flipped[#flipped + 1] = res[k] end
+            return table.concat(flipped, sep)
+        end
+        local ip = toBase(intPart)
+        local fp = ""
+        if scale > 0 then
+            local parts = {}
+            local frac = fracPart
+            for _ = 1, scale do
+                -- 取 frac * obase / 10^scale 的整数位
+                local prod = strMul(frac, tostring(obase))
+                if #prod <= scale then prod = string.rep("0", scale - #prod + 1) .. prod end
+                local d = prod:sub(1, #prod - scale)
+                frac = prod:sub(#prod - scale + 1)
+                parts[#parts + 1] = digitOf(d)
+            end
+            fp = "." .. table.concat(parts, sep)
+        end
+        out = ip .. fp
+    end
+    if isNegN(n) then out = "-" .. out end
+    return out
+end
+
+--- 把字面量按 ibase 解析成数(在**求值时**解析: ibase 可以在程序里改)
+local function parseLiteral(text, ibase)
+    local function digitVal(ch)
+        local d = tonumber(ch)
+        if d then return d end
+        local up = ch:upper()
+        if up >= "A" and up <= "Z" then return up:byte() - 65 + 10 end
+        return nil
+    end
+    local ip, fp = text:match("^([%w]*)%.?([%w]*)$")
+    if not ip then return nil end
+    if ibase == 10 then
+        local digits = ip .. fp
+        if digits == "" then return nil end
+        return num(digits, #fp, false)
+    end
+    local base = num(tostring(ibase), 0, false)
+    local acc = num("0", 0, false)
+    for k = 1, #ip do
+        local d = digitVal(ip:sub(k, k))
+        if not d or d >= ibase then return nil end
+        acc = addNum(mulNum(acc, base), num(tostring(d), 0, false), false)
+    end
+    if #fp > 0 then
+        local numerator = num("0", 0, false)
+        for k = 1, #fp do
+            local d = digitVal(fp:sub(k, k))
+            if not d or d >= ibase then return nil end
+            numerator = addNum(mulNum(numerator, base), num(tostring(d), 0, false), false)
+        end
+        local denom = num("1", 0, false)
+        for _ = 1, #fp do denom = mulNum(denom, base) end
+        local saved = scaleVar
+        scaleVar = 20
+        local frac = divNum(numerator, denom)
+        scaleVar = saved
+        acc = addNum(acc, frac, false)
+    end
+    return acc
+end
+
+-- ===============================================================
+-- 二、词法
+-- ===============================================================
+local KEYWORDS = {
+    ["if"] = true, ["else"] = true, ["while"] = true, ["for"] = true, ["break"] = true,
+    ["continue"] = true, ["return"] = true, ["define"] = true, ["auto"] = true, ["print"] = true,
+    ["quit"] = true, ["halt"] = true, ["limits"] = true, ["warranty"] = true,
+}
+local BUILTIN_NAMES = {
+    ["length"] = true, ["sqrt"] = true, ["scale"] = true, ["read"] = true, ["abs"] = true,
+    ["ibase"] = true, ["obase"] = true, ["last"] = true,
+}
+
+local function lex(src)
+    local toks, pos, line = {}, 1, 1
+    while pos <= #src do
+        local c = src:sub(pos, pos)
+        local two = src:sub(pos, pos + 1)
+        if c == "\n" then
+            toks[#toks + 1] = { t = "nl" }
+            line = line + 1
+            pos = pos + 1
+        elseif c == " " or c == "\t" or c == "\r" then
+            pos = pos + 1
+        elseif two == "\\\n" then
+            line = line + 1
+            pos = pos + 2
+        elseif c == "#" then
+            while pos <= #src and src:sub(pos, pos) ~= "\n" do pos = pos + 1 end
+        elseif two == "/*" then
+            local close = src:find("*/", pos + 2, true)
+            if not close then return nil, "(" .. line .. ") comment not terminated" end
+            for k = pos, close + 1 do
+                if src:sub(k, k) == "\n" then line = line + 1 end
+            end
+            pos = close + 2
+        elseif two == "++" or two == "--" or two == "+=" or two == "-=" or two == "*="
+            or two == "/=" or two == "%=" or two == "^=" or two == "==" or two == "!="
+            or two == "<=" or two == ">=" or two == "&&" or two == "||" then
+            toks[#toks + 1] = { t = "op", v = two }
+            pos = pos + 2
+        elseif c:match("[%+%-%*/%%%^%(%)%[%]{};,<>=!]") then
+            toks[#toks + 1] = { t = "op", v = c }
+            pos = pos + 1
+        elseif c == '"' then
+            local j = pos + 1
+            local buf = {}
+            while j <= #src and src:sub(j, j) ~= '"' do
+                local d = src:sub(j, j)
+                if d == "\\" then
+                    local nxt = src:sub(j + 1, j + 1)
+                    local map = { n = "\n", t = "\t", r = "\r", a = "\a", b = "\b",
+                                  f = "\f", v = "\v", q = '"', ["\\"] = "\\" }
+                    if nxt == "c" then return nil, "(" .. line .. ") \\c in a string is not supported" end
+                    buf[#buf + 1] = map[nxt] or nxt
+                    j = j + 2
+                else
+                    buf[#buf + 1] = d
+                    j = j + 1
+                end
+            end
+            if j > #src then return nil, "(" .. line .. ") string not terminated" end
+            toks[#toks + 1] = { t = "str", v = table.concat(buf) }
+            pos = j + 1
+        elseif c:match("%d") or (c == "." and src:sub(pos + 1, pos + 1):match("%d")) then
+            local st = pos
+            while pos <= #src and src:sub(pos, pos):match("[%w.]") do pos = pos + 1 end
+            toks[#toks + 1] = { t = "num", v = src:sub(st, pos - 1) }
+        elseif c:match("[%a_]") then
+            local st = pos
+            while pos <= #src and src:sub(pos, pos):match("[%w_]") do pos = pos + 1 end
+            local word = src:sub(st, pos - 1)
+            if word:match("^[A-F][A-F0-9]*$") then
+                -- bc 的十六进制数: 以 A-F 开头、只含 A-F 与数字的记号是**数字**(不是标识符)
+                toks[#toks + 1] = { t = "num", v = word }
+            elseif KEYWORDS[word] then
+                toks[#toks + 1] = { t = word, v = word }
+            elseif BUILTIN_NAMES[word] then
+                toks[#toks + 1] = { t = "builtin", v = word }
+            else
+                toks[#toks + 1] = { t = "name", v = word }
+            end
+        else
+            return nil, "(" .. line .. ") unexpected character '" .. c .. "'"
+        end
+    end
+    toks[#toks + 1] = { t = "eof" }
+    return toks
+end
+
+-- ===============================================================
+-- 三、语法分析(AST)
+-- ===============================================================
+local Parser = {}
+Parser.__index = Parser
+
+local function newParser(toks)
+    return setmetatable({ toks = toks, pos = 1 }, Parser)
+end
+
+function Parser:peek(off) return self.toks[self.pos + (off or 0)] or { t = "eof" } end
+function Parser:next() local t = self.toks[self.pos]; self.pos = self.pos + 1; return t end
+function Parser:accept(t, v)
+    local tok = self:peek()
+    if tok.t == t and (v == nil or tok.v == v) then self.pos = self.pos + 1; return tok end
+    return nil
+end
+function Parser:expect(t, v, what)
+    local tok = self:accept(t, v)
+    if not tok then
+        error("parse error: expected " .. (what or v or t) .. " near '"
+            .. tostring(self:peek().v or self:peek().t) .. "'", 0)
+    end
+    return tok
+end
+function Parser:skipNl() while self:peek().t == "nl" do self.pos = self.pos + 1 end end
+function Parser:acceptKw(k) return self:accept(k) end
+
+local parseExpr
+
+local function parsePrimary(p)
+    local tok = p:peek()
+    if tok.t == "num" then
+        p:next()
+        return { k = "num", text = tok.v }
+    elseif tok.t == "op" and tok.v == "(" then
+        p:next()
+        local e = parseExpr(p)
+        p:expect("op", ")", "')'")
+        return e
+    elseif tok.t == "name" then
+        p:next()
+        if p:accept("op", "[") then
+            local idx = parseExpr(p)
+            p:expect("op", "]", "']'")
+            if p:accept("op", "[") then error("parse error: arrays of arrays are not allowed", 0) end
+            return { k = "array", name = tok.v, idx = idx }
+        end
+        if p:accept("op", "(") then
+            local fargs = {}
+            if not p:accept("op", ")") then
+                repeat
+                    -- `a[]` = 传整个数组: 空下标必须在这里认掉(交给 parseExpr 会当成空的索引表达式)
+                    if p:peek().t == "name" and p:peek(1).t == "op" and p:peek(1).v == "["
+                        and p:peek(2).t == "op" and p:peek(2).v == "]" then
+                        local nm = p:next().v
+                        p:next(); p:next()
+                        fargs[#fargs + 1] = { k = "arrayref", name = nm }
+                    else
+                        fargs[#fargs + 1] = parseExpr(p)
+                    end
+                until not p:accept("op", ",")
+                p:expect("op", ")", "')'")
+            end
+            return { k = "call", name = tok.v, args = fargs }
+        end
+        return { k = "var", name = tok.v }
+    elseif tok.t == "builtin" then
+        p:next()
+        local name = tok.v
+        -- scale/ibase/obase/last 既是变量也是函数: 后面跟 "(" 才算函数(bc 同)
+        if (name == "last" or name == "ibase" or name == "obase" or name == "scale")
+            and not (p:peek().t == "op" and p:peek().v == "(") then
+            return { k = "var", name = name }
+        end
+        p:expect("op", "(", "'('")
+        local fargs = {}
+        if not p:accept("op", ")") then
+            repeat
+                fargs[#fargs + 1] = parseExpr(p)
+            until not p:accept("op", ",")
+            p:expect("op", ")", "')'")
+        end
+        return { k = "bi", name = name, args = fargs }
+    elseif tok.t == "str" then
+        p:next()
+        return { k = "str", v = tok.v }
+    elseif tok.t == "op" and (tok.v == "-" or tok.v == "!" or tok.v == "++" or tok.v == "--") then
+        p:next()
+        local e = parsePrimary(p)
+        if tok.v == "++" or tok.v == "--" then return { k = "preinc", op = tok.v, e = e } end
+        return { k = "unary", op = tok.v, e = e }
+    end
+    error("parse error: unexpected '" .. tostring(tok.v or tok.t) .. "'", 0)
+end
+
+local function parsePostfix(p)
+    local e = parsePrimary(p)
+    while true do
+        local tok = p:peek()
+        if tok.t == "op" and (tok.v == "++" or tok.v == "--") then
+            p:next()
+            e = { k = "postinc", op = tok.v, e = e }
+        else
+            break
+        end
+    end
+    return e
+end
+
+local function parsePow(p)
+    local base = parsePostfix(p)
+    local tok = p:peek()
+    if tok.t == "op" and tok.v == "^" then
+        p:next()
+        return { k = "bin", op = "^", l = base, r = parsePow(p) } -- 右结合
+    end
+    return base
+end
+
+local function parseUnaryMinus(p)
+    local tok = p:peek()
+    if tok.t == "op" and tok.v == "-" then
+        p:next()
+        return { k = "unary", op = "-", e = parseUnaryMinus(p) }
+    end
+    return parsePow(p)
+end
+
+local function parseMul(p)
+    local e = parseUnaryMinus(p)
+    while true do
+        local tok = p:peek()
+        if tok.t == "op" and (tok.v == "*" or tok.v == "/" or tok.v == "%") then
+            p:next()
+            e = { k = "bin", op = tok.v, l = e, r = parseUnaryMinus(p) }
+        else
+            break
+        end
+    end
+    return e
+end
+
+local function parseAdd(p)
+    local e = parseMul(p)
+    while true do
+        local tok = p:peek()
+        if tok.t == "op" and (tok.v == "+" or tok.v == "-") then
+            p:next()
+            e = { k = "bin", op = tok.v, l = e, r = parseMul(p) }
+        else
+            break
+        end
+    end
+    return e
+end
+
+local function parseAssign(p)
+    local e = parseAdd(p)
+    local tok = p:peek()
+    if tok.t == "op" and (tok.v == "=" or tok.v == "+=" or tok.v == "-=" or tok.v == "*="
+        or tok.v == "/=" or tok.v == "%=" or tok.v == "^=") then
+        p:next()
+        return { k = "assign", op = tok.v, l = e, r = parseAssign(p) }
+    end
+    return e
+end
+
+local function parseRel(p)
+    local e = parseAssign(p)
+    while true do
+        local tok = p:peek()
+        if tok.t == "op" and (tok.v == "<" or tok.v == "<=" or tok.v == ">" or tok.v == ">="
+            or tok.v == "==" or tok.v == "!=") then
+            p:next()
+            e = { k = "bin", op = tok.v, l = e, r = parseAssign(p) }
+        else
+            break
+        end
+    end
+    return e
+end
+
+local function parseAnd(p)
+    local e = parseRel(p)
+    while p:accept("op", "&&") do e = { k = "bin", op = "&&", l = e, r = parseRel(p) } end
+    return e
+end
+
+local function parseOr(p)
+    local e = parseAnd(p)
+    while p:accept("op", "||") do e = { k = "bin", op = "||", l = e, r = parseAnd(p) } end
+    return e
+end
+
+parseExpr = parseOr
+
+local parseStmt
+
+local function parseBody(p)
+    p:skipNl()
+    if p:accept("op", "{") then
+        local stmts = {}
+        p:skipNl()
+        while not p:accept("op", "}") do
+            if p:peek().t == "eof" then error("parse error: '}' missing", 0) end
+            local s = parseStmt(p)
+            if s then stmts[#stmts + 1] = s end
+            p:skipNl()
+        end
+        return { k = "block", stmts = stmts }
+    end
+    return parseStmt(p)
+end
+
+parseStmt = function(p)
+    local tok = p:peek()
+    if tok.t == "nl" then p:next(); return nil end
+    if tok.t == "op" and tok.v == ";" then p:next(); return nil end
+    if tok.t == "if" then
+        p:next()
+        p:expect("op", "(", "'('")
+        local cond = parseExpr(p)
+        p:expect("op", ")", "')'")
+        local thenS = parseBody(p)
+        local elseS = nil
+        local save = p.pos
+        p:skipNl()
+        if p:accept("else") then elseS = parseBody(p) else p.pos = save end
+        return { k = "if", cond = cond, thenS = thenS, elseS = elseS }
+    end
+    if tok.t == "while" then
+        p:next()
+        p:expect("op", "(", "'('")
+        local cond = parseExpr(p)
+        p:expect("op", ")", "')'")
+        return { k = "while", cond = cond, body = parseBody(p) }
+    end
+    if tok.t == "for" then
+        p:next()
+        p:expect("op", "(", "'('")
+        local init, cond, incr = nil, nil, nil
+        if not (p:peek().t == "op" and p:peek().v == ";") then init = parseExpr(p) end
+        p:expect("op", ";", "';'")
+        if not (p:peek().t == "op" and p:peek().v == ";") then cond = parseExpr(p) end
+        p:expect("op", ";", "';'")
+        if not (p:peek().t == "op" and p:peek().v == ")") then incr = parseExpr(p) end
+        p:expect("op", ")", "')'")
+        return { k = "for", init = init, cond = cond, incr = incr, body = parseBody(p) }
+    end
+    if tok.t == "break" then p:next(); return { k = "break" } end
+    if tok.t == "continue" then p:next(); return { k = "continue" } end
+    if tok.t == "return" then
+        p:next()
+        local save = p.pos
+        local e = nil
+        local nt = p:peek().t
+        if nt ~= "nl" and nt ~= "eof" and not (nt == "op" and (p:peek().v == "}" or p:peek().v == ";")) then
+            local ok, res = pcall(parseExpr, p)
+            if ok then e = res else p.pos = save end
+        end
+        return { k = "return", e = e }
+    end
+    if tok.t == "print" then
+        p:next()
+        local items = {}
+        local trailingComma = false
+        while true do
+            local t2 = p:peek()
+            if t2.t == "nl" or t2.t == "eof" then break end
+            if t2.t == "op" and (t2.v == ";" or t2.v == "}" or t2.v == ")") then break end
+            items[#items + 1] = parseExpr(p)
+            if p:accept("op", ",") then trailingComma = true else break end
+        end
+        return { k = "print", items = items, noNewline = trailingComma }
+    end
+    if tok.t == "quit" or tok.t == "halt" then p:next(); return { k = "quit" } end
+    if tok.t == "limits" or tok.t == "warranty" then
+        error("parse error: '" .. tok.t .. "' is not supported (see the header)", 0)
+    end
+    if tok.t == "op" and tok.v == "{" then return parseBody(p) end
+    if tok.t == "name" or tok.t == "num" or tok.t == "str" or tok.t == "builtin"
+        or (tok.t == "op" and (tok.v == "(" or tok.v == "-" or tok.v == "!" or tok.v == "++"
+        or tok.v == "--")) then
+        return { k = "expr", e = parseExpr(p) }
+    end
+    error("parse error: unexpected '" .. tostring(tok.v or tok.t) .. "'", 0)
+end
+
+local function parseDefine(p)
+    p:next() -- define
+    local name = p:expect("name", nil, "function name").v
+    p:expect("op", "(", "'('")
+    local params, arrayParams = {}, {}
+    if not p:accept("op", ")") then
+        repeat
+            local pname = p:expect("name", nil, "parameter name").v
+            params[#params + 1] = pname
+            if p:accept("op", "[") then
+                p:expect("op", "]", "']'")
+                arrayParams[pname] = true
+            end
+        until not p:accept("op", ",")
+        p:expect("op", ")", "')'")
+    end
+    local autos = {}
+    p:skipNl()
+    if p:accept("auto") then
+        repeat
+            local aname = p:expect("name", nil, "auto variable name").v
+            autos[#autos + 1] = aname
+            if p:accept("op", "[") then p:expect("op", "]", "']'") end
+        until not p:accept("op", ",")
+    end
+    p:expect("op", "{", "'{' (a define body must be a block)")
+    local body = {}
+    p:skipNl()
+    while not p:accept("op", "}") do
+        if p:peek().t == "eof" then error("parse error: '}' missing in define " .. name, 0) end
+        local s = parseStmt(p)
+        if s then body[#body + 1] = s end
+        p:skipNl()
+    end
+    return { name = name, params = params, arrayParams = arrayParams, autos = autos, body = body }
+end
+
+-- ===============================================================
+-- 四、求值
+-- ===============================================================
+local BREAK, CONTINUE, RETURN, QUIT = {}, {}, {}, {}
+local rt
+
+local execStmt, evalExpr
+
+local function truthy(n) return not isZero(n) end
+
+--- 打印一个数(每 70 列用 `\` 续行, 见 POSIX bc)
+local function writeNumber(n, obase)
+    local s = numToStr(n, obase)
+    while #s > 70 do
+        io.write(s:sub(1, 70) .. "\\\n")
+        s = s:sub(71)
+    end
+    io.write(s)
+end
+
+local function readVar(name)
+    if name == "scale" then return num(tostring(scaleVar), 0, false) end
+    if name == "ibase" then return num(tostring(rt.ibase), 0, false) end
+    if name == "obase" then return num(tostring(rt.obase), 0, false) end
+    if name == "last" then return rt.last end
+    return rt.vars[name] or num("0", 0, false)
+end
+
+local function arrayRef(name, idxExpr)
+    local idx = intPart(evalExpr(idxExpr))
+    if #idx.d > 9 then error("runtime error: array index too large", 0) end
+    local arr = rt.arrays[name]
+    if not arr then arr = {}; rt.arrays[name] = arr end
+    return arr, tonumber(idx.d) or 0
+end
+
+local function assignTo(target, value)
+    if target.k == "var" then
+        local name = target.name
+        if name == "scale" then
+            local v = intPart(value)
+            if #v.d > 9 then error("runtime error: scale too large", 0) end
+            scaleVar = tonumber(v.d) or 0
+        elseif name == "ibase" then
+            local v = tonumber(intPart(value).d)
+            if not v or v < 2 or v > 16 then
+                error("runtime error: ibase must be between 2 and 16", 0)
+            end
+            rt.ibase = v
+        elseif name == "obase" then
+            local v = tonumber(intPart(value).d)
+            if not v or v < 2 then error("runtime error: obase must be at least 2", 0) end
+            rt.obase = v
+        elseif name == "last" then
+            rt.last = value
+        else
+            rt.vars[name] = value
+        end
+        return
+    end
+    if target.k == "array" then
+        local arr, idx = arrayRef(target.name, target.idx)
+        arr[idx] = value
+        return
+    end
+    error("runtime error: assignment to a non-lvalue", 0)
+end
+
+local function readLvalue(target)
+    if target.k == "var" then return readVar(target.name) end
+    if target.k == "array" then
+        local arr, idx = arrayRef(target.name, target.idx)
+        return arr[idx] or num("0", 0, false)
+    end
+    error("runtime error: not an lvalue", 0)
+end
+
+-- 数学库(用大数运算实现; 见头注释的精度说明)
+-- 三个要点:
+--   1) 级数必须让"当前项"自己变小: 递推里**带上除法**(term = term*x^2/denom), 只乘不除的
+--      项在 |x|=1 时根本不衰减(曾经的 bug: s(1) 跑到 5000 次迭代还给出错值)。
+--   2) atan 在 |x| 接近 1 时收敛极慢(调和级数), 所以先用
+--      atan(x) = 2*atan(x/(1+sqrt(1+x^2))) 做**幅度折半**, 折到 |x| <= 0.5 再展开。
+--   3) 三角/对数一律先算 scale+4 位保护位, 最后截断到 scale(POSIX bc 也是截断)。
+local function trunc(n, scale) return truncate(n, scale) end
+
+--- |x| <= 0.5 时收敛的 atan 级数(用在小参数上: 1/5、1/239 与折半之后)。
+local function atanSmallSeries(x, scale)
+    local x2 = mulNum(x, x)
+    local term = x
+    local sum = x
+    local k = 0
+    while true do
+        k = k + 1
+        term = trunc(mulNum(term, x2), scale)
+        if isZero(term) then break end
+        local part = trunc(divNum(term, num(tostring(2 * k + 1), 0, false)), scale)
+        if isZero(part) then break end
+        sum = addNum(sum, part, k % 2 == 1)
+        if k > 300 then break end
+    end
+    return sum
+end
+
+--- pi 用 Machin 公式: pi = 16*atan(1/5) - 4*atan(1/239)
+local function constPi(scale)
+    local saved = scaleVar
+    scaleVar = scale
+    local one = num("1", 0, false)
+    local a = atanSmallSeries(divNum(one, num("5", 0, false)), scale)
+    local b = atanSmallSeries(divNum(one, num("239", 0, false)), scale)
+    local pi = addNum(mulNum(a, num("16", 0, false)), mulNum(b, num("4", 0, false)), true)
+    scaleVar = saved
+    return trunc(pi, scale)
+end
+
+local function sinSeries(x, scale)
+    local x2 = mulNum(x, x)
+    local term = x -- x^1/1!
+    local sum = x
+    local k = 0
+    while true do
+        k = k + 1
+        local denom = (2 * k) * (2 * k + 1)
+        term = trunc(divNum(mulNum(term, x2), num(tostring(denom), 0, false)), scale)
+        if isZero(term) then break end
+        sum = addNum(sum, term, k % 2 == 1)
+        if k > 300 then break end
+    end
+    return sum
+end
+
+local function cosSeries(x, scale)
+    local x2 = mulNum(x, x)
+    local term = num("1", 0, false)
+    local sum = term
+    local k = 0
+    while true do
+        k = k + 1
+        local denom = (2 * k - 1) * (2 * k)
+        term = trunc(divNum(mulNum(term, x2), num(tostring(denom), 0, false)), scale)
+        if isZero(term) then break end
+        sum = addNum(sum, term, k % 2 == 1)
+        if k > 300 then break end
+    end
+    return sum
+end
+
+--- 把 x 归约到 [-pi, pi](三角函数的周期性)
+local function reduceMod2Pi(x, scale)
+    local saved = scaleVar
+    scaleVar = scale
+    local twoPi = mulNum(constPi(scale), num("2", 0, false))
+    local q = intPart(divNum(x, twoPi))
+    local r = addNum(x, mulNum(q, twoPi), true)
+    scaleVar = saved
+    return r
+end
+
+local function mathSin(x, scale)
+    local saved = scaleVar
+    scaleVar = scale + 4
+    local r = reduceMod2Pi(x, scale + 4)
+    local v = sinSeries(r, scale + 4)
+    scaleVar = saved
+    return trunc(v, scale)
+end
+
+local function mathCos(x, scale)
+    local saved = scaleVar
+    scaleVar = scale + 4
+    local r = reduceMod2Pi(x, scale + 4)
+    local v = cosSeries(r, scale + 4)
+    scaleVar = saved
+    return trunc(v, scale)
+end
+
+local function mathAtan(x, scale)
+    local saved = scaleVar
+    local work = scale + 4
+    scaleVar = work
+    local one = num("1", 0, false)
+    local half = num("5", 1, false)
+    local ax = num(x.d, x.s, false) -- |x|
+    local halvings = 0
+    while cmpAbs(ax, half) > 0 do
+        -- x <- x / (1 + sqrt(1 + x^2))
+        local s = sqrtNum(addNum(one, mulNum(ax, ax), false))
+        ax = trunc(divNum(ax, addNum(one, s, false)), work)
+        halvings = halvings + 1
+        if halvings > 64 then break end
+    end
+    local v = atanSmallSeries(ax, work)
+    for _ = 1, halvings do v = trunc(mulNum(v, num("2", 0, false)), work) end
+    if isNegN(x) then v.neg = not isZero(v) end
+    scaleVar = saved
+    return trunc(v, scale)
+end
+
+local function mathLn(x, scale)
+    if isZero(x) or isNegN(x) then error("runtime error: l() of a non-positive number", 0) end
+    local saved = scaleVar
+    local work = scale + 4
+    scaleVar = work
+    local one = num("1", 0, false)
+    local two = num("2", 0, false)
+    local k = 0
+    local y = x
+    while cmpAbs(y, two) > 0 do
+        y = trunc(divNum(y, two), work)
+        k = k + 1
+    end
+    -- ln(y) = 2*atanh((y-1)/(y+1))
+    local t = trunc(divNum(addNum(y, one, true), addNum(y, one, false)), work)
+    local t2 = mulNum(t, t)
+    local term = t
+    local sum = t
+    local j = 0
+    while true do
+        j = j + 1
+        term = trunc(mulNum(term, t2), work)
+        if isZero(term) then break end
+        local part = trunc(divNum(term, num(tostring(2 * j + 1), 0, false)), work)
+        if isZero(part) then break end
+        sum = addNum(sum, part, false)
+        if j > 300 then break end
+    end
+    local result = mulNum(sum, two)
+    if k > 0 then
+        result = addNum(result, mulNum(num(tostring(k), 0, false), mathLn(two, work)), false)
+    end
+    scaleVar = saved
+    return trunc(result, scale)
+end
+
+local function mathExp(x, scale)
+    local saved = scaleVar
+    local work = scale + 4
+    scaleVar = work
+    local one = num("1", 0, false)
+    local half = num("5", 1, false)
+    local k = 0
+    local y = x
+    while cmpAbs(y, one) > 0 do
+        y = trunc(mulNum(y, half), work)
+        k = k + 1
+        if k > 40 then break end
+    end
+    local term = one
+    local sum = one
+    local j = 0
+    while true do
+        j = j + 1
+        term = trunc(divNum(mulNum(term, y), num(tostring(j), 0, false)), work)
+        if isZero(term) then break end
+        sum = addNum(sum, term, false)
+        if j > 300 then break end
+    end
+    for _ = 1, k do sum = trunc(mulNum(sum, sum), work) end
+    scaleVar = saved
+    return trunc(sum, scale)
+end
+
+local function mathBessel(orderArg, x, scale)
+    local oi = intPart(orderArg)
+    if isNegN(orderArg) then error("runtime error: j(): the order must be non-negative", 0) end
+    if orderArg.s > 0 then
+        local raw = scaled(orderArg, orderArg.s)
+        local frac = raw:sub(#raw - orderArg.s + 1)
+        if frac:gsub("0", "") ~= "" then
+            error("runtime error: j(): the order must be an integer", 0)
+        end
+    end
+    local n = tonumber(oi.d)
+    if not n or n > 100 then error("runtime error: j(): order too large", 0) end
+    local saved = scaleVar
+    local work = scale + 4
+    scaleVar = work
+    local xh = trunc(mulNum(x, num("5", 1, false)), work)
+    local term = num("1", 0, false)
+    for j = 1, n do term = trunc(divNum(term, num(tostring(j), 0, false)), work) end
+    for _ = 1, n do term = trunc(mulNum(term, xh), work) end
+    local sum = term
+    local xh2 = mulNum(xh, xh)
+    local k = 0
+    while true do
+        k = k + 1
+        local denom = mulNum(num(tostring(k), 0, false), num(tostring(n + k), 0, false))
+        term = trunc(divNum(mulNum(term, xh2), denom), work)
+        if isZero(term) then break end
+        sum = addNum(sum, term, k % 2 == 1)
+        if k > 300 then break end
+    end
+    scaleVar = saved
+    return trunc(sum, scale)
+end
+
+local MATHLIB = { s = mathSin, c = mathCos, a = mathAtan, l = mathLn, e = mathExp }
+
+local function callUserFunc(name, argNodes)
+    local f = rt.funcs[name]
+    if not f then
+        if MATHLIB[name] then
+            if #argNodes ~= 1 then
+                error("runtime error: " .. name .. "() takes one argument", 0)
+            end
+            local x = evalExpr(argNodes[1])
+            local saved = scaleVar
+            local ok, r = pcall(MATHLIB[name], x, scaleVar)
+            scaleVar = saved
+            if not ok then error(r, 0) end
+            return r
+        end
+        if name == "j" then
+            if #argNodes ~= 2 then error("runtime error: j() takes two arguments", 0) end
+            local n = evalExpr(argNodes[1])
+            local x = evalExpr(argNodes[2])
+            local saved = scaleVar
+            local ok, r = pcall(mathBessel, n, x, scaleVar)
+            scaleVar = saved
+            if not ok then error(r, 0) end
+            return r
+        end
+        error("runtime error: function " .. name .. " is not defined", 0)
+    end
+    if #argNodes ~= #f.params then
+        error("runtime error: function " .. name .. " called with the wrong number of arguments", 0)
+    end
+    local savedVars, savedArrays = rt.vars, rt.arrays
+    local newVars, newArrays = {}, {}
+    for idx, pname in ipairs(f.params) do
+        local node = argNodes[idx]
+        if f.arrayParams[pname] then
+            if node.k ~= "arrayref" and node.k ~= "array" and node.k ~= "var" then
+                error("runtime error: array parameter " .. pname .. " needs an array argument", 0)
+            end
+            local src = rt.arrays[node.name] or {}
+            local copy = {}
+            for k, v in pairs(src) do copy[k] = v end
+            newArrays[pname] = copy
+        else
+            newVars[pname] = evalExpr(node)
+        end
+    end
+    for _, aname in ipairs(f.autos) do newVars[aname] = num("0", 0, false) end
+    rt.vars, rt.arrays = newVars, newArrays
+    local savedRet = rt.retval
+    rt.retval = nil
+    local ctl
+    local ok, err = pcall(function()
+        for _, s in ipairs(f.body) do
+            ctl = execStmt(s)
+            if ctl then return end
+        end
+    end)
+    local result = rt.retval or num("0", 0, false)
+    rt.retval = savedRet
+    rt.vars, rt.arrays = savedVars, savedArrays
+    if not ok then error(err, 0) end
+    return result
+end
+
+evalExpr = function(e)
+    local k = e.k
+    if k == "num" then
+        local n = parseLiteral(e.text, rt.ibase)
+        if not n then error("runtime error: bad number '" .. e.text .. "'", 0) end
+        return n
+    end
+    if k == "str" then return { str = e.v } end
+    if k == "var" then return readVar(e.name) end
+    if k == "array" then return readLvalue(e) end
+    if k == "arrayref" then return num("0", 0, false) end
+    if k == "unary" then
+        local v = evalExpr(e.e)
+        if e.op == "-" then
+            local r = num(v.d, v.s, not isNegN(v))
+            if isZero(v) then r.neg = false end
+            return r
+        end
+        return truthy(v) and num("0", 0, false) or num("1", 0, false)
+    end
+    if k == "preinc" or k == "postinc" then
+        local old = readLvalue(e.e)
+        local nv = addNum(old, num("1", 0, false), e.op == "--")
+        assignTo(e.e, nv)
+        return (k == "preinc") and nv or old
+    end
+    if k == "assign" then
+        local rhs = evalExpr(e.r)
+        if e.op == "=" then
+            assignTo(e.l, rhs)
+            return rhs
+        end
+        local cur = readLvalue(e.l)
+        local res
+        if e.op == "+=" then res = addNum(cur, rhs, false)
+        elseif e.op == "-=" then res = addNum(cur, rhs, true)
+        elseif e.op == "*=" then res = mulNum(cur, rhs)
+        elseif e.op == "/=" then
+            res = divNum(cur, rhs)
+            if not res then error("runtime error: divide by zero", 0) end
+        elseif e.op == "%=" then
+            res = modNum(cur, rhs)
+            if not res then error("runtime error: modulus by zero", 0) end
+        elseif e.op == "^=" then
+            local r, err = powNum(cur, rhs)
+            if not r then error("runtime error: " .. err, 0) end
+            res = r
+        end
+        assignTo(e.l, res)
+        return res
+    end
+    if k == "bin" then
+        local op = e.op
+        if op == "&&" then
+            if not truthy(evalExpr(e.l)) then return num("0", 0, false) end
+            return truthy(evalExpr(e.r)) and num("1", 0, false) or num("0", 0, false)
+        elseif op == "||" then
+            if truthy(evalExpr(e.l)) then return num("1", 0, false) end
+            return truthy(evalExpr(e.r)) and num("1", 0, false) or num("0", 0, false)
+        end
+        local a, b = evalExpr(e.l), evalExpr(e.r)
+        if op == "+" then return addNum(a, b, false) end
+        if op == "-" then return addNum(a, b, true) end
+        if op == "*" then return mulNum(a, b) end
+        if op == "/" then
+            local r = divNum(a, b)
+            if not r then error("runtime error: divide by zero", 0) end
+            return r
+        end
+        if op == "%" then
+            local r = modNum(a, b)
+            if not r then error("runtime error: modulus by zero", 0) end
+            return r
+        end
+        if op == "^" then
+            local r, err = powNum(a, b)
+            if not r then error("runtime error: " .. err, 0) end
+            return r
+        end
+        local c = cmpAbs(a, b)
+        if isNegN(a) ~= isNegN(b) and c ~= 0 then c = isNegN(a) and -1 or 1 end
+        local res
+        if op == "<" then res = c < 0
+        elseif op == "<=" then res = c <= 0
+        elseif op == ">" then res = c > 0
+        elseif op == ">=" then res = c >= 0
+        elseif op == "==" then res = c == 0
+        elseif op == "!=" then res = c ~= 0 end
+        return res and num("1", 0, false) or num("0", 0, false)
+    end
+    if k == "bi" then
+        local name = e.name
+        if name == "length" then
+            if #e.args ~= 1 then error("runtime error: length() takes one argument", 0) end
+            local v = evalExpr(e.args[1])
+            local d = trimZeros(v.d)
+            if d == "0" then return num("0", 0, false) end
+            return num(tostring(#d), 0, false)
+        elseif name == "scale" then
+            if #e.args ~= 1 then error("runtime error: scale() takes one argument", 0) end
+            local v = evalExpr(e.args[1])
+            return num(tostring(v.s), 0, false)
+        elseif name == "sqrt" then
+            if #e.args ~= 1 then error("runtime error: sqrt() takes one argument", 0) end
+            local v = evalExpr(e.args[1])
+            local saved = scaleVar
+            local r, err = sqrtNum(v)
+            scaleVar = saved
+            if not r then error("runtime error: " .. err, 0) end
+            return r
+        elseif name == "abs" then
+            if standardMode then error("runtime error: abs() is not in POSIX bc", 0) end
+            local v = evalExpr(e.args[1])
+            return num(v.d, v.s, false)
+        elseif name == "read" then
+            if #e.args ~= 0 then error("runtime error: read() takes no argument", 0) end
+            local line = rt.readInput and rt.readInput()
+            if not line then return num("0", 0, false) end
+            -- 读到的行按表达式求值: 复用同一套解析器
+            local toks, lerr = lex(line .. "\n")
+            if not toks then error("runtime error: read(): " .. tostring(lerr), 0) end
+            local p = newParser(toks)
+            p:skipNl()
+            if p:peek().t == "eof" then return num("0", 0, false) end
+            local ast = parseExpr(p)
+            return evalExpr(ast)
+        end
+    end
+    if k == "call" then return callUserFunc(e.name, e.args) end
+    error("runtime error: cannot evaluate " .. tostring(k), 0)
+end
+
+execStmt = function(st)
+    local k = st.k
+    if k == "expr" then
+        local v = evalExpr(st.e)
+        if v and v.str then
+            if rt.topLevel then io.write(v.str .. "\n") end
+            return nil
+        end
+        if v and v.d then
+            rt.last = v
+            -- 顶层**非赋值**表达式要打印结果(bc 的规定)
+            if rt.topLevel then
+                if st.e.k ~= "assign" then
+                    writeNumber(v, rt.obase)
+                    io.write("\n")
+                end
+            end
+        end
+        return nil
+    end
+    if k == "block" then
+        for _, s in ipairs(st.stmts) do
+            local ctl = execStmt(s)
+            if ctl then return ctl end -- break/continue/return/quit 都往外传
+        end
+        return nil
+    end
+    if k == "if" then
+        if truthy(evalExpr(st.cond)) then return execStmt(st.thenS) end
+        if st.elseS then return execStmt(st.elseS) end
+        return nil
+    end
+    if k == "while" then
+        while truthy(evalExpr(st.cond)) do
+            local ctl = execStmt(st.body)
+            if ctl == BREAK then break end
+            if ctl == CONTINUE then ctl = nil end
+            if ctl then return ctl end
+        end
+        return nil
+    end
+    if k == "for" then
+        if st.init then evalExpr(st.init) end
+        while true do
+            if st.cond and not truthy(evalExpr(st.cond)) then break end
+            local ctl = execStmt(st.body)
+            if ctl == BREAK then break end
+            if ctl == CONTINUE then ctl = nil end
+            if ctl then return ctl end
+            if st.incr then evalExpr(st.incr) end
+        end
+        return nil
+    end
+    if k == "break" then return BREAK end
+    if k == "continue" then return CONTINUE end
+    if k == "return" then
+        rt.retval = st.e and evalExpr(st.e) or num("0", 0, false)
+        return RETURN
+    end
+    if k == "print" then
+        local first = true
+        for _, item in ipairs(st.items) do
+            local v = evalExpr(item)
+            if v and v.str then
+                io.write(v.str)
+            else
+                if not first then io.write(" ") end
+                writeNumber(v, rt.obase)
+            end
+            first = false
+        end
+        if not st.noNewline then io.write("\n") end
+        return nil
+    end
+    if k == "quit" then return QUIT end
+    return nil
+end
+
+-- ===============================================================
+-- 五、驱动
+-- ===============================================================
+rt = {
+    vars = {}, arrays = {}, funcs = {},
+    ibase = 10, obase = 10,
+    last = num("0", 0, false),
+    retval = nil, topLevel = true,
+    pendingLines = nil,
+    readInput = nil,
+}
+
+local function readAll(h)
+    if h.readAll then return h:readAll() end
+    local parts = {}
+    while true do
+        local chunk = h.read and h:read(4096)
+        if not chunk or chunk == "" then break end
+        parts[#parts + 1] = chunk
+    end
+    return table.concat(parts)
+end
+
+--- 执行一段程序文本。返回 (是否正常, 是否遇到 quit)
+local function runSource(text)
+    local toks, lerr = lex(text)
+    if not toks then
+        stderr("bc: " .. tostring(lerr) .. "\n")
+        return false
+    end
+    local p = newParser(toks)
+    local okAll = true
+    while p:peek().t ~= "eof" do
+        p:skipNl()
+        if p:peek().t == "eof" then break end
+        local ok, item = pcall(function()
+            if p:peek().t == "define" then
+                return { def = parseDefine(p) }
+            end
+            return { stmt = parseStmt(p), at = p.pos }
+        end)
+        if not ok then
+            stderr("bc: " .. tostring(item) .. "\n")
+            return false
+        end
+        if item.def then
+            rt.funcs[item.def.name] = item.def
+        elseif item.stmt then
+            local ok2, ctl = pcall(execStmt, item.stmt)
+            if not ok2 then
+                stderr("bc: " .. tostring(ctl) .. "\n")
+                okAll = false
+            elseif ctl == QUIT then
+                return okAll, true
+            end
+        end
+    end
+    return okAll, false
+end
+
+if not quiet and (interactive or #files == 0) then
+    io.write("bc 1.07 (Delin)\n")
+end
+
+if mathlib then scaleVar = 20 end
+
+local function countLines(text)
+    local n = 0
+    for _ in text:gmatch("\n") do n = n + 1 end
+    return n
+end
+
+for _, f in ipairs(files) do
+    local h, err = fs.open(f, "r")
+    if not h then
+        stderr("bc: " .. f .. ": No such file or directory" .. (err and "" or "") .. "\n")
+        return 1
+    end
+    local text = readAll(h)
+    h:close()
+    -- 程序来自文件时 read() 读 stdin
+    rt.pendingLines = nil
+    rt.readInput = function()
+        local l = io.read and io.read("*l")
+        if l == nil then return nil end
+        return tostring(l)
+    end
+    local ok, quitNow = runSource(text)
+    if quitNow then return 0 end
+    if not ok then return 1 end
+end
+
+if #files == 0 then
+    local text = readAll(io.stdin()) or ""
+    -- 程序来自 stdin 时, read() 从**程序文本剩下的行**里读(GNU 的"同一个输入流"的近似)
+    local lines = {}
+    for line in (text .. "\n"):gmatch("([^\n]*)\n") do lines[#lines + 1] = line end
+    local cursor = 1
+    rt.pendingLines = lines
+    rt.readInput = function()
+        local l = lines[cursor]
+        cursor = cursor + 1
+        return l
+    end
+    -- 程序文本本身不含 read() 要吃的行时(GNU 语义), 这里按"read 吃剩下的行"处理:
+    -- 先把整段当程序跑; read() 调用时从 pendingLines 取(游标从 1 开始)。
+    local ok, quitNow = runSource(text)
+    if not ok and not quitNow then return 1 end
+end
+return 0
