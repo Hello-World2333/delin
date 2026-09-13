@@ -15,6 +15,7 @@
      对安装到磁盘的 root.img 跑一次只读 fsck, 报告是否被跑坏
 
 用法: python3 tools/realmachine.py [--base /mnt/disk/0/parts/root.img] [--no-reboot] [--reboot-only]
+                                  [--clean]   # 只装干净镜像(无验证载荷), 给手工测试用
 
 注意: 本环境里电脑自身 FS 的文件(/.boot、/main.lua)在宿主机改写后, 游戏侧似乎仍读旧内容
 (磁盘镜像 /mnt/disk/0/parts/*.img 的改写则立即生效, 已验证), 因此第 3d 步写 DLUB 到 /main.lua
@@ -150,6 +151,7 @@ def main():
     printer = False
     probe_only = False
     force_rebuild = False
+    clean = False
     args = sys.argv[1:]
     while args:
         a = args.pop(0)
@@ -161,6 +163,8 @@ def main():
             skip_deploy = True
         elif a == "--rebuild":
             force_rebuild = True
+        elif a == "--clean":
+            clean = True
         elif a == "--printer":
             printer = True
         elif a == "--printer-probe":
@@ -205,9 +209,7 @@ def main():
         print("== deploy rootfs from %s ==" % base)
         print(run(sys.executable, os.path.join(REPO, "tools/deploy.py"), base, out, cwd=REPO))
 
-        # 3) 注入验证负载
-        print("== inject verify payload ==")
-        # 3a) 第二个分区镜像(data), 里面放一个 hello 文件
+        # 3a) 第二个分区镜像(data): 干净镜像也要它 —— /etc/fstab 里 UUID=d0-2 挂的是它。
         data_img = os.path.join(work, "data.img")
         if os.path.exists(data_img):
             os.unlink(data_img)
@@ -217,154 +219,163 @@ def main():
             f.write("hello from the data partition (fstab)\n")
         df_write(data_img, hello, "/hello.txt")
 
-        # 3b) 测试用 /etc/fstab(defaults + noauto 两条)
-        fstab = os.path.join(work, "fstab")
-        with open(fstab, "w") as f:
-            # /dev/sda 恒为电脑自带存储, 引导盘是磁盘驱动器里的第一块盘(sdb, UUID d0)。
-            # data 分区走 UUID(顺带验证 UUID 命名空间), rootcopy 走设备节点(验证 sdbN 命名)。
-            f.write("# real-machine verify fstab\n"
-                    "UUID=d0-2   /mnt/data     ext2   defaults   0 2\n"
-                    "/dev/sdb1   /mnt/rootcopy ext2   noauto     0 2\n")
-        df(out, "rm /etc/fstab")
-        df_write(out, fstab, "/etc/fstab")
-
-        # 3c) verify.service + /root/verify.sh
-        sh = os.path.join(REPO, "scripts/realmachine_verify.sh")
-        df_write(out, sh, "/root/verify.sh")
-        df(out, "set_inode_field /root/verify.sh mode 0100755")
-        unit = os.path.join(work, "verify.service")
-        with open(unit, "w") as f:
-            # TimeoutStartSec 必须给足: 自检脚本一轮要跑近百个进程, 实测已经在默认的 60s 附近
-            # (Type=oneshot 在 systemd 里的默认本来就是 infinity; Delin 的引擎默认 60s)。
-            # 超时会被 init SIGKILL 掉, 表现成"verify.log 变了但没跑完"——那是**假失败**,
-            # 会让人以为是内核回归(本轮就误判过两轮)。
-            f.write("[Unit]\nDescription=Real-machine verification\nAfter=syslogd.service\n\n"
-                    "[Service]\nType=oneshot\nTimeoutStartSec=600\nExecStart=/bin/sh /root/verify.sh\n\n"
-                    "[Install]\nWantedBy=multi-user.target\n")
-        df_write(out, unit, "/lib/systemd/system/verify.service")
-        df_mkdir(out, "/etc/systemd/system/multi-user.target.wants")
-        marker = os.path.join(work, "marker")
-        open(marker, "w").close()
-        df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/verify.service")
-        df_mkdir(out, "/mnt/rootcopy")
-
-        # 3e) verify-sh.service: sh 内建/变量自检(. set export unset PATH PSx cd) + desh 非交互自检
-        #     -> /var/log/sh_verify.log
-        for src, dst in (("scripts/sh_verify.sh", "/root/sh_verify.sh"),
-                         ("scripts/sh_builtin_test.sh", "/root/sh_builtin_test.sh"),
-                         ("scripts/sh_expand_test.sh", "/root/sh_expand_test.sh"),
-                         # desh 与 sh 共用核心: 真机上确认"非交互路径起得来、行为一致"。
-                         # 交互式那部分只有宿主能测(scripts/desh_tty_test.sh 用假终端喂按键字节)。
-                         ("scripts/desh_test.sh", "/root/desh_test.sh"),
-                         ("scripts/regex_test.sh", "/root/regex_test.sh"),
-                         ("scripts/proc_test.sh", "/root/proc_test.sh"),
-                         ("scripts/redstone_test.sh", "/root/redstone_test.sh"),
-                         ("scripts/redstone_verify.lua", "/root/redstone_verify.lua"),
-                         ("scripts/lua_test.sh", "/root/lua_test.sh"),
-                         ("scripts/user_test.sh", "/root/user_test.sh"),
-                         ("scripts/user_helper.lua", "/root/user_helper.lua")):
-            df_write(out, os.path.join(REPO, src), dst)
-            df(out, "set_inode_field %s mode 0100755" % dst)
-        unit_sh = os.path.join(work, "verify-sh.service")
-        with open(unit_sh, "w") as f:
-            f.write("[Unit]\nDescription=Real-machine sh builtin verification\nAfter=syslogd.service\n\n"
-                    "[Service]\nType=oneshot\nTimeoutStartSec=600\nExecStart=/bin/sh /root/sh_verify.sh\n\n"
-                    "[Install]\nWantedBy=multi-user.target\n")
-        df_write(out, unit_sh, "/lib/systemd/system/verify-sh.service")
-        df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/verify-sh.service")
-
-        # 3f) --printer: ccprinter 模块端到端验证; --printer-probe 额外注入原始 printer API 探测。
-        #     默认不注入: 它们会实际打印页面, 只在需要验证打印机时消耗纸张。
-        #     先清掉上一次部署残留在基础镜像里的打印机负载 —— 否则残留的 .wants 标记会让
-        #     探测/验证服务在之后每次启动时都跑一遍, 白白耗纸。
-        for unit, path in (("printer-probe.service", "/root/printer_probe.lua"),
-                           ("printer-verify.service", "/root/printer_verify.sh")):
-            df(out, "rm /etc/systemd/system/multi-user.target.wants/" + unit, check=False)
-            df(out, "rm /lib/systemd/system/" + unit, check=False)
-            df(out, "rm " + path, check=False)
-
-        if printer:
-            if probe_only:
-                probe = os.path.join(REPO, "scripts/printer_probe.lua")
-                df_write(out, probe, "/root/printer_probe.lua")
-                df(out, "set_inode_field /root/printer_probe.lua mode 0100755")
-                unit_p = os.path.join(work, "printer-probe.service")
-                with open(unit_p, "w") as f:
-                    f.write("[Unit]\nDescription=CC printer raw API probe\nAfter=syslogd.service\n\n"
-                            "[Service]\nType=oneshot\nExecStart=/root/printer_probe.lua\n\n"
-                            "[Install]\nWantedBy=multi-user.target\n")
-                df_write(out, unit_p, "/lib/systemd/system/printer-probe.service")
-                df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/printer-probe.service")
-
-            pverify = os.path.join(REPO, "scripts/printer_verify.sh")
-            if os.path.exists(pverify) and not probe_only:
-                df_write(out, pverify, "/root/printer_verify.sh")
-                df(out, "set_inode_field /root/printer_verify.sh mode 0100755")
-                unit_pv = os.path.join(work, "printer-verify.service")
-                with open(unit_pv, "w") as f:
-                    f.write("[Unit]\nDescription=ccprinter module verification\nAfter=syslogd.service\n\n"
-                            "[Service]\nType=oneshot\nExecStart=/bin/sh /root/printer_verify.sh\n\n"
-                            "[Install]\nWantedBy=multi-user.target\n")
-                df_write(out, unit_pv, "/lib/systemd/system/printer-verify.service")
-                df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/printer-verify.service")
-
-        # 3f2) posix-verify.service: POSIX 命令补齐后的自检(新工具 + sh 新内建 + 内核新能力:
-        #      符号链接/硬链接/命名管道/umask/seek) -> /var/log/posix_verify.log
-        #      内核那部分用 /bin/lua 跑 —— 见 scripts/posix_kernel_verify.lua 的头注释: 这里要验的是
-        #      **内核语义本身**, 不该依赖某个工具的包装(而且部分能力当时还没有命令行入口)。
-        #      newtools_test.sh 是新命令批(awk/bc/分页器/date/...)的自检主体 —— 宿主与真机
-        #      跑同一份(build.lua --check 里也跑), 由 posix_tools_verify.sh 调它。
-        for src, dst in (("scripts/posix_tools_verify.sh", "/root/posix_tools_verify.sh"),
-                         ("scripts/newtools_test.sh", "/root/newtools_test.sh"),
-                         ("scripts/posix_kernel_verify.lua", "/root/posix_kernel_verify.lua"),
-                         ("scripts/tee_verify.lua", "/root/tee_verify.lua")):
-            df_write(out, os.path.join(REPO, src), dst)
-            df(out, "set_inode_field %s mode 0100755" % dst)
-        unit_posix = os.path.join(work, "posix-verify.service")
-        with open(unit_posix, "w") as f:
-            f.write("[Unit]\nDescription=Real-machine POSIX tools verification\nAfter=syslogd.service\n\n"
-                    "[Service]\nType=oneshot\nTimeoutStartSec=600\nExecStart=/bin/sh /root/posix_tools_verify.sh\n\n"
-                    "[Install]\nWantedBy=multi-user.target\n")
-        df_write(out, unit_posix, "/lib/systemd/system/posix-verify.service")
-        df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/posix-verify.service")
-
-        # 3f3) mkfs.ext2/fsck.ext2 真机验证要用的"造损坏"小工具(见 scripts/ext2_corrupt.lua 的头注释:
-        #      /dev/sdXN 的字节句柄没有 seek, dd seek= 在这种设备上明确报 cannot seek)。
-        df_write(out, os.path.join(REPO, "scripts/ext2_corrupt.lua"), "/root/ext2_corrupt.lua")
-        df(out, "set_inode_field /root/ext2_corrupt.lua mode 0100755")
-
-        # 3f4) 交互式 "提示符处 ^C" 载荷(scripts/intr_test.ko, 见它的头注释): 真机上只有内核态
-        #      能驱动行规程(进程连 os.queueEvent 都被 procenv 禁掉), 所以按键注入做成一个内核
-        #      模块 —— 它在调度器起来之前包住 os.pullEventRaw, 再用 tty.routeKey/tty.feedInput
-        #      喂按键(走 CC 事件队列的按键会被别的进程 os.sleep 里的过滤拉取吃掉, 实测过)。
-        #      模块由 /lib/modules/<版本>/manifest 点名装载, 所以 .ko 与 manifest 两样都要铺。
-        ver = re.search(r'^\s*return\s+"([^"]+)"', open(os.path.join(REPO, "src/kernel/version.lua")).read(), re.M).group(1)
-        moddir = "/lib/modules/" + ver
-        df_write(out, os.path.join(REPO, "scripts/intr_test.ko"), moddir + "/intrtest.ko")
-        add_module(out, moddir, "intrtest")
-
-        # 3f5) tty 原始模式自检(scripts/rawtty_test.ko + scripts/rawtty_verify.lua):
-        #      分页器 more/less 建在"原始模式 + 终端字节流"这条契约上, 而键盘事件只有内核态
-        #      能注入 —— 模块喂按键, Lua 脚本在 /dev/tty0 上 setRaw 并读回字节。
-        df_write(out, os.path.join(REPO, "scripts/rawtty_verify.lua"), "/root/rawtty_verify.lua")
-        df(out, "set_inode_field /root/rawtty_verify.lua mode 0100755")
-        unit_raw = os.path.join(work, "rawtty-verify.service")
-        with open(unit_raw, "w") as f:
-            f.write("[Unit]\nDescription=Real-machine tty raw mode verification\n"
-                    "After=syslogd.service\n\n"
-                    "[Service]\nType=oneshot\nTimeoutStartSec=120\n"
-                    "ExecStart=/bin/lua /root/rawtty_verify.lua\n\n"
-                    "[Install]\nWantedBy=multi-user.target\n")
-        df_write(out, unit_raw, "/lib/systemd/system/rawtty-verify.service")
-        df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/rawtty-verify.service")
-        df_write(out, os.path.join(REPO, "scripts/rawtty_test.ko"), moddir + "/rawtty.ko")
-        add_module(out, moddir, "rawtty")
-
-        # 3g) 门禁: 注入后镜像仍必须干净, 不把坏镜像带上真机
-        p = subprocess.run([FSCK, "-fn", out], capture_output=True, text=True)
-        if p.returncode != 0:
-            raise RuntimeError("注入后的镜像未通过 e2fsck -fn:\n" + p.stdout + p.stderr)
-        open(fp_path, 'w').write(fp)
+        # --clean: 只装**干净**的镜像(只有 dist 产物, 不注入任何验证载荷)。
+        # 用途: 把真机交给手工测试/日常使用(交互式跑 desh 之类)—— 否则每次开机都会跑一遍
+        # oneshot 自检服务, 既刷屏又抢 tty0(rawtty/intrtest 会往登录会话里注入按键)。
+        if clean:
+            print('--clean: 跳过验证载荷注入(镜像里只有 dist 产物 + fstab/data 分区)')
+        else:
+            # 3) 注入验证负载
+            print("== inject verify payload ==")
+    
+            # 3b) 测试用 /etc/fstab(defaults + noauto 两条)
+            fstab = os.path.join(work, "fstab")
+            with open(fstab, "w") as f:
+                # /dev/sda 恒为电脑自带存储, 引导盘是磁盘驱动器里的第一块盘(sdb, UUID d0)。
+                # data 分区走 UUID(顺带验证 UUID 命名空间), rootcopy 走设备节点(验证 sdbN 命名)。
+                f.write("# real-machine verify fstab\n"
+                        "UUID=d0-2   /mnt/data     ext2   defaults   0 2\n"
+                        "/dev/sdb1   /mnt/rootcopy ext2   noauto     0 2\n")
+            df(out, "rm /etc/fstab")
+            df_write(out, fstab, "/etc/fstab")
+    
+            # 3c) verify.service + /root/verify.sh
+            sh = os.path.join(REPO, "scripts/realmachine_verify.sh")
+            df_write(out, sh, "/root/verify.sh")
+            df(out, "set_inode_field /root/verify.sh mode 0100755")
+            unit = os.path.join(work, "verify.service")
+            with open(unit, "w") as f:
+                # TimeoutStartSec 必须给足: 自检脚本一轮要跑近百个进程, 实测已经在默认的 60s 附近
+                # (Type=oneshot 在 systemd 里的默认本来就是 infinity; Delin 的引擎默认 60s)。
+                # 超时会被 init SIGKILL 掉, 表现成"verify.log 变了但没跑完"——那是**假失败**,
+                # 会让人以为是内核回归(本轮就误判过两轮)。
+                f.write("[Unit]\nDescription=Real-machine verification\nAfter=syslogd.service\n\n"
+                        "[Service]\nType=oneshot\nTimeoutStartSec=600\nExecStart=/bin/sh /root/verify.sh\n\n"
+                        "[Install]\nWantedBy=multi-user.target\n")
+            df_write(out, unit, "/lib/systemd/system/verify.service")
+            df_mkdir(out, "/etc/systemd/system/multi-user.target.wants")
+            marker = os.path.join(work, "marker")
+            open(marker, "w").close()
+            df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/verify.service")
+            df_mkdir(out, "/mnt/rootcopy")
+    
+            # 3e) verify-sh.service: sh 内建/变量自检(. set export unset PATH PSx cd) + desh 非交互自检
+            #     -> /var/log/sh_verify.log
+            for src, dst in (("scripts/sh_verify.sh", "/root/sh_verify.sh"),
+                             ("scripts/sh_builtin_test.sh", "/root/sh_builtin_test.sh"),
+                             ("scripts/sh_expand_test.sh", "/root/sh_expand_test.sh"),
+                             # desh 与 sh 共用核心: 真机上确认"非交互路径起得来、行为一致"。
+                             # 交互式那部分只有宿主能测(scripts/desh_tty_test.sh 用假终端喂按键字节)。
+                             ("scripts/desh_test.sh", "/root/desh_test.sh"),
+                             ("scripts/regex_test.sh", "/root/regex_test.sh"),
+                             ("scripts/proc_test.sh", "/root/proc_test.sh"),
+                             ("scripts/redstone_test.sh", "/root/redstone_test.sh"),
+                             ("scripts/redstone_verify.lua", "/root/redstone_verify.lua"),
+                             ("scripts/lua_test.sh", "/root/lua_test.sh"),
+                             ("scripts/user_test.sh", "/root/user_test.sh"),
+                             ("scripts/user_helper.lua", "/root/user_helper.lua")):
+                df_write(out, os.path.join(REPO, src), dst)
+                df(out, "set_inode_field %s mode 0100755" % dst)
+            unit_sh = os.path.join(work, "verify-sh.service")
+            with open(unit_sh, "w") as f:
+                f.write("[Unit]\nDescription=Real-machine sh builtin verification\nAfter=syslogd.service\n\n"
+                        "[Service]\nType=oneshot\nTimeoutStartSec=600\nExecStart=/bin/sh /root/sh_verify.sh\n\n"
+                        "[Install]\nWantedBy=multi-user.target\n")
+            df_write(out, unit_sh, "/lib/systemd/system/verify-sh.service")
+            df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/verify-sh.service")
+    
+            # 3f) --printer: ccprinter 模块端到端验证; --printer-probe 额外注入原始 printer API 探测。
+            #     默认不注入: 它们会实际打印页面, 只在需要验证打印机时消耗纸张。
+            #     先清掉上一次部署残留在基础镜像里的打印机负载 —— 否则残留的 .wants 标记会让
+            #     探测/验证服务在之后每次启动时都跑一遍, 白白耗纸。
+            for unit, path in (("printer-probe.service", "/root/printer_probe.lua"),
+                               ("printer-verify.service", "/root/printer_verify.sh")):
+                df(out, "rm /etc/systemd/system/multi-user.target.wants/" + unit, check=False)
+                df(out, "rm /lib/systemd/system/" + unit, check=False)
+                df(out, "rm " + path, check=False)
+    
+            if printer:
+                if probe_only:
+                    probe = os.path.join(REPO, "scripts/printer_probe.lua")
+                    df_write(out, probe, "/root/printer_probe.lua")
+                    df(out, "set_inode_field /root/printer_probe.lua mode 0100755")
+                    unit_p = os.path.join(work, "printer-probe.service")
+                    with open(unit_p, "w") as f:
+                        f.write("[Unit]\nDescription=CC printer raw API probe\nAfter=syslogd.service\n\n"
+                                "[Service]\nType=oneshot\nExecStart=/root/printer_probe.lua\n\n"
+                                "[Install]\nWantedBy=multi-user.target\n")
+                    df_write(out, unit_p, "/lib/systemd/system/printer-probe.service")
+                    df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/printer-probe.service")
+    
+                pverify = os.path.join(REPO, "scripts/printer_verify.sh")
+                if os.path.exists(pverify) and not probe_only:
+                    df_write(out, pverify, "/root/printer_verify.sh")
+                    df(out, "set_inode_field /root/printer_verify.sh mode 0100755")
+                    unit_pv = os.path.join(work, "printer-verify.service")
+                    with open(unit_pv, "w") as f:
+                        f.write("[Unit]\nDescription=ccprinter module verification\nAfter=syslogd.service\n\n"
+                                "[Service]\nType=oneshot\nExecStart=/bin/sh /root/printer_verify.sh\n\n"
+                                "[Install]\nWantedBy=multi-user.target\n")
+                    df_write(out, unit_pv, "/lib/systemd/system/printer-verify.service")
+                    df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/printer-verify.service")
+    
+            # 3f2) posix-verify.service: POSIX 命令补齐后的自检(新工具 + sh 新内建 + 内核新能力:
+            #      符号链接/硬链接/命名管道/umask/seek) -> /var/log/posix_verify.log
+            #      内核那部分用 /bin/lua 跑 —— 见 scripts/posix_kernel_verify.lua 的头注释: 这里要验的是
+            #      **内核语义本身**, 不该依赖某个工具的包装(而且部分能力当时还没有命令行入口)。
+            #      newtools_test.sh 是新命令批(awk/bc/分页器/date/...)的自检主体 —— 宿主与真机
+            #      跑同一份(build.lua --check 里也跑), 由 posix_tools_verify.sh 调它。
+            for src, dst in (("scripts/posix_tools_verify.sh", "/root/posix_tools_verify.sh"),
+                             ("scripts/newtools_test.sh", "/root/newtools_test.sh"),
+                             ("scripts/posix_kernel_verify.lua", "/root/posix_kernel_verify.lua"),
+                             ("scripts/tee_verify.lua", "/root/tee_verify.lua")):
+                df_write(out, os.path.join(REPO, src), dst)
+                df(out, "set_inode_field %s mode 0100755" % dst)
+            unit_posix = os.path.join(work, "posix-verify.service")
+            with open(unit_posix, "w") as f:
+                f.write("[Unit]\nDescription=Real-machine POSIX tools verification\nAfter=syslogd.service\n\n"
+                        "[Service]\nType=oneshot\nTimeoutStartSec=600\nExecStart=/bin/sh /root/posix_tools_verify.sh\n\n"
+                        "[Install]\nWantedBy=multi-user.target\n")
+            df_write(out, unit_posix, "/lib/systemd/system/posix-verify.service")
+            df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/posix-verify.service")
+    
+            # 3f3) mkfs.ext2/fsck.ext2 真机验证要用的"造损坏"小工具(见 scripts/ext2_corrupt.lua 的头注释:
+            #      /dev/sdXN 的字节句柄没有 seek, dd seek= 在这种设备上明确报 cannot seek)。
+            df_write(out, os.path.join(REPO, "scripts/ext2_corrupt.lua"), "/root/ext2_corrupt.lua")
+            df(out, "set_inode_field /root/ext2_corrupt.lua mode 0100755")
+    
+            # 3f4) 交互式 "提示符处 ^C" 载荷(scripts/intr_test.ko, 见它的头注释): 真机上只有内核态
+            #      能驱动行规程(进程连 os.queueEvent 都被 procenv 禁掉), 所以按键注入做成一个内核
+            #      模块 —— 它在调度器起来之前包住 os.pullEventRaw, 再用 tty.routeKey/tty.feedInput
+            #      喂按键(走 CC 事件队列的按键会被别的进程 os.sleep 里的过滤拉取吃掉, 实测过)。
+            #      模块由 /lib/modules/<版本>/manifest 点名装载, 所以 .ko 与 manifest 两样都要铺。
+            ver = re.search(r'^\s*return\s+"([^"]+)"', open(os.path.join(REPO, "src/kernel/version.lua")).read(), re.M).group(1)
+            moddir = "/lib/modules/" + ver
+            df_write(out, os.path.join(REPO, "scripts/intr_test.ko"), moddir + "/intrtest.ko")
+            add_module(out, moddir, "intrtest")
+    
+            # 3f5) tty 原始模式自检(scripts/rawtty_test.ko + scripts/rawtty_verify.lua):
+            #      分页器 more/less 建在"原始模式 + 终端字节流"这条契约上, 而键盘事件只有内核态
+            #      能注入 —— 模块喂按键, Lua 脚本在 /dev/tty0 上 setRaw 并读回字节。
+            df_write(out, os.path.join(REPO, "scripts/rawtty_verify.lua"), "/root/rawtty_verify.lua")
+            df(out, "set_inode_field /root/rawtty_verify.lua mode 0100755")
+            unit_raw = os.path.join(work, "rawtty-verify.service")
+            with open(unit_raw, "w") as f:
+                f.write("[Unit]\nDescription=Real-machine tty raw mode verification\n"
+                        "After=syslogd.service\n\n"
+                        "[Service]\nType=oneshot\nTimeoutStartSec=120\n"
+                        "ExecStart=/bin/lua /root/rawtty_verify.lua\n\n"
+                        "[Install]\nWantedBy=multi-user.target\n")
+            df_write(out, unit_raw, "/lib/systemd/system/rawtty-verify.service")
+            df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/rawtty-verify.service")
+            df_write(out, os.path.join(REPO, "scripts/rawtty_test.ko"), moddir + "/rawtty.ko")
+            add_module(out, moddir, "rawtty")
+    
+            # 3g) 门禁: 注入后镜像仍必须干净, 不把坏镜像带上真机
+            p = subprocess.run([FSCK, "-fn", out], capture_output=True, text=True)
+            if p.returncode != 0:
+                raise RuntimeError("注入后的镜像未通过 e2fsck -fn:\n" + p.stdout + p.stderr)
+            open(fp_path, 'w').write(fp)
 
     # 3d) 安装到磁盘(逐文件按内容校验; 机器此时已停机)
     install_verified(out, os.path.join(DISK, "parts/root.img"))
@@ -435,6 +446,15 @@ def main():
 
     if not reboot:
         print("--no-reboot: stopping here (computer #3 已关机)")
+        return
+    if clean:
+        # --clean: 干净镜像没有 verify.service, 后续那套"取回日志 + 逐条门禁"没有意义 ——
+        # 开机就交给手工用(顺便把电脑 4 的部署与重启也跳过)。
+        print("== reboot computer #3 (clean image, no verification) ==")
+        run("python3", RCON, "computercraft shutdown #3", check=False)
+        time.sleep(2)
+        run("python3", RCON, "computercraft turn-on #3", check=False)
+        print("   电脑 #3 已用干净镜像开机(磁盘 0 引导), 可以直接登录使用")
         return
     reboot_and_collect(printer)
 
