@@ -42,6 +42,7 @@ local REPO = os.getenv("DELIN_REPO") or repoRoot()
 package.path = REPO .. "/src/?.lua;" .. package.path
 local procenv = require("kernel.procenv")
 local VERSION = require("kernel.version") -- 模块目录名 /lib/modules/<version>
+local includeLib = dofile(REPO .. "/tools/include.lua") -- 构建期 --#include(与 build.lua 同一份实现)
 
 -- pipe 内核模块用 os.sleep 做协作式阻塞; 在宿主上把它改成 yield 给调度器
 -- (宿主 lua5.1 的 os 没有 sleep, 且这里必须能让出当前协程让调度器切走)。
@@ -692,13 +693,25 @@ end
 -- 构建 ROOT
 -- ---------------------------------------------------------------
 local SRCBIN = os.getenv("DELIN_SRCBIN") or (REPO .. "/src/bin")
+--- 把 src/bin 下的工具铺进测试台 ROOT/bin。
+--- **必须展开 `--#include`**(而不是 cp): 目标机上的产物是拼接后的自包含单文件, 而测试台的
+--- 文件系统里没有 /lib 源码树可读 —— 不展开的话, 宿主跑的是"引用了一堆不存在文件"的入口,
+--- 真机反而正常, 白白浪费一轮排查。与 build.lua 共用 tools/include.lua, 于是
+--- "测试台跑的"与"装到 CC 上的"是同一段源码。
+local function copyTool(name)
+    local f0 = assert(io.open(SRCBIN .. "/" .. name, "rb"), "cannot read " .. SRCBIN .. "/" .. name)
+    local raw = f0:read("*a"); f0:close()
+    local src = includeLib.expand(raw, REPO, "src/bin/" .. name)
+    local f = assert(io.open(ROOT .. "/bin/" .. name, "w"))
+    f:write(src); f:close()
+    os.execute("chmod 755 " .. ROOT .. "/bin/" .. name)
+end
 local function setupRoot()
     os.execute("rm -rf " .. ROOT .. " && mkdir -p " .. ROOT)
     os.execute("mkdir -p " .. ROOT .. "/bin " .. ROOT .. "/etc " .. ROOT .. "/home/alice " .. ROOT .. "/root " .. ROOT .. "/tmp " .. ROOT .. "/mnt/cc")
     for _, f in ipairs({ "cat","clear","cp","ed","grep","head","kill","login","ls","mkdir","mv","rm","sed","sh","sleep","tail","touch","wc","chmod","chown","mount","umount","blkid","lsblk","lp","ps","pgrep","pkill","killall","lua",
                           "passwd","useradd","userdel","usermod","groupadd","groupdel","id","whoami","groups" }) do
-        os.execute("cp -f " .. SRCBIN .. "/" .. f .. " " .. ROOT .. "/bin/" .. f)
-        os.execute("chmod 755 " .. ROOT .. "/bin/" .. f)
+        copyTool(f)
     end
     -- 上面是手写白名单(历史遗留)。**再补全 src/bin 下的其余文件**: 维护两份清单必然会漏,
     -- 漏了就在测试台上报 "cannot read /bin/<新工具>"(而真机上是好的), 白白浪费一轮排查。
@@ -706,10 +719,7 @@ local function setupRoot()
         local p = io.popen("ls -A " .. SRCBIN)
         if p then
             for f in p:lines() do
-                if not f:find("^%.") then
-                    os.execute("cp -f " .. SRCBIN .. "/" .. f .. " " .. ROOT .. "/bin/" .. f)
-                    os.execute("chmod 755 " .. ROOT .. "/bin/" .. f)
-                end
+                if not f:find("^%.") then copyTool(f) end
             end
             p:close()
         end

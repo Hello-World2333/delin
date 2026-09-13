@@ -61,6 +61,7 @@ end
 local bundle = dofile("tools/bundle.lua")
 local minify = dofile("tools/minify.lua")
 local crc32  = dofile("tools/crc32.lua")
+local includeLib = dofile("tools/include.lua")
 
 local VERSION = readAll("src/kernel/version.lua"):match('return%s+"([^"]+)"')
 assert(VERSION, "无法从 src/kernel/version.lua 读出版本号")
@@ -89,8 +90,10 @@ end
 -- ---------------------------------------------------------------
 
 --- 压缩一个文件并写出; 返回 { out, inBytes, outBytes }。
+--- 压缩前先展开 `--#include`(构建期拼接: /bin 工具在目标机上必须是自包含单文件, 见 tools/include.lua)。
 local function minifyTo(srcPath, outPath, opts)
-    local out, err, stats = minify.source(readAll(srcPath), opts or {})
+    local src = includeLib.expand(readAll(srcPath), REPO, srcPath)
+    local out, err, stats = minify.source(src, opts or {})
     if not out then error(srcPath .. ": " .. tostring(err), 0) end
     bundle.mkdirp(outPath:match("^(.*)/[^/]+$") or ".")
     writeAll(outPath, out)
@@ -300,7 +303,7 @@ end
 local function shadowGate(files, dir)
     local bad = {}
     for _, rel in ipairs(files) do
-        local src = readAll(dir .. "/" .. rel)
+        local src = includeLib.expand(readAll(dir .. "/" .. rel), REPO, dir .. "/" .. rel)
         local hits, err = minify.checkShadowedGlobals(src)
         if not hits then
             bad[#bad + 1] = string.format("  %s: 解析失败: %s", rel, tostring(err))
@@ -322,7 +325,7 @@ end
 --- 门禁: 源文件里的"局部被读成全局"(在压缩之前拦, 报的是源码行号)。
 local function runShadowGate()
     local n = 0
-    for _, dir in ipairs({ "src/bin", "src/kernel", "src/init", "src/bios", "src/modules" }) do
+    for _, dir in ipairs({ "src/bin", "src/lib", "src/kernel", "src/init", "src/bios", "src/modules" }) do
         local list = {}
         for _, name in ipairs(listFiles(dir)) do
             if name:match("%.lua$") or name:match("%.ko$") or not name:match("%.") then
