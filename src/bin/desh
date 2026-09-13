@@ -20,9 +20,12 @@
 
 --#include src/lib/shcore.lua
 
--- 核心有 148 个顶层 local, 而 Lua 每个 function(chunk 也是)最多 200 个活动 local ——
--- desh 这一层整体**包成一个函数**: 它自己有独立的 200 个 local 预算, 对核心那些名字的引用
--- 变成 upvalue(数量远低于 Lua 5.1 的 60 个 upvalue 上限, 于是宿主 lua5.1 也编得过)。
+-- S 是**核心给前端的接口表**(变量表/内建表/查找路径/求值入口……, 见 shcore.lua 里填表那段)。
+-- desh 不能直接看见核心的局部变量: 整个前端也是一个函数(下面的 deshMain), 只有 S 一路是
+-- upvalue —— 这样两边的局部变量都不挤在 chunk 上(CC 的 Lua 对"活着的局部变量"有硬上限,
+-- 见 shcore.lua 文件头那段)。
+local S = {}
+
 local function deshMain()
 
 -- ===============================================================
@@ -32,7 +35,7 @@ local ESC = "\27"
 local RESET = "\27[0m"
 
 local function out(s)
-    if stdout and stdout.write then stdout:write(s) end
+    if S.stdout and S.stdout.write then S.stdout:write(s) end
 end
 local function err(s)
     local e = io.stderr()
@@ -120,13 +123,13 @@ end
 -- 配置: 全是普通 shell 变量(deshrc 里 export/赋值都行), 每次用时现读
 -- ===============================================================
 local function cfgOn(name, def)
-    local v = vars[name]
+    local v = S.vars[name]
     if v == nil then return def end
     return not (v == "0" or v == "" or v == "no" or v == "false")
 end
-local function histFile() return vars.HISTFILE or ((vars.HOME or "/root") .. "/.desh_history") end
-local function histSize() return math.max(0, tonumber(vars.HISTSIZE) or 200) end
-local function suggestColor() return vars.DESH_SUGGEST_COLOR or "90" end -- 90 = 亮黑(灰)
+local function histFile() return S.vars.HISTFILE or ((S.vars.HOME or "/root") .. "/.desh_history") end
+local function histSize() return math.max(0, tonumber(S.vars.HISTSIZE) or 200) end
+local function suggestColor() return S.vars.DESH_SUGGEST_COLOR or "90" end -- 90 = 亮黑(灰)
 
 -- ===============================================================
 -- 历史
@@ -135,7 +138,7 @@ local hist = {}          -- 旧 -> 新
 local histLoadWarned = false
 
 local function histLoad()
-    local f = fs.open(histFile(), "r")
+    local f = S.fs.open(histFile(), "r")
     if not f then return end
     while true do
         local line = f.readLine and f:readLine()
@@ -157,11 +160,11 @@ local function histAppend(line)
     hist[#hist + 1] = line
     local cap = histSize()
     while #hist > cap do table.remove(hist, 1) end
-    local f = fs.open(histFile(), "a")
+    local f = S.fs.open(histFile(), "a")
     if not f then
         if not histLoadWarned then
             histLoadWarned = true
-            errln(shName .. ": " .. histFile() .. ": cannot write (history disabled this session)")
+            S.errln(S.name .. ": " .. histFile() .. ": cannot write (history disabled this session)")
         end
         return
     end
@@ -173,7 +176,7 @@ end
 local function histSave()
     if not cfgOn("DESH_HISTORY", true) then return end
     local cap = histSize()
-    local f = fs.open(histFile(), "w")
+    local f = S.fs.open(histFile(), "w")
     if not f then return end
     local from = math.max(1, #hist - cap + 1)
     for i = from, #hist do f:write(hist[i] .. "\n") end
@@ -216,8 +219,8 @@ end
 
 local function pathDirs()
     local dirs = {}
-    for d in ((vars.PATH or "/bin") .. ":"):gmatch("([^:]*):") do
-        dirs[#dirs + 1] = resolve(d) -- 空条目 = 当前目录(POSIX)
+    for d in ((S.vars.PATH or "/bin") .. ":"):gmatch("([^:]*):") do
+        dirs[#dirs + 1] = S.resolve(d) -- 空条目 = 当前目录(POSIX)
     end
     return dirs
 end
@@ -231,14 +234,14 @@ local function commandCandidates(prefix)
             out[#out + 1] = n
         end
     end
-    for n in pairs(builtins) do add(n) end -- 函数也登记在 builtins 里(见核心的 isFunction)
-    for n in pairs(aliases) do add(n) end
+    for n in pairs(S.builtins) do add(n) end -- 函数也登记在 builtins 里(见核心的 isFunction)
+    for n in pairs(S.aliases) do add(n) end
     for _, d in ipairs(pathDirs()) do
-        local names = fs.list(d)
+        local names = S.fs.list(d)
         if names then
             for _, n in ipairs(names) do
                 local p = d .. "/" .. n
-                if not fs.isDir(p) and fs.canExecute(p) then add(n) end
+                if not S.fs.isDir(p) and S.fs.canExecute(p) then add(n) end
             end
         end
     end
@@ -251,14 +254,14 @@ local function fileCandidates(word)
     local dirpart, base = word:match("^(.*/)([^/]*)$")
     if not dirpart then dirpart, base = "", word end
     local look = dirpart
-    if look:sub(1, 2) == "~/" then look = (vars.HOME or "/root") .. look:sub(2) end
-    local names = fs.list(resolve(look == "" and "." or look))
+    if look:sub(1, 2) == "~/" then look = (S.vars.HOME or "/root") .. look:sub(2) end
+    local names = S.fs.list(S.resolve(look == "" and "." or look))
     local out = {}
     if names then
         for _, n in ipairs(names) do
             local hiddenOk = (n:sub(1, 1) ~= ".") or (base:sub(1, 1) == ".")
             if hiddenOk and n:sub(1, #base) == base then
-                out[#out + 1] = dirpart .. n .. (fs.isDir(resolve(look .. n)) and "/" or "")
+                out[#out + 1] = dirpart .. n .. (S.fs.isDir(S.resolve(look .. n)) and "/" or "")
             end
         end
     end
@@ -270,7 +273,7 @@ end
 local function varCandidates(word)
     local name = word:sub(2)
     local out = {}
-    for _, n in ipairs(sortedKeys(vars)) do
+    for _, n in ipairs(sortedKeys(S.vars)) do
         if n:sub(1, #name) == name then out[#out + 1] = "$" .. n end
     end
     for _, n in ipairs({ "?", "#", "@", "*", "$", "!", "-" }) do
@@ -498,7 +501,7 @@ local function askListAll(n)
     out("\n" .. "display all " .. n .. " possibilities? (y or n) ")
     local go = false
     while true do
-        local name, raw = readKey(stdin)
+        local name, raw = readKey(S.stdin)
         if name == "eof" then break end
         if raw == "y" or raw == "Y" then go = true; break end
         if raw == "n" or raw == "N" or name == "enter" or name == "intr" then break end
@@ -595,14 +598,14 @@ local function correct(cmd)
     if not cmd or cmd:find("/") then return end
     if not allCommands then
         allCommands = {}
-        for n in pairs(builtins) do allCommands[n] = true end
-        for n in pairs(aliases) do allCommands[n] = true end
+        for n in pairs(S.builtins) do allCommands[n] = true end
+        for n in pairs(S.aliases) do allCommands[n] = true end
         for _, d in ipairs(pathDirs()) do
-            local names = fs.list(d)
+            local names = S.fs.list(d)
             if names then
                 for _, n in ipairs(names) do
                     local p = d .. "/" .. n
-                    if not fs.isDir(p) and fs.canExecute(p) then allCommands[n] = true end
+                    if not S.fs.isDir(p) and S.fs.canExecute(p) then allCommands[n] = true end
                 end
             end
         end
@@ -632,9 +635,9 @@ local function correct(cmd)
         end
     end
     if #names == 1 then
-        err(shName .. ": did you mean '" .. names[1] .. "'?\n")
+        err(S.name .. ": did you mean '" .. names[1] .. "'?\n")
     else
-        err(shName .. ": did you mean one of: " .. table.concat(names, ", ") .. "?\n")
+        err(S.name .. ": did you mean one of: " .. table.concat(names, ", ") .. "?\n")
     end
 end
 
@@ -747,55 +750,63 @@ end
 --- 读一个 rc 文件(它就是普通 shell 脚本: 别名/变量/函数/补全开关都写在里面)。
 --- 返回 false 表示 rc 里执行了 exit(于是不启动交互 shell)。
 local function sourceRc(path, optional)
-    local f = fs.open(path, "r")
+    local f = S.fs.open(path, "r")
     if not f then
-        if not optional then errln(shName .. ": " .. path .. ": cannot open") end
+        if not optional then S.errln(S.name .. ": " .. path .. ": cannot open") end
         return true
     end
     local src = (f.readAll and f:readAll()) or ""
     f:close()
     if src:gsub("%s", "") == "" then return true end
-    local ok, inc, err, ctrl = evalProgram(src)
+    local ok, inc, err, ctrl = S.evalProgram(src)
     if ctrl == "exit" then return false end
     if inc then
-        errln(shName .. ": " .. path .. ": syntax error: unexpected end of file")
+        S.errln(S.name .. ": " .. path .. ": syntax error: unexpected end of file")
     elseif ok == nil and err then
-        errln(shName .. ": " .. path .. ": " .. tostring(err))
+        S.errln(S.name .. ": " .. path .. ": " .. tostring(err))
     end
     return true
 end
 
---- desh 的 help 覆盖核心那份(说明的是交互层能力)。
-builtins.help = function()
-    outln("Delin desh (interactive shell, POSIX core shared with /bin/sh)")
-    outln("editing  : arrows Home/End Delete; ^A ^E ^B ^F ^K ^U ^W ^Y ^L; Tab completes")
-    outln("history  : Up/Down, ^P/^N, ^R incremental search; file $HISTFILE (default ~/.desh_history)")
-    outln("complete : commands (PATH/builtin/function/alias), files, dirs, $variables")
-    outln("suggest  : grey inline history suggestion -- accept with -> or End")
-    outln("correct  : 'did you mean' when a command is not found")
-    outln("config   : /etc/deshrc, then ~/.deshrc (or $DESHRC); switches DESH_AUTOSUGGEST,")
-    outln("           DESH_CORRECT, DESH_HISTORY, HISTFILE, HISTSIZE, DESH_SUGGEST_COLOR")
-    outln("usage    : desh [-c cmd [name [args...]]] [script] [args...]   (no script => interactive)")
-    outln("scripts  : non-interactive desh behaves exactly like sh (same core)")
+
+--- 前端就绪(核心把 S 填满、命令还没开始跑时调一次): 覆盖 help、读 rc 文件、载入历史。
+--- 这些事都要看得见核心的表与函数, 所以只能挂在这个钩子上; 返回 false = rc 里执行了 exit,
+--- 核心收到后直接收摊(不进入交互循环)。
+local function deshSetup()
+    S.builtins.help = function()
+        S.outln("Delin desh (interactive shell, POSIX core shared with /bin/sh)")
+        S.outln("editing  : arrows Home/End Delete; ^A ^E ^B ^F ^K ^U ^W ^Y ^L; Tab completes")
+        S.outln("history  : Up/Down, ^P/^N, ^R incremental search; file $HISTFILE (default ~/.desh_history)")
+        S.outln("complete : commands (PATH/builtin/function/alias), files, dirs, $variables")
+        S.outln("suggest  : grey inline history suggestion -- accept with -> or End")
+        S.outln("correct  : 'did you mean' when a command is not found")
+        S.outln("config   : /etc/deshrc, then ~/.deshrc (or $DESHRC); switches DESH_AUTOSUGGEST,")
+        S.outln("           DESH_CORRECT, DESH_HISTORY, HISTFILE, HISTSIZE, DESH_SUGGEST_COLOR")
+        S.outln("usage    : desh [-c cmd [name [args...]]] [script] [args...]   (no script => interactive)")
+        S.outln("scripts  : non-interactive desh behaves exactly like sh (same core)")
+    end
+    if not S.interactive then return true end
+    local ok = sourceRc("/etc/deshrc", true)
+    if ok then ok = sourceRc(S.vars.DESHRC or ((S.vars.HOME or "/root") .. "/.deshrc"), true) end
+    histLoad()
+    return ok
 end
 
 local ui = {
     name = "desh",
+    setup = function() return deshSetup() end,
     readLine = function(prompt, cont) return editLine(prompt, cont) end,
     commandNotFound = function(cmd) correct(cmd) end,
+    onExit = function() if S.interactive then histSave() end end,
 }
 
-local startOk = true
-if interactive then
-    startOk = sourceRc("/etc/deshrc", true)
-    if startOk then startOk = sourceRc(vars.DESHRC or ((vars.HOME or "/root") .. "/.deshrc"), true) end
-    if startOk then histLoad() end
+return ui
+
 end
 
-local rc = startOk and shellMain(ui) or lastExit
-if interactive then histSave() end
+-- 入口: 先建前端(此时只拿到一张空接口表), 再由核心填好接口并跑起来 —— 核心在进入交互循环
+-- **之前**把表填满, 所以前端那些闭包在第一次读行时看到的一定是就绪状态。
+local ui = deshMain()
+local rc = shCoreMain(ui, S)
+if ui.onExit then ui.onExit() end
 return rc
-
-end
-
-return deshMain()

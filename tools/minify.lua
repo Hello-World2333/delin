@@ -180,8 +180,8 @@ end
 -- 语法分析 + 作用域分析
 -- ===============================================================
 
-local function newFnScope(parent)
-    local f = { parent = parent, symbols = {}, children = {}, n = 0 }
+local function newFnScope(parent, line)
+    local f = { parent = parent, symbols = {}, children = {}, n = 0, line = line or 0 }
     if parent then parent.children[#parent.children + 1] = f end
     return f
 end
@@ -358,7 +358,7 @@ parseTable = function(p)
 end
 
 parseFunctionBody = function(p, isMethod)
-    local fn = newFnScope(p.scope.fn)
+    local fn = newFnScope(p.scope.fn, (cur(p) or {}).line)
     p.fnDepth = p.fnDepth + 1
     p.scope = newScope(p.scope, fn)
     if isMethod then
@@ -792,6 +792,42 @@ function minify.checkShadowedGlobals(src)
         end
     end
     return out
+end
+
+--- 门禁: **CC 的 Lua(Cobalt)对"活着的局部变量"的计数沿嵌套链累加**。
+--- Cobalt 的 Parser.newLocal 拿 `activeVariableSize + 1` 与 LUAI_MAXVARS(200) 比, 而
+--- activeVariableSize 是**整段 chunk 一路累积**的活动局部 —— 内层函数不比外层"另起一帧",
+--- 而是**在祖先的计数之上继续加**。于是:
+---   - 宿主 lua5.1/5.4 编得过(它们每个函数 200 个名额各自独立), 真机却直接
+---     `load failed: function at line N has more than 200 local variables`;
+---   - 症状是 /bin/sh 这种基础工具整个装载不了, 而报错只有一句 "/bin/sh: nil"(见 for-ai);
+---   - 实测: 主 chunk 196 个 local 时侥幸通过, 再加一个 helper(197)就挂 —— 余量只有个位数。
+--- 这条门禁按 Cobalt 的算法算: 对每个函数算"它自己 + 所有祖先"的局部变量之和, 超限即 fail-fast。
+---@param src string 源码(已展开 --#include)
+---@param limit number|nil 上限, 缺省 180(给 200 留出安全余量)
+---@return table|nil, string|nil 超限时返回 { sum, chain = { line... } }, 解析失败返回 nil, err
+function minify.checkLocalBudget(src, limit)
+    limit = limit or 180
+    local lx, lerr = lex(src)
+    if not lx then return nil, "词法错误: " .. tostring(lerr) end
+    local toks = {}
+    for _, tk in ipairs(lx.toks) do
+        if tk.t ~= "comment" and tk.t ~= "shebang" then toks[#toks + 1] = tk end
+    end
+    local ok, plan = pcall(analyze, toks)
+    if not ok then return nil, "语法错误: " .. tostring(plan) end
+    local worst = { sum = 0, chain = {} }
+    local function walk(fn, acc, chain)
+        local sum = acc + #fn.symbols
+        local c = {}
+        for i = 1, #chain do c[i] = chain[i] end
+        c[#c + 1] = { line = fn.line, count = #fn.symbols }
+        if sum > worst.sum then worst = { sum = sum, chain = c } end
+        for _, ch in ipairs(fn.children) do walk(ch, sum, c) end
+    end
+    walk(plan.rootFn, 0, {})
+    if worst.sum > limit then return worst end
+    return nil
 end
 
 --- 门禁 A: 产物语法。宿主进程是 lua5.1, 它不认识 goto/标签(5.2 语法) —— 遇到就改用

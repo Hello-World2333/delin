@@ -474,6 +474,52 @@ build()
 buildManifest()
 if doRelease then buildRelease() end
 runShadowGate()
+
+-- ---------------------------------------------------------------
+-- 门禁: Cobalt(CC 的 Lua)沿嵌套链累加局部变量, 上限 200
+-- ---------------------------------------------------------------
+-- 为什么必须有一条**构建期**门禁: 宿主 lua5.1/5.4 给每个函数 200 个独立名额, 而 CC 的
+-- Cobalt 拿"当前函数 + 所有祖先"的局部变量之和与 200 比(见 tools/minify.lua 的
+-- checkLocalBudget)。于是"在宿主全绿、真机 /bin/sh 直接装载不了"这种故障只能在这里拦:
+-- 实测踩过一次 —— 给 sh 核心加了一个 helper 函数(局部变量 196 -> 197), 真机上 /bin/sh 报
+-- `function at line N has more than 200 local variables`, 而 shell 只显示成 "/bin/sh: nil",
+-- 整个系统的服务全起不来(见 for-ai.md 的「`desh`」一节)。
+-- 判据用 200(Cobalt 的 LUAI_MAXVARS 原值); 我们的算法对块内变量是保守的(会多算), 所以
+-- 真实余量比打印出来的数字略大。190 以上就该考虑把 helper 收进表里了。
+local function runLocalGate()
+    local limit = 200
+    local bad, n = {}, 0
+    for _, dir in ipairs({ "src/bin", "src/lib" }) do
+        for _, name in ipairs(listFiles(dir)) do
+            if name:match("%.lua$") or not name:match("%.") then
+                local rel = dir .. "/" .. name
+                local src = includeLib.expand(readAll(rel), REPO, rel)
+                local hit, err = minify.checkLocalBudget(src, limit)
+                if hit == nil and err then
+                    bad[#bad + 1] = string.format("  %s: %s", rel, err)
+                elseif hit then
+                    local chain = {}
+                    for _, f in ipairs(hit.chain) do
+                        chain[#chain + 1] = string.format("line %d: %d", f.line, f.count)
+                    end
+                    bad[#bad + 1] = string.format("  %s: 沿嵌套链 %d 个局部变量(上限 %d) [%s]",
+                        rel, hit.sum, limit, table.concat(chain, " + "))
+                else
+                    n = n + 1
+                end
+            end
+        end
+    end
+    if #bad > 0 then
+        error("局部变量超了 CC 的 Lua(Cobalt)上限 —— 真机上这个文件会**装载失败**:\n"
+            .. table.concat(bad, "\n")
+            .. "\n修法: 把 helper 函数收进一张表(`local F = {}` + `function F.name(...)` 或 "
+            .. "`F.name = function`), 表字段不占局部变量名额; 见 src/lib/shcore.lua 的 F 表。", 0)
+    end
+    print(string.format("local gate: %d 个源文件在 Cobalt 的局部变量上限内(<=%d)", n, limit))
+end
+
+runLocalGate()
 asciiGate()
 if doCheck then check() end
 print("build ok (Delin " .. VERSION .. ")")

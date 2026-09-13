@@ -82,6 +82,24 @@ def shutdown_computer(timeout=90):
             return
     raise RuntimeError("computer #3 在 %ds 内没有关机; 拒绝在机器运行时读写磁盘镜像" % timeout)
 
+def add_module(img, moddir, name):
+    """把 name 追加进镜像里 /lib/modules/<版本>/manifest(内核按这份清单装载模块)。
+
+    **每次都从镜像里重新读一遍清单**: 以前两个注入点(3f4 intrtest / 3f5 rawtty)各自缓存了
+    '读到的清单', 后一个拿的是前一个**追加之前**的快照, 于是它写回的清单把刚追加的模块名
+    又抹掉了 —— 症状是"模块文件在镜像里、清单里没有", 机器上那一项自检悄无声息地不跑
+    (真机实测: intrtest 没装载, /tmp/intr.before 缺失, ^C 门禁报"正对照缺失")。
+    """
+    cur = subprocess.run([DBG, "-R", "cat " + moddir + "/manifest", img],
+                         capture_output=True, text=True).stdout
+    if name in cur.split():
+        return
+    mfile = os.path.join(WORK, "module-manifest")
+    os.makedirs(WORK, exist_ok=True)
+    with open(mfile, "w") as f:
+        f.write(cur.strip("\n") + "\n" + name + "\n")
+    df_write(img, mfile, moddir + "/manifest")
+
 def install_verified(src, dst):
     """复制到游戏侧路径后按内容校验: 不一致说明还有别的写入者在动这个文件。"""
     shutil.copy(src, dst)
@@ -323,13 +341,7 @@ def main():
         ver = re.search(r'^\s*return\s+"([^"]+)"', open(os.path.join(REPO, "src/kernel/version.lua")).read(), re.M).group(1)
         moddir = "/lib/modules/" + ver
         df_write(out, os.path.join(REPO, "scripts/intr_test.ko"), moddir + "/intrtest.ko")
-        cur_manifest = subprocess.run([DBG, "-R", "cat " + moddir + "/manifest", out],
-                                      capture_output=True, text=True).stdout
-        if "intrtest" not in cur_manifest.split():
-            mfile = os.path.join(work, "module-manifest")
-            with open(mfile, "w") as f:
-                f.write(cur_manifest.strip("\n") + "\nintrtest\n")
-            df_write(out, mfile, moddir + "/manifest")
+        add_module(out, moddir, "intrtest")
 
         # 3f5) tty 原始模式自检(scripts/rawtty_test.ko + scripts/rawtty_verify.lua):
         #      分页器 more/less 建在"原始模式 + 终端字节流"这条契约上, 而键盘事件只有内核态
@@ -346,11 +358,7 @@ def main():
         df_write(out, unit_raw, "/lib/systemd/system/rawtty-verify.service")
         df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/rawtty-verify.service")
         df_write(out, os.path.join(REPO, "scripts/rawtty_test.ko"), moddir + "/rawtty.ko")
-        if "rawtty" not in cur_manifest.split():
-            mfile = os.path.join(work, "module-manifest")
-            with open(mfile, "w") as f:
-                f.write(cur_manifest.strip("\n") + "\nrawtty\n")
-            df_write(out, mfile, moddir + "/manifest")
+        add_module(out, moddir, "rawtty")
 
         # 3g) 门禁: 注入后镜像仍必须干净, 不把坏镜像带上真机
         p = subprocess.run([FSCK, "-fn", out], capture_output=True, text=True)

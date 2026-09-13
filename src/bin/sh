@@ -1,7 +1,7 @@
 -- Delin sh: POSIX-ish shell (core subset) —— **经典入口**。
 -- 实现全在 src/lib/shcore.lua(共享核心: desh 也用它), 这里只是入口 + 身份。
 -- 本文件在构建期被 --#include 拼成一份自包含的单文件(目标机没有 require/dofile, 见
--- tools/include.lua); 因此这里**不能有**顶层 return —— 核心里的 shellMain 由本行调用返回。
+-- tools/include.lua); 因此这里**不能有**顶层 return —— 核心里的 shCoreMain 由本行调用返回。
 -- 交互式行为: 由 tty 的行规程读行(退格可用, 无历史/补全 —— 那是 /bin/desh 的事)。
 --#include src/lib/shcore.lua
-return shellMain(nil)
+return shCoreMain(nil, nil)
