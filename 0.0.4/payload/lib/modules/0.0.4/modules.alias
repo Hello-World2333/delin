@@ -1,0 +1,6 @@
+# Delin module aliases (modprobe style): <device/peripheral type> <module name>
+tm_gpu   tom
+hologram void
+monitor  ccmonitor
+printer  ccprinter
+cc_hse   cc_hse

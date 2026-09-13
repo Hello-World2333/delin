@@ -1,0 +1,5 @@
+--@name ccdisk
+--@version 0.2.0
+--@description CC native filesystem driver: registers the ccdisk fstype (whole disk /dev/sda, or any CC fs path) plus the legacy mount.ccdisk syscall.
+--@deps
+local a=require("kernel.vfs")return{init=function(b)b.registerFstype("ccdisk",function(c)return a.real(c.ccpath)end)b.registerSyscall("mount.ccdisk",function(d,c)a.mount(c,a.real(d))return true end)b.log("ccdisk: fstype registered (mount -t ccdisk /dev/sda DIR)")end,}

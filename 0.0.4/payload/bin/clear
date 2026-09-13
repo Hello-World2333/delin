@@ -1,0 +1,1 @@
+local a=io.stdout()a:write("\27[0m\27[2J\27[H")

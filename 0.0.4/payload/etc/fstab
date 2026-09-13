@@ -1,0 +1,22 @@
+# Delin /etc/fstab -- see fstab(5).
+#   <file system> <mount point> <type> <options> <dump> <pass>
+# Device:
+#   /dev/sdaN            the Nth partition (partition line number in that storage's
+#                        /parts/manifest); sda = the computer's own storage, disk drives are
+#                        numbered from sdb up in ascending disk ID order
+#   UUID=c<computer ID>-<partition> / UUID=d<disk ID>-<partition>
+#                        mount by UUID (CC has no filesystem UUID, an ID stands in for it; the
+#                        prefix separates the computer's own storage from a disk, because disk
+#                        IDs and computer IDs are two independently increasing sequences and
+#                        would collide)
+#   /dev/ccdiskN         the whole CC native filesystem (fstype ccdisk)
+# Options: defaults ro rw auto noauto nofail user users
+#   noauto is not mounted at boot; nofail does not block local-fs.target when the mount fails;
+#   ro/rw/user/users are parsed and then ignored (Delin's fstypes have no read-only mode and no
+#   setuid).
+# The root filesystem is mounted by the boot loader, it does not belong here (a duplicate entry
+# is skipped).
+#
+# Examples (commented out by default, enable when needed):
+# UUID=d0-2  /mnt/data   ext2   defaults   0 2
+# /dev/sdb2  /mnt/extra  ext2   noauto     0 2

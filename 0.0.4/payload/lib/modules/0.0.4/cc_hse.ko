@@ -1,0 +1,5 @@
+--@name cc_hse
+--@version 0.2.0
+--@description HSE clock acceleration: os.msleep(ms) via pull-mode waitNextTick
+--@deps
+local a=2000 return{init=function(f,b)local e=f.log local c=peripheral.wrap(b)if not c then error("cc_hse: cannot wrap peripheral '"..tostring(b).."'",2)end if type(c.waitNextTick)~="function"then error("cc_hse: peripheral has no waitNextTick (need pull-mode cc_hse)",2)end c.setFrequency(a)c.setPushEvents(false)c.setOn(true)e("cc_hse: pull mode on "..b.." @ "..a.."Hz (pushEvents=false)")local function d(h)while h>0 do local g=c.waitNextTick()if type(g)~="number"or g<1 then g=1 end h=h-g end end os.msleep=function(h)h=tonumber(h)or 0 if h>=50 then os.sleep(h/1000)return end local g=math.floor(h*a/1000+0.5)if g<4 then g=4 end d(g)end e("cc_hse: os.msleep installed (pull mode)")end,exit=function()for d,b in ipairs(peripheral.getNames())do if peripheral.getType(b)=="cc_hse"then local c=peripheral.wrap(b)if c then pcall(c.setOn,false)end end end os.msleep=nil end,}

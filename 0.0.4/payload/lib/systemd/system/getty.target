@@ -1,0 +1,3 @@
+[Unit]
+Description=Login Prompts
+# init instantiates getty@ttyN.service for every /dev/ttyN and hooks it onto this target.

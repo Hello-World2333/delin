@@ -1,0 +1,6 @@
+[Unit]
+Description=Local File Systems
+Wants=local-fs-pre.target
+After=local-fs-pre.target
+# init generates <mountpoint>.mount units from /etc/fstab and injects them into this target as
+# Requires=/After=.
