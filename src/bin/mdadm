@@ -1,0 +1,628 @@
+-- Delin mdadm: 管理软RAID 阵列 (mdadm(8) 子集)。
+-- 用法:
+--   mdadm --create /dev/md0 --level=1 --raid-devices=2 /dev/sdb1 /dev/sdc1
+--   mdadm --create /dev/md0 -l5 -n3 -c64 /dev/sdb1 /dev/sdc1 /dev/sdd1
+--   mdadm --assemble /dev/md0 /dev/sdb1 /dev/sdc1
+--   mdadm --assemble --scan                 (按 /etc/mdadm.conf 逐条组装; 开机自动组装走这里)
+--   mdadm --detail /dev/md0 | --detail --scan
+--   mdadm --examine /dev/sdb1
+--   mdadm --manage /dev/md0 --add /dev/sdd1 | --fail /dev/sdb1 | --remove /dev/sdb1
+--   mdadm /dev/md0 --fail /dev/sdb1         (不给模式标志时 = --manage)
+--   mdadm --stop /dev/md0
+--   mdadm --zero-superblock /dev/sdb1
+-- 级别: raid0 raid1 raid5 raid6 raid10 (0/1/5/6/10 也收)。布局: raid5/6 的
+--   left-symmetric(默认) 等, raid10 的 n2(默认)/f2/o2。
+-- 元数据: mdadm 1.2(成员的设备开头 4K 处)。设备规格与 mount/mkfs.ext2 同一套:
+--   /dev/sdXN、UUID=..、真实后端上的镜像路径。
+-- 退出码: 0 成功; 1 失败; 2 用法错误(未知选项/缺参数)。
+local args = args or {}
+
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+local function out(s) io.write(s) end
+
+--- 让出调度器(cat/dd 那套时间片: 长循环里收不到 ^C 就糟了)。
+local msleep = os.msleep or function(ms) os.sleep(math.max((ms or 0) / 1000, 0.05)) end
+
+local function syscall(name, ...)
+    local fn = syscalls and syscalls[name]
+    if not fn then return nil, "mdadm: " .. name .. " syscall not available (is md.ko loaded?)" end
+    return fn(...)
+end
+
+-- ---------------------------------------------------------------
+-- 选项解析(mdadm 的风格: 先扫模式标志, 再按模式解释其余选项)
+-- ---------------------------------------------------------------
+local MODES = {
+    C = "create", ["create"] = "create",
+    A = "assemble", ["assemble"] = "assemble",
+    D = "detail", ["detail"] = "detail",
+    E = "examine", ["examine"] = "examine",
+    Q = "query", ["query"] = "query",
+    S = "stop", ["stop"] = "stop",
+    M = "manage", ["manage"] = "manage",
+    ["add"] = "add", ["remove"] = "remove", ["fail"] = "fail",
+    ["zero-superblock"] = "zero-superblock",
+    ["version"] = "version", ["help"] = "help",
+}
+
+local opt = {
+    mode = nil, operands = {}, devices = {},
+    level = nil, layout = nil, chunk = nil, raidDisks = nil, spareDisks = nil,
+    name = nil, uuid = nil, metadata = nil,
+    scan = false, run = false, force = false, verbose = false, quiet = false,
+    config = nil, wait = false,
+}
+local usageError = nil
+
+--- 取长选项的值(--level=1 或 --level 1)。
+local function longValue(name, i, inline)
+    if inline then return inline, i end
+    local v = args[i + 1]
+    if not v then
+        usageError = "mdadm: option '--" .. name .. "' requires an argument"
+        return nil, i
+    end
+    return v, i + 1
+end
+
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if a == "--" then
+        for j = i + 1, #args do opt.operands[#opt.operands + 1] = args[j] end
+        break
+    elseif a:sub(1, 2) == "--" and #a > 2 then
+        local key, val = a:sub(3):match("^([%w%-]+)=?(.*)$")
+        local inline = (val ~= "") and val or nil
+        local name = key:lower()
+        if name == "create" or name == "assemble" or name == "detail" or name == "examine"
+            or name == "query" or name == "stop" or name == "manage"
+            or name == "add" or name == "remove" or name == "fail"
+            or name == "zero-superblock" or name == "version" or name == "help" then
+            opt.mode = MODES[name] or MODES[key]
+        elseif name == "scan" then opt.scan = true
+        elseif name == "run" then opt.run = true
+        elseif name == "force" then opt.force = true
+        elseif name == "verbose" then opt.verbose = true
+        elseif name == "quiet" then opt.quiet = true
+        elseif name == "wait" then opt.wait = true
+        elseif name == "level" then
+            local v; v, i = longValue(name, i, inline); if not v then break end; opt.level = v
+        elseif name == "layout" then
+            local v; v, i = longValue(name, i, inline); if not v then break end; opt.layout = v
+        elseif name == "chunk" then
+            local v; v, i = longValue(name, i, inline); if not v then break end; opt.chunk = v
+        elseif name == "raid-devices" then
+            local v; v, i = longValue(name, i, inline); if not v then break end; opt.raidDisks = tonumber(v)
+        elseif name == "spare-devices" then
+            local v; v, i = longValue(name, i, inline); if not v then break end; opt.spareDisks = tonumber(v)
+        elseif name == "name" then
+            local v; v, i = longValue(name, i, inline); if not v then break end; opt.name = v
+        elseif name == "uuid" then
+            local v; v, i = longValue(name, i, inline); if not v then break end; opt.uuid = v
+        elseif name == "metadata" then
+            local v; v, i = longValue(name, i, inline); if not v then break end; opt.metadata = v
+        elseif name == "config" then
+            local v; v, i = longValue(name, i, inline); if not v then break end; opt.config = v
+        else
+            usageError = "mdadm: unrecognized option '--" .. key .. "'"
+            break
+        end
+    elseif a:sub(1, 1) == "-" and #a > 1 then
+        local j = 2
+        while j <= #a do
+            local c = a:sub(j, j)
+            local function value()
+                if j < #a then
+                    local v = a:sub(j + 1)
+                    j = #a
+                    return v
+                end
+                local v = args[i + 1]
+                if not v then
+                    usageError = "mdadm: option '-" .. c .. "' requires an argument"
+                    return nil
+                end
+                i = i + 1
+                j = #a
+                return v
+            end
+            if MODES[c] then opt.mode = MODES[c]
+            elseif c == "s" then opt.scan = true
+            elseif c == "R" then opt.run = true
+            elseif c == "v" then opt.verbose = true
+            elseif c == "q" then opt.quiet = true
+            elseif c == "W" then opt.wait = true
+            elseif c == "l" then
+                local v = value(); if not v then break end; opt.level = v
+            elseif c == "p" then
+                local v = value(); if not v then break end; opt.layout = v
+            elseif c == "c" and opt.mode ~= "manage" then
+                local v = value(); if not v then break end; opt.chunk = v
+            elseif c == "n" then
+                local v = value(); if not v then break end; opt.raidDisks = tonumber(v)
+            elseif c == "x" then
+                local v = value(); if not v then break end; opt.spareDisks = tonumber(v)
+            elseif c == "N" then
+                local v = value(); if not v then break end; opt.name = v
+            elseif c == "u" then
+                local v = value(); if not v then break end; opt.uuid = v
+            elseif c == "e" then
+                local v = value(); if not v then break end; opt.metadata = v
+            elseif c == "f" then
+                -- mdadm 的坑: -f 在 create/assemble 下是 --force, 在 manage 下是 --fail
+                if opt.mode == "manage" then
+                    opt.mode = "fail"
+                else
+                    opt.force = true
+                end
+            elseif c == "a" then opt.mode = "add"
+            elseif c == "r" then opt.mode = "remove"
+            else
+                usageError = "mdadm: invalid option -- '" .. c .. "'"
+                break
+            end
+            j = j + 1
+        end
+        if usageError then break end
+    else
+        if opt.mode == "create" then
+            opt.devices[#opt.devices + 1] = a
+        else
+            opt.operands[#opt.operands + 1] = a
+        end
+    end
+    i = i + 1
+end
+
+if usageError then
+    stderr(usageError .. "\n")
+    stderr("Try 'mdadm --help' for more information.\n")
+    return 2
+end
+
+-- --help / --version 不需要别的参数
+if opt.mode == "help" or #args == 0 then
+    out([[
+Usage: mdadm --create <device> --level=<n> [--raid-devices=<n>] [--chunk=<n>] [--layout=<l>]
+                            [--name=<name>] [--uuid=<uuid>] [--force] [--run] <devices...>
+       mdadm --assemble <device> <devices...>
+       mdadm --assemble --scan [--config=<file>] [--run]
+       mdadm --detail <device> | --detail --scan
+       mdadm --examine <device>...
+       mdadm --query <device>
+       mdadm --manage <device> --add|--fail|--remove <devices...>
+       mdadm --stop <device>
+       mdadm --zero-superblock <device>...
+       mdadm --wait <device>
+Levels: raid0 raid1 raid5 raid6 raid10 (or 0 1 5 6 10)
+--name= sets the array name in the metadata (mdadm.conf name=); the array node is the
+device given to --create (/dev/md0 -> name md0).
+Metadata: 1.2 only. Devices may be /dev/sdXN, UUID=..., or an image path.
+]])
+    if #args == 0 then
+        stderr("mdadm: no mode given\n")
+        return 2
+    end
+    return 0
+end
+
+if opt.mode == "version" then
+    out("mdadm (Delin OS)\n")
+    return 0
+end
+
+-- ---------------------------------------------------------------
+-- 格式化(mdadm 的显示风格)
+-- ---------------------------------------------------------------
+--- KiB -> "1024 (1.00 MiB 1.05 MB)"(mdadm 的 Human 单位: 1024 进制 + 1000 进制)
+local function humanSize(sectors)
+    local kib = sectors / 2
+    local parts = {}
+    if kib >= 1024 * 1024 then
+        parts[#parts + 1] = string.format("%.2f GiB", kib / 1024 / 1024)
+        parts[#parts + 1] = string.format("%.2f GB", kib * 1024 / 1e9)
+    elseif kib >= 1024 then
+        parts[#parts + 1] = string.format("%.2f MiB", kib / 1024)
+        parts[#parts + 1] = string.format("%.2f MB", kib * 1024 / 1e6)
+    else
+        parts[#parts + 1] = string.format("%.2f KiB", kib)
+        parts[#parts + 1] = string.format("%.2f kB", kib * 1024 / 1000)
+    end
+    return string.format("%d (%s %s)", kib, parts[1], parts[2])
+end
+
+--- 秒 -> mdadm 的时间串(没有日期库, 只给一个稳定的 UTC 记法)。
+local function timeText(t)
+    if not t or t <= 0 then return "unknown" end
+    return tostring(t) .. " (epoch seconds)"
+end
+
+local function stateWord(info)
+    if info.state == "clean" then return "clean"
+    elseif info.state == "recovering" then return "active"
+    elseif info.state == "degraded" then return "clean, degraded"
+    end
+    return info.state
+end
+
+local function levelText(info)
+    return info.levelName
+end
+
+--- --detail --scan 的一行(mdadm.conf 的 ARRAY 格式)。
+--- **Delin 的不同**: 成员可能是"真实后端上的镜像路径"(/parts/*.img 这类, 见 devdisk.target),
+--- 这类成员**扫描不出来**(它们不是 /dev/sdXN 设备节点), 所以这里把 devices= 一并写出来 ——
+--- 否则 `--detail --scan >> /etc/mdadm.conf` 之后开机自动组装会找不到成员。
+--- devices= 本来就是 mdadm.conf(5) 认的键, 写出来对 mdadm 也是合法的。
+local function scanLine(info)
+    local devs = {}
+    for _, m in ipairs(info.members) do
+        if m.state == "active" or m.state == "recovering" then devs[#devs + 1] = m.dev end
+    end
+    local line = string.format("ARRAY %s metadata=1.2 name=%s UUID=%s",
+        info.node, info.sbName or info.name, info.uuid)
+    if #devs > 0 then line = line .. " devices=" .. table.concat(devs, ",") end
+    return line
+end
+
+local function printDetail(info)
+    out(info.node .. ":\n")
+    out(string.format("           Version : 1.2\n"))
+    out(string.format("     Creation Time : %s\n", timeText(info.ctime)))
+    out(string.format("        Raid Level : %s\n", levelText(info)))
+    out(string.format("        Array Size : %s\n", humanSize(info.sizeSectors)))
+    out(string.format("     Used Dev Size : %s\n", humanSize(info.componentSectors)))
+    out(string.format("      Raid Devices : %d\n", info.raidDisks))
+    out(string.format("     Total Devices : %d\n", #info.members))
+    out(string.format("       Persistence : Superblock is persistent\n\n"))
+    out(string.format("       Update Time : %s\n", timeText(info.utime)))
+    out(string.format("             State : %s \n", stateWord(info)))
+    out(string.format("    Active Devices : %d\n", info.active))
+    out(string.format("   Working Devices : %d\n", info.working))
+    out(string.format("    Failed Devices : %d\n", info.failed))
+    out(string.format("     Spare Devices : %d\n\n", info.spare))
+    out(string.format("              Name : %s\n", info.name))
+    out(string.format("              UUID : %s\n", info.uuid))
+    out(string.format("            Events : %d\n", info.events))
+    out(string.format("             Chunk : %dK\n", info.chunkSectors / 2))
+    if info.resync then
+        local r = info.resync
+        out(string.format("\n       Resync Status : %s = %5.1f%% (%d/%d)\n",
+            r.type, r.total > 0 and (r.offset / r.total * 100) or 0, r.offset, r.total))
+    end
+    out("\n    Number   Major   Minor   RaidDevice State\n")
+    -- Delin 没有 dev_t: Major/Minor 恒为 0, 第 5 列照 mdadm 的位置给设备节点。
+    for _, m in ipairs(info.members) do
+        local state
+        if m.state == "active" then state = "active sync"
+        elseif m.state == "recovering" then state = "recovering"
+        elseif m.state == "faulty" then state = "faulty"
+        elseif m.state == "spare" then state = "spare"
+        else state = m.state end
+        local raidDevice = m.role
+        if m.state == "faulty" or m.state == "spare" then raidDevice = "-" end
+        out(string.format("%8d %7d %7d %10s %s   %s\n",
+            m.number, 0, 0, tostring(raidDevice), state, m.dev))
+    end
+end
+
+local function printExamine(e)
+    out(e.dev .. ":\n")
+    out(string.format("          Magic : %s\n", e.magic))
+    out(string.format("        Version : %s\n", e.version))
+    out(string.format("    Feature Map : 0x%x\n", e.featureMap))
+    out(string.format("     Array UUID : %s\n", e.uuid))
+    out(string.format("           Name : %s\n", e.name))
+    out(string.format("  Creation Time : %s\n", timeText(e.ctime)))
+    out(string.format("     Raid Level : %s\n", e.levelName))
+    if e.layoutName then out(string.format("    Raid Layout : %s\n", e.layoutName)) end
+    out(string.format("   Raid Devices : %d\n\n", e.raidDisks))
+    out(string.format(" Avail Dev Size : %s\n", humanSize(e.dataSize + e.dataOffset)))
+    out(string.format("     Array Size : %s\n", humanSize(e.sizeSectors)))
+    out(string.format("  Used Dev Size : %s\n", humanSize(e.sizeSectors)))
+    out(string.format("    Data Offset : %d sectors\n", e.dataOffset))
+    out(string.format("   Super Offset : %d sectors\n", e.superOffset))
+    out(string.format("          State : %s\n", e.state))
+    out(string.format("    Device UUID : %s:%d\n", e.uuid, e.devNumber))
+    out(string.format("    Update Time : %s\n", timeText(e.utime)))
+    out(string.format("       Checksum : %x - %s\n", e.checksum, e.checksumOk and "correct" or "expected different"))
+    out(string.format("         Events : %d\n\n", e.events))
+    out(string.format("   Device Role : %s\n", e.role))
+    out(string.format("   Array State : %s ('A' == active, '.' == missing, 'R' == replacing)\n",
+        e.arrayState))
+end
+
+--- 等待所有阵列的重建结束(mdadm --wait)。
+local function waitResync()
+    while true do
+        local list = syscall("md.list") or {}
+        local busy = false
+        for _, info in ipairs(list) do
+            if info.resync then busy = true end
+        end
+        if not busy then return 0 end
+        msleep(200)
+    end
+end
+
+-- ---------------------------------------------------------------
+-- 各模式
+-- ---------------------------------------------------------------
+local mode = opt.mode
+if mode == nil then
+    -- 无模式标志但有"设备 + 管理动作"时按 manage 走(mdadm 的 `mdadm /dev/md0 --add x`)
+    mode = "manage"
+end
+
+if mode == "create" then
+    if #opt.devices == 0 then
+        stderr("mdadm: no devices given\n")
+        return 2
+    end
+    local mddev = opt.devices[1]
+    local devices = {}
+    for k = 2, #opt.devices do devices[#devices + 1] = opt.devices[k] end
+    if #devices == 0 then
+        stderr("mdadm: no devices given for " .. mddev .. "\n")
+        return 2
+    end
+    --- chunk: mdadm 收 "64"(KiB) / "64K" / "1024k"; 内核里一律按 512 字节扇区记账。
+    local chunkSectors
+    if opt.chunk then
+        local num, unit = tostring(opt.chunk):match("^(%d+%.?%d*)(%a*)$")
+        if not num then
+            stderr("mdadm: invalid chunk size: " .. tostring(opt.chunk) .. "\n")
+            return 2
+        end
+        local kib = tonumber(num)
+        unit = unit:lower()
+        if unit == "k" or unit == "" then
+            chunkSectors = kib * 2
+        elseif unit == "m" then
+            chunkSectors = kib * 2048
+        elseif unit == "s" then
+            chunkSectors = kib
+        else
+            stderr("mdadm: unknown chunk unit: " .. unit .. "\n")
+            return 2
+        end
+        if chunkSectors % 1 ~= 0 or chunkSectors < 1 then
+            stderr("mdadm: invalid chunk size: " .. tostring(opt.chunk) .. "\n")
+            return 2
+        end
+    end
+    --- layout: raid5/6 收算法名, raid10 收 n2/f2/o2。
+    local layout
+    if opt.layout then
+        local s = tostring(opt.layout):lower()
+        local lvl = tostring(opt.level or ""):lower()
+        if lvl == "10" or lvl == "raid10" then
+            local kind, copies = s:match("^([nfo])(%d+)$")
+            if not kind then
+                stderr("mdadm: invalid raid10 layout: " .. s .. " (want n2/f2/o2)\n")
+                return 2
+            end
+            copies = tonumber(copies)
+            if kind == "n" then layout = 256 + copies
+            elseif kind == "o" then layout = 0x10000 + copies * 256 + 1
+            else layout = 1 + copies * 256 end
+        else
+            local algo = ({
+                ["left-asymmetric"] = 0, ["right-asymmetric"] = 1,
+                ["left-symmetric"] = 2, ["right-symmetric"] = 3,
+                la = 0, ra = 1, ls = 2, rs = 3,
+                ["parity-first"] = 4, ["parity-last"] = 5,
+                ["left-asymmetric-6"] = 16, ["right-asymmetric-6"] = 17,
+                ["left-symmetric-6"] = 18, ["right-symmetric-6"] = 19,
+                ["parity-first-6"] = 20,
+            })[s]
+            if s == "default" then algo = 2 end
+            if not algo then
+                stderr("mdadm: unrecognized layout: " .. s .. "\n")
+                return 2
+            end
+            layout = algo
+        end
+    end
+    -- 阵列名 = md 设备名的 basename(/dev/md0 -> md0); --name= 是元数据里的名字
+    -- (mdadm.conf 的 name= 对的就是它), 两者分开, 与 mdadm 一样。
+    local info, err = syscall("md.create", {
+        name = mddev:gsub("^/dev/", ""),
+        setName = opt.name,
+        level = opt.level,
+        layout = layout,
+        chunk = chunkSectors,
+        raidDisks = opt.raidDisks,
+        devices = devices,
+        uuid = opt.uuid,
+        metadata = opt.metadata,
+        force = opt.force,
+        run = opt.run,
+    })
+    if not info then
+        stderr("mdadm: " .. tostring(err) .. "\n")
+        return 1
+    end
+    if not opt.quiet then
+        out("mdadm: Defaulting to version 1.2 metadata\n")
+        if info.degraded > 0 then
+            out("mdadm: " .. info.node .. " has been started with " .. info.active
+                .. " drive" .. (info.active == 1 and "" or "s") .. " (out of " .. info.raidDisks .. ")\n")
+        else
+            out("mdadm: array " .. info.node .. " started.\n")
+        end
+    end
+    return 0
+elseif mode == "assemble" then
+    if opt.scan then
+        local res, err = syscall("md.assemble", {
+            scan = true, config = opt.config, run = opt.run, force = opt.force,
+        })
+        if not res then
+            -- 没有配置/没有 ARRAY 行 = 没有要组装的东西: 开机自动组装必须能"空手而归"地成功
+            if tostring(err):find("nothing to assemble", 1, true) then
+                if not opt.quiet then
+                    stderr("mdadm: No arrays found in config file\n")
+                end
+                return 0
+            end
+            stderr("mdadm: " .. tostring(err) .. "\n")
+            return 1
+        end
+        for _, info in ipairs(res) do
+            if not opt.quiet then
+                out("mdadm: " .. info.node .. " has been started with " .. info.active
+                    .. " drive" .. (info.active == 1 and "" or "s")
+                    .. " (of " .. info.raidDisks .. ")\n")
+            end
+        end
+        return 0
+    end
+    if #opt.operands == 0 then
+        stderr("mdadm: no device given\n")
+        return 2
+    end
+    local name = opt.operands[1]
+    local devices = {}
+    for k = 2, #opt.operands do devices[#devices + 1] = opt.operands[k] end
+    local res, err = syscall("md.assemble", {
+        name = name:gsub("^/dev/", ""), devices = devices, run = opt.run, force = opt.force,
+    })
+    if not res then
+        stderr("mdadm: " .. tostring(err) .. "\n")
+        return 1
+    end
+    for _, info in ipairs(res) do
+        if not opt.quiet then
+            out("mdadm: " .. info.node .. " has been started with " .. info.active
+                .. " drive" .. (info.active == 1 and "" or "s") .. " (of " .. info.raidDisks .. ")\n")
+        end
+    end
+    return 0
+elseif mode == "detail" then
+    if opt.scan then
+        local list = syscall("md.list") or {}
+        for _, info in ipairs(list) do out(scanLine(info) .. "\n") end
+        return 0
+    end
+    if #opt.operands == 0 then
+        stderr("mdadm: no device given\n")
+        return 2
+    end
+    local rc = 0
+    for _, dev in ipairs(opt.operands) do
+        local info, err = syscall("md.detail", dev)
+        if not info then
+            stderr("mdadm: " .. tostring(err) .. "\n")
+            rc = 1
+        else
+            printDetail(info)
+        end
+    end
+    return rc
+elseif mode == "examine" or mode == "query" then
+    if #opt.operands == 0 then
+        stderr("mdadm: no device given\n")
+        return 2
+    end
+    local rc = 0
+    for _, dev in ipairs(opt.operands) do
+        local e, err = syscall("md.examine", dev)
+        if not e then
+            stderr("mdadm: " .. tostring(err) .. "\n")
+            rc = 1
+        elseif mode == "query" then
+            out(string.format("%s: %s, %s, %d devices, uuid %s\n",
+                e.dev, e.levelName, e.state, e.raidDisks, e.uuid))
+        else
+            printExamine(e)
+        end
+    end
+    return rc
+elseif mode == "manage" or mode == "add" or mode == "remove" or mode == "fail" then
+    if #opt.operands == 0 then
+        stderr("mdadm: no device given\n")
+        return 2
+    end
+    local name = opt.operands[1]:gsub("^/dev/", "")
+    local devices = {}
+    for k = 2, #opt.operands do devices[#devices + 1] = opt.operands[k] end
+    if mode == "manage" then
+        -- `mdadm --wait <device>`: 等重建跑完(mdadm 的 -W; 脚本里很有用)。
+        if opt.wait and #devices == 0 then return waitResync() end
+        stderr("mdadm: no action given for " .. opt.operands[1]
+            .. " (use --add/--remove/--fail/--wait)\n")
+        return 2
+    end
+    local rc = 0
+    for _, dev in ipairs(devices) do
+        local ok, err
+        if mode == "add" then
+            ok, err = syscall("md.add", name, dev)
+            if ok then out("mdadm: added " .. dev .. "\n") end
+        elseif mode == "remove" then
+            ok, err = syscall("md.remove", name, dev, opt.force)
+            if ok then out("mdadm: removed " .. dev .. "\n") end
+        else
+            ok, err = syscall("md.fail", name, dev)
+            if ok then out("mdadm: set " .. dev .. " faulty in " .. opt.operands[1] .. "\n") end
+        end
+        if not ok then
+            stderr("mdadm: " .. tostring(err) .. "\n")
+            rc = 1
+        end
+    end
+    if opt.wait then return waitResync() end
+    return rc
+elseif mode == "stop" then
+    if opt.scan then
+        local list = syscall("md.list") or {}
+        local rc = 0
+        for _, info in ipairs(list) do
+            local ok, err = syscall("md.stop", info.name)
+            if not ok then
+                stderr("mdadm: " .. tostring(err) .. "\n")
+                rc = 1
+            elseif not opt.quiet then
+                out("mdadm: stopped " .. info.node .. "\n")
+            end
+        end
+        return rc
+    end
+    if #opt.operands == 0 then
+        stderr("mdadm: no device given\n")
+        return 2
+    end
+    local rc = 0
+    for _, dev in ipairs(opt.operands) do
+        local info, err = syscall("md.stop", dev:gsub("^/dev/", ""))
+        if not info then
+            stderr("mdadm: " .. tostring(err) .. "\n")
+            rc = 1
+        elseif not opt.quiet then
+            out("mdadm: stopped " .. dev .. "\n")
+        end
+    end
+    return rc
+elseif mode == "zero-superblock" then
+    if #opt.operands == 0 then
+        stderr("mdadm: no device given\n")
+        return 2
+    end
+    local rc = 0
+    for _, dev in ipairs(opt.operands) do
+        local ok, err = syscall("md.zeroSuperblock", dev)
+        if not ok then
+            stderr("mdadm: " .. tostring(err) .. "\n")
+            rc = 1
+        end
+    end
+    return rc
+end
+
+stderr("mdadm: unsupported mode\n")
+return 2

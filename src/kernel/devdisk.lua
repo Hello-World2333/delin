@@ -31,6 +31,14 @@ local devdisk = {}
 -- fstype 注册表: name -> function(source, dir) -> backend, meta | nil, err
 local fstypes = {}
 
+-- 节点名 -> 条目(最近一次 refresh 的结果; 别名节点指向同一个条目)
+local nodes = {}
+-- 已注册到 /dev 的节点名(热插拔时用于注销失效节点)
+local registered = {}
+-- 虚拟设备节点(子系统注册, 如软RAID 的 /dev/mdN): name -> 条目。
+-- 它们不在物理扫描结果里, refresh 时与扫描结果合并 —— 磁盘热插拔不会把它们冲掉。
+local virtual = {}
+
 --- 注册文件系统类型(模块经 kapi.registerFstype 调用; 重复注册即覆盖, 供模块重载)。
 ---@param name string
 ---@param fn fun(source:table, dir:string):table|nil, table|string|nil
@@ -46,10 +54,19 @@ function devdisk.fstypes()
     return out
 end
 
--- 节点名 -> 条目(最近一次 refresh 的结果; 别名节点指向同一个条目)
-local nodes = {}
--- 已注册到 /dev 的节点名(热插拔时用于注销失效节点)
-local registered = {}
+--- 注册一个虚拟设备节点(子系统用, 如 kernel/md.lua 的 /dev/mdN)。
+--- 条目形如 { name, node, type, fstype, uuid, size, openBd = fun(mode)->bd }。
+---@param entry table
+function devdisk.registerNode(entry)
+    virtual[entry.name] = entry
+    devdisk.refresh()
+end
+
+--- 注销虚拟设备节点。
+function devdisk.unregisterNode(name)
+    virtual[name] = nil
+    devdisk.refresh()
+end
 
 --- 磁盘序号 -> 字母(a,b,..,z,aa,..), 即 /dev/sd<字母>。
 local function diskLetter(i)
@@ -162,7 +179,7 @@ function devdisk.scan()
                 local rel = p.path
                 if rel:sub(1, 1) ~= "/" then rel = "/" .. rel end
                 local img = d.mountPath .. rel
-                out[#out + 1] = {
+                local e = {
                     name = base .. n, node = "/dev/" .. base .. n, type = "part",
                     fstype = (p.fstype ~= "" and p.fstype) or "ext2",
                     uuid = uuid and (uuid .. "-" .. n) or nil,
@@ -170,51 +187,91 @@ function devdisk.scan()
                     side = d.side, img = img,
                     size = fs.exists(img) and fs.getSize(img) or nil,
                 }
+                -- 字节设备的数据源: 分区就是盘上的 .img 文件。凡是"可以按字节读写"的节点
+                -- (物理分区 / 虚拟的 RAID 阵列)都提供 openBd, 供 /dev 句柄、mkfs/fsck 与
+                -- mount 的 fstype 处理器共用一条取块设备的路径。
+                e.openBd = function(mode) return blockdev.file(img, mode) end
+                out[#out + 1] = e
             end
         end
     end
     return out
 end
 
---- 取"实参": 第一个实参是本句柄自己(冒号调用)时用后一个, 否则就是这个实参(点号调用)。
---- **不能**写成 `(type(a) == "table") and b or a`: `a` 是句柄而 `b` 是 nil 时(冒号调用
---- `h:readLine()`), `true and nil` 是 nil, 于是 `nil or a` 又把**句柄自己**传给了 CC。
---- 真机症状: `cat /dev/sdb1` 报 `bad argument #1 (boolean expected, got table)` ——
---- CC 的 `handle.readLine` 第一个参数是 boolean(`Optional<Boolean>`), 收到表就炸。
-local function selfArg(a, b)
-    if type(a) == "table" then return b end
-    return a
-end
+-- 曾经这里有一个 selfArg(a,b) 把句柄实参转出去的包装, 踩过的坑记在下面这段注释里(别再改回去):
+--   **不能**写成 `(type(a) == "table") and b or a`: `a` 是句柄而 `b` 是 nil 时(冒号调用
+--   `h:readLine()`), `true and nil` 是 nil, 于是 `nil or a` 又把**句柄自己**传给了 CC。
+--   真机症状: `cat /dev/sdb1` 报 `bad argument #1 (boolean expected, got table)` ——
+--   CC 的 `handle.readLine` 第一个参数是 boolean(`Optional<Boolean>`), 收到表就炸。
+-- 现在设备句柄走 bdHandle: 长度/位置都由内核这边记, **不把实参透传给 CC 句柄**,
+-- 而 blockdev.file 对 CC 句柄一律点号调用, 这个坑因此在设备路径上不存在了。
 
---- 分区节点的原始字节句柄(分区就是盘上的 .img 文件)。
-local function openRaw(e, mode)
-    -- "w" 是截断写、"r+"/"w+"/"a" 是不截断的可写方式 —— CC 只有 "r+" 一种续写模式,
-    -- 所以除了纯读一律用 "r+" 打开(少了 "+" 这一支, `dd of=/dev/sda1 conv=notrunc`
-    -- 会拿到只读句柄, 到写的时候才在 CC 句柄上炸)。
-    local writable = mode and (mode:find("w", 1, true) or mode:find("+", 1, true))
-    local h, err = fs.open(e.img, writable and "r+" or "r")
-    if not h then return nil, err end
-    -- CC 原生句柄是点号调用; 这里同时容忍冒号(与 ext2 后端句柄一致)。见 selfArg 的注释。
+--- 分区节点的原始字节句柄。数据源统一走条目的 openBd(物理分区 = 盘上的 .img 文件,
+--- 虚拟阵列 = 内核 md 的块设备视图), 所以这里只包一层"当前位置"。
+--- CC 的 `handle.seek("set", N)` 在 N 超出文件末尾时返回 nil, 位置跟踪在 blockdev.file 里。
+---@param bd table 块设备 { read(offset,len), write(offset,data), close() }
+local function bdHandle(bd)
+    local pos = 0
     return {
-        read = function(a, b) return h.read(selfArg(a, b)) end,
-        readLine = function(a, b) return h.readLine(selfArg(a, b)) end,
-        readAll = function() return h.readAll() end,
-        write = function(a, b) return h.write(selfArg(a, b)) end,
-        close = function() return h.close() end,
+        read = function(a, b)
+            local n = (type(a) == "table") and b or a
+            n = n or 4096
+            local data, err = bd.read(pos, n)
+            if data == nil then return nil, err end
+            pos = pos + #data
+            return data
+        end,
+        readLine = function()
+            -- 字节设备没有"行"的概念(与 /dev/random 那些同一处理): 一次给一块。
+            local data, err = bd.read(pos, 4096)
+            if data == nil then return nil, err end
+            pos = pos + #data
+            return data
+        end,
+        readAll = function()
+            local size = bd.getSize and bd.getSize() or nil
+            if not size then return nil, "unknown size" end
+            local data, err = bd.read(0, size)
+            if data == nil then return nil, err end
+            pos = size
+            return data
+        end,
+        write = function(a, b)
+            local s = (type(a) == "table") and b or a
+            if type(s) ~= "string" then return nil, "write expects a string" end
+            local ok, err = bd.write(pos, s)
+            if not ok then return nil, err end
+            pos = pos + #s
+            return ok
+        end,
+        -- dd 的 conv=notrunc/seek 会用 seek: 设备节点也支持(位置是内核这边记的)。
+        seek = function(a, b, c)
+            local whence, offset
+            if type(a) == "table" then whence, offset = b, c else whence, offset = a, b end
+            if whence == "set" then pos = offset
+            elseif whence == "cur" then pos = pos + offset
+            else return nil, "unsupported whence: " .. tostring(whence) end
+            return pos
+        end,
+        close = function() return bd.close() end,
     }
 end
 
 local function nodeOpen(name, mode)
     local e = nodes[name]
     if not e then return nil, "/dev/" .. name .. ": no such device" end
-    if e.type ~= "part" then
+    if not e.openBd then
         -- 整盘是 CC 原生文件系统(目录树), 不是字节流设备 —— 只能挂载。
         return nil, "/dev/" .. name .. ": CC native filesystem (ccdisk) - mount it, no byte stream"
     end
-    return openRaw(e, mode)
+    local writable = mode and (mode:find("w", 1, true) or mode:find("+", 1, true))
+    local bd, err = e.openBd(writable and "r+" or "r")
+    if not bd then return nil, "/dev/" .. name .. ": " .. tostring(err) end
+    return bdHandle(bd)
 end
 
 --- 重新扫描存储(自带存储 + 磁盘驱动器)并刷新 /dev 节点(盘插入/弹出时由内核事件钩子调用)。
+--- 虚拟节点(子系统注册的, 如 /dev/mdN)与扫描结果合并 —— 热插拔不会把它们冲掉。
 ---@return table[] 规范设备条目
 function devdisk.refresh()
     local list = devdisk.scan()
@@ -224,6 +281,9 @@ function devdisk.refresh()
         if e.type == "disk" then
             nodes["ccdisk" .. (e.index - 1)] = e -- 别名: /dev/ccdiskN -> 整盘条目
         end
+    end
+    for name, e in pairs(virtual) do
+        nodes[name] = e
     end
     for name in pairs(registered) do
         if not nodes[name] then
@@ -238,6 +298,10 @@ function devdisk.refresh()
         })
         registered[name] = true
     end
+    -- 返回**合并后**的条目表: 虚拟节点(软RAID 的 /dev/mdN)也要出现在 blkid/lsblk 里,
+    -- 否则阵列能挂载却"不存在于设备列表"(第一版就是这样)。
+    for _, e in pairs(virtual) do list[#list + 1] = e end
+    table.sort(list, function(x, y) return x.name < y.name end)
     return list
 end
 
@@ -288,8 +352,10 @@ function devdisk.find(spec)
 end
 
 --- fstype 处理器的输入: 描述设备的数据源。
+--- 字节设备一律给 `bd`(取块设备的工厂函数): 物理分区是盘上的 .img 文件, 虚拟阵列是
+--- 内核 md 的设备视图 —— ext2.ko 因此只有一条取块设备的路径, 不需要知道设备是什么。
 local function sourceOf(e)
-    if e.type == "part" then return { img = e.img } end
+    if e.openBd then return { bd = e.openBd } end
     return { ccpath = e.mountPath }
 end
 
@@ -299,7 +365,8 @@ local function mountRealPath(path, dir, fst)
     if not backend then return nil, path .. ": " .. tostring(rerr) end
     if not backend.toReal then return nil, path .. ": not on a real filesystem" end
     local real = backend.toReal(rel)
-    local src = (fst == "ccdisk") and { ccpath = real } or { img = real }
+    local src = (fst == "ccdisk") and { ccpath = real }
+        or { bd = function(mode) return blockdev.file(real, mode) end }
     local handler = fstypes[fst]
     if not handler then return nil, "unknown fstype: " .. fst end
     local ok, b, meta = pcall(handler, src, dir)
@@ -322,7 +389,7 @@ function devdisk.mountLocal(path, dir, fstype)
     end
     local fst = fstype or "ext2"
     -- 直接使用文件路径作为设备节点
-    local src = { img = path }
+    local src = { bd = function(mode) return blockdev.file(path, mode) end }
     local handler = fstypes[fst]
     if not handler then return nil, "unknown fstype: " .. fst end
     local ok, b, meta = pcall(handler, src, dir)
@@ -381,26 +448,31 @@ end
 -- mkfs / fsck: /bin/mkfs.ext2 与 /bin/fsck.ext2 的内核入口
 -- ---------------------------------------------------------------
 
---- 解析格式化/检查的目标: 设备节点规格(/dev/sdXN、UUID=..、裸节点名)或镜像文件路径
---- (与 mount 收的两种规格一致; 都在内核里解析, 工具不做第二套猜测)。
----@return table|nil target { img, node }, string|nil err
-local function targetOf(spec)
+--- 解析一个"块设备规格": 设备节点(/dev/sdXN、UUID=..、裸节点名, 含虚拟的 /dev/mdN)或
+--- 真实后端上的镜像路径(如 /parts/root.img)。mount / mkfs.ext2 / fsck.ext2 / mdadm 用的是
+--- **同一套**解析 —— 内核只提供一条路径, 工具不做第二套猜测。
+---@return table|nil target { node, img, openBd = fun(mode)->bd }, string|nil err
+function devdisk.target(spec)
     if type(spec) ~= "string" or spec == "" then return nil, "empty device" end
     local isNodeSpec = spec:sub(1, 5) == "UUID=" or spec:sub(1, 5) == "/dev/"
         or not spec:find("/", 1, true)
     if isNodeSpec then
         local e, err = devdisk.find(spec)
         if not e then return nil, err end
-        if e.type ~= "part" then
+        if not e.openBd then
             return nil, e.node .. ": ccdisk (CC native filesystem), not a byte device"
         end
-        return { img = e.img, node = e.node }
+        return { node = e.node, img = e.img, openBd = e.openBd }
     end
     local backend, rel, rerr = vfs.resolve(spec)
     if not backend then return nil, spec .. ": " .. tostring(rerr) end
     if not backend.toReal then return nil, spec .. ": not a device node nor a file on a real filesystem" end
-    return { img = backend.toReal(rel), node = spec }
+    local real = backend.toReal(rel)
+    return { node = spec, img = real, openBd = function(mode) return blockdev.file(real, mode) end }
 end
+
+--- 兼容旧名(内核里只有 devdisk.target 一处解析, 这个别名给读代码的人留个路标)。
+local targetOf = devdisk.target
 
 --- 目标是否正被挂载。格式化/检查一个挂载中的文件系统会把运行中的系统写坏, 一律拒绝
 --- (mke2fs/e2fsck 同此)。返回挂载点或 nil。
@@ -422,7 +494,7 @@ function devdisk.mkfs(spec, opts)
     if not t then return nil, err end
     local where = mountedAt(t)
     if where then return nil, t.node .. " is mounted on " .. where .. " (refusing to format a mounted filesystem)" end
-    local bd, berr = blockdev.file(t.img)
+    local bd, berr = t.openBd("r+")
     if not bd then return nil, tostring(berr) end
     -- 不给块数就按设备大小算(块设备/已撑开的镜像)。镜像文件是 0 字节时算不出来, fail-fast。
     if not opts.blocks then
@@ -466,7 +538,7 @@ function devdisk.fsck(spec, opts)
             lines = { t.node .. " is mounted on " .. where .. " (refusing to check a mounted filesystem)" },
         }
     end
-    local bd, berr = blockdev.file(t.img)
+    local bd, berr = t.openBd("r+")
     if not bd then return nil, tostring(berr) end
     local report = ext2.fsck(bd, {
         mode = opts.mode, ask = opts.ask, emit = opts.emit,

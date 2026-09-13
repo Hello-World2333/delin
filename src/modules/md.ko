@@ -1,0 +1,37 @@
+--@name md
+--@version 0.1.0
+--@description Software RAID (Linux md): RAID 0/1/5/6/10 over byte devices with mdadm 1.2 metadata, /dev/mdN nodes and the md.* syscalls behind /bin/mdadm and /proc/mdstat.
+--@deps
+
+--[[ 内核里的软RAID 是真源(kernel/md.lua): 超级块读写、条带/镜像/校验映射、降级与重建都在
+     那边; 这个模块只做三件事:
+       1) 把 klog 与 vfs 门面注入 md(kernel 层不 require 这两个, 宿主测试台才好单独载它);
+       2) 注册调度器心跳钩子 —— md 的重建是"内核后台线程"的等价物: 每 0.05s 搬一小片,
+          钩子在调度器自己的上下文里跑, 所以 md.tick 绝不能让出;
+       3) 注册 md.* syscall(/bin/mdadm 是它的 CLI 外壳, 与 mkfs.ext2 对 blkdev.* 的关系一样)。 ]]
+
+local klog = require("kernel.klog")
+local md   = require("kernel.md")
+local vfs_api = require("kernel.vfs_api")
+
+return {
+    init = function(kapi)
+        md.attach(klog, vfs_api.fs)
+        kapi.registerTickHook(function() md.tick() end)
+
+        -- 创建/组装/停止/增删成员: 参数与返回值都是纯表, 解析与校验全在内核里。
+        kapi.registerSyscall("md.create", function(opts) return md.create(opts) end)
+        kapi.registerSyscall("md.assemble", function(opts) return md.assemble(opts) end)
+        kapi.registerSyscall("md.stop", function(name) return md.stop(name) end)
+        kapi.registerSyscall("md.add", function(name, dev) return md.add(name, dev) end)
+        kapi.registerSyscall("md.remove", function(name, dev, force) return md.remove(name, dev, force) end)
+        kapi.registerSyscall("md.fail", function(name, dev) return md.fail(name, dev) end)
+        -- 查询
+        kapi.registerSyscall("md.detail", function(name) return md.detail(name) end)
+        kapi.registerSyscall("md.list", function() return md.listInfo() end)
+        kapi.registerSyscall("md.examine", function(dev) return md.examine(dev) end)
+        kapi.registerSyscall("md.zeroSuperblock", function(dev) return md.zeroSuperblock(dev) end)
+
+        kapi.log("md: RAID 0/1/5/6/10 ready (mdadm 1.2 metadata, /dev/mdN)")
+    end,
+}

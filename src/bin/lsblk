@@ -46,11 +46,13 @@ local function human(n)
 end
 
 --- 组装输出行: NAME 带分区缩进, MOUNTPOINT 多个挂载点用逗号连接。
+--- TYPE 取设备条目自带的类型; 软RAID 阵列用级别名(raid0/raid1/...), 与 Linux lsblk 一致
+--- (内核 lsblk 的 TYPE 列就是 "raid1" 这类, 不是 "raid")。
 local rows = {}
 for _, e in ipairs(list) do
     local name = (e.type == "part") and ("  " .. e.name) or e.name
     local mp = table.concat(e.mounted or {}, ",")
-    rows[#rows + 1] = { name = name, size = human(e.size), type = e.type, mp = mp }
+    rows[#rows + 1] = { name = name, size = human(e.size), type = e.raidLevel or e.type, mp = mp }
 end
 
 if #operands > 0 then

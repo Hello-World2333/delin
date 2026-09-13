@@ -1,16 +1,16 @@
 --@name ext2
---@version 0.2.0
---@description EXT2 filesystem driver: registers the ext2 fstype for `mount -t ext2 /dev/sdXN DIR` (a partition is a /parts/*.img image on the disk).
+--@version 0.3.0
+--@description EXT2 filesystem driver: registers the ext2 fstype for `mount -t ext2 /dev/sdXN DIR` (a partition is a /parts/*.img image on the disk; a /dev/mdN array is a byte device too).
 --@deps
 
-local blockdev = require("kernel.blockdev")
-local ext2     = require("kernel.ext2")
+local ext2 = require("kernel.ext2")
 
 return {
     init = function(kapi)
-        -- fstype 处理器: source.img = 分区镜像的真实路径(由 devdisk 给出)。
+        -- fstype 处理器: source.bd = 取块设备的工厂(物理分区 = 盘上的镜像文件,
+        -- 虚拟阵列 /dev/mdN = 内核 md 的块设备视图)。块设备的来源由 devdisk 决定, 这里不猜。
         kapi.registerFstype("ext2", function(source, dir)
-            local bd, err = blockdev.file(source.img)
+            local bd, err = source.bd()
             if not bd then return nil, tostring(err) end
             local rfs, ferr = ext2.mount(bd)
             if not rfs then

@@ -1,0 +1,17 @@
+[Unit]
+Description=Software RAID assembly (mdadm)
+Documentation=man:mdadm(8) man:mdadm.conf(5)
+# Ordered before local-fs-pre.target, and init pulls this unit in as a dependency of that target
+# when /bin/mdadm exists: every fstab mount unit runs After=local-fs-pre.target, so arrays are
+# always assembled before anything is mounted. This is the Delin equivalent of initramfs/udev
+# RAID assembly on Linux (Delin has neither).
+Before=local-fs-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=600
+ExecStart=/bin/mdadm --assemble --scan
+
+[Install]
+WantedBy=local-fs-pre.target

@@ -301,7 +301,9 @@ local function makeEnv()
         nextPid = nextPid + 1
         env.spawned[#env.spawned + 1] = { pid = nextPid, path = path, argv = argv, opts = opts }
         -- oneshot 工具跑完即退出: 排定一个退出事件, 由 os.sleep(等价内核退出回调)投递。
-        if path == "/bin/logrotate" then env.pendingExits[nextPid] = 0 end
+        -- oneshot 工具跑完即退出; mdadm --assemble --scan 也是 oneshot(丢它在外面挂着,
+        -- init 会一直等它, 于是 "init up" 永远不打印 —— 踩过一次)。
+        if path == "/bin/logrotate" or path == "/bin/mdadm" then env.pendingExits[nextPid] = 0 end
         return nextPid
     end
     -- 内核里子进程退出发生在 init 让出时; 宿主用 os.sleep 模拟这一时机。
@@ -2436,21 +2438,51 @@ do
     }
     local capacity = { ["/"] = 1000000, ["disk"] = 128000, ["disk2"] = 128000, ["disk3"] = 128000 }
 
-    -- 分区节点的字节句柄: 记录 CC 句柄收到的真实参数。CC 的 handle.readLine 第一个参数是
-    -- **boolean**(withTrailing), 于是这里的桩也照真机来 —— 拿到表/别的类型就是 bug。
-    local byteCalls = {}
+    -- 分区节点的字节句柄: 设备句柄现在包在**块设备**上(devdisk 的 entry.openBd -> blockdev.file
+    -- -> bdHandle), 所以桩要给一个能真正读写字节的 CC 句柄, 并用一张稀疏表当"盘上的镜像"。
+    -- 要锁住的三件事: ① 只读打开拿不到可写句柄(写必须失败); ② 可写打开是 "r+" 且**写得进去**
+    -- (dd of=/dev/sdX conv=notrunc 靠它); ③ 读写按字节保真、点号与冒号调用都收。
+    local byteCalls = { img = {}, opens = {} }
+    local function diskHandle(path, mode)
+        byteCalls.opens[#byteCalls.opens + 1] = { path = path, mode = mode }
+        local pos = 0
+        local h = {}
+        h.read = function(a, b)
+            local n = (type(a) == "table") and b or a
+            local out = {}
+            for i = 0, (n or 0) - 1 do out[#out + 1] = byteCalls.img[pos + i] or "\0" end
+            pos = pos + (n or 0)
+            return table.concat(out)
+        end
+        h.readLine = function() return h.read(4096) end
+        h.readAll = function()
+            local max = -1
+            for k in pairs(byteCalls.img) do if k > max then max = k end end
+            local out = {}
+            for i = 0, max do out[#out + 1] = byteCalls.img[i] or "\0" end
+            return table.concat(out)
+        end
+        h.seek = function(a, b, c)
+            local whence, off
+            if type(a) == "table" then whence, off = b, c else whence, off = a, b end
+            if whence == "set" then pos = off
+            elseif whence == "cur" then pos = pos + off
+            else return nil end
+            return pos
+        end
+        h.write = function(a, b)
+            local str = (type(a) == "table") and b or a
+            if mode == "r" then return nil, "read-only handle" end   -- CC 的只读句柄写会失败
+            for i = 1, #str do byteCalls.img[pos + i - 1] = str:sub(i, i) end
+            pos = pos + #str
+            return true
+        end
+        h.close = function() return true end
+        return h
+    end
     local fsStub = {
         open = function(path, mode)
-            if path:match("%.img$") then
-                byteCalls.mode = mode
-                return {
-                    read     = function(a) byteCalls.read = (a == nil) and "nil" or type(a); return nil end,
-                    readLine = function(a) byteCalls.readline = (a == nil) and "nil" or type(a); return nil end,
-                    readAll  = function() return "" end,
-                    write    = function() return true end,
-                    close    = function() return true end,
-                }
-            end
+            if path:match("%.img$") then return diskHandle(path, mode) end
             local mp = path:match("^(.*)/parts/manifest$") or ""
             if not manifests[mp] then return nil end
             return { readAll = function() return manifests[mp] end, close = function() end }
@@ -2542,27 +2574,37 @@ do
     eq(devdisk.byMountPath("disk2").name, "sdc", "devdisk: byMountPath 找驱动器里的盘")
     eq(devdisk.byMountPath("missing"), nil, "devdisk: byMountPath 找不到即 nil")
 
-    -- 分区节点的原始字节句柄: 点号与冒号两种调用都得把**实参**传给 CC 句柄, 不能把句柄自己
-    -- 传进去。旧的 `(type(a) == "table") and nil or a` 在 b 为 nil 时算出 a, 于是冒号调用
-    -- `h:readLine()` 把句柄表当成 withTrailing 传给了 CC —— 真机上 `cat /dev/sdb1` 报
-    -- "bad argument #1 (boolean expected, got table)"(CC 的 readLine 第一参数是 boolean)。
+    -- 分区节点的原始字节句柄。设备节点 -> 块设备 -> 句柄这条链上要保住的三件事:
+    --   ① 只读打开 ("r") 必须拿到写不进去的句柄(以前这里踩过 `dd of=... conv=notrunc` 拿到只读
+    --      句柄、到写的时候才在 CC 句柄上炸的坑);
+    --   ② r+ 打开是 "r+" 且真的写到盘上的镜像里;
+    --   ③ 读写按字节保真, 点号/冒号调用等价(老 bug: 冒号调用把句柄自己当实参传给 CC 句柄,
+    --      真机症状是 `cat /dev/sdb1` 报 "bad argument #1 (boolean expected, got table)")。
     do
         local vfs = require("kernel.vfs")
-        vfs_api.mountDev() -- boot 里也是先挂 /dev 再由 devdisk 注册节点
+        local realFs = _G.fs
+        _G.fs = fsStub          -- 块设备层的 open 走全局 fs
+        vfs_api.mountDev()      -- boot 里也是先挂 /dev 再由 devdisk 注册节点
         local bh = assert(vfs_api.fs.open("/dev/sdb1", "r"), "devdisk: /dev/sdb1 可打开为字节设备")
-        eq(byteCalls.mode, "r", "devdisk: 只读打开 -> CC 句柄 mode=r")
-        bh:readLine()
-        eq(byteCalls.readline, "nil", "devdisk: 冒号 readLine() 传给 CC 的是 nil(不是句柄自己)")
-        bh:read(4)
-        eq(byteCalls.read, "number", "devdisk: 冒号 read(n) 把 n 传给 CC")
-        bh.readLine(true)
-        eq(byteCalls.readline, "boolean", "devdisk: 冒号 readLine(true) 传的是那个 boolean")
+        eq(byteCalls.opens[#byteCalls.opens].mode, "r", "devdisk: 只读打开 -> 底层以 r 打开镜像")
+        eq(byteCalls.opens[#byteCalls.opens].path, "disk/parts/data.img", "devdisk: 打开的是分区镜像")
+        local wrote, werr = bh:write("nope")
+        ok(wrote == nil and tostring(werr):find("read%-only") ~= nil,
+            "devdisk: 只读句柄写失败(fail-fast)", werr)
+        eq(#bh:readLine(), 4096, "devdisk: 字节设备没有行 —— readLine 一次给一块")
         bh.close()
-        -- 不截断的可写方式(r+): 必须真以 "r+" 打开 .img, 否则 dd of=/dev/sdX conv=notrunc 拿到只读句柄
+
         local wh = assert(vfs_api.fs.open("/dev/sdb1", "r+"), "devdisk: /dev/sdb1 可以 r+ 打开")
-        eq(byteCalls.mode, "r+", "devdisk: r+ 打开 -> CC 句柄 mode=r+(不是 r)")
-        wh:write("x")
+        eq(byteCalls.opens[#byteCalls.opens].mode, "r+", "devdisk: r+ 打开 -> 底层以 r+ 打开镜像")
+        ok(wh:write("HELLO") == true, "devdisk: r+ 句柄写得进去")
+        wh:seek("set", 4)
+        wh:write("!")
         wh.close()
+        local rh = assert(vfs_api.fs.open("/dev/sdb1", "r"), "devdisk: 再开一次读回")
+        eq(rh:read(5), "HELL!", "devdisk: 写进去的字节按位置保真(dd conv=notrunc 语义)")
+        rh.close()
+        _G.fs = realFs
+
         local tr, terr = vfs_api.fs.open("/dev/sda", "r")
         ok(tr == nil and tostring(terr):find("ccdisk") ~= nil, "devdisk: 整盘(ccdisk)不是字节流设备")
         vfs.unmount("/dev") -- 后面的随机数用例会自己 mountDev, 不留下重复挂载

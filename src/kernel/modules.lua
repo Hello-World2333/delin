@@ -6,6 +6,7 @@
      信任: 内核态, 不沙箱。 ]]
 
 local vfs_api = require("kernel.vfs_api")
+local scheduler = require("kernel.scheduler")
 local vfs     = require("kernel.vfs")
 local display = require("kernel.display")
 local devdisk = require("kernel.devdisk")
@@ -87,6 +88,8 @@ local function makeKapi(name)
         displayList     = function() return display.list() end,
         registerSysfsClass   = function(cname, ops) sysfs.registerClass(cname, ops) end,
         unregisterSysfsClass = function(cname) sysfs.unregisterClass(cname) end,
+        -- 心跳钩子: 内核后台工作(软RAID 的重建)由调度器的 0.05s 心跳驱动。钩子不能让出。
+        registerTickHook     = function(fn) scheduler.setTickHook(fn) end,
     }
 end
 

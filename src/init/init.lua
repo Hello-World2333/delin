@@ -85,6 +85,28 @@ local function generateFstabUnits()
 end
 
 -- ---------------------------------------------------------------
+-- Unit generation: software RAID assembly (mdadm.service) before any mount
+-- ---------------------------------------------------------------
+-- Linux assembles md arrays in initramfs/udev before local-fs.target; Delin has neither, so init
+-- wires /lib/systemd/system/mdadm.service (oneshot: /bin/mdadm --assemble --scan) into
+-- local-fs-pre.target. Every mount unit generated from /etc/fstab runs After=local-fs-pre.target,
+-- so an array listed in /etc/mdadm.conf is up before the filesystems on it are mounted.
+-- Wants (soft), not Requires: a machine whose /lib/systemd/system predates this unit must still
+-- boot (it just has no RAID assembly). A *failing* assembly still fails loudly: the array never
+-- appears, so the fstab mount unit that needs it fails, and that is a hard dependency of
+-- local-fs.target.
+local function generateMdAssembly()
+    local rec, err = svc.get("mdadm.service")
+    if not rec then
+        log("no mdadm.service: " .. tostring(err))
+        return
+    end
+    svc.add(rec)
+    svc.addDep("local-fs-pre.target", rec.name, false)
+    log("mdassembly: mdadm.service <- local-fs-pre.target")
+end
+
+-- ---------------------------------------------------------------
 -- Unit generation: one getty@ttyN.service per /dev/ttyN
 -- ---------------------------------------------------------------
 local function generateGettys()
@@ -155,6 +177,7 @@ local function loadUnits()
     local n = svc.loadAll()
     log("loaded " .. n .. " unit(s) from /lib/systemd/system + /etc/systemd/system")
     generateFstabUnits()
+    generateMdAssembly()
     local nTty = generateGettys()
     log("generated getty on " .. nTty .. " tty(s)")
 end

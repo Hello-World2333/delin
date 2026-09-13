@@ -66,6 +66,7 @@ local profiles = {
             ["kernel.fb"]        = "src/kernel/fb.lua",
             ["kernel.sysfs"]     = "src/kernel/sysfs.lua",
             ["kernel.procfs"]    = "src/kernel/procfs.lua",
+            ["kernel.md"]        = "src/kernel/md.lua",
         },
         assets = {},
         -- PID 1 用户态源码: 顺序敏感(unit -> service -> main), 内部 __require。

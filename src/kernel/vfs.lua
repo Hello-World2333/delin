@@ -223,7 +223,16 @@ function vfs.real(basePath)
         exists   = function(rel) return fs.exists(toReal(rel)) end,
         isDir    = function(rel) return fs.isDir(toReal(rel)) end,
         isFile   = function(rel) return fs.exists(toReal(rel)) and not fs.isDir(toReal(rel)) end,
-        attributes = function(rel) return fs.attributes(toReal(rel)) end,
+        -- CC 的 fs.attributes 在**路径不存在**时是**抛错**的(ext2 后端返回 nil), 而上面所有
+        -- 工具都按"nil = 不存在"判(stat/ls/cp/dd/rm...)。真机上踩到过: CCFS 根下
+        -- `dd of=/parts/a.img`(文件还不存在)整个进程死在 fs.attributes 抛出的
+        -- "/parts/a.img: No such file" 上 —— 于是"创建新文件"这条路直接不可用。
+        -- 这里统一成 nil, 与 Linux stat(2) 的 ENOENT 语义一致(ext2 后端本来就是 nil)。
+        attributes = function(rel)
+            local ok, a = pcall(fs.attributes, toReal(rel))
+            if not ok then return nil end
+            return a
+        end,
         getSize  = function(rel) return fs.getSize(toReal(rel)) end,
         getDrive = function(rel) return fs.getDrive(toReal(rel)) end,
         getFreeSpace = function(rel) return fs.getFreeSpace(toReal(rel)) end,

@@ -15,6 +15,7 @@
 local vfs     = require("kernel.vfs")
 local process = require("kernel.process")
 local random  = require("kernel.random")
+local md      = require("kernel.md")
 
 local procfs = {}
 
@@ -24,7 +25,10 @@ local osVersion = "0.0.0" -- Delin 版本串(mount 时由 boot 传入)
 -- /proc/<pid>/ 下的文件(字母序, 与 ls 输出无关但保持稳定)
 local PID_FILES = { "cmdline", "comm", "cwd", "stat", "status" }
 -- /proc/ 下的系统信息文件
-local SYS_FILES = { "mounts", "uptime", "version" }
+--   mdstat 是软RAID 的阵列状态(Linux 同名文件; 见 kernel/md.lua 的 md.mdstat)。md 是内核
+--   自带的子系统(不是可卸载模块), 所以这个文件恒定存在 —— 没有阵列时就是 Linux 那句
+--   "Personalities : ..." + "unused devices: <none>" 的空表。
+local SYS_FILES = { "mdstat", "mounts", "uptime", "version" }
 -- /proc/sys/kernel/random/ 下的文件(Linux 同名路径; 值为打开时的快照)
 local SYS_RANDOM_FILES = { "entropy_avail", "poolsize", "uuid" }
 -- /proc/sys 这一层只有 kernel/random 一个分支: Delin 没有 sysctl 可调项, 不造假树。
@@ -206,6 +210,7 @@ local function sysFileText(name)
     if name == "uptime" then return uptimeText() end
     if name == "version" then return versionText() end
     if name == "mounts" then return mountsText() end
+    if name == "mdstat" then return md.mdstat() end
     return nil, "no such file: " .. tostring(name)
 end
 

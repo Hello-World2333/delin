@@ -30,10 +30,14 @@ end
 --- 只在目标位置与当前位置不同时才 seek: 顺序写(建镜像时清零、顺序落盘)因此不需要任何 seek,
 --- 天然能扩展文件。
 ---@param path string 真实 fs 路径(如 "disk/parts/root.img")
+---@param mode string|nil "r" = 只读(写会失败), 其余("r+"/"w"/nil) = 不截断的可写句柄。
+---   CC 只有 "r+" 一种续写模式, 所以可写一律用它 —— 少了这一支, `dd of=/dev/sda1 conv=notrunc`
+---   会拿到只读句柄, 到写的时候才在 CC 句柄上炸。
 ---@return table|nil bd, string|nil err
-function blockdev.file(path)
-    local handle, err = fs.open(path, "r+")
+function blockdev.file(path, mode)
+    local handle, err = fs.open(path, mode == "r" and "r" or "r+")
     if not handle then return nil, err or ("cannot open " .. path) end
+    local readonly = (mode == "r")
     local pos = 0
     local bd = {
         kind = "file",
@@ -53,6 +57,7 @@ function blockdev.file(path)
             return data
         end,
         write = function(offset, data)
+            if readonly then return nil, "block device opened read-only: " .. path end
             if offset ~= pos then
                 local ok, p = handle.seek("set", offset)
                 if not ok then return nil, tostring(p) end

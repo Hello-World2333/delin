@@ -29,6 +29,7 @@ local NEEDS_CRAFTOS = {
     ["kernel.klog"] = true, ["kernel.modules"] = true, ["kernel.process"] = true,
     ["kernel.procfs"] = true, ["kernel.sysfs"] = true, ["kernel.user"] = true,
     ["kernel.random"] = true, -- 顶层 require vfs_api -> 抓全局 fs
+    ["kernel.md"] = true,     -- 顶层 require devdisk/vfs_api -> 抓全局 fs
     ["kernel.vfs_api"] = true,
 }
 

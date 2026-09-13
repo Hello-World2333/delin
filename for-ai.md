@@ -14,10 +14,10 @@
 
 | 路径 | 作用 |
 |---|---|
-| `/bin/` | 用户工具（POSIX 强制命令已补齐，见「POSIX 命令覆盖」一节）：`basename cat chgrp chmod chown cksum clear cmp comm cp csplit cut dd df diff dirname du echo ed expand expr file find fold grep head id join kill killall ln ls mkdir mkfifo mount mv nohup od passwd paste patch pathchk pr printf ps readlink realpath rm rmdir sed sh sleep sort split strings tail tee touch tr umount unexpand uniq uudecode uuencode wc whoami xargs`；系统/服务类：`blkid dmesg fsck.ext2 logger login logrotate lp lsblk lua mkfs.ext2 pgrep pkill syslogd systemctl`；用户管理：`groupadd groupdel groups useradd userdel usermod` |
-| `/dev/` | 设备文件：`/dev/ttyN`（字符终端）、`/dev/fbN`（像素帧缓冲）、`/dev/sdX`（磁盘，见下）、`/dev/lpN`（打印机字符设备，只写，见下）、`/dev/null`（读 EOF/写丢弃）、`/dev/zero`（读 = 无限 NUL）、`/dev/random`、`/dev/urandom`（随机字节，见下）、`/dev/console`（系统控制台 = 控制台 tty）、`/dev/kmsg`（内核 ring buffer 只读流）、`/dev/log`（用户态 syslog 输入） |
-| `/etc/` | 系统配置：`passwd` `shadow`（0600 root:root）`group`、`fstab`、`syslog.conf`、`logrotate.conf`、`systemd/system/`（管理员单元与 enable 标记） |
-| `/proc/` | 虚拟进程/系统信息 fs（procfs，内核提供，见下）：`/proc/<pid>/{cmdline,comm,cwd,stat,status}`、`/proc/self`、`/proc/{mounts,uptime,version}`、`/proc/sys/kernel/random/{entropy_avail,poolsize,uuid}` |
+| `/bin/` | 用户工具（POSIX 强制命令已补齐，见「POSIX 命令覆盖」一节）：`basename cat chgrp chmod chown cksum clear cmp comm cp csplit cut dd df diff dirname du echo ed expand expr file find fold grep head id join kill killall ln ls mkdir mkfifo mount mv nohup od passwd paste patch pathchk pr printf ps readlink realpath rm rmdir sed sh sleep sort split strings tail tee touch tr umount unexpand uniq uudecode uuencode wc whoami xargs`；系统/服务类：`blkid dmesg fsck.ext2 logger login logrotate lp lsblk lua mdadm mkfs.ext2 pgrep pkill syslogd systemctl`；用户管理：`groupadd groupdel groups useradd userdel usermod` |
+| `/dev/` | 设备文件：`/dev/ttyN`（字符终端）、`/dev/fbN`（像素帧缓冲）、`/dev/sdX`（磁盘，见下）、`/dev/lpN`（打印机字符设备，只写，见下）、`/dev/null`（读 EOF/写丢弃）、`/dev/zero`（读 = 无限 NUL）、`/dev/random`、`/dev/urandom`（随机字节，见下）、`/dev/console`（系统控制台 = 控制台 tty）、`/dev/kmsg`（内核 ring buffer 只读流）、`/dev/log`（用户态 syslog 输入）、`/dev/mdN`（软RAID 阵列的块设备，见下） |
+| `/etc/` | 系统配置：`passwd` `shadow`（0600 root:root）`group`、`fstab`、`mdadm.conf`（软RAID 阵列清单，开机自动组装，见下）、`syslog.conf`、`logrotate.conf`、`systemd/system/`（管理员单元与 enable 标记） |
+| `/proc/` | 虚拟进程/系统信息 fs（procfs，内核提供，见下）：`/proc/<pid>/{cmdline,comm,cwd,stat,status}`、`/proc/self`、`/proc/{mounts,mdstat,uptime,version}`、`/proc/sys/kernel/random/{entropy_avail,poolsize,uuid}` |
 | `/sys/` | sysfs 挂载点（虚拟）：`/sys/class/<class>/<条目>/<属性>`，class 由内核/模块注册 —— `display`（每显示设备一项，`name/type/size` 只读，分辨率/位置/旋转/缩放 可读写）、`printer`（每打印设备一项，见下）与 `redstone`（每个红石面一项，见下）、`power`（CEE:CC 的电力，见「CEE:CC 平台」）、`pin`（CEE:CC 的信号引脚与端口，见同节）；属性文件是单行值，读一次即 EOF |
 | `/lib/modules/<version>/` | 内核模块目录：`.ko` 模块 + 纯文本 `manifest` + `modules.alias` |
 | `/lib/systemd/system/` | 厂商单元文件（`.service` `.target` `.timer` `.mount`） |
@@ -111,6 +111,79 @@ CC 没有裸块 API：一块存储（**电脑自带存储**，或磁盘驱动器
   等开关没有实现；交互式询问从 **stdin** 读（e2fsck 从 `/dev/tty` 读，管道一律当"不修"）；
   **不做 root 检查** —— devtmpfs 与 `dd`/`mount` 都不检查设备权限（Linux 上 mkfs 靠的是
   `/dev/sdX` 的属主/权限，Delin 的 `/dev` 目前没有这一层）。
+
+### 软RAID（`/dev/mdN`，`mdadm`）
+
+Linux md 的移植：内核 `src/kernel/md.lua`（超级块/条带映射/降级/重建）+ 模块 `src/modules/md.ko`
+（注册 `md.*` syscall 与调度器心跳钩子）+ 工具 `/bin/mdadm`（mdadm(8) 子集，与 `mkfs.ext2` 对
+`blkdev.*` 的关系一样：工具只解析选项，判定全在内核里）。
+
+| 命令 | 覆盖 |
+|---|---|
+| `mdadm --create <设备> --level=<l> [--raid-devices=<n>] [--chunk=<n>] [--layout=<l>] [--name=<名>] [--uuid=<u>] [--force] <成员...>` | 建阵列（`-C -l -n -c -p -N -u -f` 短选项、`--level=0/1/5/6/10/raid0..raid10` 都收；成员可写 `missing` 占位） |
+| `mdadm --assemble <设备> <成员...>` / `--assemble --scan [--config=<文件>]` | 组装（显式成员，或按 `/etc/mdadm.conf` 逐条组装；`--run` 允许起"不干净的降级阵列"） |
+| `mdadm --detail <设备>` / `--detail --scan` | 阵列详情 / 输出 mdadm.conf 的 `ARRAY` 行 |
+| `mdadm --examine <设备>` / `--query <设备>` | 读成员的 1.2 超级块（magic/校验和/角色/Array State） |
+| `mdadm <设备> --add/--remove/--fail/--wait <成员>` | 加盘（自动顶到缺员槽位并开始重建）、移除、标故障、等重建结束 |
+| `mdadm --stop <设备>` / `--stop --scan` / `--zero-superblock <设备>` | 停阵列（挂载中的拒绝停）、抹超级块 |
+| `mdadm --version` / `--help` | —— |
+
+- **设备模型**：成员是**块设备**，与 `mount`/`mkfs.ext2` 收的是同一套规格（`/dev/sdXN`、
+  `UUID=..`、或真实后端上的镜像路径如 `/parts/a.img`），由 `devdisk.target` 统一解析；阵列本身
+  经 `devdisk.registerNode` 注册成 `/dev/mdN`，于是 `mount /dev/md0 /mnt`、`mkfs.ext2 /dev/md0`、
+  `fsck.ext2 /dev/md0`、`blkid`（`UUID=<数组 uuid>`）、`lsblk`（TYPE 显示 `raid5` 这类级别名）
+  **一行都不用改**就能用。阵列节点的 fstype 记 `ext2`（Delin 只有这一种块文件系统，与 `/dev/sdXN`
+  分区同义），`mount UUID=<数组 uuid>` 也能挂。
+- **元数据（mdadm 1.2）**：成员设备**开头 4K 处**放 4096 字节超级块（`struct mdp_superblock_1`
+  的字段偏移、magic `0xa92b4efc`、major_version 1、`sb_csum` 是"32 位小端字累加折回"而**不是**
+  CRC —— 都照 mdadm 的 `super1.c` 写）。数据区从 `data_offset` 起：raid1 是 16 扇区(8K)，
+  条带级别向上对齐到 chunk 边界。`dev_roles[]` 按 `dev_number` 索引（`0..n-1` = 数据槽位，
+  `0xffff` 备用，`0xfffe` 故障）；`events` 计数器是**新鲜度** —— 组装只认最大的那一批，
+  被 `--remove` 掉的老盘因此自动过期（下次组装只能当备用），不需要额外的"已移除"标记。
+  中途被打断的重建把进度留在 `recovery_offset` 里，重启后接着建。
+- **级别与布局**：raid0（original layout：逻辑 chunk `c` 落在设备 `c % n`）、raid1、
+  raid5/6（P[, Q]，`left-symmetric` 默认，另收 la/ra/rs/parity-first/parity-last 与
+  raid6 的 `*-6` 变体）、raid10（`n2` 默认，`f2`/`o2` 收，near/far/offset 的换算与
+  `raid10.c` 的 `__raid10_find_phys`/`raid10_find_virt` 对应）。RAID6 的 Q 用 GF(2^8)
+  （生成多项式 `0x11d`）+ Linux 的系数顺序（从 Q 那块盘之后环行）。
+- **校验写一律 reconstruct-write**：写一个数据块时读齐同一条纹同一偏移上的其它数据块，重算 P/Q
+  再写回 —— 于是"新建阵列先做一次全盘 resync 生成校验"这一步**不需要**，校验永远与新数据一致
+  （代价是每次写校验级别的盘要多读几块；CC 的盘很小，这个取舍划算）。raid1/raid10 的初次同步
+  则是"每块数据取第一份副本为真值拷到其余副本"。
+- **重建（recovery）**：`--add` 一块盘后，内核后台按扇区分片重建（`md.tick` 由**调度器心跳**
+  `scheduler.setTickHook` 每 0.05s 驱动一次，所以钩子里绝不能让出），进度回写该成员的超级块。
+  重建期间写会**同时**写进正在重建的成员、读一律绕开它（它的数据在进度之前还是旧的）。
+- **`/proc/mdstat`**：Linux 形状（`Personalities : [raid0] [raid1] ...`、`md0 : active raid5 sdb1[0] ...`、
+  `      1024 blocks super 1.2 [2/2] [UU]`、重建时一行 `[=>...]  recovery = ...`、
+  `unused devices: <none>`）。阵列没有名字时也恒定存在（空表）。
+- **开机自动组装**：init 把 `/lib/systemd/system/mdadm.service`（oneshot：
+  `/bin/mdadm --assemble --scan`）挂到 **`local-fs-pre.target`**（`Wants`，不是 `Requires`：
+  没有这个单元的老安装照样能启动），而所有 fstab 生成的 mount 单元都是
+  `After=local-fs-pre.target` —— 于是 `/etc/mdadm.conf` 里列出的阵列**一定在挂载之前**组装好。
+  `/etc/mdadm.conf` 只认 `ARRAY` 行（`uuid=` `name=` `level=` `num-devices=` `spares=` `devices=`，
+  键大小写不敏感；`metadata=`/`bitmap=`/`container=`/`member=`/`super-minor=` 认下不用），
+  发布时只有注释、没有生效的 ARRAY 行，所以默认开机**什么都不组装**。
+- **Delin 的不同（`--detail --scan` 会写 `devices=`）**：成员可以是**镜像路径**（`/parts/*.img`），
+  这类成员**扫描不出来**（它们不是 `/dev/sdXN` 设备节点），所以 `--scan` 的输出把 `devices=` 一并
+  写出来，`--detail --scan >> /etc/mdadm.conf` 之后开机就能自动组装。`devices=` 本来就是
+  mdadm.conf(5) 认的键，对 mdadm 也合法。
+- **降级起停规则**（与 mdadm 的 "cannot start dirty degraded array" 同义）：缺员数超过级别能容的
+  上限（raid0 0、raid1 n-1、raid5 1、raid6 2、raid10 副本数-1）一律拒绝起；容得下但元数据说
+  "不干净"（`resync_offset != MaxSector`，例如上次是降级写的或重建中途停机）时要显式 `--run`。
+  `--stop` 拒绝停挂载中的阵列；`--remove` 只允许移除已 `--fail` 的成员（除非 `--force`）。
+- **已知偏离**：没有 write-intent bitmap（**写不原子**，掉电可能留下不一致的校验块）；
+  没有 reshape/`--grow`、没有 DDF/PPL/journal、没有 0.90/1.0/1.1 元数据；`--monitor`/`--incremental`
+  没有实现（未知选项一律 fail-fast 退出 2）；数组 UUID 是自造的 128 bit（`random.bytes(16)`），
+  **与宿主 mdadm 的产物互不通用** —— CC 上根本没有能被 Linux 内核认出来的块设备，互操作无从谈起，
+  所以这里只保证**自身闭环**：字段布局与算法逐条对照 mdadm/内核源码，但宿主上没有 mdadm 可以
+  交叉复判（`mdadm --examine` 那套真机验证只能在 Delin 上做）。
+- **验证**：宿主回归 `tools/mdtest.lua`（128 项：五个级别 + 三种非默认布局的读写往返、
+  **独立的布局模型**（测试文件里按手册重写一份放置公式，直接从成员镜像取数据拼逻辑阵列）、
+  RAID6 的 Q 用**独立的逐位 GF 乘法**重算、降级读/重建/组装/拒绝规则，最后把
+  `mkfs.ext2 /dev/mdN` 造出来的 ext2 用独立模型抽成普通镜像交给宿主 **e2fsck** 当裁判）；
+  真机在**电脑 #6**：`tools/md_realmachine.py` + `scripts/md_verify.sh`（两阶段：第一次开机建
+  阵列/格式化/降级/重建/组装/写 `/etc/mdadm.conf`，重启后断言阵列**在启动时就已被 mdadm.service
+  组装好**且数据仍在；41 项 ok，0 ng）。
 
 ### 打印机设备（`/dev/lpN`）
 
@@ -284,6 +357,15 @@ python3 tools/ceecc_realmachine.py --no-reboot
 - 装机时铺的是 **`dist/` 而不是 `dist/release/*/payload`**：后者只在 `--release` 时重建，
   拿它装机第一次就把**上一轮的内核**装上去了（引导日志里没有 `platform=` 行才发现）。
 - 排障小抄：`ls` 对不存在的路径**退出码是 0**（只有错误消息），判断存在性要用 `cat`/`fs.open`。
+- **软RAID 也在这台机器上验**（它的自带存储有 10MB，装得下成员镜像 + 根文件系统）：
+  `tools/md_realmachine.py` + `scripts/md_verify.sh` 是**两阶段**的 —— 第一次开机走完整生命周期
+  （建阵列/`mkfs.ext2`/挂载/降级读/加盘重建/停机重组/写 `/etc/mdadm.conf`），**重启**后第二次开机
+  断言阵列在启动时就已经被 `mdadm.service` 组装好、且数据仍在（41 项 ok/0 ng）。
+  注入脚本时会把 `RUNTOKEN` 换成唯一串并要求日志里出现它 —— NFS 会缓存属性与内容，
+  只比 `mtime` 会把**上一轮**的日志当成这一轮的（踩过一次）。
+  验证脚本是 `sh`（要跑 `mdadm`/`mkfs.ext2`/`mount` 这些真家伙），但注意 Delin 的 sh 只支持
+  `> >> <`：**`2>&1` 是语法错误**（进程的 stderr 与 stdout 本来就是同一个流，所以工具的错误消息
+  照样进日志）。
 
 ### 用户管理（`passwd` / `useradd` / …）
 
@@ -986,6 +1068,17 @@ sysfs 也从 display 专用泛化成 class 注册表（模块用 `kapi.registerS
 （`user.get` 也不回哈希，普通进程拿不到）。`scripts/user_test.sh`（125 项）在宿主 harness 与真机上
 各跑一次逐项比对，非 root 分支由 `scripts/user_helper.lua` 用内核 `spawn(uid)` 起普通用户进程验证。
 
+软RAID 落地：内核 `kernel/md.lua`（mdadm 1.2 超级块、raid0/1/5/6/10 的条带/镜像/校验映射、
+reconstruct-write、降级与重建）+ 模块 `modules/md.ko`（`md.*` syscall + 调度器心跳驱动的重建）
++ `/bin/mdadm`（create/assemble/--scan/detail/examine/manage/stop/zero-superblock/--wait）
++ `/proc/mdstat` + `/etc/mdadm.conf` + `mdadm.service`（init 把它挂进 `local-fs-pre.target`，
+阵列因此**在挂载之前**就组装好）。阵列经 `devdisk.registerNode` 成为 `/dev/mdN`，
+`mount`/`mkfs.ext2`/`fsck.ext2`/`blkid`/`lsblk` 零改动可用；成员可以是 `/dev/sdXN`，
+也可以是真实后端上的镜像路径（`/parts/*.img`）。宿主回归 `tools/mdtest.lua`（128 项，
+布局与 GF 乘法都是独立实现，阵列上的 ext2 交给宿主 e2fsck 判），真机在**电脑 #6**：
+`tools/md_realmachine.py` + `scripts/md_verify.sh`（两阶段含重启后的开机自动组装）。
+详见「软RAID」一节。
+
 CEE:CC(CEECC)平台落地：`kernel/platform.lua` 认平台(`_G.cee`)、`modules/cee.ko` 摊出
 `/sys/class/power/supply`(电力)与 `/sys/class/pin/pinN`(引脚与端口)，引脚上的磁盘驱动器由 `devdisk`
 按 CC 挂载路径去重补进 `/dev/sdX`，电缆/枢纽设备的晚到由 `peripheral` 事件触发重扫。
@@ -1074,6 +1167,14 @@ CEE:CC(CEECC)平台落地：`kernel/platform.lua` 认平台(`_G.cee`)、`modules
   游戏侧可能读不到，电脑自身 FS 的改动则生效），并在取日志前做引导门禁：本轮 verify.log 必须变过、
   且含 `=== verify done ===`，否则直接失败。（顺带把引导日志也打出来：磁盘 CC-fs 的 `/delin.log` 是 DLUB 写的、
   根镜像里的 `/delin.log` 是内核写的、电脑自身 FS 的只在回退时才有意义。）
+- **CCFS 上 `fs.attributes` 对不存在的路径是"抛错"而不是返回 nil**（ext2 后端返回 nil，所以
+  宿主测试台与 ext2 根的真机都看不出来）。真机症状：CCFS 根下 `dd of=/parts/a.img`（文件还不
+  存在）整个进程死在 CC 抛的 `"/parts/a.img: No such file"` 上 —— 而 dd 的输出端第一步就是
+  `fs.attributes(of)`，"创建新文件"这条路直接不可用（`cp` 走 exists+open w，所以没事）。
+  修法在 `kernel/vfs.lua` 的 `vfs.real`：attributes 里 pcall 一层，失败一律返回 nil（Linux 的
+  stat(2) ENOENT 语义，也是 ext2 后端本来的行为）。发现它是因为软RAID 的真机验证要在
+  `/parts` 下用 `dd` 造成员镜像 —— 这也说明"只有真机才跑得出来的路径"值得专门铺一遍。
+
 - **子进程写输出文件要自己 flush**。ext2 的 `"w"` 句柄只在 flush/close 时落盘，而 `scripts/user_helper.lua`
   不等子进程就退出（`/bin/lua` 用 xpcall 跑脚本，Lua 5.1 不能跨 pcall 让出，见其注释）——
   真机上输出文件因此**是空的**，宿主测试台却看不出来（宿主文件是直写的）。现在那份 helper 把输出句柄包成
@@ -1419,8 +1520,12 @@ lua5.1 tools/harness.lua /bin/sh < scripts/sh_expand_test.sh  # sh 展开(通配
 sh scripts/lua_repl_test.sh        # /bin/lua 交互式 REPL(宿主专用: DELIN_HARNESS_TTY=1 伪装终端)
 sh scripts/sh_intr_test.sh         # sh 交互式"提示符处 ^C"(宿主专用: 伪装终端 + 注入中断键)
 lua5.1 tools/ext2test.lua        # ext2 驱动宿主回归: 真实镜像上跑目录增删, 再用宿主 e2fsck -fn 判定
+lua5.1 tools/mdtest.lua          # 软RAID 宿主回归: 五个级别 + 非默认布局, 独立布局模型与独立 GF(2^8)
+                                 # 乘法逐块核对成员镜像, 降级/重建/组装/拒绝规则, 阵列上的 ext2 交给 e2fsck
 python3 tools/realmachine.py --base /mnt/bak/root.base.img   # 真机: 先关机->打包->部署->重启 #3->取回 /var/log/*
 python3 tools/realmachine.py --printer   # 真机 + 打印机(会实际打印页面): 探测 printer API + 验证 /dev/lp0
+python3 tools/md_realmachine.py          # 真机: 软RAID 两阶段验证(电脑 #6; 建阵列/降级/重建/组装,
+                                         # 重启后断言开机自动组装; 见「软RAID」与「CEECC 真机验证」)
 
 # 真机跑交互式安装向导(电脑3 + 磁盘0; 电脑先停机):
 cp scripts/installer_interactive_test.lua /mnt/computer/3/startup.lua
@@ -1573,6 +1678,11 @@ scripts/lua_repl_test.sh   /bin/lua 交互式 REPL 自检(宿主专用: 测试�
 scripts/redstone_verify.lua  真机交叉核对: /sys/class/redstone/* 与 CC 原始 redstone API 逐项一致
                            (写 /var/log/redstone_verify.log; 由 realmachine_verify.sh 调用)
 scripts/realmachine_verify.sh  真机验证脚本(由 verify.service 以 oneshot 运行, 结果写 /var/log/verify.log)
+scripts/md_verify.sh        软RAID 真机验证(sh, 由 mdtest.service 以 oneshot 运行, 结果写 /var/log/md.log):
+                           阶段一建 raid5+raid1 -> mkfs.ext2 -> 挂载写文件 -> --fail/--remove ->
+                           降级读 -> --add 新盘 -> --wait 等重建 -> --stop/--assemble -> 写 /etc/mdadm.conf
+                           并停掉阵列; 阶段二(重启后)断言阵列在启动时就已组装好且数据仍在。
+                           注意 Delin 的 sh **没有 `2>&1`**(语法错误), 且 stderr 与 stdout 是同一个流
 scripts/ceecc_verify.lua       CEECC 真机自检(单进程 Lua, 由 ceecc.service 运行, 结果写 /var/log/ceecc.log)
                            含 mkfs.ext2/fsck.ext2 段: 在电脑自带存储的 CC-fs 上现造 /parts/manifest +
                            /parts/scratch.img, 现场 mkfs -> 挂载写文件 -> fsck 判干净 -> 破坏块位图 ->
@@ -1635,6 +1745,12 @@ tools/ext2test.lua         宿主 ext2 回归: 真实镜像上跑目录增删(�
                            + fsck 的十种损坏/修复用例, 裁判一律是宿主 e2fsck -fn(235 项)
 tools/deploy.py            重建干净 ext2 根镜像(基镜像+内核/bin/单元/配置/标记), 属主按基镜像逐条写回;
                            基镜像损坏/rdump 漏文件/构建后 fsck 不过一律 fail-fast
+tools/mdtest.lua          软RAID 宿主回归: 五个级别 + 非默认布局的读写往返, 测试自带的**独立布局模型**
+                           与**独立 GF(2^8) 乘法**逐块核对成员镜像, 降级/重建/组装/拒绝规则,
+                           最后把 mkfs.ext2 造在阵列上的 ext2 抽成普通镜像交给宿主 e2fsck 判(128 项)
+tools/md_realmachine.py    软RAID 真机流程(电脑 #6, 两阶段): 干净 CCFS 安装 + 注入 md_verify.sh 与
+                           mdtest.service -> 第一次开机跑完整生命周期并写 /etc/mdadm.conf ->
+                           重启 -> 断言阵列在启动时就已被 mdadm.service 组装好、数据仍在
 tools/ceecc_realmachine.py CEECC(电脑 #6)真机流程: 先关机->打包->CCFS 根安装+注入 ceecc.service->开机->逐项断言
 tools/realmachine.py       真机流程: 先关机->打包->部署->注入第二分区与 verify.service->fsck 门禁->
                            写磁盘 CC-fs 引导配置(/.boot + /dlub.cfg)->装盘并 md5 校验->开机->

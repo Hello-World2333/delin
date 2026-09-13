@@ -74,6 +74,13 @@ jobs:
           done
           ls -la /tmp | head -40
 
+      # 块设备层宿主回归: ext2 驱动(用宿主 e2fsck 当裁判)与软RAID 内核 md
+      # (独立布局模型 + 独立 GF(2^8) 乘法 + 阵列上的 ext2 交给 e2fsck 复判)
+      - name: Host block-device tests (ext2 + md)
+        run: |
+          lua5.1 tools/ext2test.lua
+          lua5.1 tools/mdtest.lua
+
       # 安装器宿主回归: 在假 CraftOS 里按键驱动 dist/install.lua, 断言落盘结果
       - name: Installer tests
         run: lua5.1 tools/installertest.lua

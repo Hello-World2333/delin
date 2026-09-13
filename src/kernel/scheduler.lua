@@ -55,6 +55,15 @@ function scheduler.setEventHook(fn)
     eventHook = fn
 end
 
+--- 心跳钩子(内核后台工作的驱动者, 由 md 这类子系统注入): 每次 0.05s 调度心跳调用一次。
+--- 钩子跑在调度器自己的上下文里(**不是进程协程**), 所以它**绝不能让出** ——
+--- 软RAID 的重建就是靠它每拍搬一小片(见 kernel/md.lua 的 RESYNC_SECTORS)。
+local tickHook = nil
+
+function scheduler.setTickHook(fn)
+    tickHook = fn
+end
+
 --- 向调度器注册一个进程协程。
 ---@param proc DelinProc
 function scheduler.addProcess(proc)
@@ -110,6 +119,7 @@ function scheduler.run()
                     elseif event[2] == beatTimer then
                         beatTimer = os.startTimer(0.05)
                         kernelTimer = true
+                        if tickHook then tickHook() end
                     end
                 end
                 routeEvent(event)
