@@ -185,7 +185,7 @@ local function updateCursor(ctx)
 end
 
 local function scroll(ctx)
-    -- 所有行上移一格, 末行清空, 全部重画
+    -- 把内核自己的 grid 上移一行、末行清空(与设备侧的滚动保持一致)。
     for row = 0, ctx.rows - 2 do
         for col = 0, ctx.cols - 1 do
             ctx.grid[row * ctx.cols + col + 1] = ctx.grid[(row + 1) * ctx.cols + col + 1]
@@ -195,9 +195,20 @@ local function scroll(ctx)
         ctx.grid[(ctx.rows - 1) * ctx.cols + col + 1] =
             { ch = " ", fg = effFg(ctx), bg = ctx.bg, rev = ctx.reverse }
     end
-    for i = 1, ctx.rows * ctx.cols do markCell(ctx, i) end
     -- 滚动后旧的 cursorRenderedIdx 已失效(grid 内容移位), 必须重置。
     ctx.cursorRenderedIdx = nil
+    if ctx.dev.scroll then
+        -- **设备原生滚动**(term 型: `term.scroll(1)` 一条 CC 命令)。以前这里是"把整屏格子
+        -- 全标脏再逐格 blit" —— 一次滚屏近千次 CC 调用, 真机上打字/`ls` 都肉眼可见地卡。
+        -- 设备自己滚完之后, 只有**新露出来的末行**需要重画。
+        ctx.dev.scroll(1)
+        local base = (ctx.rows - 1) * ctx.cols
+        for col = 1, ctx.cols do markCell(ctx, base + col) end
+    else
+        -- 像素型设备(Tom/Void GPU)没有原生滚动: 退回"全屏重画"(合并成一次一行之后,
+        -- 开销已经比原来的逐格 blit 小得多)。
+        for i = 1, ctx.rows * ctx.cols do markCell(ctx, i) end
+    end
     updateCursor(ctx)
 end
 
@@ -242,33 +253,66 @@ local function putChar(ctx, ch)
     updateCursor(ctx)
 end
 
+--- 一格在设备上的最终前景/背景(SGR 7 反显 + 光标反显都在这里定)。
+local function cellColors(ctx, idx)
+    local cell = ctx.grid[idx]
+    local fg, bg = cell.fg, cell.bg
+    if cell.rev then fg, bg = bg, fg end -- SGR 7 反显(单元格级)
+    if cursorAt(ctx, idx) and cursorVisible(ctx) then fg, bg = bg, fg end -- 光标反显
+    return fg, bg
+end
+
 --- 绘制脏单元格到设备。光标所在格以反显(前景/背景互换)渲染, 形成区块光标。
+--- **同一行里连续、同色的脏格合并成一次 dev.text**: term 型的 dev.text 是
+--- `term.setCursorPos` + `term.blit` 两条 CC 调用, 逐格画一屏(51x19)要近千次 —— 整行输出
+--- (ls/ps/grep 这类)因此慢得肉眼可见。合并之后一屏通常只剩十几次调用。
 local function flushDirty(ctx)
     local dev = ctx.dev
-    for _, idx in ipairs(ctx.dirtyList) do
-        local cell = ctx.grid[idx]
+    local list = ctx.dirtyList
+    local n = #list
+    local i = 1
+    while i <= n do
+        local idx = list[i]
         local col = (idx - 1) % ctx.cols
         local row = math.floor((idx - 1) / ctx.cols)
-        local fg, bg = cell.fg, cell.bg
-        if cell.rev then fg, bg = bg, fg end -- SGR 7 反显(单元格级)
-        if cursorAt(ctx, idx) and cursorVisible(ctx) then fg, bg = bg, fg end -- 光标反显
+        local fg, bg = cellColors(ctx, idx)
+        local text = ctx.grid[idx].ch
+        -- 往后吃同色的连续格(中间有没标记的格子、或跨行就断)
+        local j = i + 1
+        while j <= n do
+            local idx2 = list[j]
+            if idx2 ~= idx + (j - i) then break end
+            if ((idx2 - 1) % ctx.cols) == 0 then break end
+            local f2, b2 = cellColors(ctx, idx2)
+            if f2 ~= fg or b2 ~= bg then break end
+            text = text .. ctx.grid[idx2].ch
+            j = j + 1
+        end
         if ctx.mode == "term" then
             -- term 型: 传给 dev.text 的是 CC blit 色码序号(hex() 会用), 需从 tty 色序换算。
-            dev.text(col, row, cell.ch, TO_CC[fg], TO_CC[bg])
+            dev.text(col, row, text, TO_CC[fg], TO_CC[bg])
         else
-            -- pixel 型: 先用背景色填满整个字格, 再居中绘制字形。否则比例字体的字格左右
-            -- 留白区不清, 换行/滚动时残留旧像素; 光标块也因此能整格填充。
-            local px = col * ctx.cellW
-            local py = row * ctx.cellH
-            dev.rect(px, py, ctx.cellW, ctx.cellH, PALETTE[bg])
-            local x = px
-            if dev.getTextWidth then
-                local cw = dev.getTextWidth(cell.ch)
-                local off = math.floor((ctx.cellW - cw) / 2)
-                if off > 0 then x = x + off end
+            -- pixel 型: 逐格画(先用背景色填满整个字格, 再居中绘制字形)。比例字体的字格左右
+            -- 留白区不清会残留旧像素; 光标块也因此能整格填充。
+            for k = i, j - 1 do
+                local idxk = list[k]
+                local cell = ctx.grid[idxk]
+                local colk = (idxk - 1) % ctx.cols
+                local rowk = math.floor((idxk - 1) / ctx.cols)
+                local fgk, bgk = cellColors(ctx, idxk)
+                local px = colk * ctx.cellW
+                local py = rowk * ctx.cellH
+                dev.rect(px, py, ctx.cellW, ctx.cellH, PALETTE[bgk])
+                local x = px
+                if dev.getTextWidth then
+                    local cw = dev.getTextWidth(cell.ch)
+                    local off = math.floor((ctx.cellW - cw) / 2)
+                    if off > 0 then x = x + off end
+                end
+                dev.text(x, py, cell.ch, PALETTE[fgk], PALETTE[bgk])
             end
-            dev.text(x, py, cell.ch, PALETTE[fg], PALETTE[bg])
         end
+        i = j
     end
     ctx.dirty = {}
     ctx.dirtyList = {}

@@ -38,6 +38,18 @@ local function eq(got, want, label)
     ok(got == want, label, "got=" .. tostring(got) .. " want=" .. tostring(want))
 end
 
+--- 按 Lua 版本装载一段源码(5.1: loadstring+setfenv; 5.2+: load 的 _ENV 参数)。
+--- 直接在调用点写 loadstring 的话, `lua5.4 tools/hosttest.lua` 会崩在
+--- "attempt to call a nil value (global 'loadstring')" —— for-ai.md 一直写着要跑 5.4。
+local function loadEnv(src, name, env)
+    if _VERSION == "Lua 5.1" then
+        local c = assert(loadstring(src, name))
+        setfenv(c, env)
+        return c
+    end
+    return assert(load(src, name, "t", env))
+end
+
 local function readFile(p)
     local f = io.open(p, "rb")
     if not f then return nil end
@@ -264,14 +276,7 @@ local function newInitEnv()
 
     local function loadSrc(name, path)
         local src = assert(readFile(path), path)
-        local chunk
-        if _VERSION == "Lua 5.1" then
-            chunk = assert(loadstring(src, name))
-            setfenv(chunk, env)
-        else
-            chunk = assert(load(src, name, "t", env))
-        end
-        return chunk()
+        return loadEnv(src, name, env)()
     end
     env.__require = function(name)
         local m = env.__initMods[name]
@@ -666,8 +671,7 @@ do
         local src = assert(readFile(path), path)
         local chunk
         if _VERSION == "Lua 5.1" then
-            chunk = assert(loadstring(src, path))
-            setfenv(chunk, tenv)
+            chunk = loadEnv(src, path, tenv)
         else
             chunk = assert(load(src, path, "t", tenv))
         end
@@ -1262,8 +1266,7 @@ do
         end
         local chunk
         if _VERSION == "Lua 5.1" then
-            chunk = assert(loadstring(src, "init_src"))
-            setfenv(chunk, env)
+            chunk = loadEnv(src, "init_src", env)
         else
             chunk = assert(load(src, "init_src", "t", env))
         end
@@ -1420,8 +1423,7 @@ do
     local env = setmetatable({ require = require }, { __index = _G })
     local chunk
     if _VERSION == "Lua 5.1" then
-        chunk = assert(loadstring(src, "ccprinter"))
-        setfenv(chunk, env)
+        chunk = loadEnv(src, "ccprinter", env)
     else
         chunk = assert(load(src, "ccprinter", "t", env))
     end
@@ -1521,7 +1523,7 @@ do
         local dev -- 先声明再建表: 闭包里的 dev 必须指向这个局部变量(不是全局)
         dev = {
             id = "test:term", type = "monitor", mode = "term", name = "test",
-            width = w, height = h, fills = 0, flushes = 0, calls = {},
+            width = w, height = h, fills = 0, flushes = 0, calls = {}, scrolls = 0,
             getSize = function() return w, h end,
             text = function(x, y, s, fg, bg)
                 dev.calls[#dev.calls + 1] = { x = x, y = y, s = s, fg = fg, bg = bg }
@@ -1529,6 +1531,8 @@ do
             end,
             blit = function(x, y, s, fg, bg) dev.lastBlit = { x = x, y = y, s = s, fg = fg, bg = bg } end,
             fill = function(color) dev.fills = dev.fills + 1; dev.lastFill = color end,
+            -- 原生滚动: tty 层优先用它(一条命令滚屏), 不再把整屏标脏逐格 blit。
+            scroll = function(n) dev.scrolls = (dev.scrolls or 0) + 1; dev.lastScroll = n end,
             rect = function() end,
             flush = function() dev.flushes = dev.flushes + 1 end,
             release = function() end,
@@ -1547,6 +1551,32 @@ do
         local t = {}
         for c = 0, ctx.cols - 1 do t[#t + 1] = cell(ctx, c, row).ch end
         return table.concat(t)
+    end
+
+    -- 性能相关(tty 只做"该做的事"): 同一行连续同色的格子合并成一次 dev.text;
+    -- 滚屏走设备原生 scroll, 而不是把整屏标脏重画。
+    do
+        local h, ctx, dev = newTty(20, 5)
+        dev.calls = {}
+        h:write("abcdefghij")
+        -- 10 个字符原本是 10 次 text; 合并后只剩"这一行"+"光标那一格"两条
+        eq(#dev.calls <= 2, true, "tty 合并: 一整行同色文本最多两条 text(原为逐格)")
+        eq(dev.calls[1].s, "abcdefghij", "tty 合并: 合并后的文本内容")
+        local before = #dev.calls
+        h:write("k")
+        eq(#dev.calls - before <= 3, true, "tty 合并: 追加一字符也只有常数条 text")
+    end
+    do
+        local h, ctx, dev = newTty(20, 5)
+        h:write("1\n2\n3\n4\n5\n") -- 第 5 行写完再换行 -> 触发一次滚动
+        eq(dev.scrolls, 1, "tty 滚屏: 走设备原生 scroll")
+        eq(dev.lastScroll, 1, "tty 滚屏: 滚动步长 1")
+        eq(rowText(ctx, 0), "2" .. string.rep(" ", 19), "tty 滚屏: 首行上移")
+        eq(rowText(ctx, 4), string.rep(" ", 20), "tty 滚屏: 末行被清空")
+        -- 滚动**不该**把整屏重画: 20x5 = 100 格, 合并后只该重画末行这一条
+        -- 原本滚一次要重画整屏(100 格 -> 100 条); 现在只有末行 + 光标那几格
+        -- 5 行文本 + 一次滚动, 合计只有个位数的 text 调用(原来滚一次就要重画整屏 100 格)
+        eq(#dev.calls <= 12, true, "tty 滚屏: 滚完只重画末行(几条 text, 不是整屏)")
     end
 
     -- 普通文本: 落屏/换行/列推进与 ANSI 引入前一致
@@ -1959,8 +1989,7 @@ do
     local env = setmetatable({ require = require }, { __index = _G })
     local chunk
     if _VERSION == "Lua 5.1" then
-        chunk = assert(loadstring(src, "redstone"))
-        setfenv(chunk, env)
+        chunk = loadEnv(src, "redstone", env)
     else
         chunk = assert(load(src, "redstone", "t", env))
     end
@@ -2080,8 +2109,7 @@ do
                               { __index = _G })
     local vchunk
     if _VERSION == "Lua 5.1" then
-        vchunk = assert(loadstring(vsrc, "redstone_verify"))
-        setfenv(vchunk, venv)
+        vchunk = loadEnv(vsrc, "redstone_verify", venv)
     else
         vchunk = assert(load(vsrc, "redstone_verify", "t", venv))
     end
@@ -2510,8 +2538,15 @@ do
         ipairs = ipairs, pairs = pairs, error = error, pcall = pcall, select = select,
     }
     local src = assert(readFile(REPO .. "/src/kernel/devdisk.lua"), "读不到 src/kernel/devdisk.lua")
-    local chunk = assert(loadstring(src, "devdisk.lua"))
-    setfenv(chunk, env)
+    -- 5.1 用 loadstring+setfenv, 5.2+ 用 load 的 _ENV 参数(与上面 loadSrc 同一套写法;
+    -- 这里以前少了这一步, `lua5.4 tools/hosttest.lua` 会死在 "attempt to call a nil value
+    -- (global 'loadstring')" —— 而 for-ai.md 一直写着"用 5.4 也跑一遍")。
+    local chunk
+    if _VERSION == "Lua 5.1" then
+        chunk = loadEnv(src, "devdisk.lua", env)
+    else
+        chunk = assert(load(src, "devdisk.lua", "t", env))
+    end
     local devdisk = chunk()
     local vfs_api = require("kernel.vfs_api")
 
@@ -2870,8 +2905,7 @@ do
     local env = setmetatable({ require = require }, { __index = _G })
     local chunk
     if _VERSION == "Lua 5.1" then
-        chunk = assert(loadstring(src, "cee"))
-        setfenv(chunk, env)
+        chunk = loadEnv(src, "cee", env)
     else
         chunk = assert(load(src, "cee", "t", env))
     end
@@ -2996,8 +3030,7 @@ do
             ipairs = ipairs, pairs = pairs, error = error, pcall = pcall, select = select,
         }
         local s = assert(readFile(REPO .. "/src/kernel/devdisk.lua"), "读不到 src/kernel/devdisk.lua")
-        local c = assert(loadstring(s, "devdisk"))
-        setfenv(c, env)
+        local c = loadEnv(s, "devdisk", env)
         local dd = c()
         local byName = {}
         for _, e in ipairs(dd.scan()) do byName[e.name] = e end

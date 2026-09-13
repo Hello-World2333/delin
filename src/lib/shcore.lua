@@ -8,8 +8,13 @@
 -- 输出走 io.stdout(父进程把它指向控制台 tty 或文件), 绝不 print(kprint 走日志+term)。
 
 local msleep = os.msleep or function(ms) os.sleep(math.max(ms / 1000, 0.05)) end
--- 让出调度器: 50ms 时间片。循环体每次迭代都让出的话, 事件往返会吞掉大部分时间;
--- 时间片式让出既防 "Too long without yielding", 又保证 ^C/按键延迟不超过一个时间片。
+-- 让出调度器: 时间片式(不按字节让出)。让出判据见下面的 _sliceMs —— 装了 HSE 就压到 2ms。
+-- 让出时间片: **装了 HSE(os.msleep 在) 就压到 2ms** —— 一次让出本体只要 ~2ms,
+-- 于是按键/^C 的投递延迟从 50ms 降到 2-4ms(HSE 不做这个就没有意义);
+-- 没装 HSE 时让出一次要睡满 50ms(os.sleep 按服务器刻量化), 保持 50ms 判据。
+local _sliceMs = os.msleep and 2 or 50
+-- 轮询间隔(等子进程/等条件): HSE 下 5ms, 否则 50ms —— os.sleep 的量化下限就是 50ms。
+local _pollMs = os.msleep and 5 or 50
 local _sliceAt = os.epoch("utc")
 -- ---------------------------------------------------------------
 -- **为什么核心是整个一个函数 + 一张 F 表**(别改回"一堆顶层 local"):
@@ -36,7 +41,7 @@ local F = {}
 
 function F.schedYield()
     local now = os.epoch("utc")
-    if now - _sliceAt >= 50 then
+    if now - _sliceAt >= _sliceMs then
         _sliceAt = now
         msleep(0)
     end
@@ -838,8 +843,48 @@ function F.pathGlob(word, qm)
     return out
 end
 
---- 一个"词"的完整展开: 字段分割之后做路径名展开。返回词表; 展开出错返回 nil。
+-- ---------------------------------------------------------------
+-- 波浪号展开(POSIX 2.6.1): `~` -> $HOME, `~user` -> 该用户的家目录
+-- ---------------------------------------------------------------
+--- 只在**词首**、且 ~ 前缀整个落在第一段"未加引号的原文"里时展开 —— 判据对着 bash 实测:
+---   ~/~x/~root/~root/x 展开;  ~nosuchuser/~$USER/~"x" 保持原样(a~b 也不展开, 不是词首)。
+--- 展开结果按**未加引号**处理(继续参与通配符展开, `~/*` 照样 glob), 与 bash 一致。
+---@param segs table 词段表
+---@return table 新词段表(未展开时原样返回)
+function F.tildeExpandSegs(segs)
+    local first = segs[1]
+    if not (first and first.raw) then return segs end
+    if first.raw:sub(1, 1) ~= "~" then return segs end
+    local qm = first.qm or ""
+    if qm:sub(1, 1) == "1" then return segs end -- `\~` / 引号里的 ~ 不是波浪号展开
+    local slash = first.raw:find("/", 2, true)
+    local prefix, rest
+    if slash then
+        prefix, rest = first.raw:sub(1, slash - 1), first.raw:sub(slash)
+    elseif #segs == 1 then
+        prefix, rest = first.raw, ""
+    else
+        return segs -- `~$USER` / `~"x"`: ~ 后面还有别的段, bash 同样不展开
+    end
+    local home
+    if prefix == "~" then
+        home = vars.HOME
+    else
+        local name = prefix:sub(2)
+        -- ~user 走 passwd(getpwnam 同义); 名字非法或查不到就原样保留
+        if name == "" or name:find("[^%w_%-%.]") then return segs end
+        local u = syscalls and syscalls["user.get"] and syscalls["user.get"](name)
+        home = u and u.home
+    end
+    if not home or home == "" then return segs end
+    local out = { { raw = home .. rest, qm = F.zeroMask(#home + #rest) } }
+    for i = 2, #segs do out[#out + 1] = segs[i] end
+    return out
+end
+
+--- 一个"词"的完整展开: 波浪号 -> 参数/命令/算术 -> 字段分割 -> 路径名展开。出错返回 nil。
 function F.expandWordList(segs)
+    segs = F.tildeExpandSegs(segs)
     local out = {}
     for _, w in ipairs(F.expandSegs(segs)) do
         if F.hasUnquotedMeta(w.s, w.qm) then
@@ -2128,13 +2173,102 @@ builtins.command = function(args)
     F.runExternal(cmd, cargs, nil, cmd)
 end
 
+-- ===============================================================
+-- setopt / unsetopt(zsh 风格)
+-- ===============================================================
+-- 管的是**所有真实存在的开关**: 核心那四个(与 `set -o` 同源, 改的就是同一份状态)与 desh 的
+-- 三个开关(它们本来就是普通 shell 变量, 所以两边改的是同一处)。名字不区分大小写, 支持 zsh 的
+-- `NO_` 前缀(setopt no_autosuggest == unsetopt autosuggest, 反向同理)。
+-- 不认识的开关 **fail-fast 退出 2**(与仓库里其它"未知选项"同一约定): 静默收下会让脚本以为
+-- 开关生效了 —— 那正是最危险的一种"看着跑过了"。
+--- 变量形式的开关: 未设置视为开, "0"/""/"no"/"false" 视为关(与 desh 的 cfgOn 同一判据)。
+function F.optVarOn(name)
+    local v = vars[name]
+    if v == nil then return true end
+    return not (v == "0" or v == "" or v == "no" or v == "false")
+end
+
+local OPTS = {
+    { name = "errexit",    desc = "exit on a failing command (set -e)",
+      get = function() return opt.errexit end,   set = function(v) opt.errexit = v end },
+    { name = "nounset",    desc = "error on unset variables (set -u)",
+      get = function() return opt.nounset end,   set = function(v) opt.nounset = v end },
+    { name = "verbose",    desc = "echo each command before running it (set -v)",
+      get = function() return opt.verbose end,   set = function(v) opt.verbose = v end },
+    { name = "xtrace",     desc = "trace expanded commands to stderr (set -x)",
+      get = function() return opt.xtrace end,    set = function(v) opt.xtrace = v end },
+    -- desh 的三个开关(前端每次用时现读这些变量, 见 src/bin/desh 的 cfgOn)
+    { name = "autosuggest", desc = "grey inline history suggestion (desh)",
+      get = function() return F.optVarOn("DESH_AUTOSUGGEST") end,
+      set = function(v) vars.DESH_AUTOSUGGEST = v and "1" or "0" end },
+    { name = "correct",    desc = "'did you mean' for unknown commands (desh)",
+      get = function() return F.optVarOn("DESH_CORRECT") end,
+      set = function(v) vars.DESH_CORRECT = v and "1" or "0" end },
+    { name = "history",    desc = "keep the history file (desh)",
+      get = function() return F.optVarOn("DESH_HISTORY") end,
+      set = function(v) vars.DESH_HISTORY = v and "1" or "0" end },
+}
+
+--- 找选项(名字小写化; 支持 NO_ 前缀, 返回 opt, wantOn)。
+local function findOpt(name)
+    local n = tostring(name):lower():gsub("%-", "_")
+    local want = true
+    if n:sub(1, 3) == "no_" then want = false; n = n:sub(4) end
+    for _, o in ipairs(OPTS) do
+        if o.name == n then return o, want end
+    end
+    return nil
+end
+
+local function setOptBuiltin(args, on)
+    local verb = on and "setopt" or "unsetopt"
+    if #args == 0 then
+        local names = {}
+        for _, o in ipairs(OPTS) do
+            if o.get() == on then names[#names + 1] = o.name end
+        end
+        table.sort(names)
+        for _, n in ipairs(names) do F.outln(n) end
+        lastExit = 0
+        return
+    end
+    local rc = 0
+    for _, a in ipairs(args) do
+        if a == "--help" then
+            F.outln("usage: " .. shName .. " " .. verb .. " [OPTION ...]"
+                .. "   (no OPTION: list " .. (on and "enabled" or "disabled") .. " options)")
+            for _, o in ipairs(OPTS) do
+                F.outln(string.format("  %-12s %-4s %s", o.name, (o.get() and "on" or "off"), o.desc))
+            end
+            return
+        end
+        local o, want = findOpt(a)
+        if not o then
+            F.errln(shName .. ": " .. verb .. ": " .. a .. ": unknown option")
+            rc = 2
+        else
+            -- setopt NAME / unsetopt NAME / setopt no_NAME / unsetopt no_NAME 四种组合:
+            -- "这次是不是 setopt" 与 "名字有没有 NO_ 前缀" 相同就是开, 不同就是关。
+            -- 别写成 `on and want or not want` —— want=false 时 Lua 的 and/or 会翻成 true。
+            local value
+            if on == want then value = true else value = false end
+            o.set(value)
+        end
+    end
+    lastExit = rc
+end
+
+builtins.setopt = function(args) return setOptBuiltin(args, true) end
+builtins.unsetopt = function(args) return setOptBuiltin(args, false) end
+
 builtins.help = function(args)
     F.outln("Delin " .. shName .. " (POSIX core subset)")
     F.outln("builtins : cd pwd echo read exit help jobs fg bg wait kill test [ true false :")
-    F.outln("           . set export unset break continue return shift")
+    F.outln("           . set export unset break continue return shift setopt unsetopt")
     F.outln("external : ls cat rm mkdir cp mv touch head tail wc grep sed ed chmod chown login clear")
     F.outln("usage    : " .. shName .. " [-c cmd [name [args...]]] [script] [args...]   (no script => interactive/stdin)")
     F.outln("options  : set -e(errexit) -u(nounset) -v(verbose) -x(xtrace) -o <name>; $- lists flags")
+    F.outln("           setopt/unsetopt <name> (zsh style: errexit nounset verbose xtrace autosuggest correct history)")
     F.outln("vars     : PATH HOME PWD OLDPWD USER SHELL TERM PPID PS1 PS2 PS3 PS4 IFS (export to pass to children)")
     F.outln("terminal : $TERM=linux (16-color ANSI); echo -e '\\e[31mred' ; clear")
 end
@@ -2174,7 +2308,9 @@ function F.pollWait(pidIn)
             msleep(0) -- 等调度器处理退出
             return "exited", -2
         end
-        msleep(50) -- 轮询子进程状态: 50ms 一次(逐拍让出会让事件往返吞掉整个时间片)
+        -- 轮询子进程状态: HSE 下 5ms 一次(命令结束/退出码的可见延迟从 ~50ms 降到 ~5ms),
+        -- 没有 HSE 时 5ms 的 msleep 会退化成 50ms 的 os.sleep, 所以直接按平台取间隔。
+        msleep(_pollMs)
     end
 end
 
@@ -2669,7 +2805,7 @@ builtins.fg = function(args)
         while waited < 1000 do
             local p = syscalls["proc.info"](j.pid)
             if not p or p.status ~= "stopped" then break end
-            msleep(50); waited = waited + 50
+            msleep(_pollMs); waited = waited + _pollMs
         end
     end
     local reason, code = F.pollWait(j.pid)
@@ -2918,7 +3054,8 @@ end
 function F.expandAssignValues(node)
     local vals = {}
     for i, a in ipairs(node.assigns) do
-        vals[i] = F.expandGlue(a.value)
+        -- 赋值右侧: **不做字段分割/通配符**(POSIX), 但波浪号展开要(bash 的 `X=~/bin`)。
+        vals[i] = F.expandGlue(F.tildeExpandSegs(a.value))
         if expandFailed then return nil end
     end
     return vals

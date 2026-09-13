@@ -273,6 +273,25 @@ chk dq_keep_backslash [ "$dq3" = 'a\tb' ]
 dq4="a\"b"
 chk dq_quote [ "$dq4" = 'a"b' ]
 
+# ---------------------------------------------------------------
+# setopt / unsetopt(zsh 风格; 与 set -o 同源, 另含 desh 的三个开关)
+# ---------------------------------------------------------------
+chk setopt_lists_enabled_by_default [ "$(setopt | grep -c '^autosuggest$')" = "1" ]
+chk setopt_enable_errexit [ -n "$(setopt errexit; setopt | grep '^errexit$'; unsetopt errexit)" ]
+chk setopt_reflects_set_o [ -n "$(set -o errexit; setopt | grep '^errexit$'; set +o errexit)" ]
+chk setopt_disable_autosuggest [ -z "$(unsetopt autosuggest; setopt | grep '^autosuggest$'; setopt autosuggest)" ]
+chk setopt_no_prefix_inverts [ -z "$(setopt no_history; setopt | grep '^history$'; setopt history)" ]
+# 注意: Delin 的 stderr 与 stdout 是同一个流(也没有 2>), 所以"退出码"要直接看 $?,
+# 不要塞进命令替换里(那会把错误消息也一起捕获)。
+setopt nosuchoption > /dev/null
+chk setopt_unknown_rc2 [ "$?" = "2" ]
+chk setopt_unknown_message [ -n "$(setopt nosuchoption | grep 'unknown option')" ]
+unsetopt nosuchoption > /dev/null
+chk unsetopt_unknown_rc2 [ "$?" = "2" ]
+setopt nosuch-option > /dev/null
+chk setopt_unknown_dash_rc2 [ "$?" = "2" ]
+chk setopt_help [ -n "$(setopt --help | grep 'autosuggest')" ]
+
 echo "== summary =="
 if [ "$outcome" = "0" ]; then echo "all ok"; else echo "FAILURES"; fi
 exit $outcome

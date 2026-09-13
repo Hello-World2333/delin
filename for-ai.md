@@ -630,6 +630,20 @@ ANSI 序列 —— 与 Linux 上 raw 终端 + `read(2)` 的契约完全一致，
 "别名体 + 其余已展开的词"重新解析执行）—— 日常用法（别名带参数/管道/重定向）一致，**已知偏离**：
 别名体里的位置参数展开时机不同，且不参与"词内"替换（`alias e=echo; e$x` 在 POSIX 里能展开，这里不能）。
 **`hash`** 维护命令路径缓存（`searchPath` 命中即不再走 PATH；**PATH 一变缓存整体作废**）。
+**波浪号展开**（POSIX 2.6.1，期望值逐条对着 bash 核过）：`~` → `$HOME`，`~user` → 该用户的家目录
+（走 passwd，`syscalls["user.get"]`），`~/x`、`~root/x` 照常；**只在词首**且 `~` 前缀整个落在
+**未加引号的原文**里才展开 —— `~nosuchuser`、`~$USER`、`~"x"`、`a~b` 一律原样保留（bash 同此），
+`"~"` 也不展开。展开结果按**未加引号**处理，所以 `~/dir/*.txt` 照样做路径名展开。赋值右侧
+（`X=~/bin`）也展开（bash 同此），但不做字段分割与通配符（POSIX）。**已知偏离**：赋值右侧里
+`:` 之后的波浪号（`PATH=~/a:~/b`）不展开，bash 会展开。
+
+**`setopt` / `unsetopt`**（zsh 风格）：管的是**所有真实存在的开关** —— 核心四个与 `set -o` 同源
+（`errexit` `nounset` `verbose` `xtrace`），另加 desh 的三个（`autosuggest` `correct` `history`，
+它们本来就只是 `DESH_*` 变量，所以两边改的是同一处状态）。名字大小写不敏感、`-` 当 `_`，
+支持 zsh 的 `NO_` 前缀（`setopt no_history` == `unsetopt history`，反向同理）；无参时列出
+"已开/已关"的选项，`--help` 给出全部选项与说明。**不认识的开关 fail-fast 退出 2**（与仓库里
+其它"未知选项"同一约定）—— 静默收下会让脚本以为开关生效了。
+
 **`umask`** 读写进程的创建掩码（缺省 `0022`，随 spawn 继承给子进程），实际收窄由**内核在创建点**统一
 应用（见「umask」一节）。**`command`** 绕过函数/别名直接执行，`-v`/`-V` 查询，`-p` 用系统缺省 PATH。
 **启动变量**（可在 shell 里读写，`export` 后才传给子进程）：`PATH`（默认 `/bin`，命令查找用）、
@@ -957,10 +971,22 @@ find . -exec echo {} \; | wc -l                 # 同理
 
 两条推论，写工具时必须照着办：
 
-1. **"让出"用 `os.msleep(0)`，且让出的判据必须是 CPU 时间而不是次数** —— 项目的统一写法是
-   `yieldCheck`：`os.epoch("utc")` 差值 ≥50ms 才 `msleep(0)` 一次。HSE 装不装都正确，
-   装了就**跑得更快**（每次让出只花 2ms 而不是 50ms），这正是 HSE 的意义。
-   反过来，按"每 N 字节让出一次"写的循环在 HSE 下会退化成一个高频事件发射器，不可取。
+1. **"让出"用 `os.msleep(0)`，判据是"累计了多少 CPU 时间"而不是次数**，而且**时间片要按平台分档**：
+   项目的统一写法是
+
+   ```lua
+   local _sliceMs = os.msleep and 2 or 50   -- 装了 HSE: 一次让出只要 ~2ms, 用 2ms 判据
+   local _sliceAt = os.epoch("utc")          -- 没装 HSE: 一次让出要睡满 50ms(os.sleep 量化), 用 50ms
+   local function yieldCheck() if os.epoch("utc") - _sliceAt >= _sliceMs then _sliceAt = ...; _msleep(0) end end
+   ```
+
+   **为什么 HSE 下要压到 2ms**：装 HSE 的意义就是把"让出"的代价从 50ms 降到 2ms；判据还钉在
+   50ms 的话，按键/`^C` 的投递延迟仍是 50ms 量级，HSE 就白装了（用户实测反馈：大多数命令的
+   让出太迟）。2ms 判据下延迟是 2-4ms，吞吐只降一点（一次让出=一个事件往返，正好贴着 HSE 的
+   2000Hz 拉模式）。**非 HSE 保持 50ms**：那里 `msleep(0)` 本体就是 `os.sleep(0.05)`。
+   反过来，按"每 N 字节让出一次"写的循环在 HSE 下会退化成一个高频事件发射器，仍然不可取。
+   等子进程/等条件的**轮询间隔**同理分档：`_pollMs = os.msleep and 5 or 50`（命令完成/退出码的
+   可见延迟从 ~50ms 降到 ~5ms）。
 2. **"延迟/轮询间隔"不能用 `msleep(0)` 充当** —— 它在 HSE 下只有 2ms，循环会变成热循环。
    要等一段时间就用 `msleep(ms)`，且**默认值 ≥50ms** 走定时器那条路；真要亚 50ms 的间隔
    （<50 是逐拍唤醒，代价是每拍一个事件）得自己想清楚。
@@ -1091,6 +1117,24 @@ Linux 的 exec 一样传给子进程（`process.setHandler` 认 `"ignore"`/`"def
 必然 nil，而静态看不出来（真机症状：`ls /proc/self` 报 `attempt to index global 'backend'`）。
 `tools/build.lua` 在压缩之前用 `minify.checkShadowedGlobals` 扫 `src/{bin,kernel,init,bios,modules}`，
 命中即 fail-fast 并给出源码行号；修法是声明与赋值分开（`local backend; backend = { ... }`）。
+
+**滚屏与重绘的性能（真机反馈"滚屏很慢"）**：`kernel/tty.lua` 原先滚一次 = 把整屏 ~grid 全标脏再
+**逐格** `dev.text`，而 term 型的 `dev.text` 是 `term.setCursorPos` + `term.blit` 两条 CC 调用 ——
+51x19 一屏就是近千次调用。两条修法（都在 `kernel/tty.lua`）：
+
+1. **设备原生滚动**：`ScreenDevice.scroll(n)` 是可选方法（控制台在 `kernel/boot.lua` 里用
+   `term.scroll(n)` 实现）。有它时 tty 只滚动自己的 grid + 把**新露出来的末行**标脏；像素型设备
+   （Tom/Void GPU）没有这个方法，退回"全屏重画"。
+2. **同一行连续同色的脏格合并成一次 `dev.text`**：整行输出（`ls`/`ps`/`grep`）因此从"每格一次"
+   变成"每行一次"。合并会被"中间有没标记的格子/跨行/颜色变化/光标反显"打断。
+
+`tools/hosttest.lua` 的假终端加了 `scroll` 计数与 `calls` 记账，锁住这两条（"一整行最多两条 text"、
+"滚完只重画末行"）。
+
+**宿主测试台在 Lua 5.4 下也能跑了**：`tools/hosttest.lua` 里有几处直接写 `loadstring`（5.2+ 没有），
+于是 `lua5.4 tools/hosttest.lua` 一直死在 "attempt to call a nil value (global 'loadstring')" ——
+现在统一走 `loadEnv(src, name, env)`（5.1: `loadstring`+`setfenv`；5.2+: `load(..., "t", env)`），
+840 项在 5.1 与 5.4 下都全绿。
 
 **构建期门禁（local gate）—— CC 的 Lua(Cobalt) 局部变量上限**：宿主 `lua5.1/5.4` 给**每个函数**
 200 个局部变量名额，而 CC 的 Cobalt 是**沿嵌套链累加**的：`Parser.newLocal` 拿

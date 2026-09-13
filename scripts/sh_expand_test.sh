@@ -231,6 +231,26 @@ echo "after errors" > $T/after.log
 eq  arith_continues_after_error "after errors" "$(cat $T/after.log)"
 
 # ---------------------------------------------------------------
+# 7. 波浪号展开(POSIX 2.6.1; 期望值对着 bash 实测核对)
+# ---------------------------------------------------------------
+# 判据: 只在**词首**、且 ~ 前缀整个落在未加引号的原文里才展开;
+# ~nosuchuser / ~$USER / "~" / a~b 一律保持原样(bash 同此)。
+eq  tilde_home "$HOME" "$(echo ~)"
+eq  tilde_home_slash "$HOME/x" "$(echo ~/x)"
+eq  tilde_user_root "/root" "$(echo ~root)"
+eq  tilde_user_root_slash "/root/x" "$(echo ~root/x)"
+eq  tilde_unknown_user "~nosuchuser/x" "$(echo ~nosuchuser/x)"
+eq  tilde_quoted "~" "$(echo "~")"
+eq  tilde_not_word_start "a~b" "$(echo a~b)"
+eq  tilde_after_var "~$USER" "$(echo ~$USER)"
+eq  tilde_in_assignment "$HOME/bin" "$(X=~/bin; echo $X)"
+eq  tilde_mixed_quotes "$HOME/x" "$(echo ~/"x")"
+# 展开结果按未加引号处理: 通配符照样生效
+mkdir -p "$HOME/tildetest"
+touch "$HOME/tildetest/a.txt" "$HOME/tildetest/b.txt"
+eq  tilde_then_glob "$HOME/tildetest/a.txt $HOME/tildetest/b.txt" "$(echo ~/tildetest/*.txt)"
+
+# ---------------------------------------------------------------
 echo "== summary =="
 echo "$outcome"
 exit $outcome

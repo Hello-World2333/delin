@@ -782,6 +782,8 @@ local function deshSetup()
         S.outln("correct  : 'did you mean' when a command is not found")
         S.outln("config   : /etc/deshrc, then ~/.deshrc (or $DESHRC); switches DESH_AUTOSUGGEST,")
         S.outln("           DESH_CORRECT, DESH_HISTORY, HISTFILE, HISTSIZE, DESH_SUGGEST_COLOR")
+        S.outln("options  : setopt / unsetopt <name>  (errexit nounset verbose xtrace autosuggest")
+        S.outln("           correct history; NO_ prefix inverts; no args lists; unknown fails 2)")
         S.outln("usage    : desh [-c cmd [name [args...]]] [script] [args...]   (no script => interactive)")
         S.outln("scripts  : non-interactive desh behaves exactly like sh (same core)")
     end
