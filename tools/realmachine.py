@@ -16,6 +16,10 @@
 
 用法: python3 tools/realmachine.py [--base /mnt/disk/0/parts/root.img] [--no-reboot] [--reboot-only]
                                   [--clean]   # 只装干净镜像(无验证载荷), 给手工测试用
+                                  [--fast --wait-file /tmp/x --grep tag]
+                                              # 快速迭代: 跳过宿主 ext2 回归与电脑 4,
+                                              # 只重启 #3 等 marker 出现, 只 dump klog 命中行
+                                  [--desh-probe]  # 注入 desh 交互诊断载荷(临时调试用)
 
 注意: 本环境里电脑自身 FS 的文件(/.boot、/main.lua)在宿主机改写后, 游戏侧似乎仍读旧内容
 (磁盘镜像 /mnt/disk/0/parts/*.img 的改写则立即生效, 已验证), 因此第 3d 步写 DLUB 到 /main.lua
@@ -152,6 +156,10 @@ def main():
     probe_only = False
     force_rebuild = False
     clean = False
+    desh_probe = False
+    fast = False
+    grep_tag = None
+    wait_file = None
     args = sys.argv[1:]
     while args:
         a = args.pop(0)
@@ -165,6 +173,14 @@ def main():
             force_rebuild = True
         elif a == "--clean":
             clean = True
+        elif a == "--desh-probe":
+            desh_probe = True
+        elif a == "--fast":
+            fast = True
+        elif a == "--grep":
+            grep_tag = args.pop(0)
+        elif a == "--wait-file":
+            wait_file = args.pop(0)
         elif a == "--printer":
             printer = True
         elif a == "--printer-probe":
@@ -186,8 +202,10 @@ def main():
     print(run("lua5.1", os.path.join(REPO, "tools/build.lua"), cwd=REPO))
 
     # 1b) 宿主 ext2 回归(秒级): 驱动层的目录/links 问题先在这里挡住, 别拿真机试
-    print("== host ext2 regression ==")
-    print(run("lua5.1", os.path.join(REPO, "tools/ext2test.lua"), cwd=REPO))
+    #     --fast(载荷/工具的快速迭代)跳过它 —— 那一轮不碰内核/ext2 驱动。
+    if not fast:
+        print("== host ext2 regression ==")
+        print(run("lua5.1", os.path.join(REPO, "tools/ext2test.lua"), cwd=REPO))
 
     # 2) 部署根镜像到 /tmp, 成功后原子替换
     # payload 指纹没变就复用上一轮注入好的镜像: deploy(拷基镜像+铺文件) 与 40 来次 debugfs
@@ -225,6 +243,12 @@ def main():
         if clean:
             print('--clean: 跳过验证载荷注入(镜像里只有 dist 产物 + fstab/data 分区)')
         else:
+            if desh_probe:
+                pv = re.search(r'^\s*return\s+"([^"]+)"',
+                               open(os.path.join(REPO, "src/kernel/version.lua")).read(), re.M).group(1)
+                pmoddir = "/lib/modules/" + pv
+                df_write(out, os.path.join(REPO, "scripts/desh_probe.ko"), pmoddir + "/deshprobe.ko")
+                add_module(out, pmoddir, "deshprobe")
             # 3) 注入验证负载
             print("== inject verify payload ==")
     
@@ -351,8 +375,9 @@ def main():
             #      模块由 /lib/modules/<版本>/manifest 点名装载, 所以 .ko 与 manifest 两样都要铺。
             ver = re.search(r'^\s*return\s+"([^"]+)"', open(os.path.join(REPO, "src/kernel/version.lua")).read(), re.M).group(1)
             moddir = "/lib/modules/" + ver
-            df_write(out, os.path.join(REPO, "scripts/intr_test.ko"), moddir + "/intrtest.ko")
-            add_module(out, moddir, "intrtest")
+            if not desh_probe:
+                df_write(out, os.path.join(REPO, "scripts/intr_test.ko"), moddir + "/intrtest.ko")
+                add_module(out, moddir, "intrtest")
     
             # 3f5) tty 原始模式自检(scripts/rawtty_test.ko + scripts/rawtty_verify.lua):
             #      分页器 more/less 建在"原始模式 + 终端字节流"这条契约上, 而键盘事件只有内核态
@@ -368,8 +393,9 @@ def main():
                         "[Install]\nWantedBy=multi-user.target\n")
             df_write(out, unit_raw, "/lib/systemd/system/rawtty-verify.service")
             df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/rawtty-verify.service")
-            df_write(out, os.path.join(REPO, "scripts/rawtty_test.ko"), moddir + "/rawtty.ko")
-            add_module(out, moddir, "rawtty")
+            if not desh_probe:
+                df_write(out, os.path.join(REPO, "scripts/rawtty_test.ko"), moddir + "/rawtty.ko")
+                add_module(out, moddir, "rawtty")
     
             # 3g) 门禁: 注入后镜像仍必须干净, 不把坏镜像带上真机
             p = subprocess.run([FSCK, "-fn", out], capture_output=True, text=True)
@@ -447,6 +473,9 @@ def main():
     if not reboot:
         print("--no-reboot: stopping here (computer #3 已关机)")
         return
+    if fast:
+        fast_collect(wait_file or "/tmp/desh_probe_done", grep_tag)
+        return
     if clean:
         # --clean: 干净镜像没有 verify.service, 后续那套"取回日志 + 逐条门禁"没有意义 ——
         # 开机就交给手工用(顺便把电脑 4 的部署与重启也跳过)。
@@ -457,6 +486,39 @@ def main():
         print("   电脑 #3 已用干净镜像开机(磁盘 0 引导), 可以直接登录使用")
         return
     reboot_and_collect(printer)
+
+
+def fast_collect(marker, tag, timeout=150):
+    """快速迭代路径(给"改一行就想看一眼真机"用; 全量验证走 reboot_and_collect):
+
+      - 只重启电脑 #3(不碰电脑 4), 等镜像里出现 marker 文件就立刻返回;
+      - 只打印 klog 里带 tag 的行 + /tmp 列表, 不跑任何门禁、不 dump 全部日志。
+
+    为什么值得有这条: 全量那轮是"关机 -> 重建镜像 -> 注入 -> 开机 -> 等 verify.log -> 重启
+    电脑 4 -> 等自检跑完 -> dump + 逐条门禁", 一轮 6 分钟起; 而调一个载荷/一行代码的实现时,
+    需要的只是"它到底跑到哪一步了"。实测这条 ~90-120 秒。
+    """
+    print("== fast: reboot computer #3 (marker %s) ==" % marker)
+    run("python3", RCON, "computercraft shutdown #3", check=False)
+    time.sleep(2)
+    run("python3", RCON, "computercraft turn-on #3", check=False)
+    img = os.path.join(DISK, "parts/root.img")
+    t0 = time.time()
+    found = False
+    while time.time() - t0 < timeout:
+        time.sleep(2)
+        if "Inode:" in df(img, "stat " + marker):
+            found = True
+            break
+    print("   marker: %s (%.0fs)" % ("found" if found else "MISSING", time.time() - t0))
+    for name in ("/var/log/messages", "/var/log/messages.1", "/var/log/kern.log"):
+        for line in df(img, "cat " + name).splitlines():
+            if tag and tag in line:
+                print("   | " + line.strip())
+    print("   --- /tmp ---")
+    print(df(img, "ls -l /tmp"))
+    if not found:
+        raise RuntimeError("fast: 等 %s 超过 %ds 没出现(上面是 klog 命中行)" % (marker, timeout))
 
 
 def reboot_and_collect(printer=False):

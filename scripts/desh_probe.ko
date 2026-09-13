@@ -1,0 +1,182 @@
+--@name deshprobe
+--@version 0.0.1
+--@deps
+--@description real-machine probe for /bin/desh interactive startup (test image only)
+--[[ 临时诊断载荷(**不随 dist/ 发布**): 在真机上把登录会话驱动到 desh, 然后把 tty 的状态
+     写进 klog, 用来回答"desh 到底有没有进交互模式"这类只有真机能看出来问题。
+
+     关键判据是 ctx.raw / ctx.reading:
+       raw=true  + reading=true  -> desh 的行编辑器正在原始模式里读键盘(交互正常)
+       raw=false + reading=true  -> 走的是规范模式(说明 interactive 判定为假, 或者编辑器没跑)
+       raw=false + reading=false -> 没人在读(命令在执行/卡在别处)
+
+     载荷只在普通 CC 上跑(与 intr_test.ko 同一套平台判据), 只经 tty.routeKey/tty.feedInput
+     喂按键 —— 与调度器处理真实按键走同一条路。 ]]
+
+local PASSWORD = "12345678" -- root 的口令(安装器设的)
+
+local function initModule()
+    local klog = require("kernel.klog")
+    local vfs_api = require("kernel.vfs_api")
+    local platform = require("kernel.platform")
+    local PRI = klog.makePri(klog.FACILITIES.kern, klog.SEVERITIES.info)
+    local function log(s) klog.write(PRI, "[deshprobe] " .. s) end
+
+    if platform.detect() ~= "cc" then
+        log("skip: not a plain CC computer")
+        return
+    end
+    local tty = require("kernel.tty")
+    local focus = tty.getFocus()
+    local function exists(p) return vfs_api.fs.exists(p) == true end
+    for _, p in ipairs({ "/tmp/desh_ok", "/tmp/desh_probe_done" }) do
+        if exists(p) then vfs_api.fs.delete(p) end
+    end
+
+    --- 按键注入: **照抄调度器的真实路径**(scheduler.routeEvent)——
+    --- 可打印字符走后端 char 事件(feedInput), 回车走 key 事件(routeKey) + 随后的 char 事件。
+    --- 只喂 feedInput 的话, "原始模式里 Enter 被规范模式 feedKey 吃掉"这个真机 bug 根本
+    --- 复现不出来(实测就是这么漏过去的)。
+    local function send(s)
+        for i = 1, #s do
+            local ch = s:sub(i, i)
+            if ch == "\n" then
+                tty.routeKey({ "key", keys.enter, false })
+                tty.feedInput({ "char", "\n" })
+            else
+                tty.feedInput({ "char", ch })
+            end
+        end
+    end
+    local function state()
+        local c = tty.get(focus)
+        if not c then return "focus=" .. tostring(focus) .. " (no ctx)" end
+        return string.format(
+            "focus=%s raw=%s reading=%s keyBuf=%d lineQueue=%d inputBuffer=%d echo=%s dup=%s guard=%s",
+            tostring(focus), tostring(c.raw), tostring(c.reading), #c.keyBuf, #c.lineQueue,
+            #c.inputBuffer, tostring(c.echo), tostring(c.dupChar),
+            tostring(tty.readGuard and tty.readGuard(focus)))
+    end
+
+    --- 进程清单(comm 是短名, 免得 klog 一行被截断): 用来判断 desh 到底还在不在。
+    local function proclist()
+        local pids = vfs_api.fs.list("/proc")
+        local out = {}
+        for _, n in ipairs(pids or {}) do
+            if n:match("^%d+$") then
+                local f = vfs_api.fs.open("/proc/" .. n .. "/comm", "r")
+                local l = ""
+                if f then l = (f:readAll() or ""):gsub("%s+$", ""); f:close() end
+                out[#out + 1] = n .. ":" .. l
+            end
+        end
+        table.sort(out, function(x, y) return (tonumber(x:match("^%d+")) or 0) < (tonumber(y:match("^%d+")) or 0) end)
+        return table.concat(out, " ")
+    end
+
+    -- 事件记录器: 把调度器喂给 tty 的**真实按键事件**逐条写进 klog —— 用来回答
+    -- "用户按回车时, 内核到底收到了什么"(是 enter, 还是被当成 ctrl+c 取消了一行)。
+    local logOn = false
+    local nLogged = 0
+    --- keys.getName 只吃数字键码; char 事件的 ev[2] 是字符, 直接传会报错。
+    local function kname(ev)
+        if type(ev[2]) == "number" and keys.getName then return tostring(keys.getName(ev[2])) end
+        return "-"
+    end
+    local origFeed, origRoute = tty.feedInput, tty.routeKey
+    tty.feedInput = function(ev)
+        if logOn and nLogged < 400 then
+            nLogged = nLogged + 1
+            local c = tty.get(focus)
+            log(string.format("EV %s name=%s ch=%s held=%s | raw=%s reading=%s intr=%s",
+                tostring(ev[1]), kname(ev),
+                tostring(ev[1] == "char" and ev[2] or "-"), tostring(ev[3]),
+                tostring(c and c.raw), tostring(c and c.reading), tostring(c and c.intr)))
+        end
+        return origFeed(ev)
+    end
+    tty.routeKey = function(ev)
+        if logOn and nLogged < 400 then
+            nLogged = nLogged + 1
+            local c = tty.get(focus)
+            log(string.format("ROUTE %s name=%s held=%s | raw=%s reading=%s intr=%s",
+                tostring(ev[1]), kname(ev),
+                tostring(ev[3]), tostring(c and c.raw), tostring(c and c.reading), tostring(c and c.intr)))
+        end
+        return origRoute(ev)
+    end
+
+    local pull = os.pullEventRaw
+    local wrapper
+    local function disarm()
+        if os.pullEventRaw == wrapper then os.pullEventRaw = pull end
+    end
+
+    -- 阶段: 1 登录 -> 2 起 desh -> 3 敲一条命令等它的文件 -> 4 ^C 收尾 -> 5 完成
+    local phase, phaseAt, lastPoll = 1, os.epoch("utc"), 0
+    local function step()
+        local now = os.epoch("utc")
+        if phase == 1 then
+            log("login as root (" .. state() .. ")")
+            send("root\n" .. PASSWORD .. "\n")
+            phase, phaseAt = 2, now
+        elseif phase == 2 then
+            log("start desh (" .. state() .. ") procs " .. proclist())
+            send("desh\n")
+            phase, phaseAt = 3, now
+        elseif phase == 3 then
+            if now - phaseAt > 4000 then
+                log("after 4s: " .. state() .. ") procs " .. proclist())
+                logOn = true
+                send("echo DESH-PROBE-OK > /tmp/desh_ok\n")
+                log("typed a command + Enter (" .. state() .. ")")
+                phase, phaseAt = 4, now
+            end
+        elseif phase == 4 then
+            if exists("/tmp/desh_ok") then
+                log("command executed OK (" .. state() .. ") procs " .. proclist())
+                logOn = false
+                phase, phaseAt = 5, now
+            elseif now - phaseAt > 20000 then
+                log("command did NOT run within 20s (" .. state() .. ") procs " .. proclist())
+                logOn = false
+                phase, phaseAt = 5, now
+            end
+        else
+            if now - phaseAt > 1000 then
+                log("done (" .. state() .. ")")
+                -- 进程表: desh 到底还活着吗(它的 cmdline/comm 是什么)
+                log("procs " .. proclist())
+                local f = vfs_api.fs.open("/tmp/desh_probe_done", "w")
+                if f then f:write("done\n"); f:close() end
+                disarm()
+                phase = 6
+            end
+            return
+        end
+        if now - phaseAt > 120000 then
+            log("stuck in phase " .. phase .. " (" .. state() .. "), giving up")
+            disarm()
+            phase = 6
+        end
+    end
+
+    wrapper = function(...)
+        if phase < 6 then
+            local now = os.epoch("utc")
+            if now - lastPoll < 1000 then return pull(...) end
+            lastPoll = now
+            local ok, err = pcall(step)
+            if not ok then
+                log("step error (probe stopped): " .. tostring(err))
+                disarm()
+                phase = 6
+            end
+        end
+        return pull(...)
+    end
+    os.pullEventRaw = wrapper
+    log("armed (" .. state() .. ")")
+end
+
+return { init = initModule }

@@ -86,7 +86,13 @@ local function initModule()
         if phase == 1 then
             if exists("/tmp/rawtty.ready") then
                 log("raw mode armed by the verifier, feeding " .. #events .. " events + Ctrl-D")
-                for _, ev in ipairs(events) do tty.feedInput(ev) end
+                -- 走**调度器那条真实路径**(scheduler.routeEvent: char/paste -> feedInput,
+                -- key/key_up -> routeKey)。只喂 feedInput 的话, Enter/Tab 这些 key 事件会绕过
+                -- routeKey, 而 routeKey 里"原始模式也走规范模式 feedKey"的 bug 就测不出来
+                -- —— 真机上 desh 敲回车毫无反应就是这么漏过去的。
+                for _, ev in ipairs(events) do
+                    if ev[1] == "key" or ev[1] == "key_up" then tty.routeKey(ev) else tty.feedInput(ev) end
+                end
                 for _, ev in ipairs(pressCtrlD()) do tty.routeKey(ev) end
                 phase, phaseAt = 2, now
                 return

@@ -673,8 +673,17 @@ function tty.routeKey(event)
             return
         end
     end
+    -- **原始模式必须走 rawFeedKey**(与 tty.feedInput 的 key 分支同一套): 真实按键的 key 事件
+    -- 是调度器经 routeKey 送进来的(见 scheduler.routeEvent), 而规范模式的 feedKey 会把
+    -- Enter 当成"整行入队 + 去重闩锁"处理 —— 于是原始模式的行编辑器**永远收不到那个 \n**
+    -- (Tab/方向键同理: 关键字节被去重闩锁吃掉, 或者干脆不产生字节)。
+    -- 实测症状(真机, desh 行编辑器): 敲回车毫无反应、Tab 补全与方向键全失效, 只有 ^C(走
+    -- 上面的 ctrl 分支, 那条本来就是 raw 感知的)有反应。宿主测试台直接喂 tty.feedInput,
+    -- 走的是 raw 感知的那条路, 所以这个 bug 在宿主上一直看不出来。
     local ctx = focus and devices[focus]
-    if ctx then feedKey(ctx, key, event[3] or false) end
+    if ctx then
+        if ctx.raw then rawFeedKey(ctx, key, event[3] or false) else feedKey(ctx, key, event[3] or false) end
+    end
 end
 
 --- 调度器把键盘事件路由给前台 tty(canonical 行规程 / 原始模式字节流)。

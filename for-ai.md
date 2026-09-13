@@ -846,6 +846,18 @@ shebang 支持 `#!/bin/sh` / `#!/usr/bin/env sh` 等形式，env 特殊解释为
 `--color[=WHEN]`（认 `GREP_COLORS`，`auto` 看 stdout 的 `isTTY`）、`--label`。组分隔符（`--`）
 只在真的带上下文时出现（GNU 同）。
 
+#### 真机四处坑（都是"宿主全绿、真机才露头"）
+
+0. **原始模式里 `routeKey` 把 key 事件交给了规范模式的 `feedKey`**（`kernel/tty.lua`）：
+   真实按键的 `key` 事件是**调度器经 `tty.routeKey` 送进来的**（见 `scheduler.lua` 的
+   `routeEvent`：`char/paste` → `feedInput`，`key/key_up` → `routeKey`），而 `routeKey` 尾巴上
+   无条件调 `feedKey`（规范模式那套）—— 于是原始模式的行编辑器**永远收不到** Enter 的 `\n`
+   （被当成"整行入队 + 去重闩锁"），Tab/方向键同理。症状：真机上 `desh` 的行编辑器敲回车
+   毫无反应、补全/方向键全失效，只有 `^C`（走上面那条 **raw 感知的** ctrl 分支）有反应。
+   修法：`routeKey` 尾巴也按 `ctx.raw` 分派到 `rawFeedKey`（与 `feedInput` 的 key 分支一致）。
+   **为什么宿主测不出来**：`scripts/rawtty_test.ko`（以及所有测试台路径）直接喂 `tty.feedInput`，
+   走的是 raw 感知的那条路 —— 载荷现在改成**照抄调度器的路由**（key → `routeKey`），门禁才有意义。
+
 #### 真机三处坑（都是"宿主全绿、真机才露头"）
 
 1. **Cobalt 的局部变量上限**：见「构建期门禁（local gate）」。给 sh 核心加一个 helper 就把
@@ -863,6 +875,25 @@ shebang 支持 `#!/bin/sh` / `#!/usr/bin/env sh` 等形式，env 特殊解释为
    另外 `tools/realmachine.py` 追加模块清单时曾经缓存住"读到的清单"，两个注入点（intrtest /
    rawtty）互相覆盖 —— 后写的把前一个刚加的名字抹掉，机器的模块清单里没有它，载荷静默不跑
    （"正对照缺失"就是这个）。现在统一走 `add_module()`，每次都重新读一遍镜像里的 manifest。
+
+#### 真机验证的三种节奏（别每次都跑全量）
+
+`tools/realmachine.py` 默认那条路（关机 → 重建镜像 → 注入 → 开机 → 等 verify.log → 重启电脑 4
+→ 等自检跑完 → dump 全部日志 + 逐条门禁）一轮 **6 分钟起**，它是"发布前的全量门禁"。
+改一行就想看一眼真机时用另外两个模式：
+
+| 模式 | 用途 | 一轮耗时 |
+|---|---|---|
+| （默认） | 全量门禁：所有自检 + ^C / rawtty / dd-siSIGINT 等真机门禁 | ~6 分钟 |
+| `--fast --wait-file <镜像内路径> --grep <tag>` | 只重启 #3、等某个 marker 文件出现、只 dump klog 里带 tag 的行；跳过宿主 ext2 回归与电脑 4 | **~40-90 秒** |
+| `--clean` | 只装干净镜像（只有 dist 产物，不注入任何验证载荷）并开机，交给人手工用 | ~1 分钟 |
+| `--desh-probe` | 注入 `scripts/desh_probe.ko`（交互式诊断载荷：自动登录 → 起 desh → 敲命令 → 把 tty 状态与**每个真实按键事件**写进 klog/文件），并**自动禁用会抢 tty0 的 intrtest/rawtty** | 陪 `--fast` 用 |
+
+**排查交互式问题时值得先想到它**：`desh_probe.ko` 的按键注入**照抄调度器的路由**
+（可打印字符 → `feedInput`，回车 → `routeKey` + 随后那个 char 事件），所以它能复现真实键盘的
+行为 —— 上面第 0 条坑就是这么定出来的（只用 `feedInput` 的话永远复现不出来）。
+`--desh-probe` 与 intrtest/rawtty 会互相打架（三个载荷都在同一个 tty0 会话上打字），所以
+它一开就自动把那两个载荷关掉。
 
 #### 真机验证（`tools/realmachine.py`）为什么要快就得这么写
 
