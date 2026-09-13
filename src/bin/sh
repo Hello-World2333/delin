@@ -3453,6 +3453,11 @@ if interactive then
         local prompt = promptExpand(p)
         if stdout and stdout.write then stdout:write(prompt) end
         local line = stdin and stdin.readLine and stdin:readLine()
+        -- 提示符处的 ^C 只用来取消当前输入行: tty 行规程已经回显 "^C"、丢掉该行(返回空行),
+        -- 并给前台进程组投了 SIGINT —— 那个 SIGINT 的目的**已经达成**, 必须在这里消费掉。
+        -- 留着它的话, 下一条外部命令刚 spawn 就被 pollWait 当成"^C 中断"立刻 SIGKILL:
+        -- 症状是"取消输入后的一条命令静默不执行(退出码 130), 再下一条才恢复"。
+        sigintPending = false
         if line == nil then
             -- EOF 时缓冲区里还有未完成的命令 -> 语法错误(与 dash 的 unexpected EOF 同义)。
             if #buf > 0 then errln("sh: syntax error: unexpected end of file") end

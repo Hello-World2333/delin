@@ -573,7 +573,13 @@ shebang 支持 `#!/bin/sh` / `#!/usr/bin/env sh` 等形式，env 特殊解释为
 `scripts/sh_builtin_test.sh`（内建/变量/选项自检，宿主用 harness 跑，真机由
 `scripts/sh_verify.sh` + `verify-sh.service` 跑并写 `/var/log/sh_verify.log`）、
 `scripts/sh_expand_test.sh`（展开自检 95 项：通配符/命令替换/算术，宿主 harness 与真机各跑一次，
-期望值逐条对着 bash/dash 核过）。
+期望值逐条对着 bash/dash 核过）、`scripts/sh_intr_test.sh`（宿主专用：提示符处 `^C`）。
+**提示符处的 `^C`**：tty 行规程做两件事（`kernel/tty.lua` 的 `tty.ctrlC`）—— 回显 `^C`、丢掉当前行
+（读到的是一整行空行），同时把 SIGINT 投给 tty 前台进程组。**交互式 sh 必须在读完这一行之后立刻
+消费掉那个 SIGINT**（`src/bin/sh` 交互循环里的 `sigintPending = false`）：它的目的（取消输入行）已经
+达成，留到下一轮就会被 `pollWait` 当成"^C 中断" —— 症状是"提示符处按过 ^C 之后的那条**外部**命令
+静默不执行（退出码 130），再下一条才恢复"（历史 bug；内建命令不走 pollWait，所以只有外部命令看得出来）。
+`/bin/lua` 的 REPL 用自己那份 `interrupted` 标志做同一件事（读之前清零、读之后消费）。
 
 #### 词展开：命令替换 / 算术 / 通配符
 
@@ -1072,6 +1078,25 @@ CEE:CC(CEECC)平台落地：`kernel/platform.lua` 认平台(`_G.cee`)、`modules
   不等子进程就退出（`/bin/lua` 用 xpcall 跑脚本，Lua 5.1 不能跨 pcall 让出，见其注释）——
   真机上输出文件因此**是空的**，宿主测试台却看不出来（宿主文件是直写的）。现在那份 helper 把输出句柄包成
   “每次写都 flush”，谁先退出都不丢内容。
+- **从内核里注入按键做交互式真机测试**（`scripts/intr_test.ko`，验证"提示符处 `^C`"就是这么测的）。
+  四条经验（都是真机上量出来的，别改回去）：
+  ① 载荷必须是**内核模块**：模块在调度器起来之前 `init`，正好在那里包住 `os.pullEventRaw`（调度器的每个
+  事件都从它过），也从那里驱动行规程；② **按键不要走 `os.queueEvent`** —— 实测注入了 90 秒、`tty.feedInput`
+  计数一直是 0：CC 事件队列里排队的按键会被**带过滤器的拉取吃掉**（`os.pullEvent("timer")` 这一路，正是
+  每个进程 `os.sleep` 的实现，init 每 50ms 就有一次），真实按键能活下来只因为内核当时已经阻塞在无过滤的
+  `pullEventRaw` 上。正确做法是直接调 `tty.routeKey`/`tty.feedInput` —— 那正是调度器 `routeEvent` 对真实
+  按键做的事，行规程/`^C` 回显/给前台进程组投 SIGINT 全是真家伙；③ **不要靠屏幕同步** —— 内核/用户态的
+  console 输出走 CC 终端的 `write`，**不经过 tty 的屏幕模型**，会把 tty 自己的格子盖掉（实测：登录提示符
+  那一行还没被看见就被别的日志盖了）。可靠的办法是"用**文件系统的产物**当同步点"（命令写 `/tmp/x`，
+  注入器 `vfs_api.fs.exists` 轮询），再加上 tty 行规程**会把整行缓冲起来**（没有读者也一样），于是登录那
+  几行可以一次性喂进去、不需要等提示符；④ 进度用 `klog.write`（ring buffer -> syslogd -> `/var/log/messages`，
+  宿主机 debugfs 读得到，注意 logrotate 会把它转成 `.1`），**别用 `kprint`**（它还画控制台）。判据三件套：
+  正对照（注入器真的驱动了会话）+ 负对照（打了一半的行必须没被执行）+ 回归判据（`^C` 之后那条命令必须
+  执行）；载荷收工后要把 `os.pullEventRaw` 还回去，别给后面的自检留开销。
+- **真机自检服务要给足 `TimeoutStartSec`**。`realmachine.py` 生成的 verify*.service 是 `Type=oneshot`，
+  而 init 引擎给 oneshot 的默认超时是 **60s**（systemd 对 oneshot 的默认其实是 infinity）—— 自检脚本
+  一轮要跑近百个进程、长度已经压在这个上限附近，被 init SIGKILL 掉就表现为"`verify.log` 变了但没跑完"，
+  看着像内核回归（本轮就因此误判过两轮）。生成的单元里写死 `TimeoutStartSec=600`。
 
 部署到电脑4：`tools/deploy_to_computer4.py`（支持两种启动模式）：
 - `python3 tools/deploy_to_computer4.py --mode rootfs --rootfs /parts/root.img`（从电脑自带存储启动）
@@ -1392,6 +1417,7 @@ lua5.1 tools/harness.lua /bin/sh < scripts/lua_test.sh   # /bin/lua 脚本/stdin
 lua5.1 tools/harness.lua /bin/sh < scripts/user_test.sh  # 用户管理(passwd/useradd/usermod/group*/id)自检(与真机比对)
 lua5.1 tools/harness.lua /bin/sh < scripts/sh_expand_test.sh  # sh 展开(通配符/命令替换/算术)自检(与真机比对)
 sh scripts/lua_repl_test.sh        # /bin/lua 交互式 REPL(宿主专用: DELIN_HARNESS_TTY=1 伪装终端)
+sh scripts/sh_intr_test.sh         # sh 交互式"提示符处 ^C"(宿主专用: 伪装终端 + 注入中断键)
 lua5.1 tools/ext2test.lua        # ext2 驱动宿主回归: 真实镜像上跑目录增删, 再用宿主 e2fsck -fn 判定
 python3 tools/realmachine.py --base /mnt/bak/root.base.img   # 真机: 先关机->打包->部署->重启 #3->取回 /var/log/*
 python3 tools/realmachine.py --printer   # 真机 + 打印机(会实际打印页面): 探测 printer API + 验证 /dev/lp0
@@ -1597,6 +1623,10 @@ tools/harness.lua          host 测试台: 用真实 Delin 工具源码在宿主
                            (`ls -A <文件>` 会把文件路径自己打印出来, 直接照搬会让宿主上的
                            fs.list(file) 返回一条路径 —— 工具的"列目录失败"分支在宿主上永远
                            走不到, 真机才炸)
+                           DELIN_HARNESS_TTY=1 时把 stdin 伪装成终端(isTTY + getDeviceName),
+                           输入里以 `\3` 结尾的一行 = "用户打了一半按了 ^C": 行规程丢掉该行、
+                           读返回空行, 同时把 SIGINT 投给顶层那条进程组(与真机 tty.ctrlC 的两件事
+                           一一对应) —— 少了投信号那一半, 提示符处 ^C 的 bug 在宿主上复现不出来
 tools/hosttest.lua         宿主测试: init 单元引擎/fstab 生成/syslogd 规则/logrotate 轮转/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone/devdisk/mkfs.ext2+fsck.ext2(680 项)
 tools/installertest.lua    安装器宿主回归: 假 CraftOS(fs/term/os/http/disk/peripheral + 脚本化事件队列)
                            + 假终端格子(含 fg/bg), 用 loadfile 跑 dist/install.lua, 按键序列驱动向导
@@ -1610,5 +1640,9 @@ tools/realmachine.py       真机流程: 先关机->打包->部署->注入第二
                            写磁盘 CC-fs 引导配置(/.boot + /dlub.cfg)->装盘并 md5 校验->开机->
                            引导门禁(verify.log 必须是本轮写的)->debugfs 取回日志->停机后再 fsck
                            (--printer 额外注入打印机探测/验证服务)
+                           还注入 scripts/intr_test.ko(交互式 ^C 载荷, 只进测试镜像): 停机后从镜像
+                           判定三份证据 —— /tmp/intr.before(正对照: 注入器真在提示符上执行了命令)、
+                           /tmp/intr.notrun 必须**不存在**(负对照: 打了一半的行真被 ^C 取消了)、
+                           /tmp/intr.after(回归: ^C 之后的第一条命令必须真的执行)
 dist/                      生成物(不提交)
 ```

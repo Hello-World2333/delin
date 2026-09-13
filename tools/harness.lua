@@ -1079,9 +1079,20 @@ for i = 2, #argsIn do toolArgs[#toolArgs + 1] = argsIn[i] end
 local stdinData = io.read("*a") or ""
 local stdinPos = 1
 -- DELIN_HARNESS_TTY=1: 把 stdin 伪装成终端, 让 sh 走交互式分支(测 PS1/PS2 提示符)。
+-- **提示符处按 ^C**: 输入里以 `\3`(真 ^C 字节, 见 scripts/sh_intr_test.sh) 结尾的一行表示
+-- "用户打了一半之后按了中断键"; 单独一行 `\3` 就是"空行上按了中断键"。内核那边是两件事一起
+-- 发生(kernel/tty.lua 的 tty.ctrlC): 行规程丢掉当前行、读返回空行; 同时给 tty 前台进程组投
+-- SIGINT。宿主测试台照这两件事一起模拟 —— 少了投信号那一半, "提示符处的 SIGINT 被漏到下一轮"
+-- 这类 bug 在宿主上就复现不出来(见 src/bin/sh 交互循环里那段注释)。
 local ttyMode = os.getenv("DELIN_HARNESS_TTY") == "1"
-local inputHandle = { isTTY = ttyMode }
-inputHandle.readLine = function()
+-- 由下面的引导代码填: 把 SIGINT 投给 tty 前台进程组(此时即顶层 sh 那一组)。
+local ttyForegroundIntr = function() end
+local inputHandle = {
+    isTTY = ttyMode,
+    -- 真 tty 句柄有 getDeviceName(见 kernel/tty.lua 的 openHandle): sh 靠它判断"有没有作业控制"。
+    getDeviceName = ttyMode and function() return "tty0" end or nil,
+}
+local function rawStdinLine()
     if stdinPos > #stdinData then return nil end
     local nl = stdinData:find("\n", stdinPos, true)
     if not nl then
@@ -1091,6 +1102,14 @@ inputHandle.readLine = function()
     end
     local line = stdinData:sub(stdinPos, nl - 1)
     stdinPos = nl + 1
+    return line
+end
+inputHandle.readLine = function()
+    local line = rawStdinLine()
+    if ttyMode and line and line:sub(-1) == "\3" then
+        ttyForegroundIntr()
+        return "" -- ^C 丢掉当前行(连已打进缓冲的那半截), 读到的是一整行空行
+    end
     return line
 end
 -- read 同时收点号与冒号: 内核里所有 stdin 句柄(管道/文件/tty)都是普通 Lua 表, 方法吃冒号,
@@ -1149,6 +1168,13 @@ for i = 1, #toolArgs do argv0[i] = toolArgs[i] end
 local topUid = tonumber(os.getenv("DELIN_HARNESS_UID") or "")
 local topGid = tonumber(os.getenv("DELIN_HARNESS_GID") or "")
 local topPid = spawn(src, toolPath, nil, topUid, topGid, argv0, { cwd = "/" })
+-- tty 前台进程组 = 顶层那组(交互式 sh 会把自己那条进程组设成 tty 前台)。
+ttyForegroundIntr = function()
+    local pgid = procs[topPid] and procs[topPid].pgrp
+    for pid, p in pairs(procs) do
+        if p.pgrp == pgid then deliver(pid, 2) end
+    end
+end
 
 -- 运行协作式调度器, 驱动顶层进程及其 spawn 出的子进程(管道/作业控制)。
 schedulerRun()

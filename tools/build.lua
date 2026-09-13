@@ -418,6 +418,11 @@ local function check()
         end
         print("   OK " .. script)
     end
+    -- 2b) sh 交互式"提示符处 ^C": 宿主专用(测试台把 stdin 伪装成终端 + 注入中断键), 没有
+    --     "压缩 vs 原始"差分一说 —— 直接跑, 只看退出码。
+    print("-- check: sh 提示符 ^C(宿主) --")
+    run("sh_intr_test", "sh scripts/sh_intr_test.sh > /tmp/delin-chk-intr.log 2>&1")
+    print("   OK sh_intr_test.sh")
     -- 3) bundle 装载自检: hosttest 与镜像树都走**真实 require**, 看不见 bundle 自己的模块清单,
     --    于是"新加内核模块但忘了进 profile"这类问题能一路全绿到真机(静态门禁在 bundle.lua 里,
     --    这里做一次动态装载兜底)。需要 Lua 5.2+ —— bundle 用 _ENV 做模块隔离, 5.1 测出来是假象;

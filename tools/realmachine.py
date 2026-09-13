@@ -208,8 +208,12 @@ def main():
         df(out, "set_inode_field /root/verify.sh mode 0100755")
         unit = os.path.join(work, "verify.service")
         with open(unit, "w") as f:
+            # TimeoutStartSec 必须给足: 自检脚本一轮要跑近百个进程, 实测已经在默认的 60s 附近
+            # (Type=oneshot 在 systemd 里的默认本来就是 infinity; Delin 的引擎默认 60s)。
+            # 超时会被 init SIGKILL 掉, 表现成"verify.log 变了但没跑完"——那是**假失败**,
+            # 会让人以为是内核回归(本轮就误判过两轮)。
             f.write("[Unit]\nDescription=Real-machine verification\nAfter=syslogd.service\n\n"
-                    "[Service]\nType=oneshot\nExecStart=/bin/sh /root/verify.sh\n\n"
+                    "[Service]\nType=oneshot\nTimeoutStartSec=600\nExecStart=/bin/sh /root/verify.sh\n\n"
                     "[Install]\nWantedBy=multi-user.target\n")
         df_write(out, unit, "/lib/systemd/system/verify.service")
         df_mkdir(out, "/etc/systemd/system/multi-user.target.wants")
@@ -234,7 +238,7 @@ def main():
         unit_sh = os.path.join(work, "verify-sh.service")
         with open(unit_sh, "w") as f:
             f.write("[Unit]\nDescription=Real-machine sh builtin verification\nAfter=syslogd.service\n\n"
-                    "[Service]\nType=oneshot\nExecStart=/bin/sh /root/sh_verify.sh\n\n"
+                    "[Service]\nType=oneshot\nTimeoutStartSec=600\nExecStart=/bin/sh /root/sh_verify.sh\n\n"
                     "[Install]\nWantedBy=multi-user.target\n")
         df_write(out, unit_sh, "/lib/systemd/system/verify-sh.service")
         df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/verify-sh.service")
@@ -286,7 +290,7 @@ def main():
         unit_posix = os.path.join(work, "posix-verify.service")
         with open(unit_posix, "w") as f:
             f.write("[Unit]\nDescription=Real-machine POSIX tools verification\nAfter=syslogd.service\n\n"
-                    "[Service]\nType=oneshot\nExecStart=/bin/sh /root/posix_tools_verify.sh\n\n"
+                    "[Service]\nType=oneshot\nTimeoutStartSec=600\nExecStart=/bin/sh /root/posix_tools_verify.sh\n\n"
                     "[Install]\nWantedBy=multi-user.target\n")
         df_write(out, unit_posix, "/lib/systemd/system/posix-verify.service")
         df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/posix-verify.service")
@@ -295,6 +299,22 @@ def main():
         #      /dev/sdXN 的字节句柄没有 seek, dd seek= 在这种设备上明确报 cannot seek)。
         df_write(out, os.path.join(REPO, "scripts/ext2_corrupt.lua"), "/root/ext2_corrupt.lua")
         df(out, "set_inode_field /root/ext2_corrupt.lua mode 0100755")
+
+        # 3f4) 交互式 "提示符处 ^C" 载荷(scripts/intr_test.ko, 见它的头注释): 真机上只有内核态
+        #      能驱动行规程(进程连 os.queueEvent 都被 procenv 禁掉), 所以按键注入做成一个内核
+        #      模块 —— 它在调度器起来之前包住 os.pullEventRaw, 再用 tty.routeKey/tty.feedInput
+        #      喂按键(走 CC 事件队列的按键会被别的进程 os.sleep 里的过滤拉取吃掉, 实测过)。
+        #      模块由 /lib/modules/<版本>/manifest 点名装载, 所以 .ko 与 manifest 两样都要铺。
+        ver = re.search(r'^\s*return\s+"([^"]+)"', open(os.path.join(REPO, "src/kernel/version.lua")).read(), re.M).group(1)
+        moddir = "/lib/modules/" + ver
+        df_write(out, os.path.join(REPO, "scripts/intr_test.ko"), moddir + "/intrtest.ko")
+        cur_manifest = subprocess.run([DBG, "-R", "cat " + moddir + "/manifest", out],
+                                      capture_output=True, text=True).stdout
+        if "intrtest" not in cur_manifest.split():
+            mfile = os.path.join(work, "module-manifest")
+            with open(mfile, "w") as f:
+                f.write(cur_manifest.strip("\n") + "\nintrtest\n")
+            df_write(out, mfile, moddir + "/manifest")
 
         # 3g) 门禁: 注入后镜像仍必须干净, 不把坏镜像带上真机
         p = subprocess.run([FSCK, "-fn", out], capture_output=True, text=True)
@@ -522,6 +542,45 @@ def reboot_and_collect(printer=False):
     #    这是"Delin 自己写坏的"唯一权威判据, 有错就整体失败(exit != 0)。
     print("\n===== 停机后 fsck: /parts/root.img =====")
     shutdown_computer()
+
+    # 6a) 交互式 "提示符处 ^C" 门禁(载荷 = /lib/modules/<版本>/intrtest.ko, 见其头注释)。
+    #     机器已经停了, 从镜像里读三份证据, 缺一不可:
+    #       /tmp/intr.before 正对照 —— 注入器真的在提示符上按计划驱动了 tty(没有它就说明
+    #                        这轮根本没跑到那一步, "after 不存在"证明不了任何事);
+    #       /tmp/intr.notrun 负对照 —— 打了一半的那行必须没被执行(^C 真的被行规程吃掉了),
+    #                        否则"after 存在"可能只是 ^C 压根没生效;
+    #       /tmp/intr.after  回归判据 —— ^C 之后的第一条命令必须真的执行(修复前它刚 spawn
+    #                        就被残留的 SIGINT 杀掉, 这个文件不会出现)。
+    img = os.path.join(DISK, "parts/root.img")
+    def img_file(path):
+        if "Inode:" not in df(img, "stat " + path):
+            return None
+        # debugfs 的 banner 会混进 stdout(同上面对 scratch 镜像的写法): 只取第一行内容。
+        lines = df(img, "cat " + path).splitlines()
+        return lines[0].strip() if lines else None
+    print("\n===== 交互式 ^C 门禁(tty0 注入按键) =====")
+    # 载荷的进度走 klog(内核 ring -> syslogd), 落在 /var/log/messages*; 它**不能**用 kprint
+    # 打进度(那会同时画到控制台, 把会话搅乱, 见载荷头注释)。日志只作诊断打印 —— 一轮里
+    # logrotate 随时可能把 messages 转成 messages.1, 拿它当门禁会变成"看运气"。
+    for name in ("/var/log/messages", "/var/log/messages.1"):
+        for line in df(img, "cat " + name).splitlines():
+            if "[intrtest]" in line:
+                print("   | " + line.strip())
+    before = img_file("/tmp/intr.before")
+    notrun = img_file("/tmp/intr.notrun")
+    after = img_file("/tmp/intr.after")
+    if before != "INTR-BEFORE":
+        raise RuntimeError("交互式 ^C 正对照缺失: /tmp/intr.before=%r —— 注入器没能在提示符上执行命令"
+                           "(见上面打印的 [intrtest] 进度)" % before)
+    print("   ok positive control: /tmp/intr.before written")
+    if notrun is not None:
+        raise RuntimeError("交互式 ^C 负对照失败: /tmp/intr.notrun 存在 —— ^C 没有取消打了一半的那行")
+    print("   ok negative control: the half-typed line was cancelled")
+    if after != "INTR-AFTER":
+        raise RuntimeError("交互式 ^C 门禁失败: /tmp/intr.after=%r —— ^C 之后的第一条命令没有执行"
+                           "(残留的 SIGINT 把它杀了; 见 src/bin/sh 交互循环)" % after)
+    print("   ok regression: the command right after ^C ran")
+
     p = subprocess.run([FSCK, "-fn", os.path.join(DISK, "parts/root.img")], capture_output=True, text=True)
     out = (p.stdout + p.stderr).strip()
     print(out[-3000:] if out else "(no output)")

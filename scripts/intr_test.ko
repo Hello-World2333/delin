@@ -1,0 +1,169 @@
+--@name intrtest
+--@version 0.0.1
+--@deps
+--@description real-machine interactive ^C test payload (test image only, never shipped in dist/)
+--[[ Real-machine payload for the "prompt ^C" shell fix (computer #3 + disk 0).
+
+     tools/realmachine.py injects this file into the *test* root image as
+     /lib/modules/<version>/intrtest.ko and appends "intrtest" to that image's module manifest.
+     It is not part of dist/: nothing ships it to a user machine.
+
+     Why a kernel module: the line discipline (kernel/tty.lua) is what a real ^C goes through, and
+     the kernel is the only context that may drive it without going through the CC event queue.
+     Modules are loaded before the scheduler starts, so init() can wrap os.pullEventRaw -- the
+     scheduler pulls every single event through it -- and feed keys from inside that loop.
+
+     Why the keys are fed through tty.routeKey/tty.feedInput instead of os.queueEvent: measured on
+     the real machine, events queued with os.queueEvent never reach the line discipline (the tty's
+     feedInput counter stayed at 0 for 90s while the shell sat blocked at the prompt).  The reason
+     is CC's event queue: a filtered pull (os.pullEvent("timer"), which is what os.sleep -- and so
+     every process that sleeps, e.g. init's tick -- is built on) discards the queued events that do
+     not match its filter.  A real key survives that only because the kernel is already blocked in
+     an unfiltered pullEventRaw when the game dispatches it.  tty.routeKey/tty.feedInput are
+     exactly what the scheduler's routeEvent does with a real key event, so the line discipline,
+     the echoed ^C and the SIGINT to the tty foreground process group are all the real thing.
+
+     Platform guard: the payload only runs on a plain CC computer (kernel/platform.lua "cc").
+     The test image is also installed on other machines, and driving a login session there would
+     only waste their CPU (and those platforms are not what this test is about).
+
+     How it stays in sync without reading the screen: the tty line discipline buffers whole lines
+     even when no process is reading them, so the login lines and the first command can be queued
+     right away; after that the injector waits for the *effect* of each command (a file under /tmp,
+     through the same mounted root) instead of guessing from the display.  Syncing on the display
+     does not work here: kernel/user console writes go straight to the CC terminal and clobber the
+     tty's own cells (measured on the real machine -- the login prompt row was overwritten by
+     unrelated log output before it could ever be seen).
+
+     Sequence (login as root on tty0):
+       queue "root" + password + echo INTR-BEFORE > /tmp/intr.before
+       wait for /tmp/intr.before        positive control: the shell really ran a command
+       queue "echo INTR-NOTRUN > /tmp/intr.notrun" (no newline) + ^C
+         -> /tmp/intr.notrun must NOT exist: the ^C really cancelled a half-typed line
+       queue "echo INTR-AFTER > /tmp/intr.after"
+         -> the regression: this command must run (before the fix the SIGINT raised by the ^C
+            stayed pending in the shell and killed it the moment it spawned)
+     tools/realmachine.py asserts exactly that.  Progress goes to the kernel log through klog (not
+     kprint: kprint also draws on the console and would litter the session).
+
+     ASCII only: this file is copied onto the CC computer. ]]
+
+local PASSWORD = "12345678" -- root's password (README: the installer sets root/12345678)
+
+local function initModule()
+    local klog = require("kernel.klog")
+    local vfs_api = require("kernel.vfs_api")
+    local platform = require("kernel.platform")
+    local PRI = klog.makePri(klog.FACILITIES.kern, klog.SEVERITIES.info)
+    local function log(s) klog.write(PRI, "[intrtest] " .. s) end
+
+    local pkind = platform.detect()
+    if pkind ~= "cc" then
+        log("skip: platform=" .. tostring(pkind) .. " (payload only drives a plain CC computer)")
+        return
+    end
+
+    local tty = require("kernel.tty")
+    local focus = tty.getFocus()
+
+    -- Count how far the injection actually gets: when an injection fails, these two counters
+    -- separate "never reached the line discipline" from "reached it but nobody read it".
+    local fed, routed = 0, 0
+    local origFeed, origRoute = tty.feedInput, tty.routeKey
+    tty.feedInput = function(ev) fed = fed + 1; return origFeed(ev) end
+    tty.routeKey = function(ev) routed = routed + 1; return origRoute(ev) end
+
+    local function exists(path) return vfs_api.fs.exists(path) == true end
+
+    -- Wipe the previous boot's evidence first: the image is reused across boots, so a leftover
+    -- /tmp/intr.before would make the positive control true before the shell even exists and the
+    -- injector would press ^C early -- that tests something else entirely (a false green).
+    local stale = 0
+    for _, p in ipairs({ "/tmp/intr.before", "/tmp/intr.notrun", "/tmp/intr.after" }) do
+        if exists(p) then vfs_api.fs.delete(p); stale = stale + 1 end
+    end
+    log("cleared " .. stale .. " stale evidence file(s)")
+    local function state()
+        local c = tty.get(focus)
+        return string.format("focus=%s queue=%d buf=%d reading=%s fed=%d routed=%d",
+            tostring(focus), c and #c.lineQueue or -1, c and #c.inputBuffer or -1,
+            tostring(c and c.reading), fed, routed)
+    end
+
+    -- Feed keys/characters through the same two entry points the scheduler uses for real keys
+    -- (see the header: NOT through the CC event queue, where queued keys are eaten by the
+    -- filtered pulls inside other processes' os.sleep, and so never reach the tty).
+    local function send(s)
+        for i = 1, #s do tty.feedInput({ "char", s:sub(i, i) }) end
+    end
+    local function pressCtrlC()
+        tty.routeKey({ "key", keys.leftCtrl, false })
+        tty.routeKey({ "key", keys.c, false })
+        tty.routeKey({ "key_up", keys.c })
+        tty.routeKey({ "key_up", keys.leftCtrl })
+    end
+
+    local pull = os.pullEventRaw -- handed back when the payload finishes (see the wrapper below)
+    -- Phases: 1 = queue login + first command, wait for its file; 2 = ^C pressed, wait for the
+    -- second command's file; 3 = finished (os.pullEventRaw handed back).
+    local phase, phaseAt, queued, lastPoll = 1, os.epoch("utc"), false, 0
+    local function step()
+        local now = os.epoch("utc")
+        if phase == 1 then
+            if not queued then
+                log("queue login + first command (" .. state() .. ")")
+                send("root\n" .. PASSWORD .. "\necho INTR-BEFORE > /tmp/intr.before\n")
+                queued = true
+            elseif exists("/tmp/intr.before") then
+                log("positive control ok (" .. state() .. "), typing a line then ^C")
+                send("echo INTR-NOTRUN > /tmp/intr.notrun") -- no newline: this line must be dropped
+                pressCtrlC()
+                send("echo INTR-AFTER > /tmp/intr.after\n")
+                phase, phaseAt = 2, now
+                return
+            end
+        elseif phase == 2 then
+            if exists("/tmp/intr.after") then
+                log("sequence done (command after ^C ran); " .. state())
+                send("exit\n") -- log out: leave no root shell parked on tty0 for the self-checks
+                os.pullEventRaw = pull -- zero residual cost once the payload is done
+                phase = 3
+                return
+            end
+        else
+            return
+        end
+        if now - phaseAt > 90000 then
+            log("stuck in phase " .. phase .. " for 90s (" .. state() .. ", before="
+                .. tostring(exists("/tmp/intr.before")) .. ", notrun="
+                .. tostring(exists("/tmp/intr.notrun")) .. ", after="
+                .. tostring(exists("/tmp/intr.after")) .. "), giving up")
+            os.pullEventRaw = pull
+            phase = 3
+        end
+    end
+
+    -- Wrap the event pull only: the injector lives inside the scheduler's own event loop, so it
+    -- needs no extra coroutine or timer. Once a second is enough (a phase step does an ext2
+    -- lookup under /tmp); phase 3 hands os.pullEventRaw back to the kernel.
+    os.pullEventRaw = function(...)
+        if phase < 3 then
+            local now = os.epoch("utc")
+            if now - lastPoll < 1000 then return pull(...) end
+            lastPoll = now
+            -- An error here tears through the scheduler and the boot (pullEventRaw is the boot's
+            -- main path) and the only symptom is "the machine did not come up"; so turn the test
+            -- payload's own errors into a log line, making the failure visible.
+            local ok, err = pcall(step)
+            if not ok then
+                log("step error (injector stopped): " .. tostring(err))
+                os.pullEventRaw = pull
+                phase = 3
+            end
+        end
+        return pull(...)
+    end
+    log("armed (" .. state() .. ")")
+end
+
+return { init = initModule }
