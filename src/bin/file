@@ -89,9 +89,36 @@ local MAXSAMPLE = 5120
 local optBrief, optDeref, optMime, optMimeType, optMimeEnc = false, false, false, false, false
 local files = {}
 local noMoreOpts = false
+-- -f FILE(从文件读名字) / -0(NUL 结尾) / -k(出错继续) / -N(不对齐) / -F SEP(输出分隔符)
+local filesFrom, zeroOut, keepGoing, noPad, sepStr = nil, false, false, false, ":"
+-- -f 读进来的名字要在解析完选项之后再进 files 表
+local function loadFilesFrom()
+    if not filesFrom then return true end
+    local h
+    if filesFrom == "-" then h = io.stdin() else h, ferr = fs.open(resolve(filesFrom), "r") end
+    if not h then
+        stderr("file: cannot open `" .. filesFrom .. "' for reading\n")
+        return false
+    end
+    local content = h:readAll() or ""
+    if filesFrom ~= "-" then h:close() end
+    local pos = 1
+    while pos <= #content do
+        local at = content:find("\n", pos, true)
+        local nm
+        if at then nm = content:sub(pos, at - 1); pos = at + 1
+        else nm = content:sub(pos); pos = #content + 1 end
+        nm = nm:gsub("\r$", "")
+        if nm ~= "" then files[#files + 1] = nm end
+    end
+    return true
+end
 
 local function setShort(ch)
     if ch == "b" then optBrief = true
+    elseif ch == "0" then zeroOut = true
+    elseif ch == "k" then keepGoing = true
+    elseif ch == "N" then noPad = true
     elseif ch == "L" then optDeref = true
     elseif ch == "h" then optDeref = false
     elseif ch == "i" then optMime = true
@@ -99,7 +126,10 @@ local function setShort(ch)
     return true
 end
 
-for _, a in ipairs(args) do
+local ai = 0
+while ai < #args do
+    ai = ai + 1
+    local a = args[ai]
     if noMoreOpts then
         files[#files + 1] = a
     elseif a == "--" then
@@ -107,6 +137,21 @@ for _, a in ipairs(args) do
     elseif a == "--brief" then optBrief = true
     elseif a == "--dereference" then optDeref = true
     elseif a == "--no-dereference" then optDeref = false
+    elseif a == "-f" or a == "--files-from" then
+        ai = ai + 1
+        filesFrom = args[ai]
+        if not filesFrom then stderr("file: option '-f' requires an argument\n"); return 2 end
+    elseif a:match("^%-%-files%-from=") then
+        filesFrom = a:sub(13)
+    elseif a == "-0" or a == "--print0" then zeroOut = true
+    elseif a == "-k" or a == "--keep-going" then keepGoing = true
+    elseif a == "-N" or a == "--no-pad" then noPad = true
+    elseif a == "-F" or a == "--separator" then
+        ai = ai + 1
+        sepStr = args[ai]
+        if not sepStr then stderr("file: option '-F' requires an argument\n"); return 2 end
+    elseif a:match("^%-%-separator=") then
+        sepStr = a:sub(13)
     elseif a == "--mime" then optMime = true
     elseif a == "--mime-type" then optMimeType = true
     elseif a == "--mime-encoding" then optMimeEnc = true
@@ -118,8 +163,9 @@ for _, a in ipairs(args) do
         files[#files + 1] = a
     end
 end
+if not loadFilesFrom() then return 1 end
 if #files == 0 then
-    stderr("Usage: file [-bLhi] FILE...\n")
+    stderr("Usage: file [-bLhik0NF] FILE...\n")
     return 1
 end
 
@@ -567,12 +613,15 @@ for _, raw in ipairs(files) do
         elseif optMimeEnc then body = rec.menc
         elseif optMime then body = rec.mtype .. "; charset=" .. rec.menc
         else body = rec.desc end
+        -- -0: 每条以 NUL 结尾(配 xargs -0); -F/-N 只影响 "名字: 类型" 里的分隔符与对齐
+        local eol = zeroOut and "\0" or "\n"
         if optBrief then
-            io.write(body .. "\n")
+            io.write(body .. eol)
         else
-            io.write(name .. ": " .. body .. "\n")
+            io.write(name .. sepStr .. (noPad and "" or " ") .. body .. eol)
         end
     end
 end
 
-if failed then return 1 end
+if failed and not keepGoing then return 1 end
+if failed then return 0 end

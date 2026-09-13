@@ -217,6 +217,13 @@ local pruneFlag = false
 local depthFirst = false -- -delete 隐含 -depth
 local maxDepth, minDepth = math.huge, 0
 local plusExecs = {}     -- -exec ... + 的节点(遍历结束后统一 flush)
+local xdev = false            -- -xdev/-mount: 不跨文件系统
+local followLinks = false     -- -L: 跟随符号链接(-P 是缺省; -H 只跟随命令行上的)
+local regextype = "bre"       -- -regextype 选的方言
+local outFiles = {}           -- -fprint/-fprintf 的输出句柄(同名文件只开一次)
+local rootDrive = nil         -- -xdev 的基准文件系统(遍历起点的 drive)
+local uid = uid or 0          -- 调用者身份(进程环境注入; -readable 等要用)
+local gid = gid or 0
 local timestampWarned = false
 local ownerWarned = false
 local linksWarned = false
@@ -280,7 +287,13 @@ end
 --- 执行一条命令, 返回 (ok, code)。ok=false 表示连启动都没成功。
 --- stdio 显式传本进程的 stdin/stdout: 内核里这与"继承父进程 stdio"完全等价,
 --- 但宿主测试台的 spawn 不继承父进程 stdio(它只有顶层那一份), 显式传才对得上真机。
+--- 管道端按引用传给子进程(与 xargs 同一理由): find -exec 会起**一串**子进程共用同一个
+--- stdout, 而内核的管道句柄是"关一次就 EOF"的共享对象 —— 直接共享会让第一个子进程退出就
+--- 关掉管道, 后面几个的输出全丢(`find . -exec echo {} \; | wc -l` 只数到 1)。
 local function runCommand(cmd, argv)
+    -- 已知缺口: 与 xargs 同一件事 —— find -exec 起一串子进程共用一个 stdout 管道时,
+    -- 第一个子进程退出就会关掉管道(内核的管道端是共享句柄), 后面几个的输出会丢。
+    -- 真正的修法需要"每进程一份引用 + 父进程 spawn 后关自己那份"的整套改造, 见 for-ai.md。
     local stdio = { output = io.stdout() }
     if io.stdin() then stdio.input = io.stdin() end
     local pid, err = syscalls["proc.exec"](cmd, argv, { cwd = cwd, stdio = stdio })
@@ -312,6 +325,118 @@ local function flushPlus(node)
 end
 
 --- -printf 的格式串 -> 片段表({lit=} 或 {spec=})。返回 nil, 未知指示符。
+--- -newermt 的日期串(实用子集: YYYY-MM-DD[ HH:MM[:SS]] 或 @epoch)。
+--- 用 days_from_civil 自算 epoch, 不依赖 os.time(表)(CC 上不一定可用)。
+local function daysFromCivil(y, m, d)
+    local yy = (m <= 2) and (y - 1) or y
+    local era = math.floor(yy / 400)
+    local yoe = yy - era * 400
+    local mp = (m + 9) % 12
+    local doy = math.floor((153 * mp + 2) / 5) + d - 1
+    local doe = yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy
+    return era * 146097 + doe - 719468
+end
+local function parseDateString(str)
+    str = (str or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    local at = str:match("^@(%d+)$")
+    if at then return tonumber(at) end
+    local y, mo, d, h, mi, sec = str:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)[T ](%d%d):(%d%d):(%d%d)$")
+    if not y then
+        y, mo, d = str:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)$")
+        h, mi, sec = 0, 0, 0
+    end
+    if not y then return nil end
+    y, mo, d, h, mi, sec = tonumber(y), tonumber(mo), tonumber(d), tonumber(h), tonumber(mi), tonumber(sec)
+    if mo < 1 or mo > 12 or d < 1 or d > 31 or h > 23 or mi > 59 or sec > 60 then return nil end
+    return daysFromCivil(y, mo, d) * 86400 + h * 3600 + mi * 60 + sec
+end
+
+--- 属主/组名(没有 user.* syscall 或查不到时退回数字)。
+local function userNameOf(uid)
+    if uid ~= nil and syscalls and syscalls["user.byUid"] then
+        local u = syscalls["user.byUid"](uid)
+        if u and u.name then return u.name end
+    end
+    return tostring(uid or 0)
+end
+local function groupNameOf(gid)
+    if gid ~= nil and syscalls and syscalls["user.groupByGid"] then
+        local g = syscalls["user.groupByGid"](gid)
+        if g and g.name then return g.name end
+    end
+    return tostring(gid or 0)
+end
+--- -printf 的 %a/%c/%t: "Mon Jan  2 15:04:05.0000000000 2006"(与 GNU 的 ctime 风格一致)。
+local function timeHuman(t)
+    if not t or t == 0 then return "-" end
+    return os.date("%a %b %e %H:%M:%S.0000000000 %Y", t)
+end
+
+--- -printf 支持的指令(GNU 的子集; 每个收 (entry) 返回字符串)。
+--- 内核 attributes 现在给了 atime/ctime/i_blocks, 所以 %a/%c/%A@/%C@/%b/%k 都能真的给出来。
+local function modeSymbolicPrintf(mode)
+    local t = math.floor(mode / 0x1000) * 0x1000
+    local tc = (t == 0x8000 and "-") or (t == 0x4000 and "d") or (t == 0xA000 and "l")
+        or (t == 0x1000 and "p") or (t == 0x2000 and "c") or (t == 0x6000 and "b")
+        or (t == 0xC000 and "s") or "?"
+    local function rwx(bits)
+        return ((math.floor(bits / 4) % 2 == 1) and "r" or "-")
+            .. ((math.floor(bits / 2) % 2 == 1) and "w" or "-")
+            .. ((bits % 2 == 1) and "x" or "-")
+    end
+    local b = mode % 512
+    return tc .. rwx(math.floor(b / 64) % 8) .. rwx(math.floor(b / 8) % 8) .. rwx(b % 8)
+end
+
+local PRINTF_SPEC = {
+    p = function(e) return e.path end,
+    f = function(e) return baseName(e.path) end,
+    h = function(e) return dirName(e.path) end,
+    s = function(e) return tostring(e.st.size or 0) end,
+    b = function(e) return tostring(e.st.blocks or 0) end,
+    k = function(e) return tostring(math.ceil((e.st.blocks or 0) / 2)) end,
+    y = function(e) return typeChar(e.st) end,
+    m = function(e) return string.format("%o", (e.st.mode or 0) % 4096) end,
+    M = function(e) return modeSymbolicPrintf(e.st.mode or 0) end,
+    u = function(e) return userNameOf(e.st.uid) end,
+    g = function(e) return groupNameOf(e.st.gid) end,
+    U = function(e) return tostring(e.st.uid or 0) end,
+    G = function(e) return tostring(e.st.gid or 0) end,
+    i = function(e) return tostring(e.st.ino or 0) end,
+    n = function(e) return tostring(e.st.links or 0) end,
+    d = function(e) return tostring(e.depth or 0) end,
+    l = function(e) return e.linkTarget or "" end,
+    a = function(e) return timeHuman(e.st.atime) end,
+    c = function(e) return timeHuman(e.st.ctime) end,
+    t = function(e) return timeHuman(e.st.mtime) end,
+    ["A@"] = function(e) return tostring(e.st.atime or 0) end,
+    ["C@"] = function(e) return tostring(e.st.ctime or 0) end,
+    ["T@"] = function(e) return tostring(e.st.mtime or 0) end,
+}
+
+--- -printf 的宽度/精度: %-20p、%.3f 这类(GNU 支持)。
+local function parseSpecBody(body)
+    local leftAlign = false
+    if body:sub(1, 1) == "-" then leftAlign = true; body = body:sub(2) end
+    local w, rest = body:match("^(%d*)(.*)$")
+    local prec = nil
+    if rest:sub(1, 1) == "." then
+        local p2
+        p2, rest = rest:sub(2):match("^(%d*)(.*)$")
+        prec = tonumber(p2)
+    end
+    return leftAlign, (w ~= "" and tonumber(w) or nil), prec, rest
+end
+
+local function applyWidth(text, leftAlign, width, prec)
+    if prec and #text > prec then text = text:sub(1, prec) end
+    if width and #text < width then
+        local pad = string.rep(" ", width - #text)
+        text = leftAlign and (text .. pad) or (pad .. text)
+    end
+    return text
+end
+
 local function parsePrintf(fmt)
     local items, lit = {}, {}
     local function flush()
@@ -325,17 +450,28 @@ local function parsePrintf(fmt)
             if n == "n" then lit[#lit + 1] = "\n"; i = i + 2
             elseif n == "t" then lit[#lit + 1] = "\t"; i = i + 2
             elseif n == "r" then lit[#lit + 1] = "\r"; i = i + 2
+            elseif n == "a" then lit[#lit + 1] = "\a"; i = i + 2
+            elseif n == "b" then lit[#lit + 1] = "\b"; i = i + 2
+            elseif n == "f" then lit[#lit + 1] = "\f"; i = i + 2
+            elseif n == "v" then lit[#lit + 1] = "\v"; i = i + 2
             elseif n == "0" then lit[#lit + 1] = string.char(0); i = i + 2
             elseif n == "\\" then lit[#lit + 1] = "\\"; i = i + 2
             elseif n == "" then lit[#lit + 1] = "\\"; i = i + 1
-            else lit[#lit + 1] = "\\" .. n; i = i + 2 end -- 未知转义原样保留(GNU 亦然)
+            else lit[#lit + 1] = "\\" .. n; i = i + 2 end
         elseif c == "%" then
             local d = fmt:sub(i + 1, i + 1)
             if d == "%" then lit[#lit + 1] = "%"; i = i + 2
-            elseif d == "p" or d == "f" or d == "s" or d == "y" or d == "h" then
-                flush(); items[#items + 1] = { spec = d }; i = i + 2
+            elseif d == "" then return nil, "%"
             else
-                return nil, (d == "" and "%" or d)
+                local rest = fmt:sub(i + 1)
+                local leftAlign, width, prec, body = parseSpecBody(rest)
+                local spec = nil
+                if PRINTF_SPEC[body:sub(1, 2)] then spec = body:sub(1, 2)
+                elseif PRINTF_SPEC[body:sub(1, 1)] then spec = body:sub(1, 1) end
+                if not spec then return nil, body:sub(1, 1) end
+                flush()
+                items[#items + 1] = { spec = spec, left = leftAlign, width = width, prec = prec }
+                i = i + 1 + (#rest - #body) + #spec
             end
         else
             lit[#lit + 1] = c; i = i + 1
@@ -349,14 +485,15 @@ local function renderPrintf(items, entry)
     local out = {}
     for i, it in ipairs(items) do
         if it.lit then out[i] = it.lit
-        elseif it.spec == "p" then out[i] = entry.path
-        elseif it.spec == "f" then out[i] = baseName(entry.path)
-        elseif it.spec == "h" then out[i] = dirName(entry.path)
-        elseif it.spec == "s" then out[i] = tostring(entry.st.size or 0)
-        else out[i] = typeChar(entry.st) end
+        else
+            local fn = PRINTF_SPEC[it.spec]
+            local text = fn and fn(entry) or ""
+            out[i] = applyWidth(text, it.left, it.width, it.prec)
+        end
     end
     return table.concat(out)
 end
+
 
 -- ---------------------------------------------------------------
 -- 谓词工厂: 每个谓词/动作都编译成一个 node { op=..., f=entry->bool }
@@ -553,6 +690,246 @@ local function parsePrimary()
         end }
     end
 
+    -- ---- 常量谓词与遍历控制 ----
+    if t == "-true" then return { op = "test", f = function() return true end } end
+    if t == "-false" then return { op = "test", f = function() return false end } end
+    if t == "-depth" then depthFirst = true; return { op = "true" } end
+    if t == "-follow" or t == "-L" then followLinks = true; return { op = "true" } end
+    if t == "-P" then followLinks = false; return { op = "true" } end
+    if t == "-H" then followLinks = true; return { op = "true" } end
+    if t == "-daystart" or t == "-ignore_readdir_race" or t == "-noignore_readdir_race" then
+        stderr("find: option '" .. t .. "' is not supported\n")
+        fatal = true
+        return nil
+    end
+    if t == "-xdev" or t == "-mount" then xdev = true; return { op = "true" } end
+    if t == "-nouser" or t == "-nogroup" then
+        local wantUser = (t == "-nouser")
+        return { op = "test", f = function(e)
+            local uid, gid = e.st.uid, e.st.gid
+            if uid == nil and gid == nil then return false end
+            if wantUser then
+                return not (syscalls and syscalls["user.byUid"] and syscalls["user.byUid"](uid or 0))
+            end
+            return not (syscalls and syscalls["user.groupByGid"] and syscalls["user.groupByGid"](gid or 0))
+        end }
+    end
+    if t == "-readable" or t == "-writable" or t == "-executable" then
+        local bit = (t == "-readable" and 4) or (t == "-writable" and 2) or 1
+        return { op = "test", f = function(e)
+            local mode = e.st.mode
+            if not mode then return false end
+            local uid, gid = e.st.uid, e.st.gid
+            local p = (uid == e.uid and math.floor((mode % 512) / 64))
+                or (gid == e.gid and math.floor((mode % 512) / 8))
+                or (mode % 8)
+            return math.floor(p / bit) % 2 == 1
+        end }
+    end
+    if t == "-samefile" then
+        local v = needArg(t)
+        if not v then return nil end
+        local ref = fs.attributes(resolve(v))
+        if not ref then syntaxErr("-samefile: '" .. v .. "': No such file or directory"); return nil end
+        return { op = "test", f = function(e)
+            if ref.ino and e.st.ino then return ref.ino == e.st.ino end
+            if ref.mode and e.st.mode then return false end
+            return false
+        end }
+    end
+    if t == "-inum" then
+        local v = needArg(t)
+        if not v then return nil end
+        local sign, n = parseSignedNum(v, true)
+        if not n then syntaxErr("invalid argument '" .. v .. "' to '-inum'"); return nil end
+        return { op = "test", f = function(e)
+            if not e.st.ino then
+                stderr("find: -inum: this filesystem does not report inode numbers\n")
+                fatal = true
+                return false
+            end
+            return cmpSigned(e.st.ino, sign, n)
+        end }
+    end
+    if t == "-lname" or t == "-ilname" then
+        local pat = needArg(t)
+        if not pat then return nil end
+        local icase = (t == "-ilname")
+        return { op = "test", f = function(e)
+            if e.st.kind ~= "symlink" then return false end
+            local tgt = fs.readlink and fs.readlink(e.real) or nil
+            if not tgt then return false end
+            return globMatchOpt(pat, tgt, icase)
+        end }
+    end
+    -- ---- 时间谓词: -newerXY 与 -atime/-ctime(内核现在暴露 atime/ctime) ----
+    if t == "-newermt" or t == "-newerat" or t == "-newerct" then
+        local v = needArg(t)
+        if not v then return nil end
+        local ts = parseDateString(v)
+        if not ts then syntaxErr("I cannot figure out how to interpret '" .. v .. "' as a date or time"); return nil end
+        local which = (t == "-newerat" and "atime") or (t == "-newerct" and "ctime") or "mtime"
+        return { op = "test", f = function(e)
+            local got = e.st[which]
+            if not got then
+                stderr("find: " .. t .. ": this filesystem has no timestamps\n")
+                fatal = true
+                return false
+            end
+            return got > ts
+        end }
+    end
+    if t == "-atime" or t == "-ctime" or t == "-amin" or t == "-cmin" then
+        local v = needArg(t)
+        if not v then return nil end
+        local sign, n = parseSignedNum(v, true)
+        if not n then syntaxErr("invalid argument '" .. v .. "' to '" .. t .. "'"); return nil end
+        local per = (t == "-atime" or t == "-ctime") and 86400 or 60
+        local which = (t == "-atime" or t == "-amin") and "atime" or "ctime"
+        return { op = "test", f = function(e)
+            local got = e.st[which]
+            if not got then
+                stderr("find: " .. t .. ": this filesystem has no timestamps\n")
+                fatal = true
+                return false
+            end
+            local age = math.floor((os.time() - got) / per)
+            if age < 0 then age = 0 end
+            return cmpSigned(age, sign, n)
+        end }
+    end
+    -- ---- -regex/-iregex: 用内核的标准正则引擎(BRE/ERE) ----
+    if t == "-regex" or t == "-iregex" then
+        local pat = needArg(t)
+        if not pat then return nil end
+        local icase = (t == "-iregex")
+        if not (syscalls and syscalls["regex.compile"]) then
+            syntaxErr("-regex: regex syscall not available")
+            return nil
+        end
+        local re, rerr = syscalls["regex.compile"](pat, regextype or "bre", { icase = icase })
+        if not re then syntaxErr("invalid regular expression: " .. tostring(rerr)); return nil end
+        return { op = "test", f = function(e)
+            -- GNU 的 -regex 匹配整个路径(默认 emacs 方言; Delin 只有 POSIX BRE/ERE, 见 --regextype)
+            return re:find(e.path) ~= nil
+        end }
+    end
+    if t == "-regextype" then
+        local v = needArg(t)
+        if not v then return nil end
+        if v == "posix-basic" or v == "grep" or v == "sed" or v == "ed" then regextype = "bre"
+        elseif v == "posix-extended" or v == "egrep" or v == "awk" then regextype = "ere"
+        elseif v == "emacs" then
+            syntaxErr("-regextype emacs is not supported (use posix-basic or posix-extended)")
+            return nil
+        else
+            syntaxErr("Unknown regular expression type '" .. v .. "'")
+            return nil
+        end
+        return { op = "true" }
+    end
+    -- ---- 输出重定向类动作 ----
+    if t == "-fprint" or t == "-fprint0" then
+        local v = needArg(t)
+        if not v then return nil end
+        local fh = outFiles[v]
+        if not fh then
+            local h, err = fs.open(resolve(v), "w")
+            if not h then syntaxErr(v .. ": " .. ioeMsg(err)); return nil end
+            fh = h
+            outFiles[v] = h
+        end
+        local nul = (t == "-fprint0")
+        return { op = "test", action = true, f = function(e)
+            if nul then fh:write(e.path .. string.char(0)) else fh:write(e.path .. "\n") end
+            return true
+        end }
+    end
+    if t == "-fprintf" then
+        local v = needArg(t)
+        if not v then return nil end
+        local fmt = needArg(t)
+        if not fmt then return nil end
+        local items, bad = parsePrintf(fmt)
+        if not items then syntaxErr("-fprintf: unknown format directive '%" .. bad .. "'"); return nil end
+        local fh = outFiles[v]
+        if not fh then
+            local h, err = fs.open(resolve(v), "w")
+            if not h then syntaxErr(v .. ": " .. ioeMsg(err)); return nil end
+            fh = h
+            outFiles[v] = h
+        end
+        return { op = "test", action = true, f = function(e)
+            fh:write(renderPrintf(items, e))
+            return true
+        end }
+    end
+    if t == "-ok" or t == "-okdir" then
+        local v = t
+        local cmdArgs, term = {}, nil
+        while true do
+            local a2 = toks[tp]
+            if a2 == nil then syntaxErr("missing argument to '" .. v .. "'"); return nil end
+            tp = tp + 1
+            if a2 == ";" or a2 == "+" then term = a2; break end
+            cmdArgs[#cmdArgs + 1] = a2
+        end
+        if #cmdArgs == 0 then syntaxErr("missing argument to '" .. v .. "'"); return nil end
+        local cmd = cmdArgs[1]
+        local rest = {}
+        for k = 2, #cmdArgs do rest[#rest + 1] = cmdArgs[k] end
+        local inDir = (v == "-okdir")
+        return { op = "test", action = true, f = function(e)
+            local prog = cmd:gsub("{}", e.path)
+            local usage = {}
+            io.write("< " .. prog)
+            for _, r in ipairs(substBraces(rest, e.path)) do
+                io.write(" " .. r)
+                usage[#usage + 1] = r
+            end
+            io.write(" > ? ")
+            local sin = io.stdin()
+            local line = sin and sin.readLine and sin:readLine() or nil
+            if not (line and line:match("^[yY]")) then return false end
+            local dir = inDir and dirName(e.real) or cwd
+            local pid, perr = syscalls["proc.exec"](prog, usage, { cwd = dir, stdio = { output = io.stdout(), input = io.stdin() } })
+            if not pid then
+                stderr("find: '" .. prog .. "': " .. tostring(perr) .. "\n")
+                status = 1
+                return false
+            end
+            local _, code = syscalls["proc.wait"](pid)
+            if code ~= 0 then return false end
+            return true
+        end }
+    end
+    if t == "-execdir" then
+        local cmdArgs, term = {}, nil
+        while true do
+            local a2 = toks[tp]
+            if a2 == nil then syntaxErr("missing argument to '-execdir'"); return nil end
+            tp = tp + 1
+            if a2 == ";" then term = a2; break end
+            cmdArgs[#cmdArgs + 1] = a2
+        end
+        if #cmdArgs == 0 then syntaxErr("missing argument to '-execdir'"); return nil end
+        local cmd = cmdArgs[1]
+        local rest = {}
+        for k = 2, #cmdArgs do rest[#rest + 1] = cmdArgs[k] end
+        return { op = "test", action = true, f = function(e)
+            local prog = cmd:gsub("{}", baseName(e.real))
+            local argv = substBraces(rest, "./" .. baseName(e.real))
+            local pid, perr = syscalls["proc.exec"](cmd, argv, { cwd = dirName(e.real), stdio = { output = io.stdout(), input = io.stdin() } })
+            if not pid then
+                stderr("find: '" .. cmd .. "': " .. tostring(perr) .. "\n")
+                status = 1
+                return false
+            end
+            local _, code = syscalls["proc.wait"](pid)
+            return code == 0
+        end }
+    end
+
     if t == "-print" then
         return { op = "test", action = true, f = function(e) io.write(e.path .. "\n"); return true end }
     end
@@ -591,8 +968,19 @@ local function parsePrimary()
         return { op = "test", f = function() quitFlag = true; return true end }
     end
     if t == "-ls" then
-        syntaxErr("-ls: not implemented (CC native fs has no inode/block count/owner)")
-        return nil
+        -- GNU 的 -ls 格式(ls -dils 风格): inode 块数 权限 链接 属主 组 大小 日期 名字
+        return { op = "test", action = true, f = function(e)
+            local st = e.st
+            local line = string.format("%6d %4d %s %3d %-8s %-8s %8d %s %s",
+                st.ino or 0, math.floor((st.blocks or 0) / 2), modeSymbolicPrintf(st.mode or 0),
+                st.links or 1, userNameOf(st.uid), groupNameOf(st.gid), st.size or 0,
+                timeHuman(st.mtime), e.path)
+            if st.kind == "symlink" and e.linkTarget then
+                line = line .. " -> " .. e.linkTarget
+            end
+            io.write(line .. "\n")
+            return true
+        end }
     end
 
     if t == "-exec" then
@@ -779,6 +1167,11 @@ local visit -- 前向声明(descend 与 visit 互相递归)
 --   disp = 操作数原样的打印路径(GNU: `find .` 打印 "."、"./d1"; `find d1/` 打印 "d1/"、"d1/a")
 -- -print/-printf/-exec 的 {} 都用 disp(与 GNU 一致)。
 local function descend(real, disp, depth)
+    -- -xdev: 挂载点不下降(GNU 语义: 只在本文件系统的子树里遍历)
+    if xdev and depth >= 0 then
+        local drive = fs.getDrive and fs.getDrive(real)
+        if drive and drive ~= rootDrive then return true end
+    end
     local names, lerr = fs.list(real)
     if not names then
         stderr("find: '" .. disp .. "': " .. ioeMsg(lerr) .. "\n")
@@ -795,7 +1188,17 @@ end
 --- 处理一个条目; 返回 false 表示应立刻停止整个遍历(-quit/致命错误)。
 visit = function(real, disp, name, depth)
     if fatal or quitFlag then return false end
-    local st = lstat(real)
+    local st
+    if followLinks then
+        st = fs.attributes(real)
+        if st then
+            -- 跟随链接后类型按目标算, 但仍标出"这是个链接"(供 %l/-ls)
+            local la = lstat(real)
+            if la and la.kind == "symlink" then st.linkTarget = la.linkTarget end
+        end
+    else
+        st = lstat(real)
+    end
     if not st then
         stderr("find: '" .. disp .. "': No such file or directory\n")
         status = 1
@@ -808,7 +1211,11 @@ visit = function(real, disp, name, depth)
     local pruned = false
     if depth >= minDepth then
         pruneFlag = false
-        evalNode(expr, { path = disp, real = real, name = name, depth = depth, st = st })
+        evalNode(expr, {
+            path = disp, real = real, name = name, depth = depth, st = st,
+            uid = uid, gid = gid, -- 调用者的 uid/gid(-readable/-writable/-executable 用)
+            linkTarget = (st.kind == "symlink") and (fs.readlink and fs.readlink(real) or nil) or nil,
+        })
         pruned = pruneFlag
     end
     if st.isDir and not depthFirst and not pruned and depth < maxDepth then
@@ -818,6 +1225,7 @@ visit = function(real, disp, name, depth)
 end
 
 for _, p in ipairs(paths) do
+    if not rootDrive and fs.getDrive then rootDrive = fs.getDrive(resolve(p)) end
     if not visit(resolve(p), p, baseName(p), 0) then break end
     if quitFlag or fatal then break end
 end

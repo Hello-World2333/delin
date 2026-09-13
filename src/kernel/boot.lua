@@ -269,6 +269,24 @@ local function registerConsole()
         writable = true,
         open = function(mode) return tty.open(ttyName, mode) end,
     })
+    -- /dev/tty = 调用者**自己的**控制终端(与 Linux 的 /dev/tty 同义)。
+    -- 它不是一个真实设备, 而是"打开时现查调用进程的 tty": 没有控制终端(如服务里的
+    -- 无终端进程)就报错 —— 与 Linux 的 ENXIO 一致。xargs -o 就是靠它把子进程的 stdin
+    -- 重新接到终端上。
+    vfs_api.registerDevice("tty", {
+        writable = true,
+        open = function(mode)
+            local proc = require("kernel.process")
+            local cur = proc and proc.current and proc.current()
+            -- process.ttyFor 给的是会话的控制终端名(如 "/dev/tty0"); 统一成 "tty0"
+            local own = cur and proc.ttyFor(cur.pid) or nil
+            if own then own = own:match("([^/]+)$") end
+            if not own or own == "" then
+                return nil, "/dev/tty: no controlling terminal"
+            end
+            return tty.open(own, mode)
+        end,
+    })
     kprint("console tty registered -> " .. ttyName .. " (/dev/console alias)")
 end
 

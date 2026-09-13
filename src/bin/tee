@@ -34,6 +34,8 @@ local function yieldCheck(_n)
 end
 
 local args = args or {}
+-- -p = --output-error=warn-nopipe: 目标管道被对端关掉(broken pipe)时不算错误。
+local optWarnNopipe = false
 local cwd = (type(cwd) == "string" and cwd) or "/"
 local function resolve(p)
     p = p or ""
@@ -77,11 +79,21 @@ for _, a in ipairs(args) do
         noMoreOpts = true
     elseif a == "-a" or a == "--append" then optAppend = true
     elseif a == "-i" or a == "--ignore-interrupts" then optIgnoreInt = true
+    elseif a == "-p" then optWarnNopipe = true
+    elseif a:match("^%-%-output%-error") then
+        local m = a:match("^%-%-output%-error=(.*)$") or "warn-nopipe"
+        if m == "warn-nopipe" then optWarnNopipe = true
+        else
+            -- warn/exit/exit-nopipe 的"立即退出"语义 Delin 不实现 -> fail-fast
+            stderr("tee: option '--output-error=" .. m .. "' is not supported\n")
+            return 2
+        end
     elseif a:sub(1, 1) == "-" and a ~= "-" then
         for k = 2, #a do
             local ch = a:sub(k, k)
             if ch == "a" then optAppend = true
             elseif ch == "i" then optIgnoreInt = true
+            elseif ch == "p" then optWarnNopipe = true
             else stderr("tee: invalid option -- '" .. ch .. "'\n"); return 1 end
         end
     else
@@ -161,8 +173,12 @@ while true do
         if not ok then
             -- 对端已关(内核管道写端返回 "broken pipe"): 只报一次, 之后不再写 stdout,
             -- 但 FILE 照常继续写(POSIX 允许, 退出码非 0)。
-            stderr("tee: standard output: " .. tostring(err or "write failed") .. "\n")
-            status = 1
+            -- -p/--output-error=warn-nopipe: "管道被对端关掉"这一类**不算错误**, 连诊断都不打。
+            local isPipeErr = tostring(err or ""):find("broken pipe") ~= nil
+            if not (optWarnNopipe and isPipeErr) then
+                stderr("tee: standard output: " .. tostring(err or "write failed") .. "\n")
+                status = 1
+            end
             stdoutDead = true
         end
     end

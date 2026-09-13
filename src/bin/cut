@@ -142,6 +142,7 @@ while i <= #args do
         if not args[i] then stderr("cut: option '--delimiter' requires an argument\n"); return 1 end
         if not setDelim(args[i]) then return 1 end
     elseif a:match("^%-%-output%-delimiter=") then outDelim = a:sub(20)
+    elseif a == "--zero-terminated" then zeroTerm = true
     elseif a == "--output-delimiter" then
         i = i + 1
         if not args[i] then stderr("cut: option '--output-delimiter' requires an argument\n"); return 1 end
@@ -156,6 +157,7 @@ while i <= #args do
             local ch = a:sub(k, k)
             if ch == "s" then onlyDelim = true; k = k + 1
             elseif ch == "n" then k = k + 1
+            elseif ch == "z" then zeroTerm = true; k = k + 1
             elseif ch == "b" or ch == "c" or ch == "f" then
                 local val = a:sub(k + 1)
                 if val == "" then
@@ -251,6 +253,35 @@ local function processLine(line)
     return render(segs)
 end
 
+-- -z: 记录以 NUL 而不是换行分隔。readLine 拿不到 NUL 记录, 得整读再切。
+local zeroTerm = false
+local sep = zeroTerm and "\0" or "\n"
+
+local function recordsOf(h)
+    if not zeroTerm then
+        local out = {}
+        while true do
+            local l = h:readLine()
+            if l == nil then break end
+            out[#out + 1] = l
+        end
+        return out
+    end
+    local content = h:readAll() or ""
+    local out = {}
+    local pos = 1
+    while true do
+        local at = content:find("\0", pos, true)
+        if not at then
+            if pos <= #content then out[#out + 1] = content:sub(pos) end
+            break
+        end
+        out[#out + 1] = content:sub(pos, at - 1)
+        pos = at + 1
+    end
+    return out
+end
+
 local buf = {}
 local function flush()
     if #buf > 0 then io.write(table.concat(buf)); buf = {} end
@@ -269,11 +300,9 @@ for _, f in ipairs(files) do
             return 1
         end
     end
-    while true do
-        local line = h:readLine()
-        if line == nil then break end
+    for _, line in ipairs(recordsOf(h)) do
         local res = processLine(line)
-        if res ~= nil then buf[#buf + 1] = res .. "\n" end
+        if res ~= nil then buf[#buf + 1] = res .. sep end
         if #buf >= 512 then flush() end
     end
     if f ~= "-" then h:close() end

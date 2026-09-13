@@ -58,6 +58,12 @@ local function makeWriteEnd(buf)
             if not closed then closed = true; buf.writers = buf.writers - 1 end
             return true
         end,
+        --- 再要一份**独立**的写端引用(POSIX 的 dup/继承语义)。
+        --- 关键: 句柄对象里的 closed 是"这一份引用"的状态, 不能共享 ——
+        --- 曾经 xargs 起多个子进程共享父进程那一个写端对象, 第一个子进程退出就把
+        --- 对象标成 closed 并把 writers 减到 0, 于是后面几个子进程的输出**全丢**
+        --- (真机症状: `printf 'a:b:c' | xargs -d: -n1 echo | wc -l` 只数到 1)。
+        ref = function() return makeWriteEnd(buf) end,
     }
     return h
 end
@@ -112,6 +118,8 @@ local function makeReadEnd(buf)
             local all = table.concat(acc)
             return all ~= "" and all or nil
         end,
+        --- 再要一份独立的读端引用(同 write 端)。
+        ref = function() return makeReadEnd(buf) end,
         close = function()
             if not closed then closed = true; buf.readers = buf.readers - 1 end
             return true

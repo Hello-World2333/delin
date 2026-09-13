@@ -70,6 +70,11 @@ end
 local sig = 15
 local optE, optQ, optUser = false, false, nil
 local names = {}
+-- psmisc 的 -e/--exact 是"名字要完全一致"(Delin 本来就按 comm 全等比较, 所以它天然成立);
+-- **-v/--verbose 才是"报告每个被杀掉的进程"** —— 老代码把 -e 当成了 -v, 语义错位。
+local optVerbose, optInteractive, optWait, optIcase = false, false, false, false
+local optRegexp, optPgroup = false, false
+local optExact = false
 
 local i = 1
 while i <= #args do
@@ -79,7 +84,17 @@ while i <= #args do
         break
     elseif a:sub(1, 2) == "--" then
         local name, val = a:match("^%-%-([%w-]+)=?(.*)$")
-        if name == "signal" then
+        if name == "verbose" then optVerbose = true
+        elseif name == "interactive" then optInteractive = true
+        elseif name == "wait" then optWait = true
+        elseif name == "ignore-case" then optIcase = true
+        elseif name == "regexp" then optRegexp = true
+        elseif name == "exact" then optExact = true
+        elseif name == "process-group" then optPgroup = true
+        elseif name == "older-than" or name == "younger-than" then
+            stderr("killall: option '--" .. name .. "' is not supported (no process start time)\n")
+            return 2
+        elseif name == "signal" then
             if val == "" then i = i + 1; val = args[i] end
             if not val then stderr("killall: option '--signal' requires an argument\n"); return 2 end
             sig = resolveSignal(val)
@@ -92,7 +107,13 @@ while i <= #args do
         local j = 2
         while j <= #a do
             local c = a:sub(j, j)
-            if c == "e" then optE = true
+            if c == "e" then optE, optExact = true, true
+            elseif c == "v" then optVerbose = true
+            elseif c == "i" then optInteractive = true
+            elseif c == "w" then optWait = true
+            elseif c == "I" then optIcase = true
+            elseif c == "r" then optRegexp = true
+            elseif c == "g" then optPgroup = true
             elseif c == "q" then optQ = true
             elseif c == "l" then
                 local t = {}
@@ -131,34 +152,84 @@ while i <= #args do
     i = i + 1
 end
 
-if #names == 0 then stderr("usage: killall [-SIGNAL] [-e] [-q] [-u user] name...\n"); return 2 end
+if #names == 0 then stderr("usage: killall [-SIGNAL] [-v] [-i] [-w] [-I] [-r] [-g] [-q] [-u user] name...\n"); return 2 end
 
 local self = selfPid()
 local procs = candidates()
 local outcome = 0
+local killedPids = {}
+
+--- -r: 名字按 ERE 匹配(procps/psmisc 的 --regexp); 缺省是完全相等。
+local function nameMatches(comm, name)
+    if optRegexp then
+        local re = syscalls["regex.compile"](name, "ere", { icase = optIcase })
+        if not re then
+            stderr("killall: invalid regular expression: " .. tostring(name) .. "\n")
+            outcome = 2
+            return false
+        end
+        return re:find(comm) ~= nil
+    end
+    if optIcase then return comm:lower() == name:lower() end
+    return comm == name
+end
+
 for _, name in ipairs(names) do
-    local sent = 0
+    local sent, found = 0, 0
     for _, p in ipairs(procs) do
-        if p.pid ~= self and p.comm == name then
+        if p.pid ~= self and nameMatches(p.comm, name) then
             local uidOk = true
             if optUser ~= nil then
                 local s = parseStatus(readFile("/proc/" .. p.pid .. "/status") or "")
                 uidOk = (tonumber(s.Uid) or -1) == optUser
             end
             if uidOk then
-                local ok, err = syscalls["signal.kill"](p.pid, sig)
-                if ok then
-                    sent = sent + 1
-                    if optE then io.write(p.comm .. " killed (pid " .. p.pid .. ")\n") end
-                else
-                    stderr("killall: " .. p.pid .. ": " .. tostring(err) .. "\n")
+                found = found + 1
+                local proceed = true
+                if optInteractive then
+                    io.write("Kill " .. p.comm .. "(" .. p.pid .. ") ? ")
+                    io.flush()
+                    local sin = io.stdin()
+                    local line = sin and sin.readLine and sin:readLine() or nil
+                    proceed = (line ~= nil) and (line:match("^[yY]") ~= nil)
+                end
+                if proceed then
+                    local ok, err
+                    if optPgroup then
+                        -- -g: 杀进程**组**(psmisc 语义)
+                        ok, err = syscalls["signal.killpg"](p.pgrp or p.pid, sig)
+                    else
+                        ok, err = syscalls["signal.kill"](p.pid, sig)
+                    end
+                    if ok then
+                        sent = sent + 1
+                        killedPids[#killedPids + 1] = p.pid
+                        if optVerbose or optE then
+                            io.write("Killed " .. p.comm .. "(" .. p.pid .. ") with signal "
+                                .. tostring(sig) .. "\n")
+                        end
+                    else
+                        stderr("killall: " .. p.pid .. ": " .. tostring(err) .. "\n")
+                    end
                 end
             end
         end
     end
-    if sent == 0 then
+    if found == 0 then
         if not optQ then stderr("killall: " .. name .. ": no process found\n") end
         outcome = 1
+    end
+end
+
+-- -w: 等所有被杀的进程真正退出(轮询 /proc/<pid>)
+if optWait and #killedPids > 0 then
+    for _ = 1, 600 do
+        local alive = false
+        for _, pid in ipairs(killedPids) do
+            if fs.exists("/proc/" .. pid) then alive = true end
+        end
+        if not alive then break end
+        if os.msleep then os.msleep(50) else os.sleep(0.05) end
     end
 end
 

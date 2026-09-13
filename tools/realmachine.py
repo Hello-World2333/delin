@@ -91,12 +91,39 @@ def install_verified(src, dst):
         raise RuntimeError("安装校验失败: %s 与 %s 内容不一致(%s != %s); 有别的写入者在改它" % (dst, src, b, a))
     print("   installed %-30s md5=%s" % (os.path.basename(dst), a))
 
+def payload_fingerprint():
+    """payload 指纹: dist/ 产物 + 要注入的 scripts/ 内容哈希(只看内容, 不看时间戳)。"""
+    h = hashlib.sha256()
+    for root in (os.path.join(REPO, "dist"), os.path.join(REPO, "scripts")):
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames.sort()
+            for name in sorted(filenames):
+                fp = os.path.join(dirpath, name)
+                h.update(os.path.relpath(fp, REPO).encode())
+                try:
+                    with open(fp, "rb") as f:
+                        h.update(f.read())
+                except OSError:
+                    pass
+    return h.hexdigest()
+
+
 def main():
+    """真机验证主流程。
+
+    速度开关(测试流程本身的开销)：
+      * payload 指纹命中时**复用**上一轮注入好的镜像(省掉 deploy + 40 来次 debugfs 注入);
+        指纹 = dist/ 全部产物 + scripts/ 内容的哈希, 只要动过一个字节就自动重建;
+      * 引导等待是**条件轮询**(/delin.log 出现 "init up" 且镜像里的 verify.log 变过),
+        不是原来那 75+30 秒盲等;
+      * `--rebuild` 强制重建镜像; `--reboot-only` 只重开机+收日志。
+    """
     base = os.path.join(DISK, "parts/root.img")
     reboot = True
     skip_deploy = False
     printer = False
     probe_only = False
+    force_rebuild = False
     args = sys.argv[1:]
     while args:
         a = args.pop(0)
@@ -106,6 +133,8 @@ def main():
             reboot = False
         elif a == "--reboot-only":
             skip_deploy = True
+        elif a == "--rebuild":
+            force_rebuild = True
         elif a == "--printer":
             printer = True
         elif a == "--printer-probe":
@@ -131,135 +160,147 @@ def main():
     print(run("lua5.1", os.path.join(REPO, "tools/ext2test.lua"), cwd=REPO))
 
     # 2) 部署根镜像到 /tmp, 成功后原子替换
-    work = WORK
-    os.makedirs(work, exist_ok=True)
-    out = os.path.join(work, "root.img")
-    if os.path.exists(out):
-        os.unlink(out)
-    print("== deploy rootfs from %s ==" % base)
-    print(run(sys.executable, os.path.join(REPO, "tools/deploy.py"), base, out, cwd=REPO))
+    # payload 指纹没变就复用上一轮注入好的镜像: deploy(拷基镜像+铺文件) 与 40 来次 debugfs
+    # 注入在迭代工具选项时要几十秒, 而 payload 里往往只变了一个 dist/bin/<tool>。
+    # 指纹一变(reused=False)就整段重做, 不会测到旧镜像。--rebuild 可强制重建。
+    fp = payload_fingerprint()
+    fp_path = os.path.join(WORK, 'payload.fingerprint')
+    reused = (not force_rebuild) and os.path.exists(fp_path) and open(fp_path).read().strip() == fp and os.path.exists(os.path.join(WORK, 'root.img'))
+    if reused:
+        print('== reuse previously injected root.img (payload %s) ==' % fp[:12])
+        out = os.path.join(WORK, 'root.img')
+        data_img = os.path.join(WORK, 'data.img')
+    else:
+        work = WORK
+        os.makedirs(work, exist_ok=True)
+        out = os.path.join(work, "root.img")
+        if os.path.exists(out):
+            os.unlink(out)
+        print("== deploy rootfs from %s ==" % base)
+        print(run(sys.executable, os.path.join(REPO, "tools/deploy.py"), base, out, cwd=REPO))
 
-    # 3) 注入验证负载
-    print("== inject verify payload ==")
-    # 3a) 第二个分区镜像(data), 里面放一个 hello 文件
-    data_img = os.path.join(work, "data.img")
-    if os.path.exists(data_img):
-        os.unlink(data_img)
-    run(MKFS, "-q", "-t", "ext2", "-b", "1024", data_img, "512")
-    hello = os.path.join(work, "hello.txt")
-    with open(hello, "w") as f:
-        f.write("hello from the data partition (fstab)\n")
-    df_write(data_img, hello, "/hello.txt")
+        # 3) 注入验证负载
+        print("== inject verify payload ==")
+        # 3a) 第二个分区镜像(data), 里面放一个 hello 文件
+        data_img = os.path.join(work, "data.img")
+        if os.path.exists(data_img):
+            os.unlink(data_img)
+        run(MKFS, "-q", "-t", "ext2", "-b", "1024", data_img, "512")
+        hello = os.path.join(work, "hello.txt")
+        with open(hello, "w") as f:
+            f.write("hello from the data partition (fstab)\n")
+        df_write(data_img, hello, "/hello.txt")
 
-    # 3b) 测试用 /etc/fstab(defaults + noauto 两条)
-    fstab = os.path.join(work, "fstab")
-    with open(fstab, "w") as f:
-        # /dev/sda 恒为电脑自带存储, 引导盘是磁盘驱动器里的第一块盘(sdb, UUID d0)。
-        # data 分区走 UUID(顺带验证 UUID 命名空间), rootcopy 走设备节点(验证 sdbN 命名)。
-        f.write("# real-machine verify fstab\n"
-                "UUID=d0-2   /mnt/data     ext2   defaults   0 2\n"
-                "/dev/sdb1   /mnt/rootcopy ext2   noauto     0 2\n")
-    df(out, "rm /etc/fstab")
-    df_write(out, fstab, "/etc/fstab")
+        # 3b) 测试用 /etc/fstab(defaults + noauto 两条)
+        fstab = os.path.join(work, "fstab")
+        with open(fstab, "w") as f:
+            # /dev/sda 恒为电脑自带存储, 引导盘是磁盘驱动器里的第一块盘(sdb, UUID d0)。
+            # data 分区走 UUID(顺带验证 UUID 命名空间), rootcopy 走设备节点(验证 sdbN 命名)。
+            f.write("# real-machine verify fstab\n"
+                    "UUID=d0-2   /mnt/data     ext2   defaults   0 2\n"
+                    "/dev/sdb1   /mnt/rootcopy ext2   noauto     0 2\n")
+        df(out, "rm /etc/fstab")
+        df_write(out, fstab, "/etc/fstab")
 
-    # 3c) verify.service + /root/verify.sh
-    sh = os.path.join(REPO, "scripts/realmachine_verify.sh")
-    df_write(out, sh, "/root/verify.sh")
-    df(out, "set_inode_field /root/verify.sh mode 0100755")
-    unit = os.path.join(work, "verify.service")
-    with open(unit, "w") as f:
-        f.write("[Unit]\nDescription=Real-machine verification\nAfter=syslogd.service\n\n"
-                "[Service]\nType=oneshot\nExecStart=/bin/sh /root/verify.sh\n\n"
-                "[Install]\nWantedBy=multi-user.target\n")
-    df_write(out, unit, "/lib/systemd/system/verify.service")
-    df_mkdir(out, "/etc/systemd/system/multi-user.target.wants")
-    marker = os.path.join(work, "marker")
-    open(marker, "w").close()
-    df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/verify.service")
-    df_mkdir(out, "/mnt/rootcopy")
+        # 3c) verify.service + /root/verify.sh
+        sh = os.path.join(REPO, "scripts/realmachine_verify.sh")
+        df_write(out, sh, "/root/verify.sh")
+        df(out, "set_inode_field /root/verify.sh mode 0100755")
+        unit = os.path.join(work, "verify.service")
+        with open(unit, "w") as f:
+            f.write("[Unit]\nDescription=Real-machine verification\nAfter=syslogd.service\n\n"
+                    "[Service]\nType=oneshot\nExecStart=/bin/sh /root/verify.sh\n\n"
+                    "[Install]\nWantedBy=multi-user.target\n")
+        df_write(out, unit, "/lib/systemd/system/verify.service")
+        df_mkdir(out, "/etc/systemd/system/multi-user.target.wants")
+        marker = os.path.join(work, "marker")
+        open(marker, "w").close()
+        df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/verify.service")
+        df_mkdir(out, "/mnt/rootcopy")
 
-    # 3e) verify-sh.service: sh 内建/变量自检(. set export unset PATH PSx cd) -> /var/log/sh_verify.log
-    for src, dst in (("scripts/sh_verify.sh", "/root/sh_verify.sh"),
-                     ("scripts/sh_builtin_test.sh", "/root/sh_builtin_test.sh"),
-                     ("scripts/sh_expand_test.sh", "/root/sh_expand_test.sh"),
-                     ("scripts/regex_test.sh", "/root/regex_test.sh"),
-                     ("scripts/proc_test.sh", "/root/proc_test.sh"),
-                     ("scripts/redstone_test.sh", "/root/redstone_test.sh"),
-                     ("scripts/redstone_verify.lua", "/root/redstone_verify.lua"),
-                     ("scripts/lua_test.sh", "/root/lua_test.sh"),
-                     ("scripts/user_test.sh", "/root/user_test.sh"),
-                     ("scripts/user_helper.lua", "/root/user_helper.lua")):
-        df_write(out, os.path.join(REPO, src), dst)
-        df(out, "set_inode_field %s mode 0100755" % dst)
-    unit_sh = os.path.join(work, "verify-sh.service")
-    with open(unit_sh, "w") as f:
-        f.write("[Unit]\nDescription=Real-machine sh builtin verification\nAfter=syslogd.service\n\n"
-                "[Service]\nType=oneshot\nExecStart=/bin/sh /root/sh_verify.sh\n\n"
-                "[Install]\nWantedBy=multi-user.target\n")
-    df_write(out, unit_sh, "/lib/systemd/system/verify-sh.service")
-    df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/verify-sh.service")
+        # 3e) verify-sh.service: sh 内建/变量自检(. set export unset PATH PSx cd) -> /var/log/sh_verify.log
+        for src, dst in (("scripts/sh_verify.sh", "/root/sh_verify.sh"),
+                         ("scripts/sh_builtin_test.sh", "/root/sh_builtin_test.sh"),
+                         ("scripts/sh_expand_test.sh", "/root/sh_expand_test.sh"),
+                         ("scripts/regex_test.sh", "/root/regex_test.sh"),
+                         ("scripts/proc_test.sh", "/root/proc_test.sh"),
+                         ("scripts/redstone_test.sh", "/root/redstone_test.sh"),
+                         ("scripts/redstone_verify.lua", "/root/redstone_verify.lua"),
+                         ("scripts/lua_test.sh", "/root/lua_test.sh"),
+                         ("scripts/user_test.sh", "/root/user_test.sh"),
+                         ("scripts/user_helper.lua", "/root/user_helper.lua")):
+            df_write(out, os.path.join(REPO, src), dst)
+            df(out, "set_inode_field %s mode 0100755" % dst)
+        unit_sh = os.path.join(work, "verify-sh.service")
+        with open(unit_sh, "w") as f:
+            f.write("[Unit]\nDescription=Real-machine sh builtin verification\nAfter=syslogd.service\n\n"
+                    "[Service]\nType=oneshot\nExecStart=/bin/sh /root/sh_verify.sh\n\n"
+                    "[Install]\nWantedBy=multi-user.target\n")
+        df_write(out, unit_sh, "/lib/systemd/system/verify-sh.service")
+        df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/verify-sh.service")
 
-    # 3f) --printer: ccprinter 模块端到端验证; --printer-probe 额外注入原始 printer API 探测。
-    #     默认不注入: 它们会实际打印页面, 只在需要验证打印机时消耗纸张。
-    #     先清掉上一次部署残留在基础镜像里的打印机负载 —— 否则残留的 .wants 标记会让
-    #     探测/验证服务在之后每次启动时都跑一遍, 白白耗纸。
-    for unit, path in (("printer-probe.service", "/root/printer_probe.lua"),
-                       ("printer-verify.service", "/root/printer_verify.sh")):
-        df(out, "rm /etc/systemd/system/multi-user.target.wants/" + unit, check=False)
-        df(out, "rm /lib/systemd/system/" + unit, check=False)
-        df(out, "rm " + path, check=False)
+        # 3f) --printer: ccprinter 模块端到端验证; --printer-probe 额外注入原始 printer API 探测。
+        #     默认不注入: 它们会实际打印页面, 只在需要验证打印机时消耗纸张。
+        #     先清掉上一次部署残留在基础镜像里的打印机负载 —— 否则残留的 .wants 标记会让
+        #     探测/验证服务在之后每次启动时都跑一遍, 白白耗纸。
+        for unit, path in (("printer-probe.service", "/root/printer_probe.lua"),
+                           ("printer-verify.service", "/root/printer_verify.sh")):
+            df(out, "rm /etc/systemd/system/multi-user.target.wants/" + unit, check=False)
+            df(out, "rm /lib/systemd/system/" + unit, check=False)
+            df(out, "rm " + path, check=False)
 
-    if printer:
-        if probe_only:
-            probe = os.path.join(REPO, "scripts/printer_probe.lua")
-            df_write(out, probe, "/root/printer_probe.lua")
-            df(out, "set_inode_field /root/printer_probe.lua mode 0100755")
-            unit_p = os.path.join(work, "printer-probe.service")
-            with open(unit_p, "w") as f:
-                f.write("[Unit]\nDescription=CC printer raw API probe\nAfter=syslogd.service\n\n"
-                        "[Service]\nType=oneshot\nExecStart=/root/printer_probe.lua\n\n"
-                        "[Install]\nWantedBy=multi-user.target\n")
-            df_write(out, unit_p, "/lib/systemd/system/printer-probe.service")
-            df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/printer-probe.service")
+        if printer:
+            if probe_only:
+                probe = os.path.join(REPO, "scripts/printer_probe.lua")
+                df_write(out, probe, "/root/printer_probe.lua")
+                df(out, "set_inode_field /root/printer_probe.lua mode 0100755")
+                unit_p = os.path.join(work, "printer-probe.service")
+                with open(unit_p, "w") as f:
+                    f.write("[Unit]\nDescription=CC printer raw API probe\nAfter=syslogd.service\n\n"
+                            "[Service]\nType=oneshot\nExecStart=/root/printer_probe.lua\n\n"
+                            "[Install]\nWantedBy=multi-user.target\n")
+                df_write(out, unit_p, "/lib/systemd/system/printer-probe.service")
+                df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/printer-probe.service")
 
-        pverify = os.path.join(REPO, "scripts/printer_verify.sh")
-        if os.path.exists(pverify) and not probe_only:
-            df_write(out, pverify, "/root/printer_verify.sh")
-            df(out, "set_inode_field /root/printer_verify.sh mode 0100755")
-            unit_pv = os.path.join(work, "printer-verify.service")
-            with open(unit_pv, "w") as f:
-                f.write("[Unit]\nDescription=ccprinter module verification\nAfter=syslogd.service\n\n"
-                        "[Service]\nType=oneshot\nExecStart=/bin/sh /root/printer_verify.sh\n\n"
-                        "[Install]\nWantedBy=multi-user.target\n")
-            df_write(out, unit_pv, "/lib/systemd/system/printer-verify.service")
-            df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/printer-verify.service")
+            pverify = os.path.join(REPO, "scripts/printer_verify.sh")
+            if os.path.exists(pverify) and not probe_only:
+                df_write(out, pverify, "/root/printer_verify.sh")
+                df(out, "set_inode_field /root/printer_verify.sh mode 0100755")
+                unit_pv = os.path.join(work, "printer-verify.service")
+                with open(unit_pv, "w") as f:
+                    f.write("[Unit]\nDescription=ccprinter module verification\nAfter=syslogd.service\n\n"
+                            "[Service]\nType=oneshot\nExecStart=/bin/sh /root/printer_verify.sh\n\n"
+                            "[Install]\nWantedBy=multi-user.target\n")
+                df_write(out, unit_pv, "/lib/systemd/system/printer-verify.service")
+                df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/printer-verify.service")
 
-    # 3f2) posix-verify.service: POSIX 命令补齐后的自检(新工具 + sh 新内建 + 内核新能力:
-    #      符号链接/硬链接/命名管道/umask/seek) -> /var/log/posix_verify.log
-    #      内核那部分用 /bin/lua 跑 —— 见 scripts/posix_kernel_verify.lua 的头注释: 这里要验的是
-    #      **内核语义本身**, 不该依赖某个工具的包装(而且部分能力当时还没有命令行入口)。
-    for src, dst in (("scripts/posix_tools_verify.sh", "/root/posix_tools_verify.sh"),
-                     ("scripts/posix_kernel_verify.lua", "/root/posix_kernel_verify.lua"),
-                     ("scripts/tee_verify.lua", "/root/tee_verify.lua")):
-        df_write(out, os.path.join(REPO, src), dst)
-        df(out, "set_inode_field %s mode 0100755" % dst)
-    unit_posix = os.path.join(work, "posix-verify.service")
-    with open(unit_posix, "w") as f:
-        f.write("[Unit]\nDescription=Real-machine POSIX tools verification\nAfter=syslogd.service\n\n"
-                "[Service]\nType=oneshot\nExecStart=/bin/sh /root/posix_tools_verify.sh\n\n"
-                "[Install]\nWantedBy=multi-user.target\n")
-    df_write(out, unit_posix, "/lib/systemd/system/posix-verify.service")
-    df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/posix-verify.service")
+        # 3f2) posix-verify.service: POSIX 命令补齐后的自检(新工具 + sh 新内建 + 内核新能力:
+        #      符号链接/硬链接/命名管道/umask/seek) -> /var/log/posix_verify.log
+        #      内核那部分用 /bin/lua 跑 —— 见 scripts/posix_kernel_verify.lua 的头注释: 这里要验的是
+        #      **内核语义本身**, 不该依赖某个工具的包装(而且部分能力当时还没有命令行入口)。
+        for src, dst in (("scripts/posix_tools_verify.sh", "/root/posix_tools_verify.sh"),
+                         ("scripts/posix_kernel_verify.lua", "/root/posix_kernel_verify.lua"),
+                         ("scripts/tee_verify.lua", "/root/tee_verify.lua")):
+            df_write(out, os.path.join(REPO, src), dst)
+            df(out, "set_inode_field %s mode 0100755" % dst)
+        unit_posix = os.path.join(work, "posix-verify.service")
+        with open(unit_posix, "w") as f:
+            f.write("[Unit]\nDescription=Real-machine POSIX tools verification\nAfter=syslogd.service\n\n"
+                    "[Service]\nType=oneshot\nExecStart=/bin/sh /root/posix_tools_verify.sh\n\n"
+                    "[Install]\nWantedBy=multi-user.target\n")
+        df_write(out, unit_posix, "/lib/systemd/system/posix-verify.service")
+        df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/posix-verify.service")
 
-    # 3f3) mkfs.ext2/fsck.ext2 真机验证要用的"造损坏"小工具(见 scripts/ext2_corrupt.lua 的头注释:
-    #      /dev/sdXN 的字节句柄没有 seek, dd seek= 在这种设备上明确报 cannot seek)。
-    df_write(out, os.path.join(REPO, "scripts/ext2_corrupt.lua"), "/root/ext2_corrupt.lua")
-    df(out, "set_inode_field /root/ext2_corrupt.lua mode 0100755")
+        # 3f3) mkfs.ext2/fsck.ext2 真机验证要用的"造损坏"小工具(见 scripts/ext2_corrupt.lua 的头注释:
+        #      /dev/sdXN 的字节句柄没有 seek, dd seek= 在这种设备上明确报 cannot seek)。
+        df_write(out, os.path.join(REPO, "scripts/ext2_corrupt.lua"), "/root/ext2_corrupt.lua")
+        df(out, "set_inode_field /root/ext2_corrupt.lua mode 0100755")
 
-    # 3g) 门禁: 注入后镜像仍必须干净, 不把坏镜像带上真机
-    p = subprocess.run([FSCK, "-fn", out], capture_output=True, text=True)
-    if p.returncode != 0:
-        raise RuntimeError("注入后的镜像未通过 e2fsck -fn:\n" + p.stdout + p.stderr)
+        # 3g) 门禁: 注入后镜像仍必须干净, 不把坏镜像带上真机
+        p = subprocess.run([FSCK, "-fn", out], capture_output=True, text=True)
+        if p.returncode != 0:
+            raise RuntimeError("注入后的镜像未通过 e2fsck -fn:\n" + p.stdout + p.stderr)
+        open(fp_path, 'w').write(fp)
 
     # 3d) 安装到磁盘(逐文件按内容校验; 机器此时已停机)
     install_verified(out, os.path.join(DISK, "parts/root.img"))
@@ -344,16 +385,36 @@ def reboot_and_collect(printer=False):
     run("python3", RCON, "computercraft shutdown #3", check=False)
     time.sleep(2)
     run("python3", RCON, "computercraft turn-on #3", check=False)
-    print("waiting %ds for boot ..." % WAIT)
-    time.sleep(WAIT)
+    # 等**条件**而不是等固定秒数: 以前是 sleep(75)+sleep(30)=盲等 105s, 现在一看 /delin.log
+    # 出现 "init up"、且镜像里的 verify.log 已经变过就往下走(正常 30-40s), 最长给 WAIT+30s。
+    t0 = time.time()
+    deadline = t0 + WAIT + 30
+    next_note = 15
+    while time.time() < deadline:
+        time.sleep(3)
+        # 判据只有一条: 镜像里的 /var/log/verify.log 变了(说明这一轮真的从磁盘根起来了,
+        # 而且 verify.service 已经跑过)。**不要**去看 /mnt/disk/0/delin.log —— 那是 NFS
+        # 看到的游戏侧文件, 实测开机后 100s 还是旧内容(知识库「电脑文件(NFS 挂载, 不稳定)」
+        # 记着这条), 拿它当条件会一直等不到, 白等一整轮。
+        cur = subprocess.run([DBG, "-R", "cat /var/log/verify.log", os.path.join(DISK, "parts/root.img")],
+                             capture_output=True, text=True).stdout
+        if cur != verify_before:
+            print("   boot guard ready after %.0fs" % (time.time() - t0))
+            break
+        if time.time() - t0 >= next_note:
+            next_note += 15
+            print("   ... %.0fs: verify.log 还是上一轮的" % (time.time() - t0))
+    else:
+        print("   (%.0fs 内 verify.log 没变, 继续往下走看日志)" % (time.time() - t0))
 
     # 4b) 重启电脑 #4
     print("== reboot computer #4 ==")
     run("python3", RCON, "computercraft shutdown #4", check=False)
     time.sleep(2)
     run("python3", RCON, "computercraft turn-on #4", check=False)
-    print("waiting 30s for boot ...")
-    time.sleep(30)
+    # 电脑 #4 只用来取它那份 /delin.log; NFS 内容不保证即时可见, 所以只等固定 15s
+    print("waiting 15s for computer #4 ...")
+    time.sleep(15)
 
     # 5) 取回日志
     print("== collect logs ==")
@@ -379,12 +440,23 @@ def reboot_and_collect(printer=False):
     # 判据仍然是"日志里出现 === verify done ===", 只是给它足够的时间(最多 6 分钟)。
     fresh = ""
     deadline = time.time() + 360
+    last_change = time.time()
+    prev = None
     while time.time() < deadline:
         fresh = subprocess.run([DBG, "-R", "cat /var/log/verify.log", os.path.join(DISK, "parts/root.img")],
                                capture_output=True, text=True).stdout
         if "=== verify done ===" in fresh:
             break
-        time.sleep(10)
+        if fresh != prev:
+            prev = fresh
+            last_change = time.time()
+        elif fresh.strip() and time.time() - last_change > 60:
+            # 日志已经有内容、却 60 秒不再增长 => 这个服务已经死了(真机上偶发: 它会在
+            # mkfs/fsck 段中途停住)。别白等满 6 分钟 —— 立刻带着半截日志去报错,
+            # 人一眼就能看出卡在哪一条。
+            print("   (verify.log 60s 没有增长, 判定 verify.service 中途停了)")
+            break
+        time.sleep(5)
     if "=== verify done ===" not in fresh:
         print("   (自检在 6 分钟内没有写出 '=== verify done ===', 下面是当前内容)")
         print(fresh[-3000:])
@@ -394,6 +466,19 @@ def reboot_and_collect(printer=False):
             "多半是 BIOS/DLUB 回退到电脑自身 FS 的旧安装了; 上面的 /delin.log 是那次引导的日志。")
     if "=== verify done ===" not in fresh:
         raise RuntimeError("失效验证: verify.log 变了但没有跑完(缺 '=== verify done ==='):\n" + fresh[-2000:])
+    # 上面等的只是 realmachine_verify.sh(verify.log)。posix-verify.service 是**另一个**服务,
+    # 它写 /var/log/posix_verify.log, 此刻可能还没跑完 —— 那样收上来的是半截日志(真机踩过:
+    # 新增的检查项一个都没出现, 看起来像"改动没生效")。再等它的汇总行, 最多 5 分钟。
+    p_deadline = time.time() + 300
+    while time.time() < p_deadline:
+        plog = subprocess.run([DBG, "-R", "cat /var/log/posix_verify.log",
+                              os.path.join(DISK, "parts/root.img")],
+                              capture_output=True, text=True).stdout
+        if "== summary:" in plog:
+            break
+        time.sleep(10)
+    else:
+        print("   (posix_verify.log 5 分钟内没有写出 '== summary:', 可能还在跑)")
     print("   boot guard ok: 磁盘根已引导, verify.log 是本轮写的")
 
     # 5a2) cat 块设备 / dd 可中断: 这两条是本轮修的 bug, 单独设门禁(其余 ok/ng 行由人读日志)。

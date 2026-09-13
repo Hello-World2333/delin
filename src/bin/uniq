@@ -40,6 +40,9 @@ end
 
 -- 组过滤器(与 GNU 一致): 只出现一次的组看 printUnique, 出现多次的组看 printDup。
 local printUnique, printDup, showCount = true, true, false
+-- -D/--group 的模式开关必须在**选项解析之前**声明: Lua 的 local 作用域从声明语句之后才开始,
+-- 声明写在 emit 块里的话, 前面的解析循环会去写同名的**全局**(症状: -D 收下了但行为不变)。
+local modeAllRepeated, modeGroup, modeGroupAppend = false, false, false
 local skipFields, skipChars, checkChars = 0, 0, nil
 local ignoreCase, zeroTerm = false, false
 local operands = {}
@@ -63,6 +66,18 @@ while i <= #args do
     elseif a == "--" then
         noMoreOpts = true
     elseif a == "-c" or a == "--count" then showCount = true
+    elseif a == "-D" or a == "--all-repeated" or (a:match("^%-%-all%-repeated=") ~= nil) then
+        modeAllRepeated = true
+        local m = a:match("^%-%-all%-repeated=(.*)$")
+        if m and m ~= "none" then
+            stderr("uniq: option '--all-repeated' only supports 'none' in Delin\n")
+            return 2
+        end
+    elseif a == "--group" or (a:match("^%-%-group=") ~= nil) then
+        local m = a:match("^%-%-group=(.*)$") or "separate"
+        if m == "append" then modeGroupAppend = true
+        elseif m == "separate" or m == "both" or m == "prepend" then modeGroup = true
+        else stderr("uniq: invalid argument '" .. m .. "' for '--group'\n"); return 2 end
     elseif a == "-d" or a == "--repeated" then printUnique = false
     elseif a == "-u" or a == "--unique" then printDup = false
     elseif a == "-i" or a == "--ignore-case" then ignoreCase = true
@@ -88,6 +103,7 @@ while i <= #args do
         while k <= #a do
             local ch = a:sub(k, k)
             if ch == "c" then showCount = true; k = k + 1
+            elseif ch == "D" then modeAllRepeated = true; k = k + 1
             elseif ch == "d" then printUnique = false; k = k + 1
             elseif ch == "u" then printDup = false; k = k + 1
             elseif ch == "i" then ignoreCase = true; k = k + 1
@@ -194,14 +210,37 @@ end
 local sep = zeroTerm and "\0" or "\n"
 
 -- 流式处理: 内存里只留当前组。
+local firstGroup = true
 local prevKey, prevLine, count = nil, nil, 0
-local function emit(k, line, n)
+local groupLines = {}   -- 当前组的全部原始行(-D/--group 要打印整组)
+
+local function printOne(line, n, withCount)
+    if withCount and showCount then outH:write(string.format("%7d ", n)) end
+    outH:write(line .. sep)
+end
+
+local function emit(k, line, n, group)
     if k == nil then return end
     local dup = n > 1
+    if modeAllRepeated then
+        -- -D: 只打印重复组里的**每一行**(--all-repeated=none)
+        if not dup then firstGroup = false; return end
+        for _, l in ipairs(group) do printOne(l, n, false) end
+        return
+    end
+    if modeGroup or modeGroupAppend then
+        -- --group[=separate|append]: 全部打印, 组之间(GNU 的 separate)或组之后(append)插空行
+        if not firstGroup then
+            if modeGroup then outH:write(sep) end
+        end
+        for _, l in ipairs(group) do printOne(l, n, true) end
+        if modeGroupAppend and not firstGroup then outH:write(sep) end
+        firstGroup = false
+        return
+    end
     if dup and not printDup then return end
     if (not dup) and not printUnique then return end
-    if showCount then outH:write(string.format("%7d ", n)) end
-    outH:write(line .. sep)
+    printOne(line, n, true)
 end
 
 while true do
@@ -210,13 +249,16 @@ while true do
     local k = makeKey(line)
     if prevKey == nil then
         prevKey, prevLine, count = k, line, 1
+        groupLines = { line }
     elseif k == prevKey then
         count = count + 1
+        groupLines[#groupLines + 1] = line
     else
-        emit(prevKey, prevLine, count)
+        emit(prevKey, prevLine, count, groupLines)
         prevKey, prevLine, count = k, line, 1
+        groupLines = { line }
     end
 end
-emit(prevKey, prevLine, count)
+emit(prevKey, prevLine, count, groupLines)
 if closeOut then outH:close() end
 if inName ~= nil and inName ~= "-" then inH:close() end

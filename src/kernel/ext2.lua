@@ -168,6 +168,8 @@ function ext2.readInode(fs, ino)
     i.size = i.sizeHigh * 4294967296 + i.sizeLo
     i.type = itype(i.mode)
     i.perms = iperms(i.mode)
+    i.atime = u32(raw, 8)
+    i.ctime = u32(raw, 12)
     i.mtime = u32(raw, 16)
     i.ptrs = {}
     for n = 0, 14 do i.ptrs[n + 1] = u32(raw, 40 + n * 4) end
@@ -770,6 +772,134 @@ function ext2.removeDirEntry(fs, dirIno, name)
     return false
 end
 
+--- 目录里是否只有 "." 与 ".."。
+local function dirIsEmpty(fs, dirIno)
+    for _, e in ipairs(ext2.readDir(fs, dirIno) or {}) do
+        if e.name ~= "." and e.name ~= ".." then return false end
+    end
+    return true
+end
+
+--- 把目录里的 ".." 条目改成 newParentIno(移动目录时要跟着改, 否则 `..` 指向旧父目录)。
+local function setDotDot(fs, dirIno, newParentIno)
+    local nBlocks = math.ceil((dirIno.size or 0) / fs.blockSize)
+    for idx = 0, nBlocks - 1 do
+        local blockNum = ext2.getBlock(fs, dirIno, idx)
+        if blockNum then
+            local data = readBlockStr(fs, blockNum)
+            local off = 0
+            while off < #data do
+                local recLen = u16(data, off + 4)
+                if recLen == 0 then break end
+                local nameLen = data:byte(off + 7)
+                if nameLen == 2 and data:sub(off + 9, off + 10) == ".." then
+                    data = setU32(data, off, newParentIno)
+                    writeBlockStr(fs, blockNum, data)
+                    return true
+                end
+                off = off + recLen
+            end
+        end
+    end
+    return false
+end
+
+--- 改时间戳(atime/mtime; ctime 由内核按"元数据变了"置为现在)。
+---@param path string
+---@param atime integer|nil 秒; nil = 不改
+---@param mtime integer|nil
+function ext2.setTimes(fs, path, atime, mtime)
+    local inode = ext2.lookup(fs, path)
+    if not inode then return nil, "no such file: " .. tostring(path) end
+    local now = os.time()
+    if atime then inode.atime = atime end
+    if mtime then inode.mtime = mtime end
+    inode.ctime = now
+    ext2.writeInode(fs, inode)
+    return true
+end
+
+--- rename(2) 的**元数据**实现: 同一文件系统内的改名/移动, 数据一个字节都不搬。
+--- 关键性质:
+---   * inode 号不变 -> 权限/属主/时间戳/硬链接计数/符号链接与 FIFO 本体全部原样保留;
+---   * **整段不让出调度器**: Delin 是协作式调度(进程只在 os.msleep/等事件时切换), 所以
+---     "中途不 yield" 就等于原子 —— 别的进程只能看到改前或改后, 没有中间态;
+---   * 覆盖已存在的目标: 先摘目标条目并回收其 inode, 再把源条目挂过去(同一段里做完)。
+--- 失败时尽量回滚(源条目放回去), 不让文件"改名改没了"。
+function ext2.move(fs, oldPath, newPath)
+    if oldPath == newPath then return true end
+    local oldDir = oldPath:match("^(.*)/[^/]*$") or "/"
+    local oldName = oldPath:match("([^/]*)$") or ""
+    local newDir = newPath:match("^(.*)/[^/]*$") or "/"
+    local newName = newPath:match("([^/]*)$") or ""
+    if oldName == "" or newName == "" then return nil, "invalid path" end
+    if oldDir == "" then oldDir = "/" end
+    if newDir == "" then newDir = "/" end
+
+    local src = ext2.lookup(fs, oldPath)
+    if not src then return nil, "no such file: " .. tostring(oldPath) end
+    local oldParent = ext2.lookup(fs, oldDir)
+    if not oldParent or oldParent.type ~= T_DIR then return nil, "not a directory: " .. tostring(oldDir) end
+    local newParent = ext2.lookup(fs, newDir)
+    if not newParent or newParent.type ~= T_DIR then return nil, "not a directory: " .. tostring(newDir) end
+    local c = cred()
+    if not (hasPerm(oldParent, c.uid, c.gid, 2) and hasPerm(oldParent, c.uid, c.gid, 1)) then
+        return nil, "permission denied (source dir)"
+    end
+    if not (hasPerm(newParent, c.uid, c.gid, 2) and hasPerm(newParent, c.uid, c.gid, 1)) then
+        return nil, "permission denied (target dir)"
+    end
+
+    -- 目录不能移进自己的子树(否则整棵树从命名空间里消失)
+    if src.type == T_DIR then
+        local cur = newParent
+        while cur do
+            if cur.ino == src.ino then return nil, "cannot move a directory into itself" end
+            if cur.ino == 2 then break end
+            local dd = findDirEntry(fs, cur, "..")
+            cur = dd and ext2.readInode(fs, dd.ino) or nil
+        end
+    end
+
+    local dst = ext2.lookup(fs, newPath)
+    if dst then
+        if dst.ino == src.ino then return true end -- 同一个 inode(硬链接): rename 什么都不做
+        if src.type == T_DIR and dst.type ~= T_DIR then return nil, "not a directory" end
+        if src.type ~= T_DIR and dst.type == T_DIR then return nil, "is a directory" end
+        if dst.type == T_DIR and not dirIsEmpty(fs, dst) then return nil, "directory not empty" end
+        if not ext2.removeDirEntry(fs, newParent, newName) then return nil, "cannot remove target entry" end
+        if dst.type == T_FIFO then fifo.forget(fs, dst.ino) end
+        ext2.freeBlocksOfInode(fs, dst)
+        ext2.freeInode(fs, dst.ino)
+        if dst.type == T_DIR then newParent.links = math.max(2, newParent.links - 1) end
+    end
+
+    if not ext2.removeDirEntry(fs, oldParent, oldName) then
+        -- 源条目摘不掉: 上面若已删掉目标就无法回滚了, 所以这里只在"还没删目标"时才可能发生
+        return nil, "cannot remove source entry"
+    end
+    local ok, err = ext2.addDirEntry(fs, newParent, newName, src.ino, typeToFileType(src.type))
+    if not ok then
+        ext2.addDirEntry(fs, oldParent, oldName, src.ino, typeToFileType(src.type)) -- 回滚
+        return nil, err or "cannot add target entry"
+    end
+
+    if src.type == T_DIR and oldParent.ino ~= newParent.ino then
+        setDotDot(fs, src, newParent.ino)
+        oldParent.links = math.max(2, oldParent.links - 1)
+        newParent.links = newParent.links + 1
+    end
+
+    local now = os.time()
+    oldParent.mtime, oldParent.ctime = now, now
+    newParent.mtime, newParent.ctime = now, now
+    src.ctime = now
+    ext2.writeInode(fs, oldParent)
+    if newParent.ino ~= oldParent.ino then ext2.writeInode(fs, newParent) end
+    ext2.writeInode(fs, src)
+    return true
+end
+
 function ext2.delete(fs, dirPath, name)
     local parent = ext2.lookup(fs, dirPath)
     if not parent or parent.type ~= T_DIR then return nil, "parent not a dir" end
@@ -809,6 +939,28 @@ function ext2.delete(fs, dirPath, name)
     return true
 end
 
+--- 文件系统统计(statvfs(3) 口径): 供 df 用 —— 大小/已用/可用/inode 总数与空闲数。
+--- 字段都在超级块里(偏移见 ext2 规范): 0 s_inodes_count, 4 s_blocks_count, 8 s_r_blocks_count,
+--- 12 s_free_blocks_count, 16 s_free_inodes_count。
+function ext2.statvfs(fs)
+    local sb = fs.bd.read(1024, 1024)
+    if not sb or #sb < 1024 then return nil, "cannot read superblock" end
+    local bs = fs.blockSize
+    local inodes = u32(sb, 0)
+    local blocks = u32(sb, 4)
+    local rblocks = u32(sb, 8)
+    local freeBlocks = u32(sb, 12)
+    local freeInodes = u32(sb, 16)
+    return {
+        blockSize = bs,
+        blocks = blocks,
+        bfree = freeBlocks,
+        bavail = math.max(0, freeBlocks - rblocks), -- 非 root 可用(扣掉保留块)
+        files = inodes,
+        ffree = freeInodes,
+    }
+end
+
 --- 改权限(保留类型位)。
 function ext2.chmod(fs, path, mode)
     local inode = ext2.lookup(fs, path)
@@ -843,6 +995,10 @@ function ext2.backend(fs)
             ino = inode.ino,
             links = inode.links,
             mtime = inode.mtime,
+            atime = inode.atime,
+            ctime = inode.ctime,
+            -- st_blocks: ext2 的 i_blocks 以 512 字节为单位(与 stat(2) 一致), 供 ls -s / du 用。
+            blocks = inode.blocks,
             kind = inode.type == T_DIR and "dir"
                 or (inode.type == T_REG and "file"
                 or (inode.type == T_SYM and "symlink"
@@ -1067,6 +1223,12 @@ function ext2.backend(fs)
                 end,
             }
         end,
+        --- 文件系统统计(statvfs), 供 df/df -i。
+        statvfs = function() return ext2.statvfs(fs) end,
+        --- rename(2): 同文件系统内的改名/移动(元数据操作, 不搬数据、不 yield -> 原子)。
+        move = function(oldrel, newrel) return ext2.move(fs, oldrel, newrel) end,
+        --- 改时间戳(touch 用)。atime/mtime 为 nil 表示不改那一项。
+        setTimes = function(rel, atime, mtime) return ext2.setTimes(fs, rel, atime, mtime) end,
         makeDir = function(rel)
             local pdir = rel:match("^(.*)/[^/]*$") or "/"
             local pname = rel:match("([^/]*)$") or rel

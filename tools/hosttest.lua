@@ -143,10 +143,29 @@ end
 function F.attributes(p)
     local h = host(p)
     if not F.exists(p) then return nil end
-    local fh = io.popen("stat -c '%f %s %Y' -- " .. h .. " 2>/dev/null")
+    local fh = io.popen("stat -c '%f %s %X %Y %Z %b' -- " .. h .. " 2>/dev/null")
     local line = fh:read("*a"); fh:close()
-    local mode, size, mtime = line:match("^(%x+)%s+(%d+)%s+(%d+)")
-    return { mode = tonumber(mode, 16), size = tonumber(size), mtime = tonumber(mtime), isDir = F.isDir(p) }
+    local mode, size, atime, mtime, ctime, blocks = line:match("^(%x+)%s+(%d+)%s+(%d+)%s+(%d+)%s+(%d+)%s+(%d+)")
+    return { mode = tonumber(mode, 16), size = tonumber(size),
+             atime = tonumber(atime), mtime = tonumber(mtime), ctime = tonumber(ctime),
+             blocks = tonumber(blocks), isDir = F.isDir(p) }
+end
+
+--- 改时间戳(touch): 真机是 ext2.setTimes, 宿主用 GNU touch 顶。
+function F.setTimes(p, atime, mtime)
+    if not F.exists(p) then return nil, "no such file" end
+    local h = host(p)
+    if atime and mtime and atime == mtime then
+        return os.execute("touch -d '@" .. tostring(atime) .. "' " .. h .. " 2>/dev/null") ~= nil
+    end
+    local ok = true
+    if atime then
+        ok = os.execute("touch -a -d '@" .. tostring(atime) .. "' " .. h .. " 2>/dev/null") ~= nil and ok
+    end
+    if mtime then
+        ok = os.execute("touch -m -d '@" .. tostring(mtime) .. "' " .. h .. " 2>/dev/null") ~= nil and ok
+    end
+    return ok
 end
 --- 不跟随符号链接的 stat(内核 fs.lstat 的对应物; harness 里也有一份同样的桩)。
 function F.lstat(p)
@@ -674,6 +693,14 @@ do
         end
     end
     env3.syscalls["klog.stats"] = kmsgStats -- 宿主内存设备取代真实 ring buffer 的统计
+    -- 匿名管道: 用内核同一份 pipe.lua(它自带协作式阻塞语义)。
+    do
+        local pipe = require("kernel.pipe")
+        env3.syscalls["pipe.create"] = function()
+            local buf = pipe.create()
+            return buf.reader, buf.writer
+        end
+    end
     env3.handlers = {}
     env3.syscalls["signal.install"] = function(sig, fn) env3.handlers[sig] = fn; return true end
 
@@ -803,7 +830,9 @@ kern.*                     /var/log/kern.log
         ok(lF.out:find("b2d/", 1, true) ~= nil, "ls -F: 目录带 / 指示符", lF.out)
         local lQ = tool("ls", { "-Q", "/tmp/b2a" })
         ok(lQ.out:find('"/tmp/b2a"', 1, true) ~= nil, "ls -Q: 名字加双引号", lQ.out)
-        eq(tool("ls", { "-s", "/tmp" }).rc, 2, "ls -s: 未实现 -> 退出 2")
+        -- -s 已实现(内核现在暴露 i_blocks): 非长格式下每行前面是块数
+        local lsBlocks = tool("ls", { "-s", "/tmp/b2a" })
+        ok(lsBlocks.out:match("^%s*%d+ /tmp/b2a") ~= nil, "ls -s: 前置块数", lsBlocks.out)
 
         -- cp: -t / -l / -s / -T
         eq(tool("cp", { "-t", "/tmp/b2d", "/tmp/b2a", "/tmp/b2b" }).rc, 0, "cp -t DIR")

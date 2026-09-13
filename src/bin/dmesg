@@ -273,12 +273,17 @@ if follow then
     -- 先冲掉当前缓冲(跟读时的历史消息), 再持续等新消息。
     local data = h:readAvailable()
     if data and data ~= "" then emit(data) end
+    -- **阻塞读, 不轮询**: /dev/kmsg 句柄的 readLine 在没有新消息时内部 os.sleep(0.05) 让出
+    -- 调度器(既不烧 CPU, ^C 也能被投递进来)。这一点与 HSE 有关 —— 装了 cc_hse 之后
+    -- os.msleep(0) 只有 4 个 HSE 拍(≈2ms, 而不是 50ms), 拿它当"轮询间隔"会变成热循环。
     while not interrupted do
-        data = h:readAvailable()
-        if data and data ~= "" then
-            emit(data)
+        local line = h.readLine and h:readLine()
+        if line ~= nil then
+            emit(line .. "\n")
         else
-            msleep(50)
+            -- 句柄没有阻塞读(宿主桩): 退回轮询 + 让出, 只为不空转
+            data = h:readAvailable()
+            if data and data ~= "" then emit(data) else msleep(50) end
         end
     end
     h:close()

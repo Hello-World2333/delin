@@ -37,23 +37,40 @@ while i <= #args do
         targets[#targets + 1] = a
     elseif a == "--" then
         noMoreOpts = true
-    elseif a == "-l" or a == "-L" then
+    elseif a == "-l" or a == "--list" then
         listMode = true
-        -- 可选的下一个参数为信号(非数字 pid 形式): kill -l N / kill -l NAME
-        local nxt = args[i + 1]
-        if nxt and nxt:match("^%-?%d+$") then
-            i = i + 1
-            local name = signalName(tonumber(nxt))
-            io.write((name or "?") .. "\n")
-            return
-        elseif nxt and not nxt:match("^%-") then
-            i = i + 1
-            local num = signalNumber(nxt:gsub("^SIG", ""))
-            io.write((num and tostring(num)) or "?")
-            io.write("\n")
-            return
+        -- 可选的操作数: kill -l N(名字) / kill -l NAME(编号); 给了多个就每行一个(procps 同此)
+        local rest = {}
+        for k = i + 1, #args do rest[#rest + 1] = args[k] end
+        if #rest > 0 then
+            local out = {}
+            for _, r in ipairs(rest) do
+                if r:match("^%d+$") then
+                    out[#out + 1] = signalName(tonumber(r)) or "?"
+                else
+                    local num = signalNumber(r:gsub("^SIG", ""))
+                    out[#out + 1] = num and tostring(num) or "?"
+                end
+            end
+            io.write(table.concat(out, "\n") .. "\n")
+            return 0
         end
-    elseif a == "-s" or a == "--signal" then
+    elseif a == "-L" or a == "--table" then
+        -- procps 的 -L 打的是**编号表**(与 -l 的平铺列表不同)
+        local nums = syscalls["signal.list"]()
+        for _, n in ipairs(nums) do
+            io.write(string.format("%2d %s\n", n, signalName(n) or "?"))
+        end
+        return 0
+    elseif a == "-h" or a == "--help" then
+        io.write("usage: kill [-SIG|-s SIG] pid... | kill -l [SIG...] | kill -L\n")
+        return 0
+    elseif a == "-V" or a == "--version" then
+        io.write("kill (Delin OS)\n")
+        return 0
+    elseif a == "-q" or a == "--queue" then
+        stderr("kill: option '-q' is not supported (no sigqueue payload)\n")
+        return 2    elseif a == "-s" or a == "--signal" then
         i = i + 1
         if not args[i] then stderr("kill: option requires an argument -- 's'\n"); return end
         sig = parseSig(args[i])

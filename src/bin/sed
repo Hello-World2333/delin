@@ -181,7 +181,10 @@ local function parseAddr(script, i, n)
                 buf[#buf + 1] = "/"; j = j + 2
             elseif ch == "/" then
                 local pat = table.concat(buf)
-                local re = compileRe(pat)
+                -- /re/I: 忽略大小写(GNU 的地址后缀)
+                local ci = false
+                if script:sub(j + 1, j + 1) == "I" then ci = true; j = j + 1 end
+                local re = compileRe(pat, ci)
                 if not re then return nil, i end
                 return { kind = "regex", pat = pat, re = re }, j + 1
             else
@@ -191,7 +194,15 @@ local function parseAddr(script, i, n)
         return nil, i
     elseif c:match("%d") then
         local num = script:match("^%d+", i)
-        return { kind = "num", n = tonumber(num) }, i + #num
+        local after = i + #num
+        -- first~step: 从 first 起每 step 行命中一次(GNU 扩展)
+        if script:sub(after, after) == "~" then
+            local stepStr = script:match("^%d+", after + 1)
+            if not stepStr then return nil, i end
+            return { kind = "step", first = tonumber(num), step = tonumber(stepStr) },
+                after + 1 + #stepStr
+        end
+        return { kind = "num", n = tonumber(num) }, after
     end
     return nil, i
 end
@@ -224,7 +235,17 @@ local function parseCmd(script, i)
     if a1 then
         i = skipSep(script, ni, n)
         if script:sub(i, i) == "," then
-            local a2, ni2 = parseAddr(script, skipSep(script, i + 1, n), n)
+            local j2 = skipSep(script, i + 1, n)
+            local a2, ni2
+            -- addr1,+N: 从 addr1 命中处再数 N 行(GNU 的 +N 地址)
+            if script:sub(j2, j2) == "+" then
+                local numStr = script:match("^%d+", j2 + 1)
+                if not numStr then return nil, i end
+                a2 = { kind = "relnum", n = tonumber(numStr) }
+                ni2 = j2 + 1 + #numStr
+            else
+                a2, ni2 = parseAddr(script, j2, n)
+            end
             if not a2 then return nil, i end
             addr = { kind = "range", start = a1, stop = a2 }
             i = skipSep(script, ni2, n)
@@ -235,6 +256,7 @@ local function parseCmd(script, i)
     if addr and addr.kind == "num" and addr.n == 0 then
         return nil, i -- 0 只允许作范围起点
     end
+    _ = nil
     local neg = false
     if script:sub(i, i) == "!" then
         neg = true; i = i + 1
@@ -258,10 +280,26 @@ local function parseCmd(script, i)
         local g, count, pr, ci = false, nil, false, false
         while i <= n do
             local f = script:sub(i, i)
+            local wfile = nil
             if f:match("%d") then count = tonumber(f)
             elseif f == "g" then g = true
             elseif f == "p" then pr = true
             elseif f == "i" or f == "I" then ci = true
+            elseif f == "M" or f == "m" then
+                stderr("sed: the 'M' flag (multiline) is not supported\n")
+                return nil, i
+            elseif f == "e" then
+                stderr("sed: the 'e' flag (execute) is not supported\n")
+                return nil, i
+            elseif f == "w" then
+                i = i + 1
+                local stop = script:find("n", i) -- 占位, 下面重算
+                local rest = script:sub(i)
+                local fn = rest:match("^([^;\n]*)")
+                if not fn or fn == "" then return nil, i end
+                wfile = (fn:gsub("^%s+", ""):gsub("%s+$", ""))
+                i = i + #fn - 1
+                break
             else break end
             i = i + 1
         end
@@ -271,6 +309,7 @@ local function parseCmd(script, i)
         cmd.count = count
         cmd.print = pr
         cmd.ignorecase = ci
+        cmd.wfile = wfile
         cmd.re = compileRe(pat, ci)
         if not cmd.re then return nil, i end
     elseif c == "y" then
@@ -298,8 +337,37 @@ local function parseCmd(script, i)
     elseif c == "q" then
         local num = script:match("^%d+", i)
         if num then cmd.code = tonumber(num); i = i + #num end
-    elseif c == "d" or c == "p" or c == "=" then
+    elseif c == "d" or c == "p" or c == "=" or c == "h" or c == "H" or c == "g" or c == "G"
+        or c == "x" or c == "z" or c == "P" or c == "D" or c == "F" then
         -- 无参数
+    elseif c == "{" then
+        cmd.blockStart = true
+    elseif c == "}" then
+        cmd.blockEnd = true
+    elseif c == ":" or c == "b" or c == "t" or c == "T" then
+        local rest = script:sub(i):match("^([^;\n]*)") or ""
+        rest = rest:gsub("^%s+", ""):gsub("%s+$", "")
+        if c == ":" and rest == "" then
+            stderr("sed: ':' without a label name\n")
+            return nil, i
+        end
+        cmd.label = rest
+        i = i + #rest
+    elseif c == "Q" then
+        local num = script:match("^%d+", i)
+        if num then cmd.code = tonumber(num); i = i + #num end
+    elseif c == "l" then
+        local num = script:match("^%d+", i)
+        if num then cmd.wrap = tonumber(num); i = i + #num end
+    elseif c == "w" or c == "W" or c == "r" or c == "R" then
+        local rest = script:sub(i):match("^([^;\n]*)") or ""
+        rest = rest:gsub("^%s+", ""):gsub("%s+$", "")
+        if rest == "" then
+            stderr("sed: '" .. c .. "' requires a filename\n")
+            return nil, i
+        end
+        cmd.file = rest
+        i = i + #rest
     else
         return nil, i
     end
@@ -340,12 +408,52 @@ if #cmds == 0 then
     return 1
 end
 
+-- 标签表与 { } 块配对: 执行时靠下标跳转(与 GNU 的"脚本指针"等价)。
+local labels, blockEndOf, blockStartOf = {}, {}, {}
+do
+    local stack = {}
+    for idx, cmd in ipairs(cmds) do
+        if cmd.type == ":" then
+            if cmd.label ~= "" then labels[cmd.label] = idx end
+        elseif cmd.blockStart then
+            stack[#stack + 1] = idx
+        elseif cmd.blockEnd then
+            local open = table.remove(stack)
+            if not open then
+                stderr("sed: unexpected '}'\n")
+                return 1
+            end
+            blockEndOf[open] = idx
+            blockStartOf[idx] = open
+        end
+    end
+    if #stack > 0 then
+        stderr("sed: unmatched '{'\n")
+        return 1
+    end
+end
+-- 分支目标: 标签不存在 -> 脚本末尾(GNU: 跳到结尾, 结束本行)
+local function jumpTarget(name)
+    if name == nil or name == "" then return #cmds + 1 end
+    local at = labels[name]
+    if not at then
+        stderr("sed: can't find label for jump to `" .. name .. "'\n")
+        return nil
+    end
+    return at
+end
+
 -- ---------------------------------------------------------------
 -- 地址匹配
 -- ---------------------------------------------------------------
 local function singleMatch(a, ln, pattern, L)
     if a.kind == "num" then return ln == a.n
     elseif a.kind == "dollar" then return ln == L
+    elseif a.kind == "step" then
+        -- first~step: first 行命中, 之后每隔 step 行一次(GNU)
+        if a.step <= 0 then return ln == a.first end
+        if ln < a.first then return false end
+        return (ln - a.first) % a.step == 0
     elseif a.kind == "regex" then return a.re:find(pattern) ~= nil end
     return false
 end
@@ -357,9 +465,12 @@ local function startMatch(a, ln, pattern, L)
     elseif a.kind == "regex" then return a.re:find(pattern) ~= nil end
     return false
 end
-local function endMatch(a, ln, pattern, L)
+local function endMatch(a, ln, pattern, L, startLn)
     if a.kind == "num" then return ln == a.n
     elseif a.kind == "dollar" then return ln == L
+    elseif a.kind == "relnum" then
+        -- +N: 从区间起点再数 N 行
+        return startLn ~= nil and ln >= startLn + a.n
     elseif a.kind == "regex" then return a.re:find(pattern) ~= nil end
     return false
 end
@@ -372,7 +483,8 @@ local function addrMatch(cmd, ln, pattern, L)
         if startMatch(aStart, ln, pattern, L) then
             cmd.inRange = true
             cmd.atStart = true
-            if endMatch(aStop, ln, pattern, L) then
+            cmd.rangeStartLn = ln
+            if endMatch(aStop, ln, pattern, L, ln) then
                 cmd.inRange = false
                 cmd.atEnd = true
             else
@@ -384,7 +496,7 @@ local function addrMatch(cmd, ln, pattern, L)
         return false
     else
         cmd.atStart = false
-        if endMatch(aStop, ln, pattern, L) then
+        if endMatch(aStop, ln, pattern, L, cmd.rangeStartLn) then
             cmd.inRange = false
             cmd.atEnd = true
         else
@@ -421,44 +533,113 @@ local function readAllLines(handle)
     return lines
 end
 
+--- w/W 的输出文件句柄(同名文件只开一次, 追加写)。
+local outFiles = {}
+local function outHandle(path)
+    if not outFiles[path] then
+        local h, err = fs.open(resolve(path), "a")
+        if not h then
+            stderr("sed: couldn't open file " .. path .. ": " .. tostring(err) .. "\n")
+            return nil
+        end
+        outFiles[path] = h
+    end
+    return outFiles[path]
+end
+
+--- l 命令: 把模式空间按 GNU 的转义规则打印出来(行尾 $, 宽度默认 70)。
+local function listText(text, wrap)
+    local out = {}
+    for k = 1, #text do
+        local ch = text:sub(k, k)
+        local b = text:byte(k)
+        if ch == "\\" then out[#out + 1] = "\\\\"
+        elseif ch == "\n" then out[#out + 1] = "\\n"
+        elseif ch == "\t" then out[#out + 1] = "\\t"
+        elseif ch == "\r" then out[#out + 1] = "\\r"
+        elseif b < 32 or b == 127 then out[#out + 1] = string.format("\\%03o", b)
+        else out[#out + 1] = ch end
+    end
+    local body = table.concat(out)
+    if wrap and wrap > 0 then
+        local parts = {}
+        local pos = 1
+        while pos <= #body do
+            parts[#parts + 1] = body:sub(pos, pos + wrap - 1) .. "\\"
+            pos = pos + wrap
+        end
+        if #parts == 0 then return "$" end
+        parts[#parts] = parts[#parts]:sub(1, -2)
+        return table.concat(parts, "\n") .. "$"
+    end
+    return body .. "$"
+end
+
 local function process(lines, source)
     local L = #lines
     local quit = false
     local quitCode = 0
-    for ln = 1, L do
-        if quit then break end
+    local hold = ""          -- 保持空间(初始为空, 与 GNU 一致)
+    local ln = 1
+    while ln <= L and not quit do
         local pattern = lines[ln]
         local deleted = false
         local skipRest = false
-        -- a 命令排队要追加的文本, 等本行输出后再写 (GNU sed: append after line)。
+        local substituted = false -- 本行是否发生过替换(t/T 分支的判据)
         local appends = {}
-        for ci = 1, #cmds do
+        local ci = 1
+        while ci <= #cmds do
             local cmd = cmds[ci]
-            if skipRest then break end
             local matched = addrMatch(cmd, ln, pattern, L)
             if cmd.neg then matched = not matched end
-            if matched then
-                local t = cmd.type
+            local t = cmd.type
+            local jumped = false
+            if t == ":" then
+                -- 标签本身不做任何事
+            elseif t == "{" then
+                -- 块: 地址不命中就跳到配对的 } 之后
+                if not matched then ci = blockEndOf[ci] or ci end
+            elseif t == "}" then
+                -- 块尾: 什么都不做
+            elseif matched then
                 if t == "s" then
                     local np, changed = subst(pattern, cmd)
                     pattern = np
-                    if changed and cmd.print then wline(pattern) end
+                    if changed then
+                        substituted = true
+                        if cmd.print then wline(pattern) end
+                        if cmd.wfile then
+                            local h = outHandle(cmd.wfile)
+                            if h then h:write(pattern .. "\n") end
+                        end
+                    end
                 elseif t == "d" then
                     deleted = true; skipRest = true
                 elseif t == "p" then
                     wline(pattern)
                 elseif t == "=" then
                     wline(tostring(ln))
+                elseif t == "F" then
+                    wline(source or "-")
+                elseif t == "z" then
+                    pattern = ""
+                elseif t == "h" then hold = pattern
+                elseif t == "H" then hold = hold .. "\n" .. pattern
+                elseif t == "g" then pattern = hold
+                elseif t == "G" then pattern = pattern .. "\n" .. hold
+                elseif t == "x" then pattern, hold = hold, pattern
+                elseif t == "l" then
+                    wline(listText(pattern, cmd.wrap))
                 elseif t == "q" then
                     if not quiet then wline(pattern) end
+                    quit = true; quitCode = cmd.code or 0; skipRest = true
+                elseif t == "Q" then
                     quit = true; quitCode = cmd.code or 0; skipRest = true
                 elseif t == "y" then
                     pattern = translit(pattern, cmd)
                 elseif t == "a" then
-                    -- 命中即排队(含区间内每一行), 在本行(或整段)输出后才写。
                     appends[#appends + 1] = cmd.text
                 elseif t == "i" then
-                    -- 命中即写(含区间内每一行), 在本行输出前插入。
                     wline(cmd.text)
                 elseif t == "c" then
                     if cmd.addr and cmd.addr.kind == "range" then
@@ -467,15 +648,57 @@ local function process(lines, source)
                     else
                         wline(cmd.text); deleted = true; skipRest = true
                     end
+                elseif t == "w" then
+                    local h = outHandle(cmd.file)
+                    if h then h:write(pattern .. "\n") end
+                elseif t == "W" then
+                    local h = outHandle(cmd.file)
+                    if h then h:write((pattern:match("^[^\n]*") or "") .. "\n") end
+                elseif t == "r" then
+                    local h = fs.open(resolve(cmd.file), "r")
+                    if h then
+                        local text = h:readAll() or ""
+                        h:close()
+                        if text ~= "" then appends[#appends + 1] = text:gsub("\n$", "") end
+                    end
+                elseif t == "R" then
+                    -- 每次命中读一行(游标在句柄上)
+                    if not cmd.rHandle then
+                        cmd.rHandle = fs.open(resolve(cmd.file), "r")
+                    end
+                    if cmd.rHandle then
+                        local one = cmd.rHandle:readLine()
+                        if one ~= nil then appends[#appends + 1] = one end
+                    end
+                elseif t == "b" then
+                    local tgt = jumpTarget(cmd.label)
+                    if not tgt then quit = true; quitCode = 1; skipRest = true
+                    else ci = tgt; jumped = true end
+                elseif t == "t" then
+                    if substituted then
+                        local tgt = jumpTarget(cmd.label)
+                        if not tgt then quit = true; quitCode = 1; skipRest = true
+                        else ci = tgt; jumped = true end
+                    end
+                elseif t == "T" then
+                    if not substituted then
+                        local tgt = jumpTarget(cmd.label)
+                        if not tgt then quit = true; quitCode = 1; skipRest = true
+                        else ci = tgt; jumped = true end
+                    end
                 end
             end
             if skipRest then break end
+            -- b/t/T 跳转: 目标就是下一条, 不再自增
+            if not jumped then ci = ci + 1 end
+            -- t/T 的"是否替换过"按 GNU 语义在本行内保持(只有 t 分支后清零)
+            if t == "t" and jumped then substituted = false end
         end
         if not quit and not deleted and not quiet then
             wline(pattern)
         end
-        -- append 文本总是写在本行之后: 无论 -n、被 d 删除还是被 q 退出。
         for ai = 1, #appends do wline(appends[ai]) end
+        ln = ln + 1
     end
     return quit, quitCode
 end

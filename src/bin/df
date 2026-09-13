@@ -184,11 +184,7 @@ while di <= #args do
     di = di + 1
 end
 
--- 内核没有 inode 统计接口: fail-fast, 不编造数字(见 for-ai.md「已知缺口」)。
-if doInodes then
-    stderr("df: option '-i' is not supported (no inode statistics)\n")
-    return 2
-end
+
 
 local mountsFn = syscalls and syscalls["fs.mounts"]
 if not mountsFn then
@@ -215,17 +211,44 @@ end
 
 --- 一个挂载点的一行数据(全部按字节保存, 显示时才换算)。
 local function rowFor(mt)
+    local dev = mt.device or ((mt.root == "/") and "rootfs" or "-")
+    -- 有 statvfs(ext2)就按 statvfs(3) 的口径算:
+    --   Used   = blocks - bfree        (真实占用, 含保留块)
+    --   Avail  = bavail                (非 root 可用, 已扣掉保留块)
+    -- 这修正了老实现"Used = 总容量 - 可用"的老毛病 —— 那时保留块被算进 Used 里了。
+    local sv = fs.statvfs and fs.statvfs(mt.root)
+    if sv then
+        local bs = sv.blockSize or 1024
+        local cap = (sv.blocks or 0) * bs
+        local used = (sv.blocks - (sv.bfree or 0)) * bs
+        local avail = (sv.bavail or 0) * bs
+        if used < 0 then used = 0 end
+        return {
+            dev = dev, fstype = mt.fstype or "-", root = mt.root,
+            cap = cap, used = used, free = avail,
+            files = sv.files, ffree = sv.ffree,
+            pct = (cap > 0) and math.ceil(used * 100 / cap) or nil,
+        }
+    end
     local cap = fs.getCapacity(mt.root)
     local free = fs.getFreeSpace(mt.root)
     local used = cap - free
     if used < 0 then used = 0 end
     return {
-        dev = mt.device or ((mt.root == "/") and "rootfs" or "-"),
+        dev = dev,
         fstype = mt.fstype or "-",
         root = mt.root,
         cap = cap, used = used, free = free,
         pct = (cap > 0) and math.ceil(used * 100 / cap) or nil,
     }
+end
+
+--- -i: inode 用量。没有 statvfs 的挂载点(CC 原生 fs)没法给数字 -> 该行标 "-"。
+local function inodeRow(row)
+    if not row.files or row.files <= 0 then return nil end
+    local used = row.files - (row.ffree or 0)
+    if used < 0 then used = 0 end
+    return used, row.ffree or 0, math.ceil(used * 100 / row.files)
 end
 
 local rows, rc = {}, 0
@@ -281,26 +304,43 @@ local function cell(bytes)
     return string.format("%d", math.ceil(bytes / blockSize))
 end
 
+-- -i: 列换成 Inodes/IUsed/IFree/IUse%(与 GNU df -i 同名)
 local cols = {}
 cols[#cols + 1] = { head = "Filesystem", right = false, min = posixFmt and 14 or 0, vals = {} }
 if showType then
     cols[#cols + 1] = { head = "Type", right = false, min = 0, vals = {} }
 end
-local sizeHead = humanOut and "Size" or (blockSize == 1024 and "1024-blocks" or "512-blocks")
-cols[#cols + 1] = { head = sizeHead, right = true, min = posixFmt and 10 or 0, vals = {} }
-cols[#cols + 1] = { head = "Used", right = true, min = posixFmt and 10 or 0, vals = {} }
-cols[#cols + 1] = { head = humanOut and "Avail" or "Available", right = true, min = posixFmt and 10 or 0, vals = {} }
-cols[#cols + 1] = { head = "Capacity", right = true, min = posixFmt and 5 or 0, vals = {} }
+if doInodes then
+    cols[#cols + 1] = { head = "Inodes", right = true, min = posixFmt and 10 or 0, vals = {} }
+    cols[#cols + 1] = { head = "IUsed", right = true, min = posixFmt and 10 or 0, vals = {} }
+    cols[#cols + 1] = { head = "IFree", right = true, min = posixFmt and 10 or 0, vals = {} }
+    cols[#cols + 1] = { head = "IUse%", right = true, min = posixFmt and 5 or 0, vals = {} }
+else
+    local sizeHead = humanOut and "Size" or (blockSize == 1024 and "1024-blocks" or "512-blocks")
+    cols[#cols + 1] = { head = sizeHead, right = true, min = posixFmt and 10 or 0, vals = {} }
+    cols[#cols + 1] = { head = "Used", right = true, min = posixFmt and 10 or 0, vals = {} }
+    cols[#cols + 1] = { head = humanOut and "Avail" or "Available", right = true, min = posixFmt and 10 or 0, vals = {} }
+    cols[#cols + 1] = { head = "Capacity", right = true, min = posixFmt and 5 or 0, vals = {} }
+end
 cols[#cols + 1] = { head = "Mounted on", right = false, min = 0, vals = {} }
 
 for _, row in ipairs(rows) do
     local n = 1
     cols[n].vals[#cols[n].vals + 1] = row.dev; n = n + 1
     if showType then cols[n].vals[#cols[n].vals + 1] = row.fstype; n = n + 1 end
-    cols[n].vals[#cols[n].vals + 1] = cell(row.cap); n = n + 1
-    cols[n].vals[#cols[n].vals + 1] = cell(row.used); n = n + 1
-    cols[n].vals[#cols[n].vals + 1] = cell(row.free); n = n + 1
-    cols[n].vals[#cols[n].vals + 1] = row.pct and (row.pct .. "%") or "-"; n = n + 1
+    if doInodes then
+        local iused, ifree, ipct = inodeRow(row)
+        local files = row.files
+        cols[n].vals[#cols[n].vals + 1] = files and tostring(files) or "-"; n = n + 1
+        cols[n].vals[#cols[n].vals + 1] = iused and tostring(iused) or "-"; n = n + 1
+        cols[n].vals[#cols[n].vals + 1] = ifree and tostring(ifree) or "-"; n = n + 1
+        cols[n].vals[#cols[n].vals + 1] = ipct and (ipct .. "%") or "-"; n = n + 1
+    else
+        cols[n].vals[#cols[n].vals + 1] = cell(row.cap); n = n + 1
+        cols[n].vals[#cols[n].vals + 1] = cell(row.used); n = n + 1
+        cols[n].vals[#cols[n].vals + 1] = cell(row.free); n = n + 1
+        cols[n].vals[#cols[n].vals + 1] = row.pct and (row.pct .. "%") or "-"; n = n + 1
+    end
     cols[n].vals[#cols[n].vals + 1] = row.root
 end
 
@@ -330,10 +370,18 @@ for _, row in ipairs(rows) do
     local n = 1
     cells[n] = row.dev; n = n + 1
     if showType then cells[n] = row.fstype; n = n + 1 end
-    cells[n] = cell(row.cap); n = n + 1
-    cells[n] = cell(row.used); n = n + 1
-    cells[n] = cell(row.free); n = n + 1
-    cells[n] = row.pct and (row.pct .. "%") or "-"; n = n + 1
+    if doInodes then
+        local iused, ifree, ipct = inodeRow(row)
+        cells[n] = row.files and tostring(row.files) or "-"; n = n + 1
+        cells[n] = iused and tostring(iused) or "-"; n = n + 1
+        cells[n] = ifree and tostring(ifree) or "-"; n = n + 1
+        cells[n] = ipct and (ipct .. "%") or "-"; n = n + 1
+    else
+        cells[n] = cell(row.cap); n = n + 1
+        cells[n] = cell(row.used); n = n + 1
+        cells[n] = cell(row.free); n = n + 1
+        cells[n] = row.pct and (row.pct .. "%") or "-"; n = n + 1
+    end
     cells[n] = row.root
     io.write(render(cells) .. "\n")
 end

@@ -71,6 +71,7 @@ local optInode, optNumeric, optClassify, optSlash = false, false, false, false
 local optSizeSort, optNoSort, optExtSort = false, false, false
 local optQuote, optDeref, optDerefCmdline = false, false, false
 local optNoGroup, optNoOwner = false, false
+local optBlocks, optCtime, optAtime = false, false, false
 local optColorWhen = "never"
 
 local paths = {}
@@ -98,11 +99,9 @@ local function setShort(ch)
     elseif ch == "H" then optDerefCmdline = true
     elseif ch == "G" or ch == "o" then optNoGroup = true
     elseif ch == "g" then optLong, optNoOwner = true, true
-    elseif ch == "s" or ch == "c" or ch == "u" then
-        -- -s 要"已分配块数"(st_blocks)、-c/-u 要 ctime/atime: 内核 attributes 都不暴露
-        -- (见 for-ai.md「已知缺口」)。收下却打错数据比报错更糟, 所以 fail-fast。
-        stderr("ls: option '-" .. ch .. "' is not supported\n")
-        return false
+    elseif ch == "s" then optBlocks = true
+    elseif ch == "c" then optCtime = true
+    elseif ch == "u" then optAtime = true
     else stderr("ls: invalid option -- '" .. ch .. "'\n"); return false end
     return true
 end
@@ -191,6 +190,21 @@ local function human(n)
     if i == 1 then return tostring(n) end
     return string.format("%.1f%s", v, units[i])
 end
+--- 长格式里显示哪个时间: 缺省 mtime; -c 用 ctime; -u 用 atime(GNU 语义, 后给的赢)。
+local function entryTime(a)
+    if optCtime and a.ctime then return a.ctime end
+    if optAtime and a.atime then return a.atime end
+    return a.mtime
+end
+
+--- 已分配块数(512 字节单位, 与 stat(2) 的 st_blocks 一致); 没有就退回表观大小折算。
+local function blocksOf(a)
+    if a.blocks then return a.blocks end
+    local sz = a.size or 0
+    if sz == 0 then return 0 end
+    return math.ceil(sz / 512)
+end
+
 local function fmtTime(t)
     if not t or t <= 0 then return "             " end
     local ok, mon = pcall(os.date, "%b", t)
@@ -264,6 +278,12 @@ end
 local function lineLong(a, name, p)
     local s = ""
     if optInode then s = string.format("%7s ", tostring(a.ino or 0)) end
+    if optBlocks then
+        local blk = blocksOf(a)
+        local txt = optHuman and human(blk * 512) or tostring(blk)
+        if optHuman then txt = string.format("%4s", txt) else txt = string.format("%4s", txt) end
+        s = s .. txt .. " "
+    end
     s = s .. modeStr(a)
     s = s .. " " .. string.format("%2d", a.links or 1)
     if not optNoOwner then
@@ -278,7 +298,7 @@ local function lineLong(a, name, p)
         s = s .. " " .. gname
     end
     s = s .. " " .. string.format("%8s", optHuman and human(a.size) or tostring(a.size or 0))
-    s = s .. " " .. fmtTime(a.mtime)
+    s = s .. " " .. fmtTime(entryTime(a))
     local shown = decorate(a, name, p)
     s = s .. " " .. colorizeName(a, p, shown)
     -- 符号链接要显示指向(GNU: "name -> target"), 除非 -L/-H 已经把链接解开了
@@ -296,8 +316,8 @@ end
 local function entry(p, follow)
     local a = attrs(p, follow)
     return { isDir = a.isDir, size = a.size, mode = a.mode, uid = a.uid, gid = a.gid,
-             mtime = a.mtime, links = a.links, kind = a.kind, isReadOnly = a.isReadOnly,
-             ino = a.ino }
+             mtime = a.mtime, atime = a.atime, ctime = a.ctime, blocks = a.blocks,
+             links = a.links, kind = a.kind, isReadOnly = a.isReadOnly, ino = a.ino }
 end
 local function classifyHidden(name)
     return name:sub(1, 1) == "."
@@ -310,6 +330,10 @@ local function renderOne(full, name)
     else
         local out = ""
         if optInode then out = string.format("%7s ", tostring(a.ino or 0)) end
+        if optBlocks then
+            local blk = blocksOf(a)
+            out = out .. string.format("%4s ", optHuman and human(blk * 512) or tostring(blk))
+        end
         out = out .. colorizeName(a, full, decorate(a, name, full)) .. "\n"
         io.write(out)
         yieldCheck(#out)
@@ -337,7 +361,11 @@ local function sortNames(out, dir)
         table.sort(out, function(x, y)
             local ax = entry(full(x))
             local ay = entry(full(y))
-            return (ax.mtime or 0) > (ay.mtime or 0)
+            -- -t 的排序键与"显示哪个时间"一致(GNU: -c/-u 也换排序键)
+            local tx = entryTime(ax) or 0
+            local ty = entryTime(ay) or 0
+            if tx ~= ty then return tx > ty end
+            return x < y
         end)
     else
         table.sort(out)
@@ -363,6 +391,14 @@ local function printDir(p)
         if not (hideAll and classifyHidden(name)) then out[#out + 1] = name end
     end
     out = sortNames(out, p)
+    -- GNU: 目录列表在长格式/块数格式下先打一行 "total <块数>"(1K 单位 = 512 字节块数 / 2)
+    if optLong or optBlocks then
+        local half = 0
+        for _, name in ipairs(out) do
+            half = half + blocksOf(entry((p == "/") and ("/" .. name) or (p .. "/" .. name)))
+        end
+        io.write("total " .. tostring(math.ceil(half / 2)) .. "\n")
+    end
     for _, name in ipairs(out) do
         local full = (p == "/") and ("/" .. name) or (p .. "/" .. name)
         renderOne(full, name)
@@ -405,8 +441,12 @@ for pi, raw in ipairs(paths) do
         if optLong then
             lineLong(a, raw, path)
         else
-            io.write((optInode and (string.format("%7s ", tostring(a.ino or 0))) or "")
-                .. colorizeName(a, path, decorate(a, raw, path)) .. "\n")
+            local pre = ""
+            if optInode then pre = pre .. string.format("%7s ", tostring(a.ino or 0)) end
+            if optBlocks then
+                pre = pre .. string.format("%4s ", optHuman and human(blocksOf(a) * 512) or tostring(blocksOf(a)))
+            end
+            io.write(pre .. colorizeName(a, path, decorate(a, raw, path)) .. "\n")
         end
     end
 end

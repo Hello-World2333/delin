@@ -1,10 +1,17 @@
--- Delin touch: 创建文件并更新时间戳 (GNU 子集)。用法: touch [OPTION]... FILE...
--- 说明: ext2 里 mtime 是持久化的, 但 Delin **还没有写时间戳的内核接口**(没有 utimes),
---       因此 -a/-m/-r/-t/-d/-h 一律 **fail-fast 退出 2**: 老版本"接受但什么都不做"会骗过脚本
---       (脚本以为时间戳改了, 实际一个字节都没动) —— 见 for-ai.md「选项约定」。
---       真正的可观察行为只有 `-c`/`--no-create`(不存在时不创建也不报错)与"建空文件"。
+-- Delin touch: 创建文件并更新时间戳 (POSIX + GNU 子集)。用法: touch [OPTION]... FILE...
 -- 选项:
---   -c, --no-create            文件不存在时不创建
+--   -a                     只改访问时间(atime)
+--   -m                     只改修改时间(mtime); -a -m 同时给 = 两个都改(缺省行为)
+--   -c, --no-create        文件不存在时不创建、也不报错
+--   -d STRING, --date=STRING   用日期串指定时间(YYYY-MM-DD[ HH:MM[:SS]] / HH:MM[:SS] / @epoch)
+--   -t STAMP               [[CC]YY]MMDDhhmm[.ss] 紧凑格式
+--   -r FILE, --reference=FILE  以 FILE 的时间为基准
+--   -h, --no-dereference   作用于符号链接本身 -> 内核没有 lsetTimes, fail-fast 退出 2
+--   -f                     忽略(GNU 里是"忽略不可创建的文件错误", 收下无害)
+--   --                     结束选项
+-- 时间戳真正落到 inode 上(fs.setTimes -> ext2.setTimes 写 i_atime/i_mtime/i_ctime):
+--   以前这几个开关是"接受但完全不做事", 脚本据此会以为时间改了 —— 现在要么真改, 要么报错。
+-- 退出码: 0 成功; 1 任一操作数失败; 2 用法错/未实现的选项。
 local args = args or {}
 local cwd = (type(cwd) == "string" and cwd) or "/"
 local function resolve(p)
@@ -22,12 +29,95 @@ local function stderr(s)
     if e and e.write then e:write(s) end
 end
 
+-- ---------------------------------------------------------------
+-- 日期 -> epoch 秒(自写, 不依赖 os.time(表): CC 上那一条不一定可用)。
+-- 用 Howard Hinnant 的 days_from_civil(UTC); Delin 没有时区概念。
+-- ---------------------------------------------------------------
+local function daysFromCivil(y, m, d)
+    local yy = (m <= 2) and (y - 1) or y
+    local era = math.floor(yy / 400)
+    local yoe = yy - era * 400
+    local mp = (m + 9) % 12
+    local doy = math.floor((153 * mp + 2) / 5) + d - 1
+    local doe = yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy
+    return era * 146097 + doe - 719468
+end
+local function mktime(y, mo, d, h, mi, s)
+    return daysFromCivil(y, mo, d) * 86400 + h * 3600 + mi * 60 + s
+end
+
+local function nowSec() return math.floor(os.epoch("utc") / 1000) end
+
+--- 解析 GNU 的 -d 日期串(实用子集; 认不出就报错, 不猜)。
+local function parseDate(str)
+    str = (str or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    local at = str:match("^@(%d+)$")
+    if at then return tonumber(at) end
+    local y, mo, d, h, mi, s = str:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)[T ](%d%d):(%d%d):(%d%d)$")
+    if not y then
+        y, mo, d = str:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)$")
+        h, mi, s = 0, 0, 0
+    end
+    if not y then
+        local th, tmi, ts = str:match("^(%d%d):(%d%d):(%d%d)$")
+        if th then
+            local today = nowSec()
+            local dayStart = today - (today % 86400)
+            return dayStart + tonumber(th) * 3600 + tonumber(tmi) * 60 + tonumber(ts)
+        end
+        th, tmi = str:match("^(%d%d):(%d%d)$")
+        if th then
+            local today = nowSec()
+            local dayStart = today - (today % 86400)
+            return dayStart + tonumber(th) * 3600 + tonumber(tmi) * 60
+        end
+    end
+    if not y then return nil end
+    y, mo, d, h, mi, s = tonumber(y), tonumber(mo), tonumber(d), tonumber(h), tonumber(mi), tonumber(s)
+    if mo < 1 or mo > 12 or d < 1 or d > 31 or h > 23 or mi > 59 or s > 60 then return nil end
+    return mktime(y, mo, d, h, mi, s)
+end
+
+--- 解析 -t [[CC]YY]MMDDhhmm[.ss](GNU/POSIX 的紧凑格式)。
+local function parseStamp(str)
+    str = (str or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    local main, sec = str:match("^(%d+)%.(%d%d)$")
+    if not main then main, sec = str, nil end
+    local y, mo, d, h, mi
+    if #main == 12 then
+        y, mo, d, h, mi = main:sub(1, 4), main:sub(5, 6), main:sub(7, 8), main:sub(9, 10), main:sub(11, 12)
+    elseif #main == 10 then
+        local yy = main:sub(1, 2)
+        -- CCYY = 19YY / 20YY(与 GNU 一致的世纪推断)
+        y = (tonumber(yy) >= 69) and ("19" .. yy) or ("20" .. yy)
+        mo, d, h, mi = main:sub(3, 4), main:sub(5, 6), main:sub(7, 8), main:sub(9, 10)
+    elseif #main == 8 then
+        y = tostring(os.date("%Y", nowSec()))
+        mo, d, h, mi = main:sub(1, 2), main:sub(3, 4), main:sub(5, 6), main:sub(7, 8)
+    else
+        return nil
+    end
+    y, mo, d, h, mi = tonumber(y), tonumber(mo), tonumber(d), tonumber(h), tonumber(mi)
+    if not y or mo < 1 or mo > 12 or d < 1 or d > 31 or h > 23 or mi > 59 then return nil end
+    return mktime(y, mo, d, h, mi, tonumber(sec or 0))
+end
+
+-- ---------------------------------------------------------------
+-- 选项
+-- ---------------------------------------------------------------
 local noCreate = false
+local setAtime, setMtime = false, false
+local stampValue, stampFromFile = nil, nil
 local rest = {}
 local noMoreOpts = false
 local i = 1
--- 需要带参数的短选项
-local needsArg = { ["r"] = true, ["t"] = true, ["d"] = true }
+
+local function needArg(at, opt)
+    local v = args[at + 1]
+    if not v then stderr("touch: option '" .. opt .. "' requires an argument\n") end
+    return v
+end
+
 while i <= #args do
     local a = args[i]
     if noMoreOpts then
@@ -35,30 +125,61 @@ while i <= #args do
     elseif a == "--" then
         noMoreOpts = true
     elseif a == "--no-create" then noCreate = true
-    elseif a == "--reference" or a == "--date" or a == "--time" or a == "--no-dereference" then
-        -- 这些开关都要真的改时间戳, 而 Delin 目前没有写时间戳的内核接口 —— "接受却什么都不做"
-        -- 会骗过脚本(脚本以为时间戳改了), 所以一律 fail-fast(见 for-ai.md「选项约定」)。
-        stderr("touch: option '" .. a .. "' is not supported\n")
+    elseif a == "--date" then
+        local v = needArg(i, a); if not v then return 2 end
+        stampValue = parseDate(v)
+        if not stampValue then stderr("touch: invalid date format '" .. v .. "'\n"); return 2 end
+        i = i + 1
+    elseif a:match("^%-%-date=") then
+        stampValue = parseDate(a:sub(8))
+        if not stampValue then stderr("touch: invalid date format '" .. a:sub(8) .. "'\n"); return 2 end
+    elseif a == "--reference" then
+        local v = needArg(i, a); if not v then return 2 end
+        stampFromFile = v; i = i + 1
+    elseif a:match("^%-%-reference=") then
+        stampFromFile = a:sub(13)
+    elseif a == "--no-dereference" then
+        stderr("touch: option '--no-dereference' is not supported\n")
         return 2
-    elseif a:sub(1, 2) == "--" and a:find("=", 1, true) then
-        stderr("touch: option '" .. a:match("^([^=]*)") .. "' is not supported\n")
-        return 2
+    elseif a == "--time" or a:match("^%-%-time=") then
+        -- --time=atime|mtime|access|modify: 只改其中一项
+        local v = (a == "--time") and needArg(i, a) or a:sub(8)
+        if not v then return 2 end
+        if a == "--time" then i = i + 1 end
+        if v == "atime" or v == "access" or v == "use" then setAtime = true
+        elseif v == "mtime" or v == "modify" then setMtime = true
+        else stderr("touch: invalid argument '" .. v .. "' for '--time'\n"); return 2 end
     elseif a:sub(1, 1) == "-" and a ~= "-" and #a > 1 then
-        for k = 2, #a do
+        local k = 2
+        while k <= #a do
             local ch = a:sub(k, k)
-            if ch == "c" then noCreate = true
-            elseif ch == "a" or ch == "m" then
-                stderr("touch: option '-" .. ch .. "' is not supported\n")
-                return 2
+            if ch == "c" then noCreate = true; k = k + 1
+            elseif ch == "a" then setAtime = true; k = k + 1
+            elseif ch == "m" then setMtime = true; k = k + 1
+            elseif ch == "f" then k = k + 1 -- GNU: 忽略无法创建的文件错误, 收下无害
             elseif ch == "h" then
                 stderr("touch: option '-h' is not supported\n")
                 return 2
-            elseif needsArg[ch] then
-                -- -t/-d/-r 同样要真的改时间戳: 未实现 -> fail-fast(不静默忽略)
-                stderr("touch: option '-" .. ch .. "' is not supported\n")
-                return 2
+            elseif ch == "d" or ch == "t" or ch == "r" then
+                local v = a:sub(k + 1)
+                if v == "" then
+                    i = i + 1
+                    v = args[i]
+                    if not v then stderr("touch: option requires an argument -- '" .. ch .. "'\n"); return 2 end
+                end
+                if ch == "d" then
+                    stampValue = parseDate(v)
+                    if not stampValue then stderr("touch: invalid date format '" .. v .. "'\n"); return 2 end
+                elseif ch == "t" then
+                    stampValue = parseStamp(v)
+                    if not stampValue then stderr("touch: invalid date format '" .. v .. "'\n"); return 2 end
+                else
+                    stampFromFile = v
+                end
+                k = #a + 1
             else
-                stderr("touch: invalid option -- '" .. ch .. "'\n"); return 1
+                stderr("touch: invalid option -- '" .. ch .. "'\n")
+                return 1
             end
         end
     else
@@ -71,7 +192,26 @@ if #rest == 0 then
     stderr("touch: missing file operand\n")
     return 1
 end
+-- 既没给 -a 也没给 -m = 两者都改
+if not setAtime and not setMtime then setAtime, setMtime = true, true end
 
+-- -r FILE: 取参考文件的时间戳
+if stampFromFile then
+    local rp = resolve(stampFromFile)
+    local a = fs.attributes(rp)
+    if not a then
+        stderr("touch: failed to get attributes of '" .. stampFromFile .. "': No such file or directory\n")
+        return 1
+    end
+    -- 用 mtime 作基准(GNU 的 -r 同时取 atime/mtime; 参考文件的 atime 我们先读出来用)
+    stampValue = a.mtime or a.modificationTime
+    if not stampValue then
+        stderr("touch: '" .. stampFromFile .. "': no timestamp available\n")
+        return 1
+    end
+end
+
+local rc = 0
 for _, fp in ipairs(rest) do
     local p = resolve(fp)
     if not fs.exists(p) then
@@ -83,8 +223,21 @@ for _, fp in ipairs(rest) do
                 if f then f:close() end
             end)
             if not ok then
-                stderr("touch: " .. fp .. ": " .. tostring(err) .. "\n")
+                stderr("touch: cannot touch '" .. fp .. "': " .. tostring(err) .. "\n")
+                rc = 1
             end
         end
     end
+    if fs.exists(p) then
+        local atime, mtime
+        local base = stampValue or nowSec()
+        if setAtime then atime = base end
+        if setMtime then mtime = base end
+        local ok, err = fs.setTimes(p, atime, mtime)
+        if not ok then
+            stderr("touch: setting times of '" .. fp .. "': " .. tostring(err) .. "\n")
+            rc = 1
+        end
+    end
 end
+return rc

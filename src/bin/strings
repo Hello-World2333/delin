@@ -11,6 +11,7 @@
 --   - Delin 一律扫描整个文件(POSIX 的"已初始化数据段"概念在 Delin 上不存在), 故 -a 是默认行为。
 --   - 只识别单字节可打印字符, 不做 locale 多字节处理。
 local args = args or {}
+local outSep = "\n"   -- -s/--output-separator: 字符串之间的分隔符(缺省换行)
 local cwd = (type(cwd) == "string" and cwd) or "/"
 local function resolve(p)
     p = p or ""
@@ -56,6 +57,14 @@ while i <= #args do
         noMoreOpts = true
     elseif a == "-a" or a == "-all" or a == "--all" then -- Delin 一律全文件扫描
     elseif a == "-f" or a == "--print-file-name" then showName = true
+    elseif a == "-o" then radix = "o"
+    elseif a == "-s" or a == "--output-separator" then
+        i = i + 1
+        local v = args[i]
+        if not v then stderr("strings: option '" .. a .. "' requires an argument\n"); return 2 end
+        outSep = v
+    elseif a:match("^%-%-output%-separator=") then
+        outSep = a:sub(21)
     elseif a:match("^%-%-bytes=") then
         local n = tonumber(a:sub(9))
         if not n or n < 1 then stderr("strings: invalid integer argument '" .. a:sub(9) .. "'\n"); return 1 end
@@ -128,7 +137,7 @@ local function scan(h, name)
                 local fmt = (radix == "d" and "%7d") or (radix == "o" and "%7o") or "%7x"
                 out[#out + 1] = string.format(fmt, runStart) .. " "
             end
-            out[#out + 1] = table.concat(run) .. "\n"
+            out[#out + 1] = table.concat(run) .. outSep
             if #out >= 256 then flush() end
         end
         runStart = nil

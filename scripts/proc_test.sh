@@ -132,8 +132,10 @@ pgrep -x sleep > $T/pgrep_after
 chkempty pkill_sleep $T/pgrep_after
 
 sleep 30 &
-killall -e sleep > $T/killall_out
-chkcontain killall_echo 'killed' $T/killall_out
+# -v 才是"报告每个被杀掉的进程"(psmisc/GNU 的措辞是 "Killed name(pid) with signal N");
+# -e/--exact 是"名字要完全一致"(Delin 本来就按 comm 全等比较)。
+killall -v sleep > $T/killall_out
+chkcontain killall_echo 'Killed' $T/killall_out
 sleep 1
 pgrep -x sleep > $T/pgrep_after2
 chkempty killall_sleep $T/pgrep_after2

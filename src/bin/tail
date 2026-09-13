@@ -14,6 +14,8 @@
 -- 跟读实现: Delin 没有 inotify, 按 poll 语义做 —— 每次醒来重开文件(ext2 的 open 会把内容
 --   快照下来, 老句柄永远看不到追加)、seek 到上次偏移再按块读。文件变小 = 被截断/轮转,
 --   打一条 "file truncated" 并从 0 重新读(GNU 同此)。
+--   轮询间隔走 os.msleep(>=50) = **一次 CC 定时器**(而不是逐拍等): 装了 cc_hse 后
+--   os.msleep(0) 只有 4 个 HSE 拍(≈2ms), 拿它当轮询间隔会变成热循环; 间隔本身按 -s 给。
 local args = args or {}
 local cwd = (type(cwd) == "string" and cwd) or "/"
 local function resolve(p)

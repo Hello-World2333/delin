@@ -46,6 +46,15 @@ local function parseStatus(text)
     return t
 end
 
+--- /proc/<pid>/stat 的 Linux 字段 1..8 (comm 可能含空格, 从最后一个 ")" 往回切)。
+local function parseStat(text)
+    local pid, comm, st, ppid, pgrp, sess, tty, tpgid =
+        text:match("^(%d+) %((.*)%) (%a+) (%d+) (%d+) (%d+) (%S+) (%-?%d+)")
+    if not pid then return nil end
+    return { pid = tonumber(pid), comm = comm, state = st, ppid = tonumber(ppid),
+             pgrp = tonumber(pgrp), sess = tonumber(sess), tty = tty, tpgid = tonumber(tpgid) }
+end
+
 local function selfPid()
     local st = readFile("/proc/self/stat")
     if not st then return nil end
@@ -91,6 +100,22 @@ local optF, optX, optV, optN, optO = false, false, false, false, false
 local optUser = nil
 local sig = 15
 local pattern = nil
+local optEcho, optCount, optHandler = false, false, false
+local optParent, optTerm, optPgrp, optSess, optGroup, optUidReal = nil, nil, nil, nil, nil, nil
+local optPidFile, optIgnoreAnc, optRunstate = nil, false, nil
+
+--- 逗号分隔的数字表 -> 集合。
+local function numSet(v)
+    local set = {}
+    for x in (tostring(v or "") .. ","):gmatch("([^,]*),") do
+        if x ~= "" then
+            local n = tonumber(x)
+            if not n then return nil end
+            set[n] = true
+        end
+    end
+    return set
+end
 
 local i = 1
 while i <= #args do
@@ -101,7 +126,12 @@ while i <= #args do
         pattern = args[i]
     elseif a:sub(1, 2) == "--" then
         local name, val = a:match("^%-%-([%w-]+)=?(.*)$")
-        if name == "signal" then
+        if name == "session" then
+            -- procps 的 -s 是 session; Delin 的 -s 是"信号"(历史约定), 所以用 --session
+            if val == "" then i = i + 1; val = args[i] end
+            optSess = numSet(val)
+            if not optSess then stderr("pkill: invalid session id list\n"); return 2 end
+        elseif name == "signal" then
             if val == "" then i = i + 1; val = args[i] end
             if not val then stderr("pkill: option '--signal' requires an argument\n"); return 2 end
             sig = resolveSignal(val)
@@ -119,6 +149,62 @@ while i <= #args do
             elseif c == "v" then optV = true
             elseif c == "n" then optN = true
             elseif c == "o" then optO = true
+            elseif c == "e" then optEcho = true
+            elseif c == "c" then optCount = true
+            elseif c == "H" then optHandler = true
+            elseif c == "P" then
+                local val = a:sub(j + 1)
+                if val == "" then i = i + 1; val = args[i] end
+                optParent = numSet(val)
+                if not optParent then stderr("pkill: invalid parent pid list\n"); return 2 end
+                j = #a
+            elseif c == "t" then
+                local val = a:sub(j + 1)
+                if val == "" then i = i + 1; val = args[i] end
+                if not val then stderr("pkill: option requires an argument -- 't'\n"); return 2 end
+                optTerm = {}
+                for x in (val .. ","):gmatch("([^,]*),") do
+                    if x ~= "" then
+                        local t = x:match("^/dev/(.*)$") or x
+                        if t:match("^%d+$") then t = "tty" .. t end
+                        optTerm[t] = true
+                    end
+                end
+                j = #a
+            elseif c == "g" then
+                local val = a:sub(j + 1)
+                if val == "" then i = i + 1; val = args[i] end
+                optPgrp = numSet(val)
+                if not optPgrp then stderr("pkill: invalid process group list\n"); return 2 end
+                j = #a
+            elseif c == "G" then
+                local val = a:sub(j + 1)
+                if val == "" then i = i + 1; val = args[i] end
+                optGroup = numSet(val)
+                if not optGroup then stderr("pkill: invalid group list\n"); return 2 end
+                j = #a
+            elseif c == "U" then
+                local val = a:sub(j + 1)
+                if val == "" then i = i + 1; val = args[i] end
+                optUidReal = resolveUser(val)
+                if optUidReal == nil then stderr("pkill: user '" .. val .. "' does not exist\n"); return 2 end
+                j = #a
+            elseif c == "F" then
+                local val = a:sub(j + 1)
+                if val == "" then i = i + 1; val = args[i] end
+                if not val then stderr("pkill: option requires an argument -- 'F'\n"); return 2 end
+                optPidFile = val
+                j = #a
+            elseif c == "A" then optIgnoreAnc = true
+            elseif c == "r" then
+                local val = a:sub(j + 1)
+                if val == "" then i = i + 1; val = args[i] end
+                if not val then stderr("pkill: option requires an argument -- 'r'\n"); return 2 end
+                optRunstate = {}
+                for x in (val .. ","):gmatch("([^,]*),") do
+                    if x ~= "" then optRunstate[x] = true end
+                end
+                j = #a
             elseif c == "s" then
                 local val = a:sub(j + 1)
                 if val == "" then i = i + 1; val = args[i] end
@@ -154,7 +240,7 @@ while i <= #args do
     i = i + 1
 end
 
-if not pattern then stderr("usage: pkill [-SIGNAL] [-fxvno] [-u user] pattern\n"); return 2 end
+if not pattern then stderr("usage: pkill [-SIGNAL] [-fxvnoecH] [-u user] [-P ppid] [-t tty] [-g pgrp] [--session sid] [-G gid] [-U uid] [-F pidfile] [-A] [-r state] pattern\n"); return 2 end
 if optN and optO then stderr("pkill: -n and -o are mutually exclusive\n"); return 2 end
 
 -- 模式编译一次(procps 的 pgrep/pkill 用 ERE)。
@@ -167,15 +253,55 @@ if not re then
 end
 
 local self = selfPid()
+
+local ancestors = {}
+if optIgnoreAnc then
+    local cur = self
+    while cur and cur ~= 0 do
+        ancestors[cur] = true
+        local st = parseStat(readFile("/proc/" .. cur .. "/stat") or "")
+        cur = st and st.ppid or nil
+    end
+end
+
+local pidFileSet = nil
+if optPidFile then
+    local text = readFile(optPidFile)
+    if not text then
+        stderr("pkill: cannot open pid file: " .. tostring(optPidFile) .. "\n")
+        return 2
+    end
+    pidFileSet = {}
+    for tok in text:gmatch("%S+") do
+        local n2 = tonumber(tok)
+        if n2 then pidFileSet[n2] = true end
+    end
+end
+
 local hits = {}
 for _, p in ipairs(candidates()) do
-    if p.pid ~= self then
-        local uidOk = true
-        if optUser ~= nil then
-            local s = parseStatus(readFile("/proc/" .. p.pid .. "/status") or "")
-            uidOk = (tonumber(s.Uid) or -1) == optUser
+    if p.pid ~= self and not (optIgnoreAnc and ancestors[p.pid]) then
+        local st = parseStat(readFile("/proc/" .. p.pid .. "/stat") or "")
+        local status = nil
+        local function statusOf()
+            if not status then status = parseStatus(readFile("/proc/" .. p.pid .. "/status") or "") end
+            return status
         end
-        if uidOk then
+        local ok = true
+        if optUser ~= nil then ok = (tonumber(statusOf().Uid) or -1) == optUser end
+        if ok and optUidReal ~= nil then ok = (tonumber(statusOf().Uid) or -1) == optUidReal end
+        if ok and optGroup ~= nil then ok = optGroup[tonumber(statusOf().Gid) or -1] == true end
+        if ok and optParent then ok = st ~= nil and optParent[st.ppid] == true end
+        if ok and optPgrp then ok = st ~= nil and optPgrp[st.pgrp] == true end
+        if ok and optSess then ok = st ~= nil and optSess[st.sess] == true end
+        if ok and optTerm then
+            local t = (st and st.tty) or "0"
+            if t == "0" then t = "?" end
+            ok = optTerm[t] == true
+        end
+        if ok and optRunstate then ok = optRunstate[(st and st.state) or "?"] == true end
+        if ok and pidFileSet then ok = pidFileSet[p.pid] == true end
+        if ok then
             local text = optF and (p.cmd or p.comm) or p.comm
             local match = re:find(text) ~= nil
             if match ~= optV then hits[#hits + 1] = p end
@@ -186,11 +312,31 @@ end
 if optN and #hits > 0 then hits = { hits[#hits] } end
 if optO and #hits > 0 then hits = { hits[1] } end
 
+-- -c: 只报计数, 不发信号(procps 语义)
+if optCount then
+    io.write(tostring(#hits) .. "\n")
+    if #hits == 0 then return 1 end
+    return 0
+end
+
+-- -H: 只杀"给该信号装了处理器"的进程(内核 proc.info 里有 sig.handlers)
+if optHandler then
+    local kept = {}
+    local info = syscalls and syscalls["proc.info"]
+    for _, p in ipairs(hits) do
+        local rec = info and info(p.pid)
+        local handlers = rec and rec.sig and rec.sig.handlers
+        if handlers and handlers[sig] then kept[#kept + 1] = p end
+    end
+    hits = kept
+end
+
 local sent = 0
 for _, p in ipairs(hits) do
     local ok, err = syscalls["signal.kill"](p.pid, sig)
     if ok then
         sent = sent + 1
+        if optEcho then io.write("killed (pid " .. p.pid .. ")\n") end
     else
         stderr("pkill: " .. p.pid .. ": " .. tostring(err) .. "\n")
     end

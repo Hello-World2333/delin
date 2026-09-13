@@ -75,6 +75,15 @@ local function candidates()
     return out
 end
 
+--- /proc/<pid>/stat 的 Linux 字段 1..8 (comm 可能含空格, 从最后一个 ")" 往回切)。
+local function parseStat(text)
+    local pid, comm, st, ppid, pgrp, sess, tty, tpgid =
+        text:match("^(%d+) %((.*)%) (%a+) (%d+) (%d+) (%d+) (%S+) (%-?%d+)")
+    if not pid then return nil end
+    return { pid = tonumber(pid), comm = comm, state = st, ppid = tonumber(ppid),
+             pgrp = tonumber(pgrp), sess = tonumber(sess), tty = tty, tpgid = tonumber(tpgid) }
+end
+
 --- 用户的 uid(用户名或数字)。
 local function resolveUser(spec)
     local n = tonumber(spec)
@@ -86,7 +95,23 @@ end
 
 local optF, optX, optV, optL, optA, optN, optO = false, false, false, false, false, false, false
 local optUser = nil
+local optCount, optDelim, optIcase = false, "\n", false
+local optParent, optTerm, optPgrp, optSess, optGroup, optUidReal = nil, nil, nil, nil, nil, nil
+local optPidFile, optIgnoreAnc, optRunstate = nil, false, nil
 local pattern = nil
+
+--- 逗号分隔的数字表 -> 集合(procps 的这些选项都收列表)。
+local function numSet(v)
+    local set = {}
+    for x in (tostring(v or "") .. ","):gmatch("([^,]*),") do
+        if x ~= "" then
+            local n = tonumber(x)
+            if not n then return nil end
+            set[n] = true
+        end
+    end
+    return set
+end
 
 local i = 1
 while i <= #args do
@@ -109,6 +134,76 @@ while i <= #args do
             elseif c == "a" then optA = true
             elseif c == "n" then optN = true
             elseif c == "o" then optO = true
+            elseif c == "c" then optCount = true
+            elseif c == "i" then optIcase = true
+            elseif c == "d" then
+                local val = a:sub(j + 1)
+                if val == "" then i = i + 1; val = args[i] end
+                if not val then stderr("pgrep: option requires an argument -- 'd'\n"); return 2 end
+                optDelim = val
+                j = #a
+            elseif c == "P" then
+                local val = a:sub(j + 1)
+                if val == "" then i = i + 1; val = args[i] end
+                optParent = numSet(val)
+                if not optParent then stderr("pgrep: invalid parent pid list\n"); return 2 end
+                j = #a
+            elseif c == "t" then
+                local val = a:sub(j + 1)
+                if val == "" then i = i + 1; val = args[i] end
+                if not val then stderr("pgrep: option requires an argument -- 't'\n"); return 2 end
+                optTerm = {}
+                for x in (val .. ","):gmatch("([^,]*),") do
+                    if x ~= "" then
+                        local t = x:match("^/dev/(.*)$") or x
+                        if t:match("^%d+$") then t = "tty" .. t end
+                        optTerm[t] = true
+                    end
+                end
+                j = #a
+            elseif c == "g" then
+                local val = a:sub(j + 1)
+                if val == "" then i = i + 1; val = args[i] end
+                optPgrp = numSet(val)
+                if not optPgrp then stderr("pgrep: invalid process group list\n"); return 2 end
+                j = #a
+            elseif c == "s" then
+                local val = a:sub(j + 1)
+                if val == "" then i = i + 1; val = args[i] end
+                optSess = numSet(val)
+                if not optSess then stderr("pgrep: invalid session id list\n"); return 2 end
+                j = #a
+            elseif c == "G" then
+                local val = a:sub(j + 1)
+                if val == "" then i = i + 1; val = args[i] end
+                optGroup = numSet(val)
+                if not optGroup then stderr("pgrep: invalid group list\n"); return 2 end
+                j = #a
+            elseif c == "U" then
+                local val = a:sub(j + 1)
+                if val == "" then i = i + 1; val = args[i] end
+                optUidReal = resolveUser(val)
+                if optUidReal == nil then stderr("pgrep: user '" .. val .. "' does not exist\n"); return 2 end
+                j = #a
+            elseif c == "F" then
+                local val = a:sub(j + 1)
+                if val == "" then i = i + 1; val = args[i] end
+                if not val then stderr("pgrep: option requires an argument -- 'F'\n"); return 2 end
+                optPidFile = val
+                j = #a
+            elseif c == "A" then optIgnoreAnc = true
+            elseif c == "r" then
+                local val = a:sub(j + 1)
+                if val == "" then i = i + 1; val = args[i] end
+                if not val then stderr("pgrep: option requires an argument -- 'r'\n"); return 2 end
+                optRunstate = {}
+                for x in (val .. ","):gmatch("([^,]*),") do
+                    if x ~= "" then optRunstate[x] = true end
+                end
+                j = #a
+            elseif c == "O" then
+                stderr("pgrep: option '-O' is not supported (no process start time)\n")
+                return 2
             elseif c == "u" then
                 local val = a:sub(j + 1)
                 if val == "" then i = i + 1; val = args[i] end
@@ -129,28 +224,87 @@ while i <= #args do
     i = i + 1
 end
 
-if not pattern then stderr("usage: pgrep [-flnvoax] [-u user] pattern\n"); return 2 end
+if not pattern then stderr("usage: pgrep [-flnvoaxcd] [-u user] [-P ppid] [-t tty] [-g pgrp] [-s sid] [-G gid] [-U uid] [-F pidfile] [-A] [-r state] pattern\n"); return 2 end
 if optN and optO then stderr("pgrep: -n and -o are mutually exclusive\n"); return 2 end
 
 -- 模式编译一次(procps 的 pgrep/pkill 用 ERE)。
 local compileRegex = syscalls and syscalls["regex.compile"]
 if not compileRegex then stderr("pgrep: regex syscall not available\n"); return 2 end
-local re, rerr = compileRegex(pattern, "ere", { line = optX })
+local re, rerr = compileRegex(pattern, "ere", { line = optX, icase = optIcase })
 if not re then
     stderr("pgrep: invalid pattern: " .. tostring(rerr) .. "\n")
     return 2
 end
 
 local self = selfPid()
+
+--- -A: 调用者自己的祖先链(这些进程要排除)
+local ancestors = {}
+if optIgnoreAnc then
+    local cur = self
+    while cur and cur ~= 0 do
+        ancestors[cur] = true
+        local st = parseStat(readFile("/proc/" .. cur .. "/stat") or "")
+        cur = st and st.ppid or nil
+    end
+end
+
+--- -F pidfile: 只考虑文件里列出的 pid
+local pidFileSet = nil
+if optPidFile then
+    local text = readFile(optPidFile)
+    if not text then
+        stderr("pgrep: cannot open pid file: " .. tostring(optPidFile) .. "\n")
+        return 2
+    end
+    pidFileSet = {}
+    for tok in text:gmatch("%S+") do
+        local n = tonumber(tok)
+        if n then pidFileSet[n] = true end
+    end
+end
+
 local hits = {}
 for _, p in ipairs(candidates()) do
-    if p.pid ~= self then
-        local uidOk = true
-        if optUser ~= nil then
-            local s = parseStatus(readFile("/proc/" .. p.pid .. "/status") or "")
-            uidOk = (tonumber(s.Uid) or -1) == optUser
+    if p.pid ~= self and not (optIgnoreAnc and ancestors[p.pid]) then
+        local st = parseStat(readFile("/proc/" .. p.pid .. "/stat") or "")
+        local status = nil
+        local function statusOf()
+            if not status then status = parseStatus(readFile("/proc/" .. p.pid .. "/status") or "") end
+            return status
         end
-        if uidOk then
+        local ok = true
+        if optUser ~= nil then
+            ok = (tonumber(statusOf().Uid) or -1) == optUser
+        end
+        if ok and optUidReal ~= nil then
+            ok = (tonumber(statusOf().Uid) or -1) == optUidReal
+        end
+        if ok and optGroup ~= nil then
+            ok = optGroup[tonumber(statusOf().Gid) or -1] == true
+        end
+        if ok and optParent then
+            ok = st ~= nil and optParent[st.ppid] == true
+        end
+        if ok and optPgrp then
+            ok = st ~= nil and optPgrp[st.pgrp] == true
+        end
+        if ok and optSess then
+            ok = st ~= nil and optSess[st.sess] == true
+        end
+        if ok and optTerm then
+            local t = (st and st.tty) or "0"
+            if t == "0" then t = "?" end
+            ok = optTerm[t] == true
+        end
+        if ok and optRunstate then
+            local state = (st and st.state) or "?"
+            ok = optRunstate[state] == true
+        end
+        if ok and pidFileSet then
+            ok = pidFileSet[p.pid] == true
+        end
+        if ok then
             local text = optF and (p.cmd or p.comm) or p.comm
             local match = re:find(text) ~= nil
             if match ~= optV then hits[#hits + 1] = p end
@@ -161,14 +315,25 @@ end
 if optN and #hits > 0 then hits = { hits[#hits] } end
 if optO and #hits > 0 then hits = { hits[1] } end
 
+-- -c: 只打印计数, 不列 pid(procps 语义)
+if optCount then
+    io.write(tostring(#hits) .. "\n")
+    if #hits == 0 then return 1 end
+    return 0
+end
+
+local first = true
 for _, p in ipairs(hits) do
+    if not first then io.write(optDelim) end
+    first = false
     if optA then
-        io.write(tostring(p.pid) .. " " .. (p.cmd or ("[" .. p.comm .. "]")) .. "\n")
+        io.write(tostring(p.pid) .. " " .. (p.cmd or ("[" .. p.comm .. "]")))
     elseif optL then
-        io.write(tostring(p.pid) .. " " .. p.comm .. "\n")
+        io.write(tostring(p.pid) .. " " .. p.comm)
     else
-        io.write(tostring(p.pid) .. "\n")
+        io.write(tostring(p.pid))
     end
 end
+if #hits > 0 then io.write("\n") end
 
 if #hits == 0 then return 1 end

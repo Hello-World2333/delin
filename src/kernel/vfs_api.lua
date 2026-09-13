@@ -110,10 +110,28 @@ function fsapi.getCapacity(path) local b, r = dispatch(path); return b.getCapaci
 -- makeDir/move/delete 的**目标**最后一段不跟随符号链接: 否则 `rm link` 会删掉链接指向的
 -- 文件(Linux 的 unlink/rename/mkdir 都不跟随最后一段)。源路径 move 同理(rename 不动链接本身)。
 function fsapi.makeDir(path) local b, r = dispatchNoFollow(path); return b.makeDir(r) end
+--- rename(2): 同一文件系统内交给后端的 move(元数据操作, 原子);
+--- 跨文件系统按 POSIX 语义返回 "cross-device link"(EXDEV), 由调用者(mv)决定要不要 copy+delete。
 function fsapi.move(a, b)
     local ba, ra = dispatchNoFollow(a)
     local bb, rb = dispatchNoFollow(b)
+    if ba ~= bb then return nil, "cross-device link" end
+    if not ba.move then return nil, "move not supported on this filesystem" end
     return ba.move(ra, rb)
+end
+
+--- 文件系统统计(statvfs(3) 的子集): 只有提供 statvfs 的后端(ext2)才有; 其余返回 nil。
+function fsapi.statvfs(path)
+    local b, r = dispatch(path)
+    if not b.statvfs then return nil, "statvfs not supported on this filesystem" end
+    return b.statvfs(r)
+end
+
+--- 改时间戳(touch(1)/utimes(2)): atime/mtime 为 nil 的那一项不动, ctime 恒置为现在。
+function fsapi.setTimes(path, atime, mtime)
+    local b, r = dispatch(path)
+    if not b.setTimes then return nil, "setTimes not supported on this filesystem" end
+    return b.setTimes(r, atime, mtime)
 end
 function fsapi.copy(a, b) local ba, ra = dispatch(a); local bb, rb = dispatch(b); return ba.copy(ra, rb) end
 function fsapi.delete(path) local b, r = dispatchNoFollow(path); return b.delete(r) end

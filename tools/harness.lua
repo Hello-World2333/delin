@@ -252,8 +252,32 @@ function F.attributes(p)
     local uid = tonumber(((hu:read("*a") or ""):gsub("%s+$", ""))) or 0
     local gid = tonumber(((gu:read("*a") or ""):gsub("%s+$", ""))) or 0
     hu:close(); gu:close()
+    -- 时间戳与已分配块数: 真机 ext2 的 attributes 给 mtime/atime/ctime/blocks, 宿主桩也得给,
+    -- 否则 ls -l/-s、find -newermt、touch、du 在宿主上的行为与真机对不上。
+    local hs = io.popen("stat -c '%X %Y %Z %b' -- " .. host(p) .. " 2>/dev/null")
+    local atime, mtime, ctime, blocks = (hs:read("*a") or ""):match("(%d+)%s+(%d+)%s+(%d+)%s+(%d+)")
+    hs:close()
     return { size = sz, isDir = F.isDir(p), mode = typebits + (perms % tonumber("1000", 8)),
-             name = n:match("[^/]+$") or "", uid = uid, gid = gid }
+             name = n:match("[^/]+$") or "", uid = uid, gid = gid,
+             mtime = tonumber(mtime), atime = tonumber(atime), ctime = tonumber(ctime),
+             blocks = tonumber(blocks) }
+end
+
+--- 改时间戳(touch 用)。真机是 ext2.setTimes; 宿主用 GNU touch 的 @epoch 形式顶。
+function F.setTimes(p, atime, mtime)
+    if not F.exists(p) then return nil, "no such file" end
+    local h = host(p)
+    if atime and mtime and atime == mtime then
+        return os.execute("touch -d '@" .. tostring(atime) .. "' " .. h .. " 2>/dev/null") ~= nil
+    end
+    local ok = true
+    if atime then
+        ok = os.execute("touch -a -d '@" .. tostring(atime) .. "' " .. h .. " 2>/dev/null") ~= nil and ok
+    end
+    if mtime then
+        ok = os.execute("touch -m -d '@" .. tostring(mtime) .. "' " .. h .. " 2>/dev/null") ~= nil and ok
+    end
+    return ok
 end
 
 function F.chmod(p, mode)

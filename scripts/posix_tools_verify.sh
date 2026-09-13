@@ -52,6 +52,13 @@ cmd_chk() {
     fi
 }
 # out_chk <名字> <期望(单行)> <命令...>: 命令 stdout 必须与期望逐字节相同
+chk_eq() { # chk_eq <名字> <期望> <实际>
+    if [ "$2" = "$3" ]; then
+        echo "ok   $1" >> $LOG
+    else
+        echo "ng   $1 (want=$2 got=$3)" >> $LOG; ng=1
+    fi
+}
 out_chk() {
     _n="$1"; _want="$2"; shift; shift
     "$@" > "$T/got" < /dev/null
@@ -316,7 +323,7 @@ rc_chk opt_unknown_mkdir 1 mkdir --zz-bogus
 rc_chk opt_unknown_sort 2 sort --zz-bogus
 rc_chk opt_unknown_grep 2 grep --zz-bogus
 rc_chk opt_unsupported_dmesg 2 dmesg -s 64
-rc_chk opt_unsupported_touch 2 touch -d 2020-01-01 "$T/five"
+rc_chk opt_unsupported_touch 2 touch -h "$T/five"
 rc_chk opt_unsupported_umount 2 umount -l "$T"
 
 # head/tail 的符号语义(以前静默按"末 N 行"处理)
@@ -367,7 +374,7 @@ printf 'two\n' > "$T/o2/b"
 # ls: -i 有 inode 号(不是 0), -F 目录带 /, -Q 加引号; -s 必须 fail-fast
 out_chk ls_F_ok 1 sh -c "ls -F $T/o2 | grep -c 'd1/'"
 out_chk ls_Q_ok 1 sh -c "ls -Q $T/o2/a | grep -c '\"\$'"
-rc_chk ls_s_unsupported 2 ls -s "$T/o2"
+rc_chk ls_s_ok 0 ls -s "$T/o2"
 
 # cp: -t / -l / -s / -T, 源不存在 -> 1
 cmd_chk cp_t cp -t "$T/o2/d1" "$T/o2/a" "$T/o2/b"
@@ -413,6 +420,84 @@ rc_chk logger_net_unsupported 2 logger -n 127.0.0.1 hi
 # systemctl: is-failed 对"在跑"的单元返回 3; cat 能打印单元文件
 rc_chk systemctl_is_failed 3 systemctl is-failed syslogd.service
 cmd_chk systemctl_cat systemctl cat syslogd.service
+
+# ---------------------------------------------------------------
+# 批次 3: 内核侧新能力落地后的行为(原子 rename / 时间戳 / statvfs / 属性暴露 / /dev/tty)
+# ---------------------------------------------------------------
+echo "-- option semantics batch3 (rename/touch/stat/df -i/find/sed) --" >> $LOG
+mkdir -p "$T/o3"
+printf 'hello\n' > "$T/o3/a"
+
+# 原子 rename: mv 一个**符号链接**之后它仍是链接 —— copy+delete 会跟随链接变成普通文件。
+ln -s /etc/passwd "$T/o3/sl"
+mv "$T/o3/sl" "$T/o3/sl2"
+out_chk mv_keeps_symlink 1 sh -c "ls -l $T/o3/sl2 | grep -c '^l'"
+# 同一个文件改名: inode 号不变(原子 rename 的直接证据)
+printf 'x\n' > "$T/o3/ino"
+_before=$(stat -c %i "$T/o3/ino")
+mv "$T/o3/ino" "$T/o3/ino2"
+_after=$(stat -c %i "$T/o3/ino2")
+if [ "$_before" = "$_after" ] && [ -n "$_before" ]; then
+    echo "ok   mv_keeps_inode" >> $LOG
+else
+    echo "ng   mv_keeps_inode (before=$_before after=$_after)" >> $LOG; ng=1
+fi
+
+# touch 的时间戳真的落盘: -d 2020-01-01 = 1577836800(UTC)
+touch -d 2020-01-01 "$T/o3/a"
+_v=$(stat -c %Y "$T/o3/a")
+chk_eq touch_date 1577836800 "$_v"
+touch -t 202002020304.05 "$T/o3/a"
+_v=$(stat -c %Y "$T/o3/a")
+chk_eq touch_stamp 1580612645 "$_v"
+printf 'y\n' > "$T/o3/b"
+touch -r "$T/o3/a" "$T/o3/b"
+_v=$(stat -c %Y "$T/o3/b")
+chk_eq touch_reference 1580612645 "$_v"
+touch -m -d 2021-01-01 "$T/o3/a"
+touch -a -d 2022-01-01 "$T/o3/a"
+_v=$(stat -c %X "$T/o3/a")
+chk_eq touch_atime_only 1640995200 "$_v"
+_v=$(stat -c %Y "$T/o3/a")
+chk_eq touch_mtime_kept 1609459200 "$_v"
+
+# stat: 默认输出 + 格式符 + 块数
+cmd_chk stat_default stat "$T/o3/a"
+_v=$(stat -c "%F %s" "$T/o3/a")
+chk_eq stat_format "regular file 6" "$_v"
+_v=$(stat -c %b "$T/o3/a")
+if [ "$_v" -gt 0 ]; then echo "ok   stat_blocks_nonzero" >> $LOG; else echo "ng   stat_blocks_nonzero ($_v)" >> $LOG; ng=1; fi
+
+# df -i: inode 用量(ext2 superblock 计数)
+out_chk df_inodes 1 sh -c "df -i | grep -c 'IUse%'"
+cmd_chk df_i df -i
+
+# find: -printf 的块/时间指令与 -newermt / -ls
+cmd_chk find_printf find "$T/o3" -printf "%p %y %m %s %T@\n"
+cmd_chk find_newermt find "$T/o3" -newermt 2000-01-01 -name a
+cmd_chk find_ls find "$T/o3" -maxdepth 1 -ls
+
+# sed: 保持空间 / 分支 / 块 / 步长地址
+out_chk sed_hold a sh -c "printf 'a\n' | sed -n '1h;1g;p'"
+out_chk sed_branch A sh -c "printf 'a\n' | sed 's/a/A/;tb;s/^/X/;:b'"
+out_chk sed_block 2 sh -c "printf 'a\nb\nc\n' | sed -n '/b/,/c/{p}' | wc -l"
+out_chk sed_step 2 sh -c "printf 'a\nb\nc\nd\n' | sed -n '1~2p' | wc -l"
+
+# uniq -D / --group / xargs -d / kill -L / wc --files0-from / /dev/tty
+out_chk uniq_D 2 sh -c "printf 'a\na\nb\n' | uniq -D | wc -l"
+out_chk uniq_group 4 sh -c "printf 'a\na\nb\n' | uniq --group | wc -l"
+printf 'a:b:c' > "$T/o3/in3"
+xargs -a "$T/o3/in3" -d: -n1 echo > "$T/o3/out3"
+_v=$(wc -l < "$T/o3/out3")
+chk_eq xargs_delim 3 "$_v"
+# 已知缺口, 不断言(见 for-ai.md「管道端是共享句柄对象」一节): xargs 起一串子进程共用同一个
+# stdout 管道时, 第一个子进程退出就把管道关了 ——
+#   printf 'a:b:c' | xargs -d: -n1 echo | wc -l   ->  1(期望 3)
+# 重定向到文件不受影响, 上面 xargs_delim 走的就是文件路径。
+out_chk kill_table 1 sh -c "kill -L | grep -c KILL"
+printf '%s\0' "$T/o3/a" > "$T/o3/list0"
+out_chk wc_files0_out 1 sh -c "wc --files0-from=$T/o3/list0 | grep -c o3"
+out_chk dev_tty_node 1 sh -c "ls /dev | grep -cx tty"
 
 # ---------------------------------------------------------------
 # 标准正则(grep/sed/ed/expr/csplit 的 BRE/ERE 方言与退出码)

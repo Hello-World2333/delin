@@ -1,0 +1,341 @@
+-- Delin stat: 显示文件/文件系统状态 (GNU coreutils stat 子集)。
+-- 用法: stat [OPTION]... FILE...
+--   -L, --dereference      跟随符号链接(显示目标的状态)
+--   -f, --file-system      显示**文件系统**状态而不是文件本身
+--   -c, --format=FORMAT    用格式串输出(每行一个操作数, 不自动加换行)
+--   --printf=FORMAT        同 -c, 但解释 \n \t 等反斜杠转义(GNU 语义)
+--   -t, --terse            简短格式(无标签; -f 时是 "name: 值" 一行)
+-- 文件格式符(GNU 的子集):
+--   %n 名字  %s 大小  %b 已分配块数(512B)  %B 块大小(512)  %f 原始 mode(十六进制)
+--   %F 类型名  %a 权限(八进制)  %A 权限(符号)  %u 属主 uid  %U 属主名
+--   %g 组 gid  %G 组名  %h 硬链接数  %i inode 号  %d 设备号  %t/%T 主/次设备号(字符设备)
+--   %X/%Y/%Z atime/mtime/ctime(epoch 秒)  %x/%y/%z 同样的三个时间(人类可读)
+--   缺省格式(不带 -c/--printf)与 GNU 一致: File/Size/Blocks/IO Block/type/Device/Inode/
+--   Links/Access/Context?(省略)/Uid/Gid/Access/Modify/Change/Birth?(省略)
+-- 文件系统格式符: %n 挂载点 %s 块大小 %b 总块数 %f 空闲块数 %a 非 root 可用块数
+--   %c inode 总数 %d 空闲 inode 数 %T 类型名(用 -f 的 %t 同义)
+-- 退出码: 0 成功; 1 任一操作数失败(打不出状态); 2 用法错/未实现的格式符。
+-- 已知偏离: 没有 %C(安全上下文)/%m(挂载点)/%w(出生时间) —— 内核不提供这些数据,
+--   用了就 fail-fast 报错, 不打印假值。
+local args = args or {}
+local cwd = (type(cwd) == "string" and cwd) or "/"
+local function resolve(p)
+    p = p or ""
+    if p == "" then return (cwd == "/") and "/" or cwd end
+    if p:sub(1, 1) == "/" then
+        if p == "/" then return "/" end
+        return p:gsub("/+$", "")
+    end
+    local base = (cwd == "/") and "" or cwd
+    return (base .. "/" .. p):gsub("/+", "/")
+end
+local function stderr(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+local function baseName(p) return (p:match("([^/]*)$")) or p end
+
+local deref, fsMode, terse = false, false, false
+local format, printfMode = nil, false
+local operands, noMoreOpts = {}, false
+
+local function setFormat(v, isPrintf)
+    format = v
+    printfMode = isPrintf and true or false
+end
+
+local i = 1
+while i <= #args do
+    local a = args[i]
+    if noMoreOpts then
+        operands[#operands + 1] = a
+    elseif a == "--" then
+        noMoreOpts = true
+    elseif a == "-L" or a == "--dereference" then deref = true
+    elseif a == "-f" or a == "--file-system" then fsMode = true
+    elseif a == "-t" or a == "--terse" then terse = true
+    elseif a == "-c" then
+        i = i + 1
+        if not args[i] then stderr("stat: option '-c' requires an argument\n"); return 2 end
+        setFormat(args[i], false)
+    elseif a:match("^%-%-format=") then setFormat(a:sub(10), false)
+    elseif a == "--format" then
+        i = i + 1
+        if not args[i] then stderr("stat: option '--format' requires an argument\n"); return 2 end
+        setFormat(args[i], false)
+    elseif a == "--printf" then
+        i = i + 1
+        if not args[i] then stderr("stat: option '--printf' requires an argument\n"); return 2 end
+        setFormat(args[i], true)
+    elseif a:match("^%-%-printf=") then setFormat(a:sub(10), true)
+    elseif a == "--help" or a == "-h" then
+        io.write("usage: stat [-L] [-f] [-t] [-c FORMAT|--printf=FORMAT] FILE...\n")
+        return 0
+    elseif a == "-cL" then deref = true
+    elseif a:sub(1, 2) == "--" then
+        stderr("stat: unrecognized option '" .. a .. "'\n")
+        return 1
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+        -- 组合短选项(只有纯开关能合并)
+        for k = 2, #a do
+            local ch = a:sub(k, k)
+            if ch == "L" then deref = true
+            elseif ch == "f" then fsMode = true
+            elseif ch == "t" then terse = true
+            else stderr("stat: invalid option -- '" .. ch .. "'\n"); return 1 end
+        end
+    else
+        operands[#operands + 1] = a
+    end
+    i = i + 1
+end
+
+if #operands == 0 then
+    stderr("stat: missing operand\n")
+    return 1
+end
+
+-- ---------------------------------------------------------------
+-- 辅助
+-- ---------------------------------------------------------------
+local function rwx(bits)
+    return ((math.floor(bits / 4) % 2 == 1) and "r" or "-")
+        .. ((math.floor(bits / 2) % 2 == 1) and "w" or "-")
+        .. ((bits % 2 == 1) and "x" or "-")
+end
+--- 符号权限串(与 ls -l 相同; setuid/setgid/sticky 用小写/大写字母区分)。
+local function modeSymbolic(mode)
+    local t = math.floor(mode / 0x1000) * 0x1000
+    local tchar = (t == 0x8000 and "-") or (t == 0x4000 and "d") or (t == 0xA000 and "l")
+        or (t == 0x1000 and "p") or (t == 0x2000 and "c") or (t == 0x6000 and "b")
+        or (t == 0xC000 and "s") or "?"
+    local bits = mode % 512
+    local u = rwx(math.floor(bits / 64) % 8)
+    local g = rwx(math.floor(bits / 8) % 8)
+    local o = rwx(bits % 8)
+    -- setuid/setgid/sticky 位(八进制的 4000/2000/1000)
+    local m = mode % 0x1000
+    if math.floor(m / 2048) % 2 == 1 then u = u:sub(1, 2) .. (u:sub(3) == "x" and "s" or "S") end
+    if math.floor(m / 1024) % 2 == 1 then g = g:sub(1, 2) .. (g:sub(3) == "x" and "s" or "S") end
+    if math.floor(m / 512) % 2 == 1 then o = o:sub(1, 2) .. (o:sub(3) == "x" and "t" or "T") end
+    return tchar .. u .. g .. o
+end
+local function kindName(a)
+    local k = a.kind
+    if k == "symlink" then return "symbolic link" end
+    if k == "fifo" then return "fifo" end
+    if k == "socket" then return "socket" end
+    if k == "device" then
+        local t = math.floor((a.mode or 0) / 0x1000) * 0x1000
+        return (t == 0x2000) and "character special file" or "block special file"
+    end
+    if a.isDir then return "directory" end
+    return "regular file"
+end
+local function timeStr(t)
+    if not t or t == 0 then return "-" end
+    return os.date("%Y-%m-%d %H:%M:%S.000000000 +0000", t)
+end
+local function userName(uid)
+    local u = syscalls and syscalls["user.byUid"] and syscalls["user.byUid"](uid)
+    return (u and u.name) or tostring(uid)
+end
+local function groupName(gid)
+    local g = syscalls and syscalls["user.groupByGid"] and syscalls["user.groupByGid"](gid)
+    return (g and g.name) or tostring(gid)
+end
+
+local function attrsOf(p)
+    if deref then return fs.attributes(p) end
+    return (fs.lstat and fs.lstat(p)) or fs.attributes(p)
+end
+
+-- ---------------------------------------------------------------
+-- 格式串
+-- ---------------------------------------------------------------
+--- 文件格式符表(GNU stat 的子集; 每个函数收 (attrs, path, display))。
+local FILE_PCT = {
+    n = function(a, p, d) return d end,
+    N = function(a, p, d) return "'" .. d .. "'" end,
+    s = function(a) return a.size or 0 end,
+    b = function(a) return a.blocks or math.ceil((a.size or 0) / 512) end,
+    B = function() return 512 end,
+    o = function(a) return 1024 end,
+    f = function(a) return string.format("%x", a.mode or 0) end,
+    F = function(a) return kindName(a) end,
+    a = function(a) return string.format("%o", (a.mode or 0) % 0x1000) end,
+    A = function(a) return modeSymbolic(a.mode or 0) end,
+    u = function(a) return a.uid or 0 end,
+    U = function(a) return userName(a.uid or 0) end,
+    g = function(a) return a.gid or 0 end,
+    G = function(a) return groupName(a.gid or 0) end,
+    h = function(a) return a.links or 1 end,
+    i = function(a) return a.ino or 0 end,
+    d = function() return 0 end,
+    t = function(a) return string.format("%x", math.floor((a.mode or 0) / 0x1000)) end,
+    T = function(a) return string.format("%d", math.floor((a.mode or 0) / 0x1000)) end,
+    X = function(a) return a.atime or 0 end,
+    Y = function(a) return a.mtime or 0 end,
+    Z = function(a) return a.ctime or 0 end,
+    x = function(a) return timeStr(a.atime) end,
+    y = function(a) return timeStr(a.mtime) end,
+    z = function(a) return timeStr(a.ctime) end,
+}
+
+--- 文件系统格式符表(收 (statvfs, path, display))。
+local FS_PCT = {
+    n = function(sv, p, d) return d end,
+    s = function(sv) return sv.blockSize or 1024 end,
+    S = function(sv) return sv.blockSize or 1024 end,
+    b = function(sv) return sv.blocks or 0 end,
+    f = function(sv) return sv.bfree or 0 end,
+    a = function(sv) return sv.bavail or 0 end,
+    c = function(sv) return sv.files or 0 end,
+    d = function(sv) return sv.ffree or 0 end,
+    t = function() return "ef53" end,
+    T = function() return "ext2" end,
+}
+
+-- 内核不提供这些数据(安全上下文/挂载点/出生时间): 用了就 fail-fast, 不打印假值。
+local UNSUPPORTED_PCT = { C = true, m = true, w = true, W = true }
+
+local function expandEscapes(str)
+    -- --printf 才解释反斜杠转义(GNU 语义)
+    local out = {}
+    local k = 1
+    while k <= #str do
+        local c = str:sub(k, k)
+        if c == "\\" then
+            local n = str:sub(k + 1, k + 1)
+            local map = { n = "\n", t = "\t", r = "\r", a = "\a", b = "\b", f = "\f", v = "\v", ["\\"] = "\\" }
+            if map[n] then out[#out + 1] = map[n]; k = k + 2
+            else out[#out + 1] = "\\" .. n; k = k + 2 end
+        else
+            out[#out + 1] = c
+            k = k + 1
+        end
+    end
+    return table.concat(out)
+end
+
+--- 按格式串渲染一个操作数; 返回文本或 nil, err。
+local function renderFile(fmt, path, display)
+    local a
+    if fsMode then
+        a = nil
+    else
+        a = attrsOf(path)
+        if not a then return nil, "cannot statx '" .. display .. "': No such file or directory" end
+    end
+    local sv
+    if fsMode then
+        sv = fs.statvfs and fs.statvfs(path)
+        if not sv then return nil, "cannot read file system information for '" .. display .. "'" end
+    end
+    local out = {}
+    local k = 1
+    while k <= #fmt do
+        local c = fmt:sub(k, k)
+        if c ~= "%" then
+            out[#out + 1] = c
+            k = k + 1
+        else
+            local spec = fmt:sub(k + 1, k + 1)
+            if spec == "%" then out[#out + 1] = "%"
+            elseif spec == "" then out[#out + 1] = "%"
+            elseif fsMode then
+                -- -f: 只认文件系统格式符(表的选取按模式定, 不能按"哪张表里有"来判 ——
+                -- %n/%s 两张表里都有, 先查 FS 表会让 stat -c '%n' 报成 "can't be used with -f")
+                if UNSUPPORTED_PCT[spec] then
+                    return nil, "unsupported format specifier '%" .. spec .. "'"
+                end
+                local fn = FS_PCT[spec]
+                if not fn then return nil, "invalid format character '%" .. spec .. "'" end
+                out[#out + 1] = tostring(fn(sv, path, display))
+            elseif UNSUPPORTED_PCT[spec] then
+                return nil, "unsupported format specifier '%" .. spec .. "'"
+            elseif FILE_PCT[spec] then
+                out[#out + 1] = tostring(FILE_PCT[spec](a, path, display))
+            else
+                return nil, "invalid format character '%" .. spec .. "'"
+            end
+            k = k + 2
+        end
+    end
+    return table.concat(out)
+end
+
+local function defaultFileText(a, display)
+    local lines = {}
+    lines[#lines + 1] = "  File: " .. display
+    lines[#lines + 1] = "  Size: " .. tostring(a.size or 0) .. "\tBlocks: "
+        .. tostring(a.blocks or math.ceil((a.size or 0) / 512)) .. "\tIO Block: 1024  " .. kindName(a)
+    lines[#lines + 1] = "Device: 0\tInode: " .. tostring(a.ino or 0) .. "\tLinks: " .. tostring(a.links or 1)
+    if a.kind == "symlink" and fs.readlink then
+        lines[#lines + 1] = "  Link: " .. (fs.readlink(display) or "?")
+    end
+    lines[#lines + 1] = "Access: (" .. string.format("%04o", a.mode or 0) .. "/" .. modeSymbolic(a.mode or 0)
+        .. ")  Uid: (" .. tostring(a.uid or 0) .. "/" .. userName(a.uid or 0)
+        .. ")   Gid: (" .. tostring(a.gid or 0) .. "/" .. groupName(a.gid or 0) .. ")"
+    lines[#lines + 1] = "Access: " .. timeStr(a.atime)
+    lines[#lines + 1] = "Modify: " .. timeStr(a.mtime)
+    lines[#lines + 1] = "Change: " .. timeStr(a.ctime)
+    return table.concat(lines, "\n") .. "\n"
+end
+
+local function defaultFsText(sv, display)
+    local inodes = sv.files or 0
+    local iused = inodes - (sv.ffree or 0)
+    local blocks = sv.blocks or 0
+    local bused = blocks - (sv.bfree or 0)
+    local lines = {}
+    lines[#lines + 1] = "  File: \"" .. display .. "\""
+    lines[#lines + 1] = "    ID: 0        Namelen: 255     Type: ext2"
+    lines[#lines + 1] = "Block size: " .. tostring(sv.blockSize or 1024)
+        .. "        Fundamental block size: " .. tostring(sv.blockSize or 1024)
+    lines[#lines + 1] = "Blocks: Total: " .. tostring(blocks) .. "        Free: " .. tostring(sv.bfree or 0)
+        .. "        Available: " .. tostring(sv.bavail or 0)
+    lines[#lines + 1] = "Inodes: Total: " .. tostring(inodes) .. "        Free: " .. tostring(sv.ffree or 0)
+    return table.concat(lines, "\n") .. "\n"
+end
+
+-- ---------------------------------------------------------------
+-- 主流程
+-- ---------------------------------------------------------------
+local rc = 0
+for _, raw in ipairs(operands) do
+    local p = resolve(raw)
+    if format then
+        local text, err = renderFile(printfMode and expandEscapes(format) or format, p, raw)
+        if not text then
+            stderr("stat: " .. tostring(err) .. "\n")
+            rc = 1
+        else
+            io.write(text)
+            if printfMode then
+                -- --printf 不自动加换行(调用者自己在格式里写 \n)
+            end
+        end
+    elseif fsMode then
+        local sv = fs.statvfs and fs.statvfs(p)
+        if not sv then
+            stderr("stat: cannot read file system information for '" .. raw .. "'\n")
+            rc = 1
+        else
+            io.write(defaultFsText(sv, raw))
+        end
+    else
+        local a = attrsOf(p)
+        if not a then
+            stderr("stat: cannot statx '" .. raw .. "': No such file or directory\n")
+            rc = 1
+        elseif terse then
+            io.write(raw .. " " .. tostring(a.size or 0) .. " " .. tostring(a.blocks or 0) .. " "
+                .. string.format("%x", a.mode or 0) .. " " .. tostring(a.uid or 0) .. " "
+                .. tostring(a.gid or 0) .. " 0 " .. tostring(a.ino or 0) .. "\n")
+        else
+            io.write(defaultFileText(a, raw))
+        end
+    end
+end
+return rc

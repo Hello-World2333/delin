@@ -32,6 +32,7 @@ local function ioeMsg(err)
 end
 
 local doL, doW, doC, doM, doLmax = false, false, false, false, false
+local filesFrom, totalWhen = nil, "auto"
 local files = {}
 local noMoreOpts = false
 
@@ -55,9 +56,33 @@ for _, a in ipairs(args) do
     elseif a == "--bytes" then doC = true
     elseif a == "--chars" then doM = true
     elseif a == "--max-line-length" then doLmax = true
+    elseif a == "--files0-from" then
+        i = i + 1
+        local v = args[i]
+        if not v then stderr("wc: option '--files0-from' requires an argument\n"); return 2 end
+        filesFrom = v
+    elseif a:match("^%-%-files0%-from=") then
+        filesFrom = a:sub(15)
+    elseif a == "--total" then
+        i = i + 1
+        local v = args[i]
+        if not v then stderr("wc: option '--total' requires an argument\n"); return 2 end
+        if v == "always" then totalWhen = "always"
+        elseif v == "only" then totalWhen = "only"
+        elseif v == "never" then totalWhen = "never"
+        elseif v == "auto" then totalWhen = "auto"
+        else stderr("wc: invalid argument '" .. v .. "' for '--total'\n"); return 2 end
+    elseif a:match("^%-%-total=") then
+        local v = a:sub(9)
+        if v == "always" then totalWhen = "always"
+        elseif v == "only" then totalWhen = "only"
+        elseif v == "never" then totalWhen = "never"
+        elseif v == "auto" then totalWhen = "auto"
+        else stderr("wc: invalid argument '" .. v .. "' for '--total'\n"); return 2 end
     elseif a:sub(1, 2) == "--" then
         stderr("wc: unrecognized option '" .. a .. "'\n")
-        return 1
+        return 1 -- 与宿主 GNU wc 一致(文本类 coreutils 的用法错是 1)
+
     elseif a:sub(1, 1) == "-" and a ~= "-" then
         for k = 2, #a do if not setShort(a:sub(k, k)) then return 1 end end
     else
@@ -115,7 +140,29 @@ local function statsLines(lines)
     return { l = #lines, w = w, c = #concat + nNewlines, m = utf8len(concat) + nNewlines, lmax = lmax }
 end
 
-if #files == 0 then files = { "-" } end
+-- --files0-from 给的文件名才是输入: 此时**不要**回退到 stdin(GNU 语义)
+if #files == 0 and not filesFrom then files = { "-" } end
+
+-- --files0-from=FILE: 从文件里读 NUL 分隔的文件名("-" = stdin)
+if filesFrom then
+    local h
+    local ferr
+    if filesFrom == "-" then h = io.stdin() else h, ferr = fs.open(resolve(filesFrom), "r") end
+    if not h then
+        stderr("wc: " .. filesFrom .. ": cannot open\n")
+        return 1
+    end
+    local content = h:readAll() or ""
+    if filesFrom ~= "-" then h:close() end
+    local pos = 1
+    while pos <= #content do
+        local at = content:find("\0", pos, true)
+        local name
+        if at then name = content:sub(pos, at - 1); pos = at + 1
+        else name = content:sub(pos); pos = #content + 1 end
+        if name ~= "" then files[#files + 1] = name end
+    end
+end
 
 local totals = { l = 0, w = 0, c = 0, m = 0, lmax = 0 }
 local many = #files > 1
@@ -160,4 +207,13 @@ for _, a in ipairs(files) do
     if st.lmax > totals.lmax then totals.lmax = st.lmax end
 end
 
-if many then report("total", totals) end
+-- --total=WHEN: auto(缺省, 多于一个输入才打) / always / only / never
+if totalWhen == "only" then
+    report("total", totals)
+elseif totalWhen == "always" then
+    report("total", totals)
+elseif totalWhen == "never" then
+    -- 不打印合计行
+elseif many then
+    report("total", totals)
+end

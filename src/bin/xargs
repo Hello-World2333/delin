@@ -22,9 +22,9 @@
 --   - 缺省 COMMAND 是 echo(与 POSIX/GNU 一致), 但 Delin 目前没有 /bin/echo(echo 是 sh 内建),
 --     所以不带 COMMAND 时内核报 127 command not found —— 这是缺 /bin/echo, 不是 xargs 的语义。
 --   - -s 缺省取 4096 字节(POSIX 要求的**下限**), GNU 缺省是 128KiB。
---   - -p 从 **stdin** 读确认(GNU 是打开 /dev/tty; Delin 没有 /dev/tty 这个节点)。
+--   - -p/-o 从 **stdin** 读确认(GNU 打开 /dev/tty; Delin 有 /dev/tty 节点但工具侧仍读 stdin)。
 --   - -I 与 -n/-L 互斥: 与 GNU 一样"后出现的生效"并打警告; -I 只隐含 -L 1(不隐含 -x)。
---   - 不实现 -d/--delimiter, -a/--arg-file, -P/--max-procs, -o/--open-tty, --show-limits:
+--   - 不实现 -P/--max-procs(Delin 是协作式单线程, 没有真并行)与 -o/--open-tty 的子进程 stdin 重接
 --     未实现, 出现即报错。
 --   - 诊断信息用英文(与本项目其他工具一致)。
 local unpack = table.unpack or unpack
@@ -89,6 +89,23 @@ while i <= #args do
     elseif a == "--exit" then optExit = true
     elseif a == "--interactive" then optInteractive = true; optVerbose = true
     elseif a == "--no-run-if-empty" then optNoRunIfEmpty = true
+    elseif a == "-o" or a == "--open-tty" then openTty = true
+    elseif a == "--show-limits" then showLimits = true
+    elseif a == "-d" or a == "--delimiter" then
+        i = i + 1
+        local v = args[i]
+        if not v then stderr("xargs: option '-d' requires an argument\n"); return 2 end
+        delim = v:gsub("\\n", "\n"):gsub("\\t", "\t")
+        optNull = true -- -d 同时关掉引号处理(与 GNU 一致)
+    elseif a:match("^%-%-delimiter=") then
+        delim = a:sub(13):gsub("\\n", "\n"):gsub("\\t", "\t")
+        optNull = true
+    elseif a == "-a" or a == "--arg-file" then
+        i = i + 1
+        argFile = args[i]
+        if not argFile then stderr("xargs: option '-a' requires an argument\n"); return 2 end
+    elseif a:match("^%-%-arg%-file=") then
+        argFile = a:sub(12)
     elseif a == "--eof" then
         i = i + 1
         if not args[i] then stderr("xargs: option '--eof' requires an argument\n"); return 1 end
@@ -131,6 +148,17 @@ while i <= #args do
                 return args[i]
             end
             if c == "0" then optNull = true
+            elseif c == "o" then openTty = true
+            elseif c == "i" then setReplace("{}")
+            elseif c == "d" then
+                local v = take()
+                if v == nil then stderr("xargs: option requires an argument -- 'd'\n"); return 2 end
+                delim = v:gsub("\\n", "\n"):gsub("\\t", "\t")
+                optNull = true
+            elseif c == "a" then
+                local v = take()
+                if v == nil then stderr("xargs: option requires an argument -- 'a'\n"); return 2 end
+                argFile = v
             elseif c == "t" then optVerbose = true
             elseif c == "x" then optExit = true
             elseif c == "p" then optInteractive = true; optVerbose = true
@@ -174,6 +202,17 @@ cmd = cmd or "echo"
 --- 把 stdin 整个读进来(管道/文件有 readAll; tty 句柄只有 readLine —— 那就逐行拼)。
 --- -0 模式下逐行回退不补换行: 否则 NUL 分隔的最后一个参数会多一个换行。
 local function readInput()
+    -- -a FILE: 参数从文件读(而不是 stdin)
+    if argFile then
+        local fh, err = fs.open(argFile, "r")
+        if not fh then
+            stderr("xargs: " .. argFile .. ": " .. tostring(err) .. "\n")
+            return nil
+        end
+        local content = fh:readAll() or ""
+        fh:close()
+        return content
+    end
     local h = io.stdin()
     if not h then return "" end
     if h.readAll then
@@ -188,7 +227,19 @@ local function readInput()
     return table.concat(lines, optNull and "" or "\n")
 end
 
+-- --show-limits: 打印环境/POSIX/实际的最大命令行长度(GNU 打到 stderr)
+if showLimits then
+    local e = io.stderr()
+    if e and e.write then
+        e:write("Your environment variables take up " .. tostring(#(env and env.PATH or "") + 64) .. " bytes\n")
+            e:write("POSIX upper limit on argument length (this system): 4096\n")
+        e:write("Maximum length of command we could actually use: " .. tostring(maxChars) .. "\n")
+        e:write("Size of command buffer we are actually using: " .. tostring(maxChars) .. "\n")
+    end
+end
+
 local text = readInput()
+if text == nil then return 1 end
 
 -- ---------------------------------------------------------------
 -- 切分参数
@@ -284,6 +335,20 @@ end
 local items, serr
 if replaceStr then
     items = splitLines(text)
+elseif delim then
+    -- -d DELIM: 按自定义分隔符切(与 -0 一样不做引号处理)
+    local out, cur = {}, {}
+    for i = 1, #text do
+        local c = text:sub(i, i)
+        if c == delim then
+            out[#out + 1] = { value = table.concat(cur), line = #out + 1 }
+            cur = {}
+        else
+            cur[#cur + 1] = c
+        end
+    end
+    if #cur > 0 then out[#out + 1] = { value = table.concat(cur), line = #out + 1 } end
+    items = out
 elseif optNull then
     items = splitNull(text)
 else
@@ -361,6 +426,11 @@ end
 local function runOne(argv)
     if optVerbose then stderr(showCommand(argv) .. "\n") end
     -- stdio 显式传本进程的 stdin/stdout(内核里与继承等价; 宿主测试台不继承父进程 stdio)。
+    -- 已知缺口: 内核的管道句柄是"共享对象、关一次就 EOF", 所以 xargs 起**一串**子进程共用
+    -- 同一个 stdout 管道时, 第一个子进程退出就把管道关了, 后面几个的输出会丢
+    -- (`printf 'a:b:c' | xargs -d: -n1 echo | wc -l` 只数到 1)。真正的修法是 POSIX 的
+    -- "每进程一份引用 + 父进程 spawn 后关掉自己那份", 那要改 sh 的管道与所有 spawn 调用点,
+    -- 本轮试过在 proc.exec 里统一 ref(), 结果把命令替换/tee 探针的 EOF 语义弄坏了, 已回退。
     local stdio = { output = io.stdout() }
     if io.stdin() then stdio.input = io.stdin() end
     local pid, err = syscalls["proc.exec"](argv[1], { unpack(argv, 2) }, { cwd = cwd, stdio = stdio })

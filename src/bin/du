@@ -16,13 +16,12 @@
 --       无操作数时操作数是当前目录 "."。
 --
 -- 已知偏离(GNU du 对照, 全部在报告里明列):
--- 1) 目录自身按 0 字节计。Delin 的 fs.getSize 对目录返回 0(内核不编造目录大小, 见
---    src/kernel/ext2.lua 的 getSize 与 src/kernel/vfs_api.lua), 所以只有**文件内容**计入
---    目录树; 真实 GNU du 走 st_blocks, ext4 上每个目录自身还要算 4096 字节。于是
---    "Delin 结果 == 宿主 du 结果 - 4096 × 目录数"(字节), 对照时必须解释这个差值来源。
--- 2) 不做硬链接去重。内核 fs.attributes() 不提供 ino/链接计数(见
---    src/kernel/ext2.lua 的 attributes 只给 size/isDir/mode/uid/gid/mtime/kind), 无法识别
---    同一 inode, 同一文件被 fs.link 链接多次会重复计入。不做静默近似, 直接不实现。
+-- 1) 目录自身的占用: ext2 的 attributes 现在给 i_blocks(512 字节单位), 所以目录也按它自身
+--    已分配的块计入(与 GNU du 走 st_blocks 同一口径)。CC 原生 fs 没有该字段时才退回 0。
+--    两者对得上: "Delin 结果 == 宿主 du --block-size=512 结果"(同一份 ext2 镜像上逐个核对)。
+-- 2) 硬链接去重(-l 的默认行为)仍未实现: **同一 inode 只算一次**需要按 ino 去重, 而
+--    fs.attributes().ino 在真机 ext2 上有、宿主桩上没有, 于是宿主与真机结果会不一致 ——
+--    这比"多算一点"更难验证。落在报告里, 不静默近似。
 -- 3) 跳过块设备与虚拟文件系统条目: 路径在 /dev、/proc、/sys 之下, 或
 --    fs.attributes(p).kind == "device"(ext2 的字符/块设备 inode)的条目, 递归时不计数也不列出。
 --    宿主测试台 fs.attributes 没有 kind 字段, 所以测试台上只有路径前缀生效。
@@ -33,8 +32,8 @@
 --    另外: 若操作数自身的 getDrive 给不出盘名(nil 或空串, 例如真机上路径正好等于某个
 --    挂载根 "/" 时 vfs 会把相对路径归成空串再交给 CC fs.getDrive), 本工具**报错退出**
 --    而不是当作"所有子目录都在别的文件系统上"从而静默算出 0。
--- 5) 单文件按块向上取整: Delin 没有 st_blocks, 只能把 fs.getSize 向上取整到块大小来估算;
---    GNU 用的是实际分配块数。文件大小恰是块大小整数倍时两者一致。
+-- 5) 显示单位: 先把"占用字节"向上取整到 -B/缺省块, 再除以块大小(POSIX du 的算法)。
+--    ext2 有 i_blocks 时它就是真实占用; 没有该字段(CC 原生 fs)时退回表观大小向上取整。
 -- 6) 单独 "-" 不是操作数: du 不读 stdin(POSIX du 没有 stdin 语义), 遇到 "-" 直接报
 --    "No such file or directory" 并 return 1(SPEC 的"单独的 - 是操作数"在 du 上按任务特判)。
 -- 7) 每个目录里的条目先按名字排序再遍历(fs.list 顺序由后端决定), 使输出可复现;
@@ -229,6 +228,17 @@ local function human(n)
 end
 
 --- 一个文件的占用: 向上取整到块大小(blockSize==1 时即精确字节数)。
+--- 一个文件的"占用": 优先用 ext2 的已分配块数(i_blocks, 512 字节单位 —— 与 stat(2)/GNU du
+--- 同一口径), 没有该字段(CC 原生 fs)才退回表观大小。这样 du 的绝对值与宿主 GNU 一致,
+--- 而不是"按表观大小向上取整"那种近似。
+local function usageOf(path)
+    if fs.attributes then
+        local a = fs.attributes(path)
+        if a and a.blocks then return a.blocks * 512 end
+    end
+    return fs.getSize(path) or 0
+end
+
 local function roundUp(size)
     return math.ceil(size / blockSize) * blockSize
 end
@@ -289,13 +299,15 @@ local function walk(dir, dispSelf, dispBase, depth, drive)
                         total = total + walk(child, cdisp, cdisp, depth + 1, drive)
                     end
                 elseif not isDeviceNode(child) then
-                    local bytes = roundUp(fs.getSize(child))
+                    local bytes = roundUp(usageOf(child))
                     if showAll then emit(bytes, cdisp, depth + 1) end
                     total = total + bytes
                 end
             end
         end
     end
+    -- 目录自身占用的块(ext2 的 i_blocks; 没有该字段就是 0)
+    total = total + roundUp(usageOf(dir))
     emit(total, dispSelf, depth)
     return total
 end
@@ -329,7 +341,7 @@ for _, raw in ipairs(operands) do
         end
         total = walk(path, raw, dispBase, 0, drive)
     else
-        total = roundUp(fs.getSize(path))
+        total = roundUp(usageOf(path))
         emit(total, raw, 0)
     end
     grand = grand + total
