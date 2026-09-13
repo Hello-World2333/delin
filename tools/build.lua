@@ -396,7 +396,7 @@ end
 local CHECK_SCRIPTS = {
     "posix_test.sh", "jobctl_test.sh", "proc_test.sh", "newtools_test.sh",
     "redstone_test.sh", "lua_test.sh", "sh_builtin_test.sh", "sh_expand_test.sh",
-    "user_test.sh", "regex_test.sh",
+    "user_test.sh", "regex_test.sh", "desh_test.sh",
 }
 
 local function check()
@@ -431,6 +431,11 @@ local function check()
     print("-- check: 分页器(宿主) --")
     run("pager_test", "sh scripts/pager_test.sh > /tmp/delin-chk-pager.log 2>&1")
     print("   OK pager_test.sh")
+    -- 2d) desh 行编辑器: 同样宿主专用(按键 -> 屏幕字节流)。断言的是"补全/历史/^R/建议/纠错/
+    --     deshrc/历史落盘"这些纯交互行为 —— 它们没有"压缩 vs 原始"的可比输出, 所以直接跑看退出码。
+    print("-- check: desh 行编辑器(宿主) --")
+    run("desh_tty_test", "sh scripts/desh_tty_test.sh > /tmp/delin-chk-desh.log 2>&1")
+    print("   OK desh_tty_test.sh")
     -- 3) bundle 装载自检: hosttest 与镜像树都走**真实 require**, 看不见 bundle 自己的模块清单,
     --    于是"新加内核模块但忘了进 profile"这类问题能一路全绿到真机(静态门禁在 bundle.lua 里,
     --    这里做一次动态装载兜底)。需要 Lua 5.2+ —— bundle 用 _ENV 做模块隔离, 5.1 测出来是假象;

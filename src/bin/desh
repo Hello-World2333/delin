@@ -1,0 +1,800 @@
+-- Delin desh: 交互式增强 shell(对标 zsh 的日常体验), 与 /bin/sh 共用同一份核心。
+--
+-- 与 sh 的关系: 核心(词法/解析/展开/作业控制/内建)就是 src/lib/shcore.lua, 构建期由
+-- `--#include` 拼进来 —— 目标机的进程环境是白名单(没有 require/dofile), 所以"共享实现"
+-- 只能是构建期拼接(见 tools/include.lua)。于是 desh 与 sh 的**语义**永远一致, 差别只在
+-- 交互层: sh 交给 tty 行规程读行(退格可用), desh 自己接管键盘。
+--
+-- desh 提供(全部在**交互式**下才生效; 脚本/`-c` 与 sh 逐字节一致):
+--   行编辑器   : 光标移动/Home/End/Delete/^A^E^B^F^K^U^W^Y^L/横向滚动(长行不折行)
+--   历史       : 上下翻阅 + ^P/^N + ^R 增量搜索 + 落盘 $HISTFILE(缺省 ~/.desh_history)
+--   Tab 补全   : 命令($PATH 可执行 + 内建 + 函数 + 别名)/文件/目录/变量, 公共前缀补齐,
+--                多候选列菜单, 再按 Tab 在候选间循环
+--   智能提示   : 灰字内联历史建议(zsh-autosuggestions 那种), → 或 End 接受, 回车只执行真实输入
+--   错误更正   : command not found 时给 did-you-mean(编辑距离), 只建议不擅自改命令
+--   配置       : /etc/deshrc(系统) + ~/.deshrc 或 $DESHRC(用户), 都是普通 shell 脚本
+--
+-- 约定: 编辑器只在**读键盘的那段时间**开原始模式, 把行交给核心之前一定关回去 ——
+-- 子进程(编辑器/分页器/read)要拿回正常的行输入, 与 Linux 上的 shell 一致。
+-- 提示符/报错前缀都走核心的 shName(ui.name = "desh"), 于是报错写的是 "desh: ..."。
+
+--#include src/lib/shcore.lua
+
+-- 核心有 148 个顶层 local, 而 Lua 每个 function(chunk 也是)最多 200 个活动 local ——
+-- desh 这一层整体**包成一个函数**: 它自己有独立的 200 个 local 预算, 对核心那些名字的引用
+-- 变成 upvalue(数量远低于 Lua 5.1 的 60 个 upvalue 上限, 于是宿主 lua5.1 也编得过)。
+local function deshMain()
+
+-- ===============================================================
+-- 终端小工具
+-- ===============================================================
+local ESC = "\27"
+local RESET = "\27[0m"
+
+local function out(s)
+    if stdout and stdout.write then stdout:write(s) end
+end
+local function err(s)
+    local e = io.stderr()
+    if e and e.write then e:write(s) end
+end
+local function sgr(code) return "\27[" .. tostring(code) .. "m" end
+
+--- 可见宽度: 去掉 ANSI 转义序列后的字符数(PS1 里可以有 \e[31m, 画行时不能把它算成 1 列)。
+local function visWidth(s)
+    local w, i, n = 0, 1, #s
+    while i <= n do
+        local c = s:sub(i, i)
+        if c == ESC then
+            local j = i + 1
+            if s:sub(j, j) == "[" then
+                j = j + 1
+                while j <= n and not s:sub(j, j):match("[@-~]") do j = j + 1 end
+                i = j + 1
+            else
+                i = i + 2 -- ESC 7 / ESC 8 / ESC c 这类两字节序列
+            end
+        else
+            w = w + 1
+            i = i + 1
+        end
+    end
+    return w
+end
+
+local function termCols()
+    local h = io.stdin()
+    if h and h.getSize then
+        local c = select(1, h:getSize())
+        if c and c > 0 then return c end
+    end
+    return 51 -- CC 缺省终端宽度(kernel/tty.lua 的缺省一致)
+end
+
+--- 原始模式的键盘解码。内核 tty 把方向键之类发成**完整**的 ANSI 序列(见 kernel/tty.lua 的
+--- KEY_SEQ), 序列的字节落在同一个 keyBuf 里, 所以这里在 ESC 之后连续 read(1) 不会卡住
+--- (裸 ESC 键没有绑定 —— 那样读会阻塞到下一次按键, 与 less 的取舍一致)。
+--- 返回: (名字, 原始字节); 普通字符返回 (nil, 该字符); EOF 返回 "eof"; ^C 返回 "intr"。
+local SEQS = {
+    ["\27[A"] = "up", ["\27[B"] = "down", ["\27[C"] = "right", ["\27[D"] = "left",
+    ["\27[H"] = "home", ["\27[F"] = "end", ["\27[1~"] = "home", ["\27[4~"] = "end",
+    ["\27[3~"] = "delete", ["\27[5~"] = "pgup", ["\27[6~"] = "pgdn",
+}
+local function readKey(t)
+    local b, rerr = t:read(1)
+    if b == nil then
+        if rerr == "interrupted" then return "intr" end
+        return "eof"
+    end
+    if b == ESC then
+        local seq = ESC
+        for _ = 1, 4 do
+            local more = t:read(1)
+            if more == nil then break end
+            seq = seq .. more
+            if SEQS[seq] then return SEQS[seq] end
+        end
+        return "unknown", seq
+    end
+    if b == "\r" or b == "\n" then return "enter", b end
+    if b == "\t" then return "tab", b end
+    if b == "\b" or b == "\127" then return "backspace", b end
+    if b == "\4" then return "ctrl-d", b end
+    if b == "\1" then return "ctrl-a", b end
+    if b == "\2" then return "ctrl-b", b end
+    if b == "\5" then return "ctrl-e", b end
+    if b == "\6" then return "ctrl-f" end
+    if b == "\7" then return "ctrl-g" end
+    if b == "\11" then return "ctrl-k" end
+    if b == "\12" then return "ctrl-l" end
+    if b == "\14" then return "ctrl-n" end
+    if b == "\16" then return "ctrl-p" end
+    if b == "\18" then return "ctrl-r" end
+    if b == "\21" then return "ctrl-u" end
+    if b == "\23" then return "ctrl-w" end
+    if b == "\25" then return "ctrl-y" end
+    return nil, b
+end
+
+-- ===============================================================
+-- 配置: 全是普通 shell 变量(deshrc 里 export/赋值都行), 每次用时现读
+-- ===============================================================
+local function cfgOn(name, def)
+    local v = vars[name]
+    if v == nil then return def end
+    return not (v == "0" or v == "" or v == "no" or v == "false")
+end
+local function histFile() return vars.HISTFILE or ((vars.HOME or "/root") .. "/.desh_history") end
+local function histSize() return math.max(0, tonumber(vars.HISTSIZE) or 200) end
+local function suggestColor() return vars.DESH_SUGGEST_COLOR or "90" end -- 90 = 亮黑(灰)
+
+-- ===============================================================
+-- 历史
+-- ===============================================================
+local hist = {}          -- 旧 -> 新
+local histLoadWarned = false
+
+local function histLoad()
+    local f = fs.open(histFile(), "r")
+    if not f then return end
+    while true do
+        local line = f.readLine and f:readLine()
+        if line == nil then break end
+        line = line:gsub("\r$", "")
+        if line ~= "" then hist[#hist + 1] = line end
+    end
+    f:close()
+    local cap = histSize()
+    while #hist > cap do table.remove(hist, 1) end
+end
+
+--- 落盘: 每条命令追加一行(便宜且崩了也不丢), 退出时再按 HISTSIZE 整体重写一次。
+local function histAppend(line)
+    if not cfgOn("DESH_HISTORY", true) then return end
+    -- 与 bash 的 HISTCONTROL=ignorespace 同义: 行首空格的命令不进历史(免得密钥落盘)。
+    if line == "" or line:sub(1, 1) == " " then return end
+    if hist[#hist] == line then return end -- 连续重复只记一次
+    hist[#hist + 1] = line
+    local cap = histSize()
+    while #hist > cap do table.remove(hist, 1) end
+    local f = fs.open(histFile(), "a")
+    if not f then
+        if not histLoadWarned then
+            histLoadWarned = true
+            errln(shName .. ": " .. histFile() .. ": cannot write (history disabled this session)")
+        end
+        return
+    end
+    f:write(line .. "\n")
+    f:close()
+end
+
+--- 退出时按上限重写(把追加上去的老行裁掉)。
+local function histSave()
+    if not cfgOn("DESH_HISTORY", true) then return end
+    local cap = histSize()
+    local f = fs.open(histFile(), "w")
+    if not f then return end
+    local from = math.max(1, #hist - cap + 1)
+    for i = from, #hist do f:write(hist[i] .. "\n") end
+    f:close()
+end
+
+-- ===============================================================
+-- 补全
+-- ===============================================================
+-- 词边界(POSIX 分词里会断开一个词的那些字符; 引号也算 —— 与 bash 的 COMP_WORDBREAKS 同义)。
+local BREAK = " \t\n|&;<>()\"'`"
+
+local function wordStart(buf, pos)
+    local i = pos - 1
+    while i >= 1 do
+        if BREAK:find(buf:sub(i, i), 1, true) then break end
+        i = i - 1
+    end
+    return i + 1
+end
+
+--- 这个位置是不是"命令词"(命令名可以补全)? 空行/管道后/&&/||/; 后/以及 then do else !
+--- 之后都算 —— 与 shell 语法的命令位置一致。
+local function isCommandPos(buf, ws)
+    local pre = buf:sub(1, ws - 1):gsub("[ \t]+$", "")
+    if pre == "" then return true end
+    local last = pre:sub(-1)
+    if last == "|" or last == "&" or last == ";" or last == "(" or last == "!" then return true end
+    local w = pre:match("([%a_][%w_]*)$")
+    if w == "then" or w == "do" or w == "else" or w == "elif" or w == "time" then return true end
+    return false
+end
+
+local function sortedKeys(t)
+    local ks = {}
+    for k in pairs(t) do ks[#ks + 1] = k end
+    table.sort(ks)
+    return ks
+end
+
+local function pathDirs()
+    local dirs = {}
+    for d in ((vars.PATH or "/bin") .. ":"):gmatch("([^:]*):") do
+        dirs[#dirs + 1] = resolve(d) -- 空条目 = 当前目录(POSIX)
+    end
+    return dirs
+end
+
+--- 命令名候选: 内建 + shell 函数 + 别名 + $PATH 里可执行的普通文件。
+local function commandCandidates(prefix)
+    local seen, out = {}, {}
+    local function add(n)
+        if not seen[n] and n:sub(1, #prefix) == prefix then
+            seen[n] = true
+            out[#out + 1] = n
+        end
+    end
+    for n in pairs(builtins) do add(n) end -- 函数也登记在 builtins 里(见核心的 isFunction)
+    for n in pairs(aliases) do add(n) end
+    for _, d in ipairs(pathDirs()) do
+        local names = fs.list(d)
+        if names then
+            for _, n in ipairs(names) do
+                local p = d .. "/" .. n
+                if not fs.isDir(p) and fs.canExecute(p) then add(n) end
+            end
+        end
+    end
+    table.sort(out)
+    return out
+end
+
+--- 文件/目录候选(带 dir 部分与 ~ 展开)。目录补出来的名字带结尾 "/"(继续往下补)。
+local function fileCandidates(word)
+    local dirpart, base = word:match("^(.*/)([^/]*)$")
+    if not dirpart then dirpart, base = "", word end
+    local look = dirpart
+    if look:sub(1, 2) == "~/" then look = (vars.HOME or "/root") .. look:sub(2) end
+    local names = fs.list(resolve(look == "" and "." or look))
+    local out = {}
+    if names then
+        for _, n in ipairs(names) do
+            local hiddenOk = (n:sub(1, 1) ~= ".") or (base:sub(1, 1) == ".")
+            if hiddenOk and n:sub(1, #base) == base then
+                out[#out + 1] = dirpart .. n .. (fs.isDir(resolve(look .. n)) and "/" or "")
+            end
+        end
+    end
+    table.sort(out)
+    return out
+end
+
+--- 变量候选: $NAME(shell 变量) + 特殊参数。
+local function varCandidates(word)
+    local name = word:sub(2)
+    local out = {}
+    for _, n in ipairs(sortedKeys(vars)) do
+        if n:sub(1, #name) == name then out[#out + 1] = "$" .. n end
+    end
+    for _, n in ipairs({ "?", "#", "@", "*", "$", "!", "-" }) do
+        if name == "" or n:sub(1, #name) == name then out[#out + 1] = "$" .. n end
+    end
+    table.sort(out)
+    return out
+end
+
+local function commonPrefix(list)
+    if #list == 0 then return "" end
+    local p = list[1]
+    for i = 2, #list do
+        local c = list[i]
+        local j = 1
+        while j <= #p and j <= #c and p:sub(j, j) == c:sub(j, j) do j = j + 1 end
+        p = p:sub(1, j - 1)
+    end
+    return p
+end
+
+--- 编辑距离(纠错用): OSA(最优字符串对齐)变体 —— 相邻换位算 1 步。
+--- 为什么不是朴素 Levenshtein: `sl` -> `ls` 这种"手滑换位"在朴素距离里是 2, 会把真正的
+--- 目标排在 `sh`/`nl` 后面甚至被阈值挡掉; 换位算 1 步就与人的直觉一致(zsh 的 correct 同此)。
+local function editDistance(a, b)
+    if a == b then return 0 end
+    local la, lb = #a, #b
+    if la == 0 then return lb end
+    if lb == 0 then return la end
+    local d = {}
+    for i = 0, la do
+        d[i] = { [0] = i }
+    end
+    for j = 0, lb do d[0][j] = j end
+    for i = 1, la do
+        local ca = a:sub(i, i)
+        for j = 1, lb do
+            local cost = (ca == b:sub(j, j)) and 0 or 1
+            local m = d[i - 1][j - 1] + cost
+            if d[i - 1][j] + 1 < m then m = d[i - 1][j] + 1 end
+            if d[i][j - 1] + 1 < m then m = d[i][j - 1] + 1 end
+            if i > 1 and j > 1 and ca == b:sub(j - 1, j - 1) and a:sub(i - 1, i - 1) == b:sub(j, j) then
+                if d[i - 2][j - 2] + 1 < m then m = d[i - 2][j - 2] + 1 end
+            end
+            d[i][j] = m
+        end
+    end
+    return d[la][lb]
+end
+
+-- ===============================================================
+-- 编辑器状态与绘制
+-- ===============================================================
+--- E 是"当前这一行"的全部状态: 缓冲区/光标/提示符/历史游标/补全菜单。
+--- menu 非空表示已经列过一次候选, 之后每按一次 Tab 在候选间循环(zsh 的 menu-complete)。
+local E = { buf = "", pos = 1, prompt = "", cont = false, histIdx = nil, saved = "", menu = nil, kill = "" }
+
+--- 画提示符 + 缓冲区 + (可选)灰字建议, 并把光标放到 pos 处。
+--- 长行不折行, 而是横向开窗(两端用 < > 标示) —— CC 的屏幕只有 51 列, 折行重画在滚动边界上
+--- 很容易画花; 开窗的行为是可预测的(已知偏离, 见 for-ai.md)。
+--- 无论哪种情形, 写入的最后一个字符都不会落在最后一列(CC 终端会自动换行, 那会把光标甩走)。
+local function paint(pos, withSug)
+    local buf = E.buf
+    local cols = termCols()
+    local pw = visWidth(E.prompt)
+    local avail = cols - pw - 1
+    if avail < 8 then avail = 8 end
+    local view, off, markL, markR
+    if #buf <= avail then
+        view, off, markL, markR = buf, 0, false, false
+    else
+        local inner = avail - 2 -- 左右各留一列给 < >
+        if inner < 4 then inner = 4 end
+        off = pos - 1 - math.floor(inner / 2)
+        if off < 0 then off = 0 end
+        if off > #buf - inner then off = #buf - inner end
+        view = buf:sub(off + 1, off + inner)
+        markL, markR = off > 0, (off + inner) < #buf
+    end
+    local text = (markL and "<" or "") .. view .. (markR and ">" or "")
+    out("\r" .. E.prompt .. text)
+    -- 灰字建议: 光标在行尾、视图没被截断(否则建议会落在 ">" 之后, 误导人)
+    if withSug and not markR and pos == #buf + 1 and buf ~= "" and cfgOn("DESH_AUTOSUGGEST", true) then
+        for i = #hist, 1, -1 do
+            local h = hist[i]
+            if h ~= buf and #h > #buf and h:sub(1, #buf) == buf then
+                local room = avail - #text
+                if room > 0 then out(sgr(suggestColor()) .. h:sub(#buf + 1, #buf + room) .. RESET) end
+                break
+            end
+        end
+    end
+    out("\27[K") -- 擦掉上一帧更长的尾巴
+    local col = pw + (markL and 1 or 0) + (pos - 1 - off)
+    out("\r")
+    if col > 0 then out("\27[" .. col .. "C") end
+end
+
+--- 重画当前这一行(带建议; 补全菜单开着时不画建议)。
+local function draw()
+    paint(E.pos, not E.menu)
+end
+
+--- 把 [a, a+#old-1] 换成 new, 光标落在新文本之后。
+local function replaceRange(a, old, new)
+    E.buf = E.buf:sub(1, a - 1) .. new .. E.buf:sub(a + #old)
+    E.pos = a + #new
+end
+
+--- 光标处那颗建议(历史里最近一条以当前输入开头的命令的后半截)。
+local function currentSuggestion()
+    if E.menu or E.pos ~= #E.buf + 1 or E.buf == "" then return nil end
+    for i = #hist, 1, -1 do
+        local h = hist[i]
+        if h ~= E.buf and #h > #E.buf and h:sub(1, #E.buf) == E.buf then return h:sub(#E.buf + 1) end
+    end
+    return nil
+end
+
+--- 接受灰字建议(→ / End)。
+local function acceptSuggestion()
+    local s = currentSuggestion()
+    if not s then return false end
+    E.buf = E.buf .. s
+    E.pos = #E.buf + 1
+    return true
+end
+
+-- ===============================================================
+-- 历史导航与 ^R 增量搜索
+-- ===============================================================
+local function histPrev()
+    if #hist == 0 then return end
+    if E.histIdx == nil then
+        E.saved = E.buf
+        E.histIdx = #hist
+    elseif E.histIdx > 1 then
+        E.histIdx = E.histIdx - 1
+    end
+    E.buf = hist[E.histIdx] or ""
+    E.pos = #E.buf + 1
+end
+
+local function histNext()
+    if E.histIdx == nil then return end
+    E.histIdx = E.histIdx + 1
+    if E.histIdx > #hist then
+        E.histIdx = nil
+        E.buf = E.saved or ""
+    else
+        E.buf = hist[E.histIdx] or ""
+    end
+    E.pos = #E.buf + 1
+end
+
+--- 从 from 往前找第一条包含 query 的历史; 找不到返回 nil。
+local function histFind(query, from)
+    for i = from, 1, -1 do
+        local h = hist[i]
+        if h:find(query, 1, true) then return i end
+    end
+    return nil
+end
+
+--- ^R 增量搜索(zsh 的 reverse-i-search): 边打边搜, ^R 再往前一条, 回车直接执行, ESC 回到编辑。
+--- 返回 "exec" 表示"这条就当输入了", "edit" 表示"回到编辑但保留结果", nil 表示取消。
+local function reverseSearch(t)
+    local query = ""
+    local found = nil -- 命中的历史下标
+    local savedBuf, savedPos, savedPrompt = E.buf, E.pos, E.prompt
+    local function paint()
+        local shown = found and hist[found] or savedBuf
+        E.prompt = "(reverse-i-search)`" .. query .. "': "
+        E.buf = shown
+        E.pos = 1
+        draw()
+    end
+    paint()
+    while true do
+        local name, raw = readKey(t)
+        if name == "eof" then return nil end
+        if name == "intr" then return nil end -- ^C: 整行作废(tty 已经回显)
+        if name == "ctrl-r" or name == "ctrl-p" or name == "up" then
+            found = histFind(query, (found or #hist + 1) - 1) or found
+            paint()
+        elseif name == "backspace" then
+            query = query:sub(1, -2)
+            found = (query == "") and nil or histFind(query, #hist)
+            paint()
+        elseif name == "ctrl-g" then
+            E.prompt, E.buf, E.pos = savedPrompt, savedBuf, savedPos
+            draw()
+            return nil
+        elseif name == "enter" then
+            E.prompt = savedPrompt
+            E.buf = found and hist[found] or savedBuf
+            E.pos = #E.buf + 1
+            return "exec"
+        elseif name == "right" or name == "left" or name == "end" or name == "home" then
+            E.prompt = savedPrompt
+            E.buf = found and hist[found] or savedBuf
+            E.pos = #E.buf + 1
+            draw()
+            return "edit"
+        elseif raw and #raw == 1 then
+            local b = raw:byte()
+            if b and b >= 32 and b ~= 127 then
+                query = query .. raw
+                local idx = histFind(query, #hist)
+                if idx then found = idx end
+                paint()
+            end
+        end
+    end
+end
+
+-- ===============================================================
+-- Tab 补全(含候选菜单)
+-- ===============================================================
+--- 候选太多时先问一句(bash 的 "display all N possibilities?" 同义): CC 屏幕只有 19 行,
+--- 一次刷一百多个命令名会把屏幕冲得什么都看不见。返回 false 表示用户不想看。
+--- 无论怎么看, 返回时**光标都已经在新行的行首**(调用方在那一行重画输入行)。
+local function askListAll(n)
+    out("\n" .. "display all " .. n .. " possibilities? (y or n) ")
+    local go = false
+    while true do
+        local name, raw = readKey(stdin)
+        if name == "eof" then break end
+        if raw == "y" or raw == "Y" then go = true; break end
+        if raw == "n" or raw == "N" or name == "enter" or name == "intr" then break end
+    end
+    out("\r\27[K\n")
+    return go
+end
+
+--- 列候选(列优先排布, 与 ls 的默认排布一致)。调用方保证光标在行首。
+local function listCandidates(cands)
+    local cols = termCols()
+    local wmax = 0
+    for _, c in ipairs(cands) do if #c > wmax then wmax = #c end end
+    local w = wmax + 2
+    local ncol = math.max(1, math.floor(cols / w))
+    local nrow = math.ceil(#cands / ncol)
+    for r = 0, nrow - 1 do
+        local line = {}
+        for c = 0, ncol - 1 do
+            local i = c * nrow + r + 1
+            local name = cands[i]
+            if name then
+                line[#line + 1] = name .. string.rep(" ", math.max(1, w - #name))
+            end
+        end
+        out(table.concat(line):gsub("%s+$", "") .. "\n")
+    end
+end
+
+--- Tab: 公共前缀 -> 菜单 -> 逐候选循环。
+local function complete()
+    local ws = wordStart(E.buf, E.pos)
+    local word = E.buf:sub(ws, E.pos - 1)
+    -- 已经在菜单循环里(且词的位置没变): 换下一个候选
+    if E.menu and E.menu.ws == ws then
+        E.menu.idx = E.menu.idx + 1
+        if E.menu.idx > #E.menu.cands then E.menu.idx = 1 end
+        local c = E.menu.cands[E.menu.idx]
+        replaceRange(ws, E.menu.applied, c)
+        E.menu.applied = c
+        return
+    end
+    local cands
+    if word:sub(1, 1) == "$" then
+        cands = varCandidates(word)
+    elseif isCommandPos(E.buf, ws) and not word:find("/") then
+        cands = commandCandidates(word)
+    else
+        cands = fileCandidates(word)
+    end
+    if #cands == 0 then
+        E.menu = nil
+        return
+    end
+    if #cands == 1 then
+        local c = cands[1]
+        -- 目录补 "/"(继续往下补), 其余补一个空格(词到此为止)
+        replaceRange(ws, word, c .. (c:sub(-1) == "/" and "" or " "))
+        E.menu = nil
+        return
+    end
+    local cp = commonPrefix(cands)
+    if #cp > #word then
+        replaceRange(ws, word, cp)
+        E.menu = { cands = cands, idx = 0, ws = ws, applied = cp }
+        return
+    end
+    -- 公共前缀到头了: 列候选(太多先问一句); 之后每按一次 Tab 依次代入(zsh 的 menu-complete)
+    E.menu = { cands = cands, idx = 0, ws = ws, applied = word }
+    if #cands > 50 then
+        if not askListAll(#cands) then return end
+    else
+        out("\n")
+    end
+    listCandidates(cands)
+end
+
+-- ===============================================================
+-- 错误更正: command not found 的 did-you-mean
+-- ===============================================================
+--- 两个名字是不是"同一组字母的重排"(sl -> ls 这类手滑换位)。
+local function sameLetters(a, b)
+    if #a ~= #b then return false end
+    local ta, tb = {}, {}
+    for i = 1, #a do ta[i] = a:sub(i, i); tb[i] = b:sub(i, i) end
+    table.sort(ta); table.sort(tb)
+    for i = 1, #a do if ta[i] ~= tb[i] then return false end end
+    return true
+end
+
+local allCommands = nil -- 摊平的命令名表(第一次纠错时建, 之后复用)
+local function correct(cmd)
+    if not cfgOn("DESH_CORRECT", true) then return end
+    if not cmd or cmd:find("/") then return end
+    if not allCommands then
+        allCommands = {}
+        for n in pairs(builtins) do allCommands[n] = true end
+        for n in pairs(aliases) do allCommands[n] = true end
+        for _, d in ipairs(pathDirs()) do
+            local names = fs.list(d)
+            if names then
+                for _, n in ipairs(names) do
+                    local p = d .. "/" .. n
+                    if not fs.isDir(p) and fs.canExecute(p) then allCommands[n] = true end
+                end
+            end
+        end
+    end
+    local limit = (#cmd >= 4) and 2 or 1 -- 短名字(1-3 字节)放宽到 2 会满屏都是无关建议
+    local hits = {}
+    for n in pairs(allCommands) do
+        local d = editDistance(cmd, n)
+        if d > 0 and d <= limit and math.abs(#n - #cmd) <= limit then
+            hits[#hits + 1] = { name = n, d = d, an = sameLetters(cmd, n) }
+        end
+    end
+    if #hits == 0 then return end
+    table.sort(hits, function(x, y)
+        if x.d ~= y.d then return x.d < y.d end
+        -- 距离一样时, "同一组字母的重排"更像手滑(ls 打成 sl), 排在前面
+        if x.an ~= y.an then return x.an end
+        return x.name < y.name
+    end)
+    -- 只报"最像的那一档": 距离 1 已经找到目标时, 再列一堆距离 2 的只会吵人;
+    -- 同档里若存在重排匹配(最典型的手滑), 就只报重排那些 —— `sl` 应该只说 'ls'。
+    local best = hits[1]
+    local names = {}
+    for i = 1, #hits do
+        if hits[i].d == best.d and hits[i].an == best.an and #names < 3 then
+            names[#names + 1] = hits[i].name
+        end
+    end
+    if #names == 1 then
+        err(shName .. ": did you mean '" .. names[1] .. "'?\n")
+    else
+        err(shName .. ": did you mean one of: " .. table.concat(names, ", ") .. "?\n")
+    end
+end
+
+-- ===============================================================
+-- 行编辑器主循环
+-- ===============================================================
+--- 读一行(核心经 ui.readLine 调进来)。返回 nil = EOF(^D 空行),
+--- 返回 "" = 取消(^C; tty 已经回显 ^C 并丢了这一行), 其余为输入内容。
+--- **返回之前一定把终端恢复成规范模式**: 接下来核心要跑子进程, 它们需要正常的行输入。
+local function editLine(prompt, cont)
+    local t = io.stdin()
+    if not (t and t.setRaw and t.read) then return nil end
+    E.buf, E.pos, E.prompt, E.cont = "", 1, prompt, cont and true or false
+    E.histIdx, E.saved, E.menu = nil, "", nil
+    t:setRaw(true)
+    draw()
+    local eof = false
+    while true do
+        local name, raw = readKey(t)
+        if name == "eof" then
+            eof = true
+            break
+        elseif name == "intr" then
+            -- ^C: 内核 tty 已回显 ^C 并把这一行丢掉(返回空行给核心, 与 sh 的规范模式一致)
+            E.buf = ""
+            name = "enter"
+        end
+        if name == "enter" then
+            break
+        elseif name == "ctrl-d" then
+            if E.buf == "" then
+                eof = true
+                break
+            elseif E.pos <= #E.buf then
+                E.buf = E.buf:sub(1, E.pos - 1) .. E.buf:sub(E.pos + 1)
+            end
+        elseif name == "tab" then
+            complete()
+        elseif name == "up" or name == "ctrl-p" then
+            if not E.cont then histPrev() end
+        elseif name == "down" or name == "ctrl-n" then
+            if not E.cont then histNext() end
+        elseif name == "left" or name == "ctrl-b" then
+            if E.pos > 1 then E.pos = E.pos - 1 end
+        elseif name == "right" or name == "ctrl-f" then
+            if E.pos <= #E.buf then E.pos = E.pos + 1 else acceptSuggestion() end
+        elseif name == "home" or name == "ctrl-a" then
+            E.pos = 1
+        elseif name == "end" or name == "ctrl-e" then
+            if E.pos <= #E.buf then E.pos = #E.buf + 1 else acceptSuggestion() end
+        elseif name == "delete" then
+            if E.pos <= #E.buf then E.buf = E.buf:sub(1, E.pos - 1) .. E.buf:sub(E.pos + 1) end
+        elseif name == "backspace" then
+            if E.pos > 1 then
+                E.buf = E.buf:sub(1, E.pos - 2) .. E.buf:sub(E.pos)
+                E.pos = E.pos - 1
+            end
+        elseif name == "ctrl-k" then
+            E.kill = E.buf:sub(E.pos)
+            E.buf = E.buf:sub(1, E.pos - 1)
+        elseif name == "ctrl-u" then
+            E.kill = E.buf:sub(1, E.pos - 1)
+            E.buf = E.buf:sub(E.pos)
+            E.pos = 1
+        elseif name == "ctrl-w" then
+            local i = E.pos - 1
+            while i >= 1 and E.buf:sub(i, i) == " " do i = i - 1 end
+            local j = i
+            while j >= 1 and E.buf:sub(j, j) ~= " " do j = j - 1 end
+            E.kill = E.buf:sub(j + 1, E.pos - 1)
+            E.buf = E.buf:sub(1, j) .. E.buf:sub(E.pos)
+            E.pos = j + 1
+        elseif name == "ctrl-y" then
+            E.buf = E.buf:sub(1, E.pos - 1) .. E.kill .. E.buf:sub(E.pos)
+            E.pos = E.pos + #E.kill
+        elseif name == "ctrl-l" then
+            out("\27[2J\27[H")
+        elseif name == "ctrl-r" then
+            local r = reverseSearch(t)
+            -- "exec": 搜索结果直接当输入回车(此时 E.buf 已经是那条历史); "edit"/nil: 继续编辑
+            if r == "exec" then break end
+        elseif raw and #raw == 1 then
+            local b = raw:byte()
+            if b and b >= 32 and b ~= 127 then
+                E.buf = E.buf:sub(1, E.pos - 1) .. raw .. E.buf:sub(E.pos)
+                E.pos = E.pos + 1
+            end
+        end
+        -- 除 Tab 之外的任何键都退出"候选循环"状态(Tab 靠它自己在候选间转)
+        if name ~= "tab" then E.menu = nil end
+        draw()
+    end
+    t:setRaw(false)
+    if eof then
+        out("\n")
+        return nil
+    end
+    -- 记历史(空行与 ^C 取消的行不进; 行首空格的命令也不进, 见 histAppend)
+    if E.buf ~= "" then histAppend(E.buf) end
+    -- 收尾: 擦掉灰字建议(回车只执行**真实输入**), 光标挪到行尾后换行 —— 子进程的输出从这里开始。
+    -- 仍然走 paint(横向开窗), 否则长行会把终端画到下一行去。
+    paint(#E.buf + 1, false)
+    out("\n")
+    return E.buf
+end
+
+-- ===============================================================
+-- 启动: 配置 -> 历史 -> 入口
+-- ===============================================================
+--- 读一个 rc 文件(它就是普通 shell 脚本: 别名/变量/函数/补全开关都写在里面)。
+--- 返回 false 表示 rc 里执行了 exit(于是不启动交互 shell)。
+local function sourceRc(path, optional)
+    local f = fs.open(path, "r")
+    if not f then
+        if not optional then errln(shName .. ": " .. path .. ": cannot open") end
+        return true
+    end
+    local src = (f.readAll and f:readAll()) or ""
+    f:close()
+    if src:gsub("%s", "") == "" then return true end
+    local ok, inc, err, ctrl = evalProgram(src)
+    if ctrl == "exit" then return false end
+    if inc then
+        errln(shName .. ": " .. path .. ": syntax error: unexpected end of file")
+    elseif ok == nil and err then
+        errln(shName .. ": " .. path .. ": " .. tostring(err))
+    end
+    return true
+end
+
+--- desh 的 help 覆盖核心那份(说明的是交互层能力)。
+builtins.help = function()
+    outln("Delin desh (interactive shell, POSIX core shared with /bin/sh)")
+    outln("editing  : arrows Home/End Delete; ^A ^E ^B ^F ^K ^U ^W ^Y ^L; Tab completes")
+    outln("history  : Up/Down, ^P/^N, ^R incremental search; file $HISTFILE (default ~/.desh_history)")
+    outln("complete : commands (PATH/builtin/function/alias), files, dirs, $variables")
+    outln("suggest  : grey inline history suggestion -- accept with -> or End")
+    outln("correct  : 'did you mean' when a command is not found")
+    outln("config   : /etc/deshrc, then ~/.deshrc (or $DESHRC); switches DESH_AUTOSUGGEST,")
+    outln("           DESH_CORRECT, DESH_HISTORY, HISTFILE, HISTSIZE, DESH_SUGGEST_COLOR")
+    outln("usage    : desh [-c cmd [name [args...]]] [script] [args...]   (no script => interactive)")
+    outln("scripts  : non-interactive desh behaves exactly like sh (same core)")
+end
+
+local ui = {
+    name = "desh",
+    readLine = function(prompt, cont) return editLine(prompt, cont) end,
+    commandNotFound = function(cmd) correct(cmd) end,
+}
+
+local startOk = true
+if interactive then
+    startOk = sourceRc("/etc/deshrc", true)
+    if startOk then startOk = sourceRc(vars.DESHRC or ((vars.HOME or "/root") .. "/.deshrc"), true) end
+    if startOk then histLoad() end
+end
+
+local rc = startOk and shellMain(ui) or lastExit
+if interactive then histSave() end
+return rc
+
+end
+
+return deshMain()

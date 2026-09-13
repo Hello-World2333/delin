@@ -748,24 +748,32 @@ end
 
 --- 原始模式下的 read(2): 阻塞到**至少有一个字节**, 返回至多 n 字节(n 缺省 1)。
 --- 与 Linux 一致: 被信号打断返回 (nil, "interrupted"); 后台进程组读控制终端前先投 SIGTTIN。
+--- ctx.reading 的记账与 readLine 完全一致 —— ^C(tty.ctrlC -> abortLine)只打断"正在阻塞读"
+--- 的 ctx; 原始模式不记账的话, 装了 SIGINT 处理器的行编辑器(desh)在 ^C 之后会一直阻塞到
+--- 用户再按一个键才醒过来(信号处理器已经接管, 进程不会被默认动作杀掉)。
 local function rawRead(ctx, n)
     n = tonumber(n) or 1
     if n <= 0 then n = 1 end
+    ctx.reading = true
+    local function done(v, err)
+        ctx.reading = false
+        return v, err
+    end
     while true do
-        if ctx.closed then return nil, "device closed" end
+        if ctx.closed then return done(nil, "device closed") end
         if tty.readGuard and tty.readGuard(ctx.name) then
             os.pullEvent() -- 投递 SIGTTIN 后阻塞(与 readLine 同一套)
         elseif #ctx.keyBuf > 0 then
             local take = math.min(n, #ctx.keyBuf)
             local out = ctx.keyBuf:sub(1, take)
             ctx.keyBuf = ctx.keyBuf:sub(take + 1)
-            return out
+            return done(out)
         elseif ctx.intr then
             ctx.intr = false
-            return nil, "interrupted"
+            return done(nil, "interrupted")
         elseif ctx.eof then
             ctx.eof = false
-            return nil
+            return done(nil)
         else
             os.pullEvent()
         end

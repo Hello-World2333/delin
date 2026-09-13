@@ -910,6 +910,14 @@ end
 
 setupRoot()
 
+-- DELIN_HARNESS_SEED=<宿主目录>: 把该目录的内容递归铺进测试根(ROOT)。
+-- 用于"进程起来之前就得摆好某些文件"的场景 —— 典型是交互式自检要先放一份 ~/.deshrc 或
+-- 历史文件, 而 setupRoot 每次都会 rm -rf 掉测试根。测试脚本自己用 mktemp 造好这个目录。
+do
+    local seed = os.getenv("DELIN_HARNESS_SEED")
+    if seed and seed ~= "" then os.execute("cp -a " .. seed .. "/. " .. ROOT .. "/") end
+end
+
 -- ---------------------------------------------------------------
 -- user.* syscalls: 用真实内核模块(与真机同一份源码)。db 从上面写好的 /etc 三张表解析,
 -- 写接口照 syscall 语义授权后特权写回 —— 所以 passwd/useradd/... 在宿主上跑的是真逻辑。
@@ -1161,6 +1169,14 @@ inputHandle.read = function(a, b)
     end
     local n = tonumber(fmt)
     if not n or n <= 0 then return "" end
+    -- 原始模式下的 ^C: 内核 tty 把它变成"打断阻塞中的 read"(SIGINT 投给前台进程组 +
+    -- 让 rawRead 返回 nil,"interrupted", 见 kernel/tty.lua)。测试台照抄这一条, 于是
+    -- 行编辑器(desh)的 ^C 路径在宿主上也能测。
+    if ttyMode and ttyRaw and n == 1 and stdinData:sub(stdinPos, stdinPos) == "\3" then
+        stdinPos = stdinPos + 1
+        ttyForegroundIntr()
+        return nil, "interrupted"
+    end
     if stdinPos + n - 1 > #stdinData then
         local rest = stdinData:sub(stdinPos)
         stdinPos = #stdinData + 1
