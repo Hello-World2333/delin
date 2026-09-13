@@ -19,10 +19,11 @@ end
 
 -- 让出调度器: 无限循环里必须让, 否则 ^C 投不进来、整个系统也跟着卡住。
 local _msleep = os.msleep or function(ms) os.sleep(math.max((ms or 0) / 1000, 0.05)) end
--- 让出时间片: **装了 HSE(os.msleep 在) 就压到 2ms** —— 一次让出本体只要 ~2ms,
--- 于是按键/^C 的投递延迟从 50ms 降到 2-4ms(HSE 不做这个就没有意义);
--- 没装 HSE 时让出一次要睡满 50ms(os.sleep 按服务器刻量化), 保持 50ms 判据。
-local _sliceMs = os.msleep and 2 or 50
+-- 让出时间片(ms)。**默认 50**: 实测电脑 #3 上一次让出 `os.msleep(0)` 要 ~75ms(不是文档里
+-- 说的 2ms —— 那块 HSE 外设的 waitNextTick 实际按游戏刻返回), 让出太勤会把命令拖到 ~1 行/拍。
+-- 真·HSE 快让出(每次 ~2ms)的机器可以用环境变量把时间片调小(如 DELIN_YIELD_MS=2):
+-- 那是"低延迟换吞吐"的取舍, 由使用者定。见 for-ai.md「os.msleep 与 HSE」。
+local _sliceMs = (type(env) == "table" and tonumber(env.DELIN_YIELD_MS)) or 50
 local _sliceAt = os.epoch("utc")
 local function yieldCheck()
     local now = os.epoch("utc")

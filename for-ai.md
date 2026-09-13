@@ -971,22 +971,23 @@ find . -exec echo {} \; | wc -l                 # 同理
 
 两条推论，写工具时必须照着办：
 
-1. **"让出"用 `os.msleep(0)`，判据是"累计了多少 CPU 时间"而不是次数**，而且**时间片要按平台分档**：
-   项目的统一写法是
+1. **"让出"用 `os.msleep(0)`，判据是"累计了多少 CPU 时间"而不是次数**，项目的统一写法是
+   `yieldCheck` + 一个可配时间片：
 
    ```lua
-   local _sliceMs = os.msleep and 2 or 50   -- 装了 HSE: 一次让出只要 ~2ms, 用 2ms 判据
-   local _sliceAt = os.epoch("utc")          -- 没装 HSE: 一次让出要睡满 50ms(os.sleep 量化), 用 50ms
+   -- 默认 50ms; 真·HSE 快让出(一次 ~2ms)的机器可用 DELIN_YIELD_MS=2 换低延迟
+   local _sliceMs = (type(env) == "table" and tonumber(env.DELIN_YIELD_MS)) or 50
+   local _sliceAt = os.epoch("utc")
    local function yieldCheck() if os.epoch("utc") - _sliceAt >= _sliceMs then _sliceAt = ...; _msleep(0) end end
    ```
 
-   **为什么 HSE 下要压到 2ms**：装 HSE 的意义就是把"让出"的代价从 50ms 降到 2ms；判据还钉在
-   50ms 的话，按键/`^C` 的投递延迟仍是 50ms 量级，HSE 就白装了（用户实测反馈：大多数命令的
-   让出太迟）。2ms 判据下延迟是 2-4ms，吞吐只降一点（一次让出=一个事件往返，正好贴着 HSE 的
-   2000Hz 拉模式）。**非 HSE 保持 50ms**：那里 `msleep(0)` 本体就是 `os.sleep(0.05)`。
-   反过来，按"每 N 字节让出一次"写的循环在 HSE 下会退化成一个高频事件发射器，仍然不可取。
-   等子进程/等条件的**轮询间隔**同理分档：`_pollMs = os.msleep and 5 or 50`（命令完成/退出码的
-   可见延迟从 ~50ms 降到 ~5ms）。
+   **默认为什么是 50ms（实测，不是保守起见）**：电脑 #3 上量过
+   `os.msleep(0) x50 = 2348~3741ms` —— **一次让出要 ~47-75ms**，而不是本文档上面那张表推出来的
+   2ms（那块 HSE 外设的 `waitNextTick` 实际按游戏刻返回）。于是"时间片压到 2ms"= 进程 ~97% 的
+   时间都在让出：命令慢到 **~1 行/游戏刻**（真机实测反馈，滚动/`ls` 全部拖死）。HSE 想真正拿到
+   2ms 让出，得先修 `cc_hse` 的 waitNextTick 语义，而不是把时间片调小。
+   等子进程/等条件的**轮询间隔**同理：`_pollMs = ... DELIN_POLL_MS ... or 50`。
+   反过来，按"每 N 字节让出一次"写的循环同样不可取 —— 让出是本项目里最贵的操作。
 2. **"延迟/轮询间隔"不能用 `msleep(0)` 充当** —— 它在 HSE 下只有 2ms，循环会变成热循环。
    要等一段时间就用 `msleep(ms)`，且**默认值 ≥50ms** 走定时器那条路；真要亚 50ms 的间隔
    （<50 是逐拍唤醒，代价是每拍一个事件）得自己想清楚。
@@ -1118,13 +1119,23 @@ Linux 的 exec 一样传给子进程（`process.setHandler` 认 `"ignore"`/`"def
 `tools/build.lua` 在压缩之前用 `minify.checkShadowedGlobals` 扫 `src/{bin,kernel,init,bios,modules}`，
 命中即 fail-fast 并给出源码行号；修法是声明与赋值分开（`local backend; backend = { ... }`）。
 
+**长按重复事件（真机反馈"按住退格只删一个字符"）**：CC 在按住某键时**持续**发 `key` 事件，第 3 个
+参数 `isHeld` 为 true。Delin 以前把所有 `isHeld` 事件一律丢掉（`feedKey`/`rawFeedKey` 的第一行），
+于是行编辑里按住退格/方向键只生效一次。现在有一张 `REPEATABLE` 表（`backspace delete left right
+up down home end pageUp pageDown`），只有这些键放过重复事件；**Enter/Tab 故意不放**（按住回车刷空行、
+按住 Tab 狂刷补全都不是想要的）。去重闩锁 `dupChar` 对重复事件同样成立：每个重复的 `key` 事件推
+一个字节，紧随其后的重复 `char` 事件被吃掉 —— 不会一次删两个字符（hosttest 里锁着这 5 条）。
+
 **滚屏与重绘的性能（真机反馈"滚屏很慢"）**：`kernel/tty.lua` 原先滚一次 = 把整屏 ~grid 全标脏再
 **逐格** `dev.text`，而 term 型的 `dev.text` 是 `term.setCursorPos` + `term.blit` 两条 CC 调用 ——
 51x19 一屏就是近千次调用。两条修法（都在 `kernel/tty.lua`）：
 
-1. **设备原生滚动**：`ScreenDevice.scroll(n)` 是可选方法（控制台在 `kernel/boot.lua` 里用
-   `term.scroll(n)` 实现）。有它时 tty 只滚动自己的 grid + 把**新露出来的末行**标脏；像素型设备
-   （Tom/Void GPU）没有这个方法，退回"全屏重画"。
+1. **（已回退，留作前车之鉴）设备原生滚动**：曾经给 `ScreenDevice` 加过可选 `scroll(n)`（控制台用
+   `term.scroll(n)`），tty 有它就只滚动自己的 grid + 把新露出的末行标脏、其余不重画。真机上
+   **文本不显示、光标残留**（CC 侧的滚动结果与内核 grid 对不上，而那块屏读不回来、没法自动化
+   验证），所以退回了"整屏标脏重画" —— 真正贵的不是"重画多少格"，而是**逐格 blit**（见第 2 条），
+   换成合并之后一次滚屏只有 ~19 次调用，够用了。要再快只能走原生滚动，但必须先解决
+   "内核 grid 与设备状态同步"这个可以在真机上验证的问题。
 2. **同一行连续同色的脏格合并成一次 `dev.text`**：整行输出（`ls`/`ps`/`grep`）因此从"每格一次"
    变成"每行一次"。合并会被"中间有没标记的格子/跨行/颜色变化/光标反显"打断。
 

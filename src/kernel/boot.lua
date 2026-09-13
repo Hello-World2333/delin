@@ -259,13 +259,6 @@ local function registerConsole()
             term.setBackgroundColor(color or 0)
             term.clear()
         end,
-        -- 原生滚屏: CC 的 term.scroll 是一条命令; 没有它的话 tty 层只能把整屏标脏再逐格 blit
-        -- (一次滚屏近千次 CC 调用, 真机上打字/`ls` 都卡)。
-        scroll = function(n, fg, bg)
-            if fg then term.setTextColor(fg) end
-            if bg then term.setBackgroundColor(bg) end
-            term.scroll(n or 1)
-        end,
         flush = function() end,
         release = function() end,
     }

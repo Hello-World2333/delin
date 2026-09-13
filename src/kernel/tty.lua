@@ -197,18 +197,11 @@ local function scroll(ctx)
     end
     -- 滚动后旧的 cursorRenderedIdx 已失效(grid 内容移位), 必须重置。
     ctx.cursorRenderedIdx = nil
-    if ctx.dev.scroll then
-        -- **设备原生滚动**(term 型: `term.scroll(1)` 一条 CC 命令)。以前这里是"把整屏格子
-        -- 全标脏再逐格 blit" —— 一次滚屏近千次 CC 调用, 真机上打字/`ls` 都肉眼可见地卡。
-        -- 设备自己滚完之后, 只有**新露出来的末行**需要重画。
-        ctx.dev.scroll(1)
-        local base = (ctx.rows - 1) * ctx.cols
-        for col = 1, ctx.cols do markCell(ctx, base + col) end
-    else
-        -- 像素型设备(Tom/Void GPU)没有原生滚动: 退回"全屏重画"(合并成一次一行之后,
-        -- 开销已经比原来的逐格 blit 小得多)。
-        for i = 1, ctx.rows * ctx.cols do markCell(ctx, i) end
-    end
+    -- 滚屏 = 把整屏标脏重画。**曾经试过调用设备原生滚动(`term.scroll`)只重画末行** ——
+    -- 真机上文本不显示、光标残留(渲染与内核 grid 状态对不上, 而且那块屏没法读回来验证),
+    -- 所以退回"老实重画"。真正的开销在**逐格 blit**(51x19 近千次 CC 调用), 那个已经由
+    -- flushDirty 的"同一行连续同色合并成一次 dev.text"解决: 现在一次滚屏只有 ~19 次调用。
+    for i = 1, ctx.rows * ctx.cols do markCell(ctx, i) end
     updateCursor(ctx)
 end
 
@@ -607,6 +600,18 @@ local KEY_CHAR = {
     ["backspace"] = "\b", ["tab"] = "\t",
 }
 
+--- 长按会**重复**的键。CC 在按住时持续发 key 事件, 第 3 个参数 `isHeld` 为 true —— 以前这些
+--- 事件被整个丢掉, 于是"按住退格只删一个字符、按住方向键只动一格"(真机反馈)。
+--- Enter/Tab 故意不在这里: 按住回车刷一屏空行、按住 Tab 狂刷补全都不是想要的行为。
+--- 按键字节的去重闩锁(KEY_CHAR + dupChar)对重复事件同样成立: 每个重复的 key 事件推一个字节,
+--- 紧随其后的那个重复 char 事件被吃掉, 不会一次删两个字符。
+local REPEATABLE = {
+    ["backspace"] = true, ["delete"] = true,
+    ["left"] = true, ["right"] = true, ["up"] = true, ["down"] = true,
+    ["home"] = true, ["end"] = true,
+    ["pageUp"] = true, ["pageDown"] = true,
+}
+
 --- 把字节追加到原始输入缓冲。
 local function rawPush(ctx, bytes)
     if bytes and bytes ~= "" then ctx.keyBuf = ctx.keyBuf .. bytes end
@@ -618,8 +623,10 @@ local function rawFeedKey(ctx, keycode, isHeld)
     if not name then return end
     local seq = KEY_SEQ[name]
     if seq then
+        -- 方向键/Home/End 等: 按住会重复(REPEATABLE 里的键由 CC 持续发 held 事件)
+        if isHeld and not REPEATABLE[name] then return end
         rawPush(ctx, seq)
-    elseif not isHeld and KEY_CHAR[name] then
+    elseif KEY_CHAR[name] and (not isHeld or REPEATABLE[name]) then
         -- 该键也可能产生 char 事件: 先按 key 处理, 并把 char 事件记成"要丢掉的重复"。
         -- 版本 A: CC 只发 key 事件 -> 字节已在这里发出, dupChar 不会被用到;
         -- 版本 B: CC 两条都发 -> 紧随的那个 char 事件被丢掉, 不会发两遍。
@@ -648,7 +655,7 @@ end
 
 --- 喂一个按键(key 事件)。只处理按下(非按住), 针对 backspace/enter。
 local function feedKey(ctx, keycode, isHeld)
-    if isHeld then return end
+    if isHeld and not REPEATABLE[keys.getName(keycode)] then return end
     local name = keys.getName(keycode)
     -- CC 可能对这个键**同时**发 key 与 char 事件(见 ctx.dupChar 的说明): 记下期望的字节,
     -- 让紧随其后那个重复的 char 事件被丢掉。

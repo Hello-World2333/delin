@@ -1553,8 +1553,31 @@ do
         return table.concat(t)
     end
 
-    -- 性能相关(tty 只做"该做的事"): 同一行连续同色的格子合并成一次 dev.text;
-    -- 滚屏走设备原生 scroll, 而不是把整屏标脏重画。
+    -- 长按重复: CC 按住键时持续发 key 事件(event[3]=true)。退格/方向键必须连续生效;
+    -- 回车/Tab 的重复事件仍要丢掉(按住回车不该刷空行)。
+    do
+        _G.keys = { getName = function(k) return k end } -- 宿主上键码直接用名字代替
+        local h, ctx, dev = newTty(20, 5)
+        h:setRaw(true)
+        tty.routeKey({ "key", "backspace", true })
+        tty.routeKey({ "key", "backspace", true })
+        eq(ctx.keyBuf, "\b\b", "tty 重复键: 按住退格在原始模式下连续出字节")
+        tty.routeKey({ "key", "enter", true })
+        eq(ctx.keyBuf, "\b\b", "tty 重复键: 按住回车不产生重复换行")
+        tty.routeKey({ "key", "left", true })
+        eq(ctx.keyBuf, "\b\b\27[D", "tty 重复键: 按住方向键连续出序列")
+        h:setRaw(false)
+        ctx.keyBuf = ""
+        ctx.inputBuffer = "abc"
+        tty.routeKey({ "key", "backspace", true })
+        eq(ctx.inputBuffer, "ab", "tty 重复键: 规范模式下按住退格连续删")
+        tty.routeKey({ "key", "enter", true })
+        eq(#ctx.lineQueue, 0, "tty 重复键: 规范模式下按住回车不重复提交")
+        _G.keys = nil
+    end
+
+    -- 性能相关(tty 只做"该做的事"): 同一行连续同色的格子合并成一次 dev.text
+    -- (逐格 blit 是滚屏/整行输出慢的根因)。
     do
         local h, ctx, dev = newTty(20, 5)
         dev.calls = {}
@@ -1569,11 +1592,11 @@ do
     do
         local h, ctx, dev = newTty(20, 5)
         h:write("1\n2\n3\n4\n5\n") -- 第 5 行写完再换行 -> 触发一次滚动
-        eq(dev.scrolls, 1, "tty 滚屏: 走设备原生 scroll")
-        eq(dev.lastScroll, 1, "tty 滚屏: 滚动步长 1")
         eq(rowText(ctx, 0), "2" .. string.rep(" ", 19), "tty 滚屏: 首行上移")
         eq(rowText(ctx, 4), string.rep(" ", 20), "tty 滚屏: 末行被清空")
-        -- 滚动**不该**把整屏重画: 20x5 = 100 格, 合并后只该重画末行这一条
+        -- 滚屏仍是"整屏标脏重画", 但重画走**同一行合并**: 20x5 屏上合计十几条 text,
+        -- 不是 100 条(逐格画)。51x19 的真实屏同理: ~19 条而不是近千条。
+        eq(#dev.calls <= 20, true, "tty 滚屏: 整屏重画也走行合并(几十条 text, 不是逐格)")
         -- 原本滚一次要重画整屏(100 格 -> 100 条); 现在只有末行 + 光标那几格
         -- 5 行文本 + 一次滚动, 合计只有个位数的 text 调用(原来滚一次就要重画整屏 100 格)
         eq(#dev.calls <= 12, true, "tty 滚屏: 滚完只重画末行(几条 text, 不是整屏)")
