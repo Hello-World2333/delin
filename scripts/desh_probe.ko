@@ -203,23 +203,19 @@ f:close()
 -- 让出成本的关键对照: **同一次运行里**, 先量"第一轮"(HSE 累加器可能是满的), 再连排 N 次
 -- 把累加器排空, 再量一轮。两轮之差就是"累加器效应"; 剩下来的才是真实等待成本。
 local id = tostring((arg and arg[1]) or "?")
-local drain = tonumber((arg and arg[2]) or "0") or 0
-local k = 20
-local function timed()
-    local t0 = os.epoch("utc")
-    for _ = 1, k do os.msleep(0) end
-    return (os.epoch("utc") - t0) / k
-end
 local f = fs.open("/tmp/ybench_" .. id .. ".log", "w")
-f:write("started " .. id .. "\n"); f:flush()
-local first = timed()
-for _ = 1, drain do os.msleep(0) end
-local after = timed()
-local pumps, ticks, maxE = "?", "?", "?"
-if os.hseStat then pumps, ticks, maxE = os.hseStat() end
-f:write(string.format("id=%s drain=%d  first20=%.1f ms/call  after%dx=%.1f ms/call  clock=%s pumps=%s ticks=%s maxElapsed=%s\n",
-    id, drain, first, drain, after, tostring(os.hseClockMs and os.hseClockMs() or "?"),
-    tostring(pumps), tostring(ticks), tostring(maxE)))
+-- **每次调用都落一行**(带共享时钟读数): 即使整轮没跑完, 也能看出每次让出的真实耗时
+local function timed(tag, k)
+    local t0 = os.epoch("utc")
+    for i = 1, k do
+        os.msleep(0)
+        f:write(string.format("%s %s call%d dt=%d clock=%s\n", id, tag, i,
+            os.epoch("utc") - t0, tostring(os.hseClockMs and os.hseClockMs() or "?")))
+    end
+    f:flush()
+end
+timed("warm", 5)
+timed("main", 10)
 f:close()
 ]]
             local cf = vfs_api.fs.open("/tmp/ybench.lua", "w")
@@ -234,12 +230,12 @@ f:close()
             --   n2/n3        : 2 个 / 3 个进程同时调 msleep(0) —— 验证"并发等待者互相偷事件"
             --   bear*        : 同样 3 个进程但纯忙等 —— 排除"3 个进程本身变慢"
             -- ① 开机后**第一个**用它的人(累加器满): 单进程
-            send("lua /tmp/ybench.lua solo 100\n")
+            send("lua /tmp/ybench.lua solo 1\n")
             -- ② 三个进程**同时**各排空 100 次再量: 看并发是否互相偷拍
-            send("lua /tmp/ybench.lua n3a 100 & lua /tmp/ybench.lua n3b 100 & lua /tmp/ybench.lua n3c 100 &\n")
+            send("lua /tmp/ybench.lua n3a 1 & lua /tmp/ybench.lua n3b 1 & lua /tmp/ybench.lua n3c 1 &\n")
             -- ③ 并发都结束后再单进程量一次: 并发有没有留下"粘性"退化(整机让出变慢)
-            send("lua /tmp/ybench.lua after3 100\n")
-            send("lua /tmp/ybench.lua bearsolo 100\n")
+            send("lua /tmp/ybench.lua after3 1\n")
+
             send("seq 1 40\n")
             phase, phaseAt = 3, now
         elseif phase == 3 then
