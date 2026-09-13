@@ -1376,10 +1376,16 @@ lua5.4 tools/hosttest.lua        # 同上用 5.4 跑一遍(CC 是 5.2 语义, �
                                  # 测试台的 fs 门面曾用 os.execute(...)==0 判目录 —— 5.1 独有语义)
 lua5.1 tools/harness.lua /bin/sh # 宿主上跑真实工具源码(sh/作业控制/管道; /sys 走真实 sysfs 后端, /proc 走真实 procfs 后端)
 lua5.1 tools/installertest.lua    # 安装器宿主回归: 假 CraftOS 环境(假终端格子+脚本化事件队列)跑构建产物
-                                  # dist/install.lua, 按键序列驱动整套向导(16 用例/208 断言: 两种落盘形态、
+                                  # dist/install.lua, 按键序列驱动整套向导(16 用例/207 断言: 两种落盘形态、
                                   # 自定义容量、坏源/空间不足/网络断连 fail-fast、http 重试、退格回退、
                                   # 无人值守、双驱动器、装完只有回车重启; 默认源用软链假装 GitHub 可访问;
                                   # 失败时 dump 每一屏 + 日志 + 目标文件树)
+                                  # **自定义容量用例(case 4)的尺寸必须跟着 payload 体积长**: 它写死一个
+                                  # 非预设值(0.0.4 起 1152 KB; 曾经是 896 KB)。0.0.3 -> 0.0.4 payload
+                                  # 622 KB/115 文件 -> 812 KB/117 文件, 实际块用量 866 块 > 896 KB 镜像
+                                  # 格式化后的 858 块空闲, 于是装到第 97 个文件报 `FAIL: no block`。
+                                  # 见到这个错先按 ceil(size/1024) 逐文件求和 + 间接块 + 目录块重算容量,
+                                  # 别先怀疑 ext2 分配器(auto 档由 autoBlocks 按同一份 payload 算, 不受影响)
 lua5.1 tools/harness.lua /bin/sh < scripts/proc_test.sh   # /proc + ps/pgrep/pkill/killall 自检(与真机比对)
 lua5.1 tools/harness.lua /bin/sh < scripts/redstone_test.sh   # /sys/class/redstone 读写/校验自检(与真机比对)
 lua5.1 tools/harness.lua /bin/sh < scripts/lua_test.sh   # /bin/lua 脚本/stdin/arg/dofile/退出码 + 进程环境白名单(与真机比对)
