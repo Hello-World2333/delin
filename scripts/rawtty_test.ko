@@ -72,6 +72,14 @@ local function initModule()
     end
 
     local pull = os.pullEventRaw
+    -- 还原**只在自己还是当前包装时**做: 两个注入载荷(scripts/intr_test.ko 与 rawtty_test.ko)
+    -- 都会包这一层; 谁先收工就无条件把 os.pullEventRaw 还原, 会把**后包上去**的那层从链条里
+    -- 抹掉(LIFO 才对) —— 症状是另一个载荷从此再也不被调用, 它那条门禁无声地失败
+    -- (真机踩过: intrtest 先收工, rawtty 的包装被拿掉, /tmp/rawtty.hex 永远不出现)。
+    local wrapper
+    local function disarm()
+        if os.pullEventRaw == wrapper then os.pullEventRaw = pull end
+    end
     local phase, phaseAt, lastPoll = 1, os.epoch("utc"), 0
     local function step()
         local now = os.epoch("utc")
@@ -86,7 +94,7 @@ local function initModule()
         elseif phase == 2 then
             if exists("/tmp/rawtty.done") then
                 log("done, payload hands pullEventRaw back")
-                os.pullEventRaw = pull
+                disarm()
                 phase = 3
                 return
             end
@@ -99,12 +107,12 @@ local function initModule()
         if now - phaseAt > 240000 then
             log("stuck in phase " .. phase .. " for 240s (ready=" .. tostring(exists("/tmp/rawtty.ready"))
                 .. " done=" .. tostring(exists("/tmp/rawtty.done")) .. "), giving up")
-            os.pullEventRaw = pull
+            disarm()
             phase = 3
         end
     end
 
-    os.pullEventRaw = function(...)
+    wrapper = function(...)
         if phase < 3 then
             local now = os.epoch("utc")
             if now - lastPoll < 500 then return pull(...) end
@@ -112,12 +120,13 @@ local function initModule()
             local ok, err = pcall(step)
             if not ok then
                 log("step error (injector stopped): " .. tostring(err))
-                os.pullEventRaw = pull
+                disarm()
                 phase = 3
             end
         end
         return pull(...)
     end
+    os.pullEventRaw = wrapper -- 装上(disarm 只在自己还是这一层时才还回去)
     log("armed (expects " .. EXPECTED .. " bytes)")
 end
 

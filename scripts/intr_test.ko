@@ -104,6 +104,14 @@ local function initModule()
     end
 
     local pull = os.pullEventRaw -- handed back when the payload finishes (see the wrapper below)
+    -- 还原**只在自己还是当前包装时**做: 两个注入载荷(scripts/intr_test.ko 与 rawtty_test.ko)
+    -- 都会包这一层; 谁先收工就无条件把 os.pullEventRaw 还原, 会把**后包上去**的那层从链条里
+    -- 抹掉(LIFO 才对) —— 症状是另一个载荷从此再也不被调用, 它那条门禁无声地失败
+    -- (真机踩过: intrtest 先收工, rawtty 的包装被拿掉, /tmp/rawtty.hex 永远不出现)。
+    local wrapper
+    local function disarm()
+        if os.pullEventRaw == wrapper then os.pullEventRaw = pull end
+    end
     -- Phases: 1 = queue login + first command, wait for its file; 2 = ^C pressed, wait for the
     -- second command's file; 3 = finished (os.pullEventRaw handed back).
     local phase, phaseAt, queued, lastPoll = 1, os.epoch("utc"), false, 0
@@ -126,7 +134,7 @@ local function initModule()
             if exists("/tmp/intr.after") then
                 log("sequence done (command after ^C ran); " .. state())
                 send("exit\n") -- log out: leave no root shell parked on tty0 for the self-checks
-                os.pullEventRaw = pull -- zero residual cost once the payload is done
+                disarm()
                 phase = 3
                 return
             end
@@ -138,7 +146,7 @@ local function initModule()
                 .. tostring(exists("/tmp/intr.before")) .. ", notrun="
                 .. tostring(exists("/tmp/intr.notrun")) .. ", after="
                 .. tostring(exists("/tmp/intr.after")) .. "), giving up")
-            os.pullEventRaw = pull
+            disarm()
             phase = 3
         end
     end
@@ -146,7 +154,7 @@ local function initModule()
     -- Wrap the event pull only: the injector lives inside the scheduler's own event loop, so it
     -- needs no extra coroutine or timer. Once a second is enough (a phase step does an ext2
     -- lookup under /tmp); phase 3 hands os.pullEventRaw back to the kernel.
-    os.pullEventRaw = function(...)
+    wrapper = function(...)
         if phase < 3 then
             local now = os.epoch("utc")
             if now - lastPoll < 1000 then return pull(...) end
@@ -157,12 +165,13 @@ local function initModule()
             local ok, err = pcall(step)
             if not ok then
                 log("step error (injector stopped): " .. tostring(err))
-                os.pullEventRaw = pull
+                disarm()
                 phase = 3
             end
         end
         return pull(...)
     end
+    os.pullEventRaw = wrapper -- 装上(disarm 只在自己还是这一层时才还回去)
     log("armed (" .. state() .. ")")
 end
 

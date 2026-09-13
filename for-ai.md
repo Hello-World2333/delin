@@ -738,14 +738,22 @@ shebang 支持 `#!/bin/sh` / `#!/usr/bin/env sh` 等形式，env 特殊解释为
 `sh` **逐字节一致**（`scripts/desh_test.sh` 在宿主差分里锁着），差别只在"stdin 是终端且没有脚本
 参数"时的读行方式。
 
-**共享方式（构建期拼接）**：实现放在 `src/lib/shcore.lua`，`src/bin/sh` 与 `src/bin/desh` 各自用
-`--#include src/lib/shcore.lua` 把它拼进来（见「构建」一节的 `#include`）。为什么不做运行时
-`require`：目标机的进程环境是白名单（`kernel/procenv.lua`），`/bin` 工具**没有** `require/dofile/
-loadfile`，只能构建期拼成自包含单文件。核心不带身份：`shellMain(ui)` 收一张前端钩子表 ——
-`ui.name`（报错前缀与 PS1 的 `\s`）、`ui.readLine(prompt, cont)`（交互式读一行）、
-`ui.commandNotFound(cmd)`（纠错建议）；`sh` 传 `nil`，行为与以前逐字节一致。
-`shellMain` 是核心里的**函数**而不是顶层代码：拼接后两个入口共享同一段 chunk，顶层 `return`
-会把产物截断（`tools/include.lua` 在构建期就把带顶层 `return` 的被 include 文件拦下来）。
+**共享方式（构建期拼接 + 显式接口表）**：实现放在 `src/lib/shcore.lua`，`src/bin/sh` 与
+`src/bin/desh` 各自用 `--#include src/lib/shcore.lua` 把它拼进来（见「构建」一节的 `#include`）。
+为什么不做运行时 `require`：目标机的进程环境是白名单（`kernel/procenv.lua`），`/bin` 工具**没有**
+`require/dofile/loadfile`，只能构建期拼成自包含单文件。入口是 **`shCoreMain(ui, S)`**（核心里的
+**函数**而不是顶层代码 —— 拼接后两个入口共享同一段 chunk，顶层 `return` 会把产物截断，
+`tools/include.lua` 在构建期就拦；另外见「local gate」：chunk 级 local 也要不得）：
+
+| 参数 | 作用 |
+|---|---|
+| `ui = nil` | 经典行为（`/bin/sh`：tty 行规程读行，报错前缀 `sh:`） |
+| `ui.name` | shell 名（报错前缀、PS1 的 `\s`、用法文本） |
+| `ui.readLine(prompt, cont)` | 交互式读一行（`cont` = 续行）；返回 `nil` = EOF、`""` = 取消（^C）。**返回前必须把终端恢复成规范模式**（子进程要拿回正常的行输入） |
+| `ui.commandNotFound(cmd)` | 命令找不到时的额外提示（did-you-mean）；只打印，不动退出码 |
+| `ui.setup(S)` | 接口表填满后、命令开跑前调一次；返回 `false` 表示直接收摊（desh 用它读 rc/载历史/覆盖 `help`） |
+| `ui.onExit()` | `shCoreMain` 返回前调用（desh 用它落盘历史） |
+| `S`（表，`sh` 传 nil） | 前端**唯一**能看到核心的地方：`name/vars/builtins/aliases/fs/resolve/evalProgram/errln/outln/stdin/stdout/interactive/lastExit()`。desh 不再能直接看见核心的局部变量——这是把两边各自关进函数之后的必然结果，也顺带成了一条**显式接口** |
 
 **能力与缺省值**（都是普通 shell 变量，`deshrc` 里改）：
 
@@ -777,9 +785,8 @@ loadfile`，只能构建期拼成自包含单文件。核心不带身份：`shel
 - **光标列宽要按"可见宽度"算**：`PS1` 里可以有 `\e[31m` 这类序列，`visWidth()` 去掉 ANSI 再数。
 - **候选菜单的分行**：列候选前先换行，列完停在行首，再重画输入行（`askListAll` 与 `listCandidates`
   的契约就是"返回时光标在新行行首"）。
-- **`desh` 这一层整个包在一个函数里**（`deshMain`）：核心 chunk 有 148 个顶层 local，而 Lua 每个
-  function 最多 200 个活动 local —— 包成函数后 desh 有自己的预算，对核心那些名字的引用变成
-  upvalue（数量远低于 Lua 5.1 的 60 个 upvalue 上限，于是宿主 `lua5.1` 也编得过）。
+- **`desh` 这一层也整个包在一个函数里**（`deshMain`），只把接口表 `S` 当 upvalue：CC 的 Lua
+  沿嵌套链累加局部变量（见「local gate」），两边各自在函数里才不会互相挤。
 - **`^Z` 在提示符处不挂起 shell**：核心在作业控制开启时就给 SIGTSTP 装了空处理器，于是它只让
   `abortLine` 置 intr —— desh 把它当成"取消当前行"（与 `^C` 同路）。
 
@@ -838,6 +845,24 @@ loadfile`，只能构建期拼成自包含单文件。核心不带身份：`shel
 `-f`、`-L`、`-I`、`-a`、`-b`、`-z`、`--include/--exclude/--exclude-dir/--exclude-from`、
 `--color[=WHEN]`（认 `GREP_COLORS`，`auto` 看 stdout 的 `isTTY`）、`--label`。组分隔符（`--`）
 只在真的带上下文时出现（GNU 同）。
+
+#### 真机三处坑（都是"宿主全绿、真机才露头"）
+
+1. **Cobalt 的局部变量上限**：见「构建期门禁（local gate）」。给 sh 核心加一个 helper 就把
+   `/bin/sh` 弄成装载失败，`init` 的每个服务都报 `FAILED: /bin/sh: nil`。
+2. **`spawn` 失败的错误消息在两边放在不同位置**：内核 `process.spawn` 失败返回
+   `(nil, nil, "load failed: …")`（消息在**第 3 个**返回值），而宿主测试台的 spawn 桩返回
+   `(nil, "load failed: …")`（第 2 个）。`sh` 的 `spawnChild` 以前只取第 2 个，于是真机上
+   装载失败只显示 `sh: desh: nil`，原因被吞掉。现在有 `spawnErr(e1, e2)` 两个都看。
+   —— 这条本身也是"报错吞掉原因"的典型，写新代码时注意 X 个返回值都要接住。
+3. **两个真机按键注入载荷会互相拆台**（`scripts/intr_test.ko` 与 `scripts/rawtty_test.ko`）：
+   两者都包 `os.pullEventRaw` 并在收工时 `os.pullEventRaw = pull`。谁**先**收工都会把**后包上去**
+   的那层从链条里抹掉（应该 LIFO），于是另一个载荷从此不再被调用 —— 症状是它那条门禁
+   **无声地**失败（实测：`intrtest` 先收工，`rawtty` 的包装被拿掉，`/tmp/rawtty.hex` 永远不出现）。
+   修法：各自记住自己的包装函数，**只在自己还是当前那一层时**才还原。
+   另外 `tools/realmachine.py` 追加模块清单时曾经缓存住"读到的清单"，两个注入点（intrtest /
+   rawtty）互相覆盖 —— 后写的把前一个刚加的名字抹掉，机器的模块清单里没有它，载荷静默不跑
+   （"正对照缺失"就是这个）。现在统一走 `add_module()`，每次都重新读一遍镜像里的 manifest。
 
 #### 真机验证（`tools/realmachine.py`）为什么要快就得这么写
 
@@ -1035,6 +1060,26 @@ Linux 的 exec 一样传给子进程（`process.setHandler` 认 `"ignore"`/`"def
 必然 nil，而静态看不出来（真机症状：`ls /proc/self` 报 `attempt to index global 'backend'`）。
 `tools/build.lua` 在压缩之前用 `minify.checkShadowedGlobals` 扫 `src/{bin,kernel,init,bios,modules}`，
 命中即 fail-fast 并给出源码行号；修法是声明与赋值分开（`local backend; backend = { ... }`）。
+
+**构建期门禁（local gate）—— CC 的 Lua(Cobalt) 局部变量上限**：宿主 `lua5.1/5.4` 给**每个函数**
+200 个局部变量名额，而 CC 的 Cobalt 是**沿嵌套链累加**的：`Parser.newLocal` 拿
+`activeVariableSize + 1` 与 `LUAI_MAXVARS`(200) 比，而 `activeVariableSize` 是"当前函数 +
+**所有祖先**函数"的活动局部之和。于是：
+
+- 一个 ~196 个顶层 local 的 chunk **本来能装载**（每个内层函数只剩几个名额），**再加一个 local**
+  （哪怕只是一个 helper 函数）就可能让某个内层函数越线:
+  `load failed: function at line N has more than 200 local variables`；
+- 而 shell 只会把装载失败打成一个 `nil`（见下「spawn 的报错」，已修），症状是**整个系统的服务
+  都起不来**（`init` 的每个 `/bin/sh` 服务都报 `FAILED: /bin/sh: nil`），看着像内核坏了；
+- 宿主上永远复现不出来（这正是它当年一路全绿到真机的原因）。
+
+判据与做法（`tools/minify.lua` 的 `checkLocalBudget` + `tools/build.lua` 的 `localGate`，扫
+`src/bin` 与 `src/lib`，上限 200，超限 fail-fast 并打印最坏嵌套链）：
+
+- **文件级实现一律包成一个函数**（`local function shCoreMain(ui, S)`），chunk 只剩两三个 local；
+- **文件里的 helper 函数一律是表字段**（`local F = {}` + `function F.foo`），表字段不占局部变量
+  名额 —— 这一条把 `sh` 核心的最坏嵌套链从 246 降到 ~150；
+- `src/bin/find` 目前是 197（离上限只差 3），动它时要留意这条门禁。
 
 **标准正则**：`grep`/`sed`/`ed`/`expr`/`csplit`/`pgrep`/`pkill` 的**面向用户的模式**一律是
 **POSIX 标准正则**（BRE / ERE），实现是内核里的唯一真源 `src/kernel/regex.lua`，工具经
