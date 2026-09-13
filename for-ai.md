@@ -14,7 +14,7 @@
 
 | 路径 | 作用 |
 |---|---|
-| `/bin/` | 用户工具（POSIX 强制命令已补齐，见「POSIX 命令覆盖」一节）：`awk base64 basename bc cat chgrp chmod chown cksum clear cmp column comm cp csplit cut date dd df diff dirname du echo ed env expand expr file find fold grep head id join kill killall less ln logname ls mkdir mkfifo more mount mv nl nohup od passwd paste patch pathchk pr printf ps readlink realpath rev rm rmdir sed seq sh sleep sort split strings tac tail tee timeout touch tr tsort tty umount uname unexpand uniq uudecode uuencode wc which whoami xargs yes`（分页器 `less more`、任意精度计算器 `bc`、文本处理语言 `awk` 等 19 个是「批次 3」补齐的，见下文）；系统/服务类：`blkid dmesg fsck.ext2 logger login logrotate lp lsblk lua mdadm mkfs.ext2 pgrep pkill syslogd systemctl`；用户管理：`groupadd groupdel groups useradd userdel usermod` |
+| `/bin/` | 用户工具（POSIX 强制命令已补齐，见「POSIX 命令覆盖」一节）：`awk base64 basename bc cat chgrp chmod chown cksum clear cmp column comm cp csplit cut date dd df diff dirname du echo ed env expand expr file find fold grep head id join kill killall less ln logname ls mkdir mkfifo more mount mv nl nohup od passwd paste patch pathchk pr printf ps readlink realpath rev rm rmdir sed seq sh sleep sort split strings tac tail tee timeout touch tr tsort tty umount uname unexpand uniq uudecode uuencode wc which whoami xargs yes`（分页器 `less more`、任意精度计算器 `bc`、文本处理语言 `awk` 等 19 个是「批次 3」补齐的，见下文）；系统/服务类：`blkid desh dmesg fsck.ext2 logger login logrotate lp lsblk lua mdadm mkfs.ext2 pgrep pkill syslogd systemctl`（`desh` = 交互式增强 shell：补全/历史/智能提示/纠错，与 `sh` 共用同一份核心，见「`desh`」一节）；用户管理：`groupadd groupdel groups useradd userdel usermod` |
 | `/dev/` | 设备文件：`/dev/ttyN`（字符终端）、`/dev/fbN`（像素帧缓冲）、`/dev/sdX`（磁盘，见下）、`/dev/lpN`（打印机字符设备，只写，见下）、`/dev/null`（读 EOF/写丢弃）、`/dev/zero`（读 = 无限 NUL）、`/dev/random`、`/dev/urandom`（随机字节，见下）、`/dev/console`（系统控制台 = 控制台 tty）、`/dev/kmsg`（内核 ring buffer 只读流）、`/dev/log`（用户态 syslog 输入）、`/dev/mdN`（软RAID 阵列的块设备，见下） |
 | `/etc/` | 系统配置：`passwd` `shadow`（0600 root:root）`group`、`fstab`、`mdadm.conf`（软RAID 阵列清单，开机自动组装，见下）、`syslog.conf`、`logrotate.conf`、`systemd/system/`（管理员单元与 enable 标记） |
 | `/proc/` | 虚拟进程/系统信息 fs（procfs，内核提供，见下）：`/proc/<pid>/{cmdline,comm,cwd,stat,status}`、`/proc/self`、`/proc/{mounts,mdstat,uptime,version}`、`/proc/sys/kernel/random/{entropy_avail,poolsize,uuid}` |
@@ -731,6 +731,62 @@ shebang 支持 `#!/bin/sh` / `#!/usr/bin/env sh` 等形式，env 特殊解释为
 `cd /tmp; echo $(ls *.txt)` 静默列出 `/root` 下的东西。配套地 `login` 现在按 login(1) 语义用
 `cwd = <家目录>` spawn 用户 shell（登录 shell 的起始目录是家目录）。
 
+#### `desh`：交互式增强 shell（与 `sh` 共用核心）
+
+`/bin/desh` 是"zsh 那一档"的交互层：**词法/解析/展开/内建/作业控制全部与 `sh` 是同一份代码**，
+它自己只做"键盘到屏幕"这件事。于是脚本语义不会漂：`desh -c '...'` 与 `desh script.sh` 的行为与
+`sh` **逐字节一致**（`scripts/desh_test.sh` 在宿主差分里锁着），差别只在"stdin 是终端且没有脚本
+参数"时的读行方式。
+
+**共享方式（构建期拼接）**：实现放在 `src/lib/shcore.lua`，`src/bin/sh` 与 `src/bin/desh` 各自用
+`--#include src/lib/shcore.lua` 把它拼进来（见「构建」一节的 `#include`）。为什么不做运行时
+`require`：目标机的进程环境是白名单（`kernel/procenv.lua`），`/bin` 工具**没有** `require/dofile/
+loadfile`，只能构建期拼成自包含单文件。核心不带身份：`shellMain(ui)` 收一张前端钩子表 ——
+`ui.name`（报错前缀与 PS1 的 `\s`）、`ui.readLine(prompt, cont)`（交互式读一行）、
+`ui.commandNotFound(cmd)`（纠错建议）；`sh` 传 `nil`，行为与以前逐字节一致。
+`shellMain` 是核心里的**函数**而不是顶层代码：拼接后两个入口共享同一段 chunk，顶层 `return`
+会把产物截断（`tools/include.lua` 在构建期就把带顶层 `return` 的被 include 文件拦下来）。
+
+**能力与缺省值**（都是普通 shell 变量，`deshrc` 里改）：
+
+| 能力 | 行为 |
+|---|---|
+| 行编辑 | 方向键/Home/End/Delete/PageUp/Down 不绑定；`^A ^E ^B ^F ^K(杀到行尾) ^U(杀到行首) ^W(删词) ^Y(粘回) ^L(清屏)`；`^D` 空行=EOF、行中=删一字符 |
+| 历史 | 上/下、`^P`/`^N`（`PS2` 续行下不翻历史）、`^R` 增量搜索（`^R` 再往前、回车直接执行、ESC/方向键回到编辑、`^G` 取消）；文件 `$HISTFILE`（缺省 `~/.desh_history`，条数 `$HISTSIZE` 缺省 200）；**行首空格的命令不入历史**（bash 的 `HISTCONTROL=ignorespace`）、连续重复只记一次；每条追加写、退出时按 `HISTSIZE` 整体重写一次 |
+| Tab 补全 | 命令（`$PATH` 里可执行的普通文件 + 内建 + shell 函数 + 别名）、文件/目录、`$变量`（含 `$? $# $@ $* $$ $! $-`）；唯一候选直接补齐（目录补 `/`、其余补一个空格）；多候选先补公共前缀，再 Tab 列候选（**超过 50 个先问 `display all N possibilities?`**，bash 同义），第三次起每按一次 Tab 依次代入（menu-complete）；词边界与 bash 的 `COMP_WORDBREAKS` 同义（含引号），命令位置包括行首/`\| && \|\| ;` 之后/`then do else elif time !` 之后 |
+| 智能提示 | 历史里**最近一条以当前输入开头**的命令的后半截，用 `\e[90m`（亮黑=灰）画在光标之后；`→` 或 `End` 接受，回车**只执行真实输入**；只在光标处于行尾、视图未被截断时画 |
+| 错误更正 | `command not found` 时打一行 `desh: did you mean 'ls'?` / `did you mean one of: ...`；距离用 **OSA（相邻换位算 1 步）**，阈值 1（名字 ≤3 字节）或 2，长度差也要在阈值内；同距离时"同一组字母的重排"优先且只报这一档（`sl` → 只报 `ls`，不会把 `nl sh` 一起列出来）；**只建议不擅自改命令**（不自动纠正执行） |
+| 配置 | `/etc/deshrc`（系统）→ `$DESHRC` 或 `~/.deshrc`（用户），**都是普通 shell 脚本**（用同一个 `evalProgram` 跑，别名/函数/变量都能定义）；开关 `DESH_AUTOSUGGEST` `DESH_CORRECT` `DESH_HISTORY`（`0`/空/`no`/`false` 为关）、`DESH_SUGGEST_COLOR`（SGR 参数，缺省 `90`） |
+| 内置 `help` | desh 覆盖了核心那份 `help`，打的是交互层的能力与开关（`desh -c 'help'` 也走这条） |
+
+**设计要点（都是踩过或想过坑的地方）**：
+
+- **原始模式只在"读键盘"时开**：`editLine` 进入时 `stdin:setRaw(true)`，把行交给核心**之前**一定
+  `setRaw(false)` —— 子进程（`read` 内建、分页器、`ed`）需要拿回规范模式的行输入，与 Linux 上的
+  shell 一致。副作用：`setRaw(false)` 会清掉内核 tty 的 `keyBuf`，快速连打的下一个键可能丢
+  （与"type-ahead 被冲刷"同义，可接受）。
+- **`^C` 要能把阻塞中的 `read` 叫醒**：原始模式下 `^C` 由内核 tty 处理（回显 `^C`、丢当前行、
+  给前台进程组投 SIGINT）。但行编辑器装了 SIGINT 处理器（作业控制那套），进程不会被默认动作杀
+  掉 —— 于是 `kernel/tty.lua` 的 `rawRead` 也和 `readLine` 一样记账 `ctx.reading`，
+  `abortLine` 才能置 `ctx.intr`，`read` 返回 `nil,"interrupted"`（Linux 的 EINTR 语义）。
+  没有这一步，`^C` 之后编辑器会一直阻塞到用户再按一个键才醒。分页器不受影响（它们被默认动作
+  杀掉）。宿主测试台照抄了这一条（`DELIN_HARNESS_TTY=1` 下管道里的 `\3` = EINTR + 投 SIGINT）。
+- **长行横向开窗而不是折行**：CC 屏只有 51 列，折行重画在滚动边界上极易画花；`paint()` 把窗口
+  两端用 `<`/`>` 标出来，并保证**最后一个字符不落在最后一列**（CC 终端会自动换行，会把光标甩走）。
+  已知偏离：没有"多行折行显示"。
+- **光标列宽要按"可见宽度"算**：`PS1` 里可以有 `\e[31m` 这类序列，`visWidth()` 去掉 ANSI 再数。
+- **候选菜单的分行**：列候选前先换行，列完停在行首，再重画输入行（`askListAll` 与 `listCandidates`
+  的契约就是"返回时光标在新行行首"）。
+- **`desh` 这一层整个包在一个函数里**（`deshMain`）：核心 chunk 有 148 个顶层 local，而 Lua 每个
+  function 最多 200 个活动 local —— 包成函数后 desh 有自己的预算，对核心那些名字的引用变成
+  upvalue（数量远低于 Lua 5.1 的 60 个 upvalue 上限，于是宿主 `lua5.1` 也编得过）。
+- **`^Z` 在提示符处不挂起 shell**：核心在作业控制开启时就给 SIGTSTP 装了空处理器，于是它只让
+  `abortLine` 置 intr —— desh 把它当成"取消当前行"（与 `^C` 同路）。
+
+自检：`scripts/desh_test.sh`（非交互 24 项，宿主与真机各跑一次，进 `--check` 的差分清单）、
+`scripts/desh_tty_test.sh`（宿主专用 33 项按键自检：补全/历史/`^R`/建议/纠错/`^C`/`^U`/长行开窗/
+历史落盘/deshrc 五组开关）。
+
 #### 选项约定：未知选项与"未实现"的选项一律 fail-fast
 
 工具的选项解析必须**分清三种情况**，不许把任何一种静默吞掉（判据都对着宿主 GNU 实测过）：
@@ -1441,6 +1497,24 @@ wget run https://raw.githubusercontent.com/Hello-World2333/delin/release/<版本
 `tools/deploy.py` / `tools/realmachine.py` / `tools/deploy_to_computer4.py` 一律消费 `dist/`
 （`dist/bin` 缺失即 fail-fast），不再直接从 `src/` 取，避免内核与工具版本不同步。
 
+**`--#include`（构建期拼接）**：目标机的进程环境是白名单，`/bin` 工具**没有**
+`require/dofile/loadfile`（见 `kernel/procenv.lua`），所以"两个工具共用一份实现"只能是构建期
+拼成一整份。源文件里写一行 `--#include <相对仓库根的路径>`，`tools/include.lua` 在**压缩之前**
+把它替换成那个文件的内容（可嵌套，路径一律相对仓库根）：
+
+```lua
+-- src/bin/sh(4 行的入口; 实现全在 src/lib/shcore.lua)
+--#include src/lib/shcore.lua
+return shellMain(nil)
+```
+
+三条约束都在 `tools/include.lua` 里 fail-fast（报出"谁 include 的谁、第几行"）：被 include 的
+文件**不能有顶层 `return`**（拼接后是同一段 chunk，一个 return 会把产物截断）、不能成环、
+嵌套不超过 8 层。用它的地方必须**共用同一份实现**：`tools/build.lua` 的 `minifyTo` 与
+`shadowGate`、`tools/harness.lua` 往测试台铺 `src/bin` 时的 `copyTool`（**展开后写文件, 不是
+`cp`** —— 不展开的话宿主跑的是"引用了一堆不存在文件"的入口，真机反而正常，白白浪费一轮排查）。
+`src/lib` 也在 shadow 门禁的扫描目录里。
+
 **压缩器**（`tools/minify.lua`）：去注释、去缩进、折叠空白，并把**局部变量/参数改名成短名**。
 它不是正则清洗 —— 源码里到处是 `local args = args or {}`（右值是内核注入的**全局** `args`），
 按 token 改名会压成 `local a = a or {}` 让工具全崩，所以必须先做真正的语法分析：
@@ -1589,6 +1663,9 @@ DELIN_SRCBIN=<压缩后的 bin> lua5.1 tools/harness.lua /bin/sh # 同上, 工�
 lua5.4 tools/hosttest.lua        # 同上用 5.4 跑一遍(CC 是 5.2 语义, 不能只在 5.1 上验;
                                  # 测试台的 fs 门面曾用 os.execute(...)==0 判目录 —— 5.1 独有语义)
 lua5.1 tools/harness.lua /bin/sh # 宿主上跑真实工具源码(sh/作业控制/管道; /sys 走真实 sysfs 后端, /proc 走真实 procfs 后端)
+                                 # DELIN_HARNESS_TTY=1 让 stdin/stdout 伪装成终端(分页器/REPL/desh 的按键自检都靠它);
+                                 # DELIN_HARNESS_SEED=<宿主目录> 在 setupRoot 之后把该目录铺进测试根 ——
+                                 # "进程起来前就得摆好文件"的场景(如先放一份 ~/.deshrc)用得上
 lua5.1 tools/installertest.lua    # 安装器宿主回归: 假 CraftOS 环境(假终端格子+脚本化事件队列)跑构建产物
                                   # dist/install.lua, 按键序列驱动整套向导(16 用例/207 断言: 两种落盘形态、
                                   # 自定义容量、坏源/空间不足/网络断连 fail-fast、http 重试、退格回退、
@@ -1605,6 +1682,8 @@ lua5.1 tools/harness.lua /bin/sh < scripts/redstone_test.sh   # /sys/class/redst
 lua5.1 tools/harness.lua /bin/sh < scripts/lua_test.sh   # /bin/lua 脚本/stdin/arg/dofile/退出码 + 进程环境白名单(与真机比对)
 lua5.1 tools/harness.lua /bin/sh < scripts/user_test.sh  # 用户管理(passwd/useradd/usermod/group*/id)自检(与真机比对)
 lua5.1 tools/harness.lua /bin/sh < scripts/sh_expand_test.sh  # sh 展开(通配符/命令替换/算术)自检(与真机比对)
+lua5.1 tools/harness.lua /bin/sh < scripts/desh_test.sh  # desh 非交互(与 sh 逐字节一致: -c/脚本/退出码/报错前缀)自检
+sh scripts/desh_tty_test.sh        # desh 行编辑器(宿主专用: 伪装终端, 33 项按键自检 —— 补全/历史/^R/建议/纠错/deshrc)
 sh scripts/lua_repl_test.sh        # /bin/lua 交互式 REPL(宿主专用: DELIN_HARNESS_TTY=1 伪装终端)
 sh scripts/sh_intr_test.sh         # sh 交互式"提示符处 ^C"(宿主专用: 伪装终端 + 注入中断键)
 lua5.1 tools/ext2test.lua        # ext2 驱动宿主回归: 真实镜像上跑目录增删, 再用宿主 e2fsck -fn 判定

@@ -230,10 +230,14 @@ def main():
         df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/verify.service")
         df_mkdir(out, "/mnt/rootcopy")
 
-        # 3e) verify-sh.service: sh 内建/变量自检(. set export unset PATH PSx cd) -> /var/log/sh_verify.log
+        # 3e) verify-sh.service: sh 内建/变量自检(. set export unset PATH PSx cd) + desh 非交互自检
+        #     -> /var/log/sh_verify.log
         for src, dst in (("scripts/sh_verify.sh", "/root/sh_verify.sh"),
                          ("scripts/sh_builtin_test.sh", "/root/sh_builtin_test.sh"),
                          ("scripts/sh_expand_test.sh", "/root/sh_expand_test.sh"),
+                         # desh 与 sh 共用核心: 真机上确认"非交互路径起得来、行为一致"。
+                         # 交互式那部分只有宿主能测(scripts/desh_tty_test.sh 用假终端喂按键字节)。
+                         ("scripts/desh_test.sh", "/root/desh_test.sh"),
                          ("scripts/regex_test.sh", "/root/regex_test.sh"),
                          ("scripts/proc_test.sh", "/root/proc_test.sh"),
                          ("scripts/redstone_test.sh", "/root/redstone_test.sh"),

@@ -328,6 +328,18 @@ end
 --- menu 非空表示已经列过一次候选, 之后每按一次 Tab 在候选间循环(zsh 的 menu-complete)。
 local E = { buf = "", pos = 1, prompt = "", cont = false, histIdx = nil, saved = "", menu = nil, kill = "" }
 
+--- 光标处那颗建议(历史里最近一条以当前输入开头的命令的后半截)。
+--- 开关在这里判一次: 画建议与"→ 接受建议"走同一处判定, 不会出现"关了还在提示"或"关不掉"。
+local function currentSuggestion()
+    if not cfgOn("DESH_AUTOSUGGEST", true) then return nil end
+    if E.menu or E.pos ~= #E.buf + 1 or E.buf == "" then return nil end
+    for i = #hist, 1, -1 do
+        local h = hist[i]
+        if h ~= E.buf and #h > #E.buf and h:sub(1, #E.buf) == E.buf then return h:sub(#E.buf + 1) end
+    end
+    return nil
+end
+
 --- 画提示符 + 缓冲区 + (可选)灰字建议, 并把光标放到 pos 处。
 --- 长行不折行, 而是横向开窗(两端用 < > 标示) —— CC 的屏幕只有 51 列, 折行重画在滚动边界上
 --- 很容易画花; 开窗的行为是可预测的(已知偏离, 见 for-ai.md)。
@@ -352,15 +364,13 @@ local function paint(pos, withSug)
     end
     local text = (markL and "<" or "") .. view .. (markR and ">" or "")
     out("\r" .. E.prompt .. text)
-    -- 灰字建议: 光标在行尾、视图没被截断(否则建议会落在 ">" 之后, 误导人)
-    if withSug and not markR and pos == #buf + 1 and buf ~= "" and cfgOn("DESH_AUTOSUGGEST", true) then
-        for i = #hist, 1, -1 do
-            local h = hist[i]
-            if h ~= buf and #h > #buf and h:sub(1, #buf) == buf then
-                local room = avail - #text
-                if room > 0 then out(sgr(suggestColor()) .. h:sub(#buf + 1, #buf + room) .. RESET) end
-                break
-            end
+    -- 灰字建议: 只在"画的是当前光标那一帧"且视图没被截断时画(否则建议会落在 ">" 之后, 误导人)。
+    -- 判定只用 currentSuggestion 一处, 免得这里的条件与"→ 接受"的条件漂开。
+    if withSug and pos == E.pos and not markR then
+        local sug = currentSuggestion()
+        if sug then
+            local room = avail - #text
+            if room > 0 then out(sgr(suggestColor()) .. sug:sub(1, room) .. RESET) end
         end
     end
     out("\27[K") -- 擦掉上一帧更长的尾巴
@@ -378,16 +388,6 @@ end
 local function replaceRange(a, old, new)
     E.buf = E.buf:sub(1, a - 1) .. new .. E.buf:sub(a + #old)
     E.pos = a + #new
-end
-
---- 光标处那颗建议(历史里最近一条以当前输入开头的命令的后半截)。
-local function currentSuggestion()
-    if E.menu or E.pos ~= #E.buf + 1 or E.buf == "" then return nil end
-    for i = #hist, 1, -1 do
-        local h = hist[i]
-        if h ~= E.buf and #h > #E.buf and h:sub(1, #E.buf) == E.buf then return h:sub(#E.buf + 1) end
-    end
-    return nil
 end
 
 --- 接受灰字建议(→ / End)。
@@ -441,25 +441,26 @@ local function reverseSearch(t)
     local query = ""
     local found = nil -- 命中的历史下标
     local savedBuf, savedPos, savedPrompt = E.buf, E.pos, E.prompt
-    local function paint()
+    -- 搜索态的一帧: 提示符换成 "(reverse-i-search)`query': ", 光标停在查询串之后(即匹配行之前)。
+    local function repaint()
         local shown = found and hist[found] or savedBuf
         E.prompt = "(reverse-i-search)`" .. query .. "': "
         E.buf = shown
         E.pos = 1
         draw()
     end
-    paint()
+    repaint()
     while true do
         local name, raw = readKey(t)
         if name == "eof" then return nil end
         if name == "intr" then return nil end -- ^C: 整行作废(tty 已经回显)
         if name == "ctrl-r" or name == "ctrl-p" or name == "up" then
             found = histFind(query, (found or #hist + 1) - 1) or found
-            paint()
+            repaint()
         elseif name == "backspace" then
             query = query:sub(1, -2)
             found = (query == "") and nil or histFind(query, #hist)
-            paint()
+            repaint()
         elseif name == "ctrl-g" then
             E.prompt, E.buf, E.pos = savedPrompt, savedBuf, savedPos
             draw()
@@ -481,7 +482,7 @@ local function reverseSearch(t)
                 query = query .. raw
                 local idx = histFind(query, #hist)
                 if idx then found = idx end
-                paint()
+                repaint()
             end
         end
     end
