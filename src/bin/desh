@@ -10,8 +10,10 @@
 --   历史       : 上下翻阅 + ^P/^N + ^R 增量搜索 + 落盘 $HISTFILE(缺省 ~/.desh_history)
 --   Tab 补全   : 命令($PATH 可执行 + 内建 + 函数 + 别名)/文件/目录/变量, 公共前缀补齐,
 --                多候选列菜单, 再按 Tab 在候选间循环
---   智能提示   : 灰字内联历史建议(zsh-autosuggestions 那种), → 或 End 接受, 回车只执行真实输入
---   错误更正   : command not found 时给 did-you-mean(编辑距离), 只建议不擅自改命令
+--   智能提示   : 灰字内联补全 —— 就是"Tab 会补进来的那一截"(同一份候选), → 或 End 接受,
+--                回车只执行真实输入(**不是**按历史建议)
+--   错误更正   : command not found 时按 zsh 的 correct 提问 `desh: correct 'x' to 'y' [nyae]? `
+--                (y 执行更正后的命令 / n 不更正 / a 放弃整条命令行 / e 放回行编辑器继续改)
 --   配置       : /etc/deshrc(系统) + ~/.deshrc 或 $DESHRC(用户), 都是普通 shell 脚本
 --
 -- 约定: 编辑器只在**读键盘的那段时间**开原始模式, 把行交给核心之前一定关回去 ——
@@ -225,6 +227,28 @@ local function pathDirs()
     return dirs
 end
 
+--- $PATH 里的命令名(只扫一次, 之后复用)。**为什么缓存**: 灰字提示每次按键都要问一次候选,
+--- 逐次扫 $PATH(每个目录一次 list + 每个名字两次 attributes)在真机上太贵。
+--- zsh 也把命令名 hash 起来(新增的命令要 rehash 才看得见), 这里同一取舍: **$PATH 一变就重扫**。
+--- 已知偏离: 新装进 $PATH 的命令在当前这个 shell 里补不出来(与 zsh 的 hash 同此)。
+local cmdCache, cmdCachePath = nil, nil
+local function pathCommands()
+    local p = S.vars.PATH or "/bin"
+    if cmdCache ~= nil and cmdCachePath == p then return cmdCache end
+    local out = {}
+    for _, d in ipairs(pathDirs()) do
+        local names = S.fs.list(d)
+        if names then
+            for _, n in ipairs(names) do
+                local full = d .. "/" .. n
+                if not S.fs.isDir(full) and S.fs.canExecute(full) then out[n] = true end
+            end
+        end
+    end
+    cmdCache, cmdCachePath = out, p
+    return out
+end
+
 --- 命令名候选: 内建 + shell 函数 + 别名 + $PATH 里可执行的普通文件。
 local function commandCandidates(prefix)
     local seen, out = {}, {}
@@ -236,15 +260,7 @@ local function commandCandidates(prefix)
     end
     for n in pairs(S.builtins) do add(n) end -- 函数也登记在 builtins 里(见核心的 isFunction)
     for n in pairs(S.aliases) do add(n) end
-    for _, d in ipairs(pathDirs()) do
-        local names = S.fs.list(d)
-        if names then
-            for _, n in ipairs(names) do
-                local p = d .. "/" .. n
-                if not S.fs.isDir(p) and S.fs.canExecute(p) then add(n) end
-            end
-        end
-    end
+    for n in pairs(pathCommands()) do add(n) end
     table.sort(out)
     return out
 end
@@ -329,18 +345,41 @@ end
 -- ===============================================================
 --- E 是"当前这一行"的全部状态: 缓冲区/光标/提示符/历史游标/补全菜单。
 --- menu 非空表示已经列过一次候选, 之后每按一次 Tab 在候选间循环(zsh 的 menu-complete)。
-local E = { buf = "", pos = 1, prompt = "", cont = false, histIdx = nil, saved = "", menu = nil, kill = "" }
+--- pending 是"下一次读行时预先摆在编辑器里的内容"(纠错提问里选 e 时填)。
+local E = { buf = "", pos = 1, prompt = "", cont = false, histIdx = nil, saved = "", menu = nil,
+            kill = "", pending = nil }
 
---- 光标处那颗建议(历史里最近一条以当前输入开头的命令的后半截)。
---- 开关在这里判一次: 画建议与"→ 接受建议"走同一处判定, 不会出现"关了还在提示"或"关不掉"。
+--- 光标处那个词的补全候选 —— **Tab 与灰字提示共用这一个入口**, 于是两者永远说同一件事。
+--- 返回 (词起点, 词, 候选表)。词为空时也照常返回(空词上按 Tab 要列全部命令, 见 complete)。
+local function candidatesFor(buf, pos)
+    local ws = wordStart(buf, pos)
+    local word = buf:sub(ws, pos - 1)
+    local cands
+    if word:sub(1, 1) == "$" then
+        cands = varCandidates(word)
+    elseif isCommandPos(buf, ws) and not word:find("/") then
+        cands = commandCandidates(word)
+    else
+        cands = fileCandidates(word)
+    end
+    return ws, word, cands
+end
+
+--- 光标处那颗灰字提示 = **Tab 会补进来的那一截**(候选的公共前缀超出现在这个词的部分)。
+--- 从前这里是"历史里最近一条以当前输入开头的命令的后半截"(zsh-autosuggestions 那种), 与 Tab 的
+--- 候选完全是两回事: 打 `cat /pu` 时灰字在提示某条历史命令, 而按 Tab 补的是目录名 —— 两者对不上,
+--- 会把人往错的方向带(用户反馈)。现在按 Tab 补什么就提示什么; `→`/End 接受的也是同一截。
+--- 只有一条候选时公共前缀就是那条候选, 于是唯一候选整体提示(与 Tab 的唯一候选补齐一致)。
+--- 开关在这里判一次: 画提示与"→ 接受"走同一处判定, 不会出现"关了还在提示"或"关不掉"。
 local function currentSuggestion()
     if not cfgOn("DESH_AUTOSUGGEST", true) then return nil end
-    if E.menu or E.pos ~= #E.buf + 1 or E.buf == "" then return nil end
-    for i = #hist, 1, -1 do
-        local h = hist[i]
-        if h ~= E.buf and #h > #E.buf and h:sub(1, #E.buf) == E.buf then return h:sub(#E.buf + 1) end
-    end
-    return nil
+    if E.menu or E.pos ~= #E.buf + 1 then return nil end
+    local _, word, cands = candidatesFor(E.buf, E.pos)
+    -- 空词上不提示: 命令位置的候选是整张 $PATH, 公共前缀基本是空, 而且每次按键都要扫一遍候选。
+    if word == "" or #cands == 0 then return nil end
+    local cp = commonPrefix(cands)
+    if #cp <= #word then return nil end
+    return cp:sub(#word + 1)
 end
 
 --- 画提示符 + 缓冲区 + (可选)灰字建议, 并把光标放到 pos 处。
@@ -382,7 +421,7 @@ local function paint(pos, withSug)
     if col > 0 then out("\27[" .. col .. "C") end
 end
 
---- 重画当前这一行(带建议; 补全菜单开着时不画建议)。
+--- 重画当前这一行(带灰字提示; 补全菜单开着时不提示)。
 local function draw()
     paint(E.pos, not E.menu)
 end
@@ -393,7 +432,7 @@ local function replaceRange(a, old, new)
     E.pos = a + #new
 end
 
---- 接受灰字建议(→ / End)。
+--- 接受灰字提示(→ / End): 就是"把 Tab 第一次会补的那一截补上"(不列候选、不进菜单)。
 local function acceptSuggestion()
     local s = currentSuggestion()
     if not s then return false end
@@ -532,9 +571,9 @@ local function listCandidates(cands)
 end
 
 --- Tab: 公共前缀 -> 菜单 -> 逐候选循环。
+--- 候选表与灰字提示同源(见 candidatesFor)—— 两者说的永远是同一件事。
 local function complete()
-    local ws = wordStart(E.buf, E.pos)
-    local word = E.buf:sub(ws, E.pos - 1)
+    local ws, word, cands = candidatesFor(E.buf, E.pos)
     -- 已经在菜单循环里(且词的位置没变): 换下一个候选
     if E.menu and E.menu.ws == ws then
         E.menu.idx = E.menu.idx + 1
@@ -543,14 +582,6 @@ local function complete()
         replaceRange(ws, E.menu.applied, c)
         E.menu.applied = c
         return
-    end
-    local cands
-    if word:sub(1, 1) == "$" then
-        cands = varCandidates(word)
-    elseif isCommandPos(E.buf, ws) and not word:find("/") then
-        cands = commandCandidates(word)
-    else
-        cands = fileCandidates(word)
     end
     if #cands == 0 then
         E.menu = nil
@@ -580,7 +611,7 @@ local function complete()
 end
 
 -- ===============================================================
--- 错误更正: command not found 的 did-you-mean
+-- 错误更正: command not found 的 zsh 式纠错(setopt CORRECT)
 -- ===============================================================
 --- 两个名字是不是"同一组字母的重排"(sl -> ls 这类手滑换位)。
 local function sameLetters(a, b)
@@ -592,78 +623,131 @@ local function sameLetters(a, b)
     return true
 end
 
-local allCommands = nil -- 摊平的命令名表(第一次纠错时建, 之后复用)
-local function correct(cmd)
-    if not cfgOn("DESH_CORRECT", true) then return end
-    if not cmd or cmd:find("/") then return end
-    if not allCommands then
-        allCommands = {}
-        for n in pairs(S.builtins) do allCommands[n] = true end
-        for n in pairs(S.aliases) do allCommands[n] = true end
-        for _, d in ipairs(pathDirs()) do
-            local names = S.fs.list(d)
-            if names then
-                for _, n in ipairs(names) do
-                    local p = d .. "/" .. n
-                    if not S.fs.isDir(p) and S.fs.canExecute(p) then allCommands[n] = true end
-                end
-            end
-        end
-    end
-    local limit = (#cmd >= 4) and 2 or 1 -- 短名字(1-3 字节)放宽到 2 会满屏都是无关建议
+--- 全部命令名(内建 + 函数 + 别名 + $PATH 可执行文件): 纠错与 Tab 补全用的是同一份来源。
+local function allCommandNames()
+    local cmds = {}
+    for n in pairs(S.builtins) do cmds[n] = true end
+    for n in pairs(S.aliases) do cmds[n] = true end
+    for n in pairs(pathCommands()) do cmds[n] = true end
+    return cmds
+end
+
+--- 与 cmd 最像的**那一档**命令名(最多 3 个; 空表 = 没有值得建议的)。
+--- 距离用 OSA(相邻换位算 1 步), 阈值 1(名字 ≤3 字节)或 2, 长度差也要在阈值内 ——
+--- 短名字放宽到 2 会满屏都是无关建议; 同距离时"同一组字母的重排"优先且只报这一档
+--- (`sl` 应该只说 'ls', 不会把 `nl sh` 一起列出来)。
+local function correctionHits(cmd)
+    local limit = (#cmd >= 4) and 2 or 1
     local hits = {}
-    for n in pairs(allCommands) do
+    for n in pairs(allCommandNames()) do
         local d = editDistance(cmd, n)
         if d > 0 and d <= limit and math.abs(#n - #cmd) <= limit then
             hits[#hits + 1] = { name = n, d = d, an = sameLetters(cmd, n) }
         end
     end
-    if #hits == 0 then return end
+    if #hits == 0 then return {} end
     table.sort(hits, function(x, y)
         if x.d ~= y.d then return x.d < y.d end
-        -- 距离一样时, "同一组字母的重排"更像手滑(ls 打成 sl), 排在前面
-        if x.an ~= y.an then return x.an end
+        if x.an ~= y.an then return x.an end -- 距离一样时"同一组字母的重排"更像手滑
         return x.name < y.name
     end)
-    -- 只报"最像的那一档": 距离 1 已经找到目标时, 再列一堆距离 2 的只会吵人;
-    -- 同档里若存在重排匹配(最典型的手滑), 就只报重排那些 —— `sl` 应该只说 'ls'。
-    local best = hits[1]
-    local names = {}
+    local best, out = hits[1], {}
     for i = 1, #hits do
-        if hits[i].d == best.d and hits[i].an == best.an and #names < 3 then
-            names[#names + 1] = hits[i].name
+        if hits[i].d == best.d and hits[i].an == best.an and #out < 3 then
+            out[#out + 1] = hits[i].name
         end
     end
-    if #names == 1 then
-        err(S.name .. ": did you mean '" .. names[1] .. "'?\n")
-    else
-        err(S.name .. ": did you mean one of: " .. table.concat(names, ", ") .. "?\n")
+    return out
+end
+
+--- zsh 的 correct 提问: `desh: correct 'sl' to 'ls' [nyae]? ` —— 等**一个按键**(不必回车):
+---   y = 就用更正后的名字执行; n = 不更正(照常报 command not found);
+---   a = 放弃整条命令行(整行作废, 回 PS1); e = 把更正过的命令行摆回行编辑器继续改。
+--- 返回 "y" / "a" / "e" / nil(不更正)。^C/^D(读不到键)按 a 处理 —— zsh 里在纠错提问上
+--- 按 ^C 也是中止这条命令。
+local function askCorrect(cmd, fix)
+    err(S.name .. ": correct '" .. cmd .. "' to '" .. fix .. "' [nyae]? ")
+    local t = io.stdin()
+    if not (t and t.setRaw and t.read) then return nil end
+    t:setRaw(true) -- 单键读取(与 zsh 的 ZLE 一样不必回车); 进原始模式会清掉预输入的键(已知偏离)
+    local ans
+    while true do
+        local name, raw = readKey(t)
+        if name == "eof" or name == "intr" then ans = "a"; break end
+        local c = (raw or ""):lower()
+        if c == "y" or c == "n" or c == "a" or c == "e" then
+            out(raw) -- 原始模式没有回显, 答案自己打出来(zsh 也回显)
+            ans = c
+            break
+        end
+        -- 其它键(含回车): 重新问, 与 zsh 同此
     end
+    t:setRaw(false)
+    out("\n")
+    return ans
+end
+
+--- 把命令词的源文本换成更正后的名字(纠错提问里选 e 时用): `sl -la` -> `ls -la`。
+--- 命令词不是字面量(带引号/变量展开)时换掉第一个词, 其余原样保留。
+local function correctedText(src, cmd, fix)
+    if not src or src == "" then return fix end
+    local a, b = src:find(cmd, 1, true)
+    if a then return src:sub(1, a - 1) .. fix .. src:sub(b + 1) end
+    local _, e = src:find("^%s*%S+")
+    return fix .. src:sub(e + 1)
+end
+
+--- command not found 的纠错钩子(核心的 ui.commandNotFound, 契约见 src/lib/shcore.lua)。
+--- 交互式: zsh 的 [nyae] 提问; 非交互(脚本/`-c`, 拿不到键盘): 只回一句提示, 由核心在
+--- "command not found" 之后打出来(于是非交互的输出与从前逐字节一致)。
+local function commandNotFound(cmd, src)
+    if not cfgOn("DESH_CORRECT", true) then return nil end
+    if not cmd or cmd:find("/") then return nil end
+    local names = correctionHits(cmd)
+    if #names == 0 then return nil end
+    local fix = names[1]
+    if not S.interactive then
+        if #names == 1 then return "hint", "did you mean '" .. fix .. "'?" end
+        return "hint", "did you mean one of: " .. table.concat(names, ", ") .. "?"
+    end
+    local ans = askCorrect(cmd, fix)
+    if ans == "y" then return "retry", fix end
+    if ans == "e" then
+        E.pending = correctedText(src, cmd, fix) -- 下一次 editLine 拿它当初始内容
+        return "abort"
+    end
+    if ans == "a" then return "abort" end
+    return nil -- n: 照常报 command not found
 end
 
 -- ===============================================================
 -- 行编辑器主循环
 -- ===============================================================
 --- 读一行(核心经 ui.readLine 调进来)。返回 nil = EOF(^D 空行),
---- 返回 "" = 取消(^C; tty 已经回显 ^C 并丢了这一行), 其余为输入内容。
+--- 返回 ("", "intr") = 被 ^C 取消(核心据此把**整条输入**作废, 含 PS2 续行里读进来的那些行),
+--- 其余为输入内容。
 --- **返回之前一定把终端恢复成规范模式**: 接下来核心要跑子进程, 它们需要正常的行输入。
 local function editLine(prompt, cont)
     local t = io.stdin()
     if not (t and t.setRaw and t.read) then return nil end
-    E.buf, E.pos, E.prompt, E.cont = "", 1, prompt, cont and true or false
+    -- 上一轮若在纠错提问里选了 e, 这里就把那条更正过的命令行摆出来继续编辑(zsh 的 correct 'e')。
+    E.pending = E.pending or ""
+    E.buf, E.pos, E.prompt, E.cont = E.pending, #E.pending + 1, prompt, cont and true or false
+    E.pending = nil
     E.histIdx, E.saved, E.menu = nil, "", nil
     t:setRaw(true)
     draw()
-    local eof = false
+    local eof, intr = false, false
     while true do
         local name, raw = readKey(t)
         if name == "eof" then
             eof = true
             break
         elseif name == "intr" then
-            -- ^C: 内核 tty 已回显 ^C 并把这一行丢掉(返回空行给核心, 与 sh 的规范模式一致)
-            E.buf = ""
-            name = "enter"
+            -- ^C: 整条输入作废。**不在这里删除缓冲区内容** —— 交给核心(它才知道 PS2 里
+            -- 已经读进了哪些行); 这里只把"这是取消, 不是空行"告诉它。
+            intr = true
+            break
         end
         if name == "enter" then
             break
@@ -735,6 +819,11 @@ local function editLine(prompt, cont)
         out("\n")
         return nil
     end
+    if intr then
+        -- 原始模式没开回显, ^C 得自己打出来(规范模式下由 tty.ctrlC 回显同一行)。
+        out("^C\n")
+        return "", "intr"
+    end
     -- 记历史(空行与 ^C 取消的行不进; 行首空格的命令也不进, 见 histAppend)
     if E.buf ~= "" then histAppend(E.buf) end
     -- 收尾: 擦掉灰字建议(回车只执行**真实输入**), 光标挪到行尾后换行 —— 子进程的输出从这里开始。
@@ -778,8 +867,8 @@ local function deshSetup()
         S.outln("editing  : arrows Home/End Delete; ^A ^E ^B ^F ^K ^U ^W ^Y ^L; Tab completes")
         S.outln("history  : Up/Down, ^P/^N, ^R incremental search; file $HISTFILE (default ~/.desh_history)")
         S.outln("complete : commands (PATH/builtin/function/alias), files, dirs, $variables")
-        S.outln("suggest  : grey inline history suggestion -- accept with -> or End")
-        S.outln("correct  : 'did you mean' when a command is not found")
+        S.outln("suggest  : grey inline completion -- the common prefix Tab would insert (-> or End)")
+        S.outln("correct  : 'correct X to Y [nyae]?' when a command is not found")
         S.outln("config   : /etc/deshrc, then ~/.deshrc (or $DESHRC); switches DESH_AUTOSUGGEST,")
         S.outln("           DESH_CORRECT, DESH_HISTORY, HISTFILE, HISTSIZE, DESH_SUGGEST_COLOR")
         S.outln("options  : setopt / unsetopt <name>  (errexit nounset verbose xtrace autosuggest")
@@ -798,7 +887,7 @@ local ui = {
     name = "desh",
     setup = function() return deshSetup() end,
     readLine = function(prompt, cont) return editLine(prompt, cont) end,
-    commandNotFound = function(cmd) correct(cmd) end,
+    commandNotFound = commandNotFound,
     onExit = function() if S.interactive then histSave() end end,
 }
 

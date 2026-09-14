@@ -114,9 +114,16 @@ def install_verified(src, dst):
         raise RuntimeError("安装校验失败: %s 与 %s 内容不一致(%s != %s); 有别的写入者在改它" % (dst, src, b, a))
     print("   installed %-30s md5=%s" % (os.path.basename(dst), a))
 
-def payload_fingerprint():
-    """payload 指纹: dist/ 产物 + 要注入的 scripts/ 内容哈希(只看内容, 不看时间戳)。"""
+def payload_fingerprint(mode):
+    """payload 指纹: dist/ 产物 + 要注入的 scripts/ 内容哈希(只看内容, 不看时间戳) + 开关。
+
+    mode 是"这一轮注入了哪些载荷"的标记(clean/desh_probe/desh_check)。它必须进指纹:
+    几个载荷互相**互斥**(三个按键注入载荷都抢 tty0), 同一份源码用不同开关跑出来的镜像
+    内容并不一样 —— 不带开关的话, 换开关那一轮会静默复用上一轮的镜像(门禁就会报"载荷
+    没注入"这类假失败)。
+    """
     h = hashlib.sha256()
+    h.update(("mode:" + mode + "\n").encode())
     # 本文件也进指纹: 改**注入清单**(往镜像里铺哪些文件)同样会让旧镜像失效 ——
     # 只看 dist/ 与 scripts/ 的话, 加了新 payload 却指纹没变, 会静默复用上一轮的镜像
     # (本轮踩过: newtools_test.sh 加进清单后跑出来仍是 "not deployed")。
@@ -144,7 +151,8 @@ def main():
 
     速度开关(测试流程本身的开销)：
       * payload 指纹命中时**复用**上一轮注入好的镜像(省掉 deploy + 40 来次 debugfs 注入);
-        指纹 = dist/ 全部产物 + scripts/ 内容的哈希, 只要动过一个字节就自动重建;
+        指纹 = dist/ 全部产物 + scripts/ 内容的哈希 + 本轮的载荷开关(clean/--desh-probe/
+        --desh-check/--printer —— 它们决定铺哪些载荷, 三者互斥), 任一变化都自动重建;
       * 引导等待是**条件轮询**(/delin.log 出现 "init up" 且镜像里的 verify.log 变过),
         不是原来那 75+30 秒盲等;
       * `--rebuild` 强制重建镜像; `--reboot-only` 只重开机+收日志。
@@ -157,6 +165,7 @@ def main():
     force_rebuild = False
     clean = False
     desh_probe = False
+    desh_check = False
     fast = False
     grep_tag = None
     wait_file = None
@@ -175,6 +184,8 @@ def main():
             clean = True
         elif a == "--desh-probe":
             desh_probe = True
+        elif a == "--desh-check":
+            desh_check = True
         elif a == "--fast":
             fast = True
         elif a == "--grep":
@@ -190,7 +201,7 @@ def main():
 
     if skip_deploy:
         print("--reboot-only: skipping build/deploy")
-        reboot_and_collect(printer)
+        reboot_and_collect(printer, desh_check)
         return
 
     # 0) 先关机: 下面读基镜像(live /parts/root.img)和写盘都必须在一台停机的机器上进行
@@ -211,7 +222,8 @@ def main():
     # payload 指纹没变就复用上一轮注入好的镜像: deploy(拷基镜像+铺文件) 与 40 来次 debugfs
     # 注入在迭代工具选项时要几十秒, 而 payload 里往往只变了一个 dist/bin/<tool>。
     # 指纹一变(reused=False)就整段重做, 不会测到旧镜像。--rebuild 可强制重建。
-    fp = payload_fingerprint()
+    fp = payload_fingerprint('clean=%d desh_probe=%d desh_check=%d printer=%d'
+                         % (clean, desh_probe, desh_check, printer))
     fp_path = os.path.join(WORK, 'payload.fingerprint')
     reused = (not force_rebuild) and os.path.exists(fp_path) and open(fp_path).read().strip() == fp and os.path.exists(os.path.join(WORK, 'root.img'))
     if reused:
@@ -244,19 +256,23 @@ def main():
             print('--clean: 跳过验证载荷注入(镜像里只有 dist 产物 + fstab/data 分区)')
             # --clean + --desh-probe: 干净系统上只注入诊断载荷 —— 量让出/渲染这类
             # "会被别的进程干扰"的东西时, 需要一台没有自检服务的机器(噪声源)。
-            if desh_probe:
+            for modfile, modname in (("desh_probe.ko", "deshprobe"), ("desh_check.ko", "deshcheck")):
+                if (modfile == "desh_probe.ko" and not desh_probe) or (modfile == "desh_check.ko" and not desh_check):
+                    continue
                 pv = re.search(r'^\s*return\s+"([^"]+)"',
                                open(os.path.join(REPO, "src/kernel/version.lua")).read(), re.M).group(1)
                 pmoddir = "/lib/modules/" + pv
-                df_write(out, os.path.join(REPO, "scripts/desh_probe.ko"), pmoddir + "/deshprobe.ko")
-                add_module(out, pmoddir, "deshprobe")
+                df_write(out, os.path.join(REPO, "scripts/" + modfile), pmoddir + "/" + modname + ".ko")
+                add_module(out, pmoddir, modname)
         else:
-            if desh_probe:
+            for modfile, modname in (("desh_probe.ko", "deshprobe"), ("desh_check.ko", "deshcheck")):
+                if (modfile == "desh_probe.ko" and not desh_probe) or (modfile == "desh_check.ko" and not desh_check):
+                    continue
                 pv = re.search(r'^\s*return\s+"([^"]+)"',
                                open(os.path.join(REPO, "src/kernel/version.lua")).read(), re.M).group(1)
                 pmoddir = "/lib/modules/" + pv
-                df_write(out, os.path.join(REPO, "scripts/desh_probe.ko"), pmoddir + "/deshprobe.ko")
-                add_module(out, pmoddir, "deshprobe")
+                df_write(out, os.path.join(REPO, "scripts/" + modfile), pmoddir + "/" + modname + ".ko")
+                add_module(out, pmoddir, modname)
             # 3) 注入验证负载
             print("== inject verify payload ==")
     
@@ -383,25 +399,29 @@ def main():
             #      模块由 /lib/modules/<版本>/manifest 点名装载, 所以 .ko 与 manifest 两样都要铺。
             ver = re.search(r'^\s*return\s+"([^"]+)"', open(os.path.join(REPO, "src/kernel/version.lua")).read(), re.M).group(1)
             moddir = "/lib/modules/" + ver
-            if not desh_probe:
+            if not desh_probe and not desh_check:
                 df_write(out, os.path.join(REPO, "scripts/intr_test.ko"), moddir + "/intrtest.ko")
                 add_module(out, moddir, "intrtest")
     
             # 3f5) tty 原始模式自检(scripts/rawtty_test.ko + scripts/rawtty_verify.lua):
             #      分页器 more/less 建在"原始模式 + 终端字节流"这条契约上, 而键盘事件只有内核态
             #      能注入 —— 模块喂按键, Lua 脚本在 /dev/tty0 上 setRaw 并读回字节。
-            df_write(out, os.path.join(REPO, "scripts/rawtty_verify.lua"), "/root/rawtty_verify.lua")
-            df(out, "set_inode_field /root/rawtty_verify.lua mode 0100755")
-            unit_raw = os.path.join(work, "rawtty-verify.service")
-            with open(unit_raw, "w") as f:
-                f.write("[Unit]\nDescription=Real-machine tty raw mode verification\n"
-                        "After=syslogd.service\n\n"
-                        "[Service]\nType=oneshot\nTimeoutStartSec=120\n"
-                        "ExecStart=/bin/lua /root/rawtty_verify.lua\n\n"
-                        "[Install]\nWantedBy=multi-user.target\n")
-            df_write(out, unit_raw, "/lib/systemd/system/rawtty-verify.service")
-            df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/rawtty-verify.service")
-            if not desh_probe:
+            #      --desh-check 时**整套都别铺**: 喂按键的 rawtty_test.ko 没注入, 而
+            #      rawtty_verify.lua 会一直等 /tmp/rawtty.hex, 白等满 120s 再报一条 FAILED
+            #      (日志被搅浑, 还拖慢一轮); 它读 /dev/tty0 也威胁 deshcheck 注入的按键。
+            if not desh_check:
+                df_write(out, os.path.join(REPO, "scripts/rawtty_verify.lua"), "/root/rawtty_verify.lua")
+                df(out, "set_inode_field /root/rawtty_verify.lua mode 0100755")
+                unit_raw = os.path.join(work, "rawtty-verify.service")
+                with open(unit_raw, "w") as f:
+                    f.write("[Unit]\nDescription=Real-machine tty raw mode verification\n"
+                            "After=syslogd.service\n\n"
+                            "[Service]\nType=oneshot\nTimeoutStartSec=120\n"
+                            "ExecStart=/bin/lua /root/rawtty_verify.lua\n\n"
+                            "[Install]\nWantedBy=multi-user.target\n")
+                df_write(out, unit_raw, "/lib/systemd/system/rawtty-verify.service")
+                df_write(out, marker, "/etc/systemd/system/multi-user.target.wants/rawtty-verify.service")
+            if not desh_probe and not desh_check:
                 df_write(out, os.path.join(REPO, "scripts/rawtty_test.ko"), moddir + "/rawtty.ko")
                 add_module(out, moddir, "rawtty")
     
@@ -493,7 +513,7 @@ def main():
         run("python3", RCON, "computercraft turn-on #3", check=False)
         print("   电脑 #3 已用干净镜像开机(磁盘 0 引导), 可以直接登录使用")
         return
-    reboot_and_collect(printer)
+    reboot_and_collect(printer, desh_check)
 
 
 def fast_collect(marker, tag, timeout=150):
@@ -529,7 +549,7 @@ def fast_collect(marker, tag, timeout=150):
         raise RuntimeError("fast: 等 %s 超过 %ds 没出现(上面是 klog 命中行)" % (marker, timeout))
 
 
-def reboot_and_collect(printer=False):
+def reboot_and_collect(printer=False, desh_check=False):
     # 引导指纹: 开机前的 verify.log, 开机后必须变 —— 否则说明这轮根本没从磁盘根启动
     verify_before = subprocess.run([DBG, "-R", "cat /var/log/verify.log", os.path.join(DISK, "parts/root.img")],
                                    capture_output=True, text=True).stdout
@@ -693,46 +713,120 @@ def reboot_and_collect(printer=False):
         lines = df(img, "cat " + path).splitlines()
         return lines[0].strip() if lines else None
     print("\n===== 交互式 ^C 门禁(tty0 注入按键) =====")
+    if desh_check:
+        print("   (--desh-check: 本轮用 deshcheck.ko 驱动 tty0, intrtest/rawtty 未注入 —— 见下面的门禁)")
+    # --desh-check 与 intrtest/rawtty 会互相抢 tty0(三个载荷都往登录会话里打字), 所以
+    # 注入时三者互斥; 门禁也按同一条件跳过。
+    if not desh_check:
     # 载荷的进度走 klog(内核 ring -> syslogd), 落在 /var/log/messages*; 它**不能**用 kprint
     # 打进度(那会同时画到控制台, 把会话搅乱, 见载荷头注释)。日志只作诊断打印 —— 一轮里
     # logrotate 随时可能把 messages 转成 messages.1, 拿它当门禁会变成"看运气"。
-    for name in ("/var/log/messages", "/var/log/messages.1"):
-        for line in df(img, "cat " + name).splitlines():
-            if "[intrtest]" in line:
-                print("   | " + line.strip())
-    before = img_file("/tmp/intr.before")
-    notrun = img_file("/tmp/intr.notrun")
-    after = img_file("/tmp/intr.after")
-    if before != "INTR-BEFORE":
-        raise RuntimeError("交互式 ^C 正对照缺失: /tmp/intr.before=%r —— 注入器没能在提示符上执行命令"
-                           "(见上面打印的 [intrtest] 进度)" % before)
-    print("   ok positive control: /tmp/intr.before written")
-    if notrun is not None:
-        raise RuntimeError("交互式 ^C 负对照失败: /tmp/intr.notrun 存在 —— ^C 没有取消打了一半的那行")
-    print("   ok negative control: the half-typed line was cancelled")
-    if after != "INTR-AFTER":
-        raise RuntimeError("交互式 ^C 门禁失败: /tmp/intr.after=%r —— ^C 之后的第一条命令没有执行"
-                           "(残留的 SIGINT 把它杀了; 见 src/bin/sh 交互循环)" % after)
-    print("   ok regression: the command right after ^C ran")
+        for name in ("/var/log/messages", "/var/log/messages.1"):
+            for line in df(img, "cat " + name).splitlines():
+                if "[intrtest]" in line:
+                    print("   | " + line.strip())
+        before = img_file("/tmp/intr.before")
+        notrun = img_file("/tmp/intr.notrun")
+        after = img_file("/tmp/intr.after")
+        if before != "INTR-BEFORE":
+            raise RuntimeError("交互式 ^C 正对照缺失: /tmp/intr.before=%r —— 注入器没能在提示符上执行命令"
+                               "(见上面打印的 [intrtest] 进度)" % before)
+        print("   ok positive control: /tmp/intr.before written")
+        if notrun is not None:
+            raise RuntimeError("交互式 ^C 负对照失败: /tmp/intr.notrun 存在 —— ^C 没有取消打了一半的那行")
+        print("   ok negative control: the half-typed line was cancelled")
+        if after != "INTR-AFTER":
+            raise RuntimeError("交互式 ^C 门禁失败: /tmp/intr.after=%r —— ^C 之后的第一条命令没有执行"
+                               "(残留的 SIGINT 把它杀了; 见 src/bin/sh 交互循环)" % after)
+        print("   ok regression: the command right after ^C ran")
 
     # 6a2) tty **原始模式**门禁(载荷 = scripts/rawtty_test.ko + /root/rawtty_verify.lua):
     #      分页器 more/less 全靠这条契约(setRaw 之后 read(n) = 终端字节流, 特殊键是 ANSI 序列),
     #      而它只有真机的内核 tty 层能验。判据是 /tmp/rawtty.hex 逐字节等于期望序列:
     #        x | 空格 | ↑(1b 5b 41) | 7 | enter(只一次, 去重闩锁生效) | ^D(普通字节)
     print("\n===== tty 原始模式门禁(rawtty 注入按键) =====")
-    for name in ("/var/log/rawtty_verify.log", "/var/log/messages", "/var/log/messages.1"):
-        if "Inode:" not in df(img, "stat " + name):
-            continue
-        for line in df(img, "cat " + name).splitlines():
-            if "rawtty" in line:
-                print("   | " + line.strip())
-    raw_hex = img_file("/tmp/rawtty.hex")
-    want_hex = "78201b5b41370a04"
-    if raw_hex != want_hex:
-        raise RuntimeError("tty 原始模式门禁失败: /tmp/rawtty.hex=%r, 期望 %r"
-                           "(见上面打印的 [rawtty] 进度; 元凶通常是 setRaw 的字节语义或按键映射)"
-                           % (raw_hex, want_hex))
-    print("   ok raw tty: setRaw + read(n) returned " + raw_hex)
+    if not desh_check:
+        for name in ("/var/log/rawtty_verify.log", "/var/log/messages", "/var/log/messages.1"):
+            if "Inode:" not in df(img, "stat " + name):
+                continue
+            for line in df(img, "cat " + name).splitlines():
+                if "rawtty" in line:
+                    print("   | " + line.strip())
+        raw_hex = img_file("/tmp/rawtty.hex")
+        want_hex = "78201b5b41370a04"
+        if raw_hex != want_hex:
+            raise RuntimeError("tty 原始模式门禁失败: /tmp/rawtty.hex=%r, 期望 %r"
+                               "(见上面打印的 [rawtty] 进度; 元凶通常是 setRaw 的字节语义或按键映射)"
+                               % (raw_hex, want_hex))
+        print("   ok raw tty: setRaw + read(n) returned " + raw_hex)
+
+    # 6a3) 交互式 shell 门禁(载荷 = /lib/modules/<版本>/deshcheck.ko, 见 scripts/desh_check.ko):
+    #      sh/desh 在 PS2 续行下按 ^C 取消整条输入、desh 的 zsh 式 [nyae] 纠错、灰字提示的来源。
+    #      证据全在 /tmp/dc.* 里(机器已停机, 从镜像里读); 正对照(/tmp/dc.before 与各个 *.done)
+    #      缺一不可 —— 没有它们, "文件不存在"证明不了任何事。
+    if desh_check:
+        print("\n===== 交互式 shell 门禁(deshcheck 注入按键) =====")
+        for name in ("/var/log/messages", "/var/log/messages.1"):
+            if "Inode:" not in df(img, "stat " + name):
+                continue
+            for line in df(img, "cat " + name).splitlines():
+                if "[deshcheck]" in line:
+                    print("   | " + line.strip())
+        print("   progress: %r" % img_file("/tmp/dc.progress"))
+        if img_file("/tmp/dc.before") != "DC-BEFORE":
+            raise RuntimeError("deshcheck 正对照缺失: /tmp/dc.before=%r —— 载荷没能在登录会话里跑起命令"
+                               "(见上面打印的 [deshcheck] 进度与 /tmp/dc.progress)" % img_file("/tmp/dc.before"))
+        print("   ok positive control: the login session ran a command")
+
+        # (1) sh: PS2 续行 + ^C 取消整条输入
+        sh_rc = img_file("/tmp/dc.sh.ps2rc")
+        if sh_rc != "RC=130":
+            raise RuntimeError("sh: PS2 续行下 ^C 之后的 $? 应为 130, 实际 %r"
+                               "(取消输入后 $? 置 130, 见 src/lib/shcore.lua 交互循环)" % sh_rc)
+        if img_file("/tmp/dc.sh.after") != "SH-AFTER":
+            raise RuntimeError("sh: ^C 取消 PS2 续行后, 下一条命令没有执行 —— 半截输入没被丢掉"
+                               "(它会被并进没闭合的引号里, 直到 EOF 才报语法错误)")
+        print("   ok sh: ^C on an incomplete line dropped the whole input ($?=130)")
+
+        # (2) desh: 同样一条(走原始模式 EINTR 那条路)
+        desh_rc = img_file("/tmp/dc.desh.ps2rc")
+        if desh_rc != "RC2=130":
+            raise RuntimeError("desh: PS2 续行下 ^C 之后的 $? 应为 130, 实际 %r" % desh_rc)
+        print("   ok desh: ^C on an incomplete line dropped the whole input ($?=130)")
+
+        # (3) desh [nyae]
+        if img_file("/tmp/dc.y") != "DC-Y":
+            raise RuntimeError("desh 纠错: 选 y 之后更正后的命令没有执行(/tmp/dc.y=%r)" % img_file("/tmp/dc.y"))
+        print("   ok correct: y runs the corrected command")
+        if img_file("/tmp/dc.n.done") != "DC-NDONE":
+            raise RuntimeError("desh 纠错: 选 n 之后 shell 没有回到可用状态(/tmp/dc.n.done 缺失)")
+        # 注意: 重定向目标(`> /tmp/dc.n`)在 spawn **之前**就被 shell 打开了, 所以那个文件
+        # 本来就存在(空文件) —— 判据是"里面没有命令的输出", 不是"文件不存在"。
+        n_out = img_file("/tmp/dc.n")
+        if n_out is not None and "DC-N" in n_out:
+            raise RuntimeError("desh 纠错: 选 n 之后命令仍然执行了(/tmp/dc.n=%r)" % n_out)
+        print("   ok correct: n runs nothing and reports command not found")
+        if img_file("/tmp/dc.a.done") != "DC-ADONE":
+            raise RuntimeError("desh 纠错: 选 a 之后 shell 没有回到可用状态(/tmp/dc.a.done 缺失)")
+        a_out = img_file("/tmp/dc.a")
+        a_tail = img_file("/tmp/dc.a.tail")
+        if (a_out is not None and "DC-A" in a_out) or a_tail is not None:
+            raise RuntimeError("desh 纠错: 选 a 之后本行剩下的命令仍然执行了"
+                               "(/tmp/dc.a=%r, /tmp/dc.a.tail=%r —— 后者是 `;` 之后那条, 它不该被建出来)"
+                               % (a_out, a_tail))
+        print("   ok correct: a drops the whole command line")
+        if img_file("/tmp/dc.e") != "DC-E":
+            raise RuntimeError("desh 纠错: 选 e 之后把更正后的命令行放回编辑器再回车没有执行(/tmp/dc.e=%r)"
+                               % img_file("/tmp/dc.e"))
+        print("   ok correct: e puts the corrected line back into the editor")
+
+        # (4) 灰字提示 = Tab 会补的那一截(不是历史那条命令的尾巴)
+        sug = img_file("/tmp/dc.sug") or ""
+        print("   grey hint frame: %s" % sug)
+        if "after=[o]" not in sug or "grey=[o]" not in sug:
+            raise RuntimeError("desh 灰字提示不是 Tab 会补的那一截: %r(期望 after=[o] grey=[o], "
+                               "即 `ech` 后面只多一个 o; 出现 DCHISTONLY 说明走的还是历史建议)" % sug)
+        print("   ok grey hint: the completion prefix (what Tab would insert), not history")
 
     p = subprocess.run([FSCK, "-fn", os.path.join(DISK, "parts/root.img")], capture_output=True, text=True)
     out = (p.stdout + p.stderr).strip()

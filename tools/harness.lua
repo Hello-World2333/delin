@@ -1114,9 +1114,10 @@ local stdinPos = 1
 -- DELIN_HARNESS_TTY=1: 把 stdin 伪装成终端, 让 sh 走交互式分支(测 PS1/PS2 提示符)。
 -- **提示符处按 ^C**: 输入里以 `\3`(真 ^C 字节, 见 scripts/sh_intr_test.sh) 结尾的一行表示
 -- "用户打了一半之后按了中断键"; 单独一行 `\3` 就是"空行上按了中断键"。内核那边是两件事一起
--- 发生(kernel/tty.lua 的 tty.ctrlC): 行规程丢掉当前行、读返回空行; 同时给 tty 前台进程组投
--- SIGINT。宿主测试台照这两件事一起模拟 —— 少了投信号那一半, "提示符处的 SIGINT 被漏到下一轮"
--- 这类 bug 在宿主上就复现不出来(见 src/bin/sh 交互循环里那段注释)。
+-- 发生(kernel/tty.lua 的 tty.ctrlC): 行规程丢掉当前行、读返回 ("", "intr"); 同时给 tty 前台
+-- 进程组投 SIGINT。宿主测试台照这两件事一起模拟 —— 少了投信号那一半, "提示符处的 SIGINT 被漏到
+-- 下一轮"这类 bug 在宿主上就复现不出来(见 src/bin/sh 交互循环里那段注释); 少了第二个返回值,
+-- "PS2 续行下按 ^C 能不能取消整条输入"就测不了。
 local ttyMode = os.getenv("DELIN_HARNESS_TTY") == "1"
 -- 由下面的引导代码填: 把 SIGINT 投给 tty 前台进程组(此时即顶层 sh 那一组)。
 local ttyForegroundIntr = function() end
@@ -1150,7 +1151,8 @@ inputHandle.readLine = function()
     local line = rawStdinLine()
     if ttyMode and line and line:sub(-1) == "\3" then
         ttyForegroundIntr()
-        return "" -- ^C 丢掉当前行(连已打进缓冲的那半截), 读到的是一整行空行
+        -- ^C 丢掉当前行(连已打进缓冲的那半截); "intr" 让 shell 把整条输入作废, 见 kernel/tty.lua
+        return "", "intr"
     end
     return line
 end

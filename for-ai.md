@@ -697,10 +697,18 @@ shebang 支持 `#!/bin/sh` / `#!/usr/bin/env sh` 等形式，env 特殊解释为
 `scripts/sh_expand_test.sh`（展开自检 95 项：通配符/命令替换/算术，宿主 harness 与真机各跑一次，
 期望值逐条对着 bash/dash 核过）、`scripts/sh_intr_test.sh`（宿主专用：提示符处 `^C`）。
 **提示符处的 `^C`**：tty 行规程做两件事（`kernel/tty.lua` 的 `tty.ctrlC`）—— 回显 `^C`、丢掉当前行
-（读到的是一整行空行），同时把 SIGINT 投给 tty 前台进程组。**交互式 sh 必须在读完这一行之后立刻
+（`readLine` 返回 **`"", "intr"`**：第二个返回值把"被 ^C 取消"与"读到一行空行"分开），同时把 SIGINT
+投给 tty 前台进程组。**交互式 sh 必须在读完这一行之后立刻
 消费掉那个 SIGINT**（`src/bin/sh` 交互循环里的 `sigintPending = false`）：它的目的（取消输入行）已经
 达成，留到下一轮就会被 `pollWait` 当成"^C 中断" —— 症状是"提示符处按过 ^C 之后的那条**外部**命令
 静默不执行（退出码 130），再下一条才恢复"（历史 bug；内建命令不走 pollWait，所以只有外部命令看得出来）。
+**`"intr"` 还要让 shell 把整条输入缓冲区丢掉**（bash/dash/zsh 同此）：`echo "abc` 这种没闭合的引号
+显示 PS2 时按 ^C，取消的是**整条命令**（含 PS2 续行里已经读进来的行），`$?` 置 130。从前只丢当前
+这一行，于是 ^C 之后还是 PS2（退不出去），而之后打的每一行都被并进那条没闭合的引号里，直到 EOF 才报
+`unexpected end of file`（真机/宿主都复现过）。
+**`line, intr = a and b and c()` 这种写法会让第二个返回值消失**（Lua 的 and/or 表达式只产生一个值）——
+上面这条协议的第一版就栽在这里：tty 明明返回了 `"intr"`，交互循环读到的却是 `nil`。写成
+`if ... then line, intr = stdin:readLine() end` 才是对的（`hosttest`/`sh_intr_test` 锁着）。
 `/bin/lua` 的 REPL 用自己那份 `interrupted` 标志做同一件事（读之前清零、读之后消费）。
 
 #### 词展开：命令替换 / 算术 / 通配符
@@ -763,8 +771,8 @@ shebang 支持 `#!/bin/sh` / `#!/usr/bin/env sh` 等形式，env 特殊解释为
 |---|---|
 | `ui = nil` | 经典行为（`/bin/sh`：tty 行规程读行，报错前缀 `sh:`） |
 | `ui.name` | shell 名（报错前缀、PS1 的 `\s`、用法文本） |
-| `ui.readLine(prompt, cont)` | 交互式读一行（`cont` = 续行）；返回 `nil` = EOF、`""` = 取消（^C）。**返回前必须把终端恢复成规范模式**（子进程要拿回正常的行输入） |
-| `ui.commandNotFound(cmd)` | 命令找不到时的额外提示（did-you-mean）；只打印，不动退出码 |
+| `ui.readLine(prompt, cont)` | 交互式读一行（`cont` = 续行）；返回 `nil` = EOF、`("", "intr")` = 这一行被 `^C` 取消（核心据此把**整条输入**作废，见「提示符处的 `^C`」）。**返回前必须把终端恢复成规范模式**（子进程要拿回正常的行输入） |
+| `ui.commandNotFound(cmd, text)` | 命令找不到时的纠错钩子（zsh 的 `setopt CORRECT`；`text` = 该命令的源文本）。返回 `("retry", 名字)` 用更正后的名字重跑 / `("abort")` 放弃整条命令行 / `("hint", 文本)` 报错后补打一行 / `nil` 什么也不做（核心照常报 `command not found`）。钩子在**报错之前**调用 —— 接受更正就不该先看到错误 |
 | `ui.setup(S)` | 接口表填满后、命令开跑前调一次；返回 `false` 表示直接收摊（desh 用它读 rc/载历史/覆盖 `help`） |
 | `ui.onExit()` | `shCoreMain` 返回前调用（desh 用它落盘历史） |
 | `S`（表，`sh` 传 nil） | 前端**唯一**能看到核心的地方：`name/vars/builtins/aliases/fs/resolve/evalProgram/errln/outln/stdin/stdout/interactive/lastExit()`。desh 不再能直接看见核心的局部变量——这是把两边各自关进函数之后的必然结果，也顺带成了一条**显式接口** |
@@ -776,8 +784,9 @@ shebang 支持 `#!/bin/sh` / `#!/usr/bin/env sh` 等形式，env 特殊解释为
 | 行编辑 | 方向键/Home/End/Delete/PageUp/Down 不绑定；`^A ^E ^B ^F ^K(杀到行尾) ^U(杀到行首) ^W(删词) ^Y(粘回) ^L(清屏)`；`^D` 空行=EOF、行中=删一字符 |
 | 历史 | 上/下、`^P`/`^N`（`PS2` 续行下不翻历史）、`^R` 增量搜索（`^R` 再往前、回车直接执行、ESC/方向键回到编辑、`^G` 取消）；文件 `$HISTFILE`（缺省 `~/.desh_history`，条数 `$HISTSIZE` 缺省 200）；**行首空格的命令不入历史**（bash 的 `HISTCONTROL=ignorespace`）、连续重复只记一次；每条追加写、退出时按 `HISTSIZE` 整体重写一次 |
 | Tab 补全 | 命令（`$PATH` 里可执行的普通文件 + 内建 + shell 函数 + 别名）、文件/目录、`$变量`（含 `$? $# $@ $* $$ $! $-`）；唯一候选直接补齐（目录补 `/`、其余补一个空格）；多候选先补公共前缀，再 Tab 列候选（**超过 50 个先问 `display all N possibilities?`**，bash 同义），第三次起每按一次 Tab 依次代入（menu-complete）；词边界与 bash 的 `COMP_WORDBREAKS` 同义（含引号），命令位置包括行首/`\| && \|\| ;` 之后/`then do else elif time !` 之后 |
-| 智能提示 | 历史里**最近一条以当前输入开头**的命令的后半截，用 `\e[90m`（亮黑=灰）画在光标之后；`→` 或 `End` 接受，回车**只执行真实输入**；只在光标处于行尾、视图未被截断时画 |
-| 错误更正 | `command not found` 时打一行 `desh: did you mean 'ls'?` / `did you mean one of: ...`；距离用 **OSA（相邻换位算 1 步）**，阈值 1（名字 ≤3 字节）或 2，长度差也要在阈值内；同距离时"同一组字母的重排"优先且只报这一档（`sl` → 只报 `ls`，不会把 `nl sh` 一起列出来）；**只建议不擅自改命令**（不自动纠正执行） |
+| 灰字提示 | **Tab 会补进来的那一截**（候选的公共前缀超出当前词的部分），用 `\e[90m`（亮黑=灰）画在光标之后；`→` 或 `End` 接受，回车**只执行真实输入**；只在光标处于行尾、视图未被截断、词非空时画。与 Tab 补全**共用同一个候选入口**（`candidatesFor`），所以两者永远说同一件事：从前这里提示的是"历史里最近一条以当前输入开头的命令的尾巴"（zsh-autosuggestions 那种），打 `cat /pu` 时灰字在推荐某条历史命令、而 Tab 补的是目录名，对不上（用户反馈后改掉的） |
+| 错误更正 | `command not found` 时按 zsh 的 `correct` 提问：`desh: correct 'sl' to 'ls' [nyae]? `（**等一个按键**，不必回车；`^C`/`^D` 当 `a`）。`y` = 用更正后的名字重跑、`n` = 不更正（照常报 `command not found`、退出码 127）、`a` = **放弃整条命令行**（本行剩下的命令也不跑，`$?` 为 1）、`e` = 把更正过的命令行摆回行编辑器接着改（回车即执行）。**非交互**（脚本/`-c`，拿不到键盘）只回一句 `did you mean 'ls'?`，由核心排在 `command not found` **之后**打印。距离用 **OSA（相邻换位算 1 步）**，阈值 1（名字 ≤3 字节）或 2，长度差也要在阈值内；同距离时"同一组字母的重排"优先且只报这一档（`sl` → 只报 `ls`，不会把 `nl sh` 一起列出来）。**已知偏离**：`e` 放回编辑器的是**那条命令的源文本**（命令词换成更正后的名字），多命令行（管道/`;`/`&&`）里其余部分不会跟着回来 —— 整行恢复要把输入行里的位置透传到前端，现在没做 |
+| 候选缓存 | `$PATH` 的命令名只扫一次（`pathCommands`），`$PATH` 一变就重扫：灰字提示每次按键都要问一次候选，逐次扫 PATH（每个目录一次 `list` + 每个名字两次 `attributes`）在真机上太贵。**已知偏离**：新装进 `$PATH` 的命令在当前这个 shell 里补不出来（zsh 也是把命令名 hash 起来、要 `rehash`）。路径词的候选不做缓存 —— 那就是一次 `fs.list(词所在目录)`，与按一次 Tab 同价 |
 | 配置 | `/etc/deshrc`（系统）→ `$DESHRC` 或 `~/.deshrc`（用户），**都是普通 shell 脚本**（用同一个 `evalProgram` 跑，别名/函数/变量都能定义）；开关 `DESH_AUTOSUGGEST` `DESH_CORRECT` `DESH_HISTORY`（`0`/空/`no`/`false` 为关）、`DESH_SUGGEST_COLOR`（SGR 参数，缺省 `90`） |
 | 内置 `help` | desh 覆盖了核心那份 `help`，打的是交互层的能力与开关（`desh -c 'help'` 也走这条） |
 
@@ -802,11 +811,28 @@ shebang 支持 `#!/bin/sh` / `#!/usr/bin/env sh` 等形式，env 特殊解释为
 - **`desh` 这一层也整个包在一个函数里**（`deshMain`），只把接口表 `S` 当 upvalue：CC 的 Lua
   沿嵌套链累加局部变量（见「local gate」），两边各自在函数里才不会互相挤。
 - **`^Z` 在提示符处不挂起 shell**：核心在作业控制开启时就给 SIGTSTP 装了空处理器，于是它只让
-  `abortLine` 置 intr —— desh 把它当成"取消当前行"（与 `^C` 同路）。
+  `abortLine` 置 intr —— desh 把它当成"取消"（与 `^C` 同路）。
+- **`^C` 取消的是整条输入，不只是当前这一行**：`editLine` 在 `^C` 时返回 `("", "intr")`，由核心把
+  累积的缓冲区整个丢掉（`echo "abc` 这种 PS2 状态下按 `^C` 要能回到 PS1，见「提示符处的 `^C`」）。
+  原始模式没有回显，所以 desh 自己打一行 `^C`（与规范模式下 `tty.ctrlC` 的可见行为一致）。
+- **纠错提问要等一个按键**：`askCorrect` 前后 `setRaw(true/false)`，于是 `y/n/a/e` 不必回车
+  （与 zsh 的 ZLE 一样）。副作用与「原始模式只在读键盘时开」那条同源：进原始模式会清掉预输入的键。
+  提问里按 `^C` 走 `a`，那条 SIGINT 在核心的 `abort` 分支里被**立刻消费掉** —— 不然它会残留到
+  下一条外部命令（症状见「提示符处的 `^C`」，这条踩过一次就够）。
+- **`abort` 是一条控制信号**（与 `exit` 同级）：`runExternal` 返回它，`evalSimple` → `evalList` →
+  `evalProgram` → 交互循环逐层透传，最后丢弃整条输入、`$?` 置 1。`for`/`while`/函数体/别名/`.`
+  都要跟着透传（漏一处的症状是"选了 a 之后本行剩下的命令照跑"）。**已知偏离**：管道元素
+  （`sl | wc`，`F.evalPipe` 的 Pass B）不纠错，所以那里的 `abort` 也不穿透 —— 管道路径要清理
+  已 spawn 的元素与管道端，代价不成比例。
+- **`e` 用 `E.pending` 把命令行交回下一次 `editLine`**：纠错发生在命令**执行期**（行编辑器早就
+  返回了），所以"摆回编辑器"只能是"下一次读行时用它开头"。
 
-自检：`scripts/desh_test.sh`（非交互 24 项，宿主与真机各跑一次，进 `--check` 的差分清单）、
-`scripts/desh_tty_test.sh`（宿主专用 33 项按键自检：补全/历史/`^R`/建议/纠错/`^C`/`^U`/长行开窗/
-历史落盘/deshrc 五组开关）。
+自检：`scripts/desh_test.sh`（非交互 28 项，宿主与真机各跑一次，进 `--check` 的差分清单）、
+`scripts/desh_tty_test.sh`（宿主专用 43 项按键自检：补全/历史/`^R`/灰字提示/纠错 `[nyae]`/`^C`
+（含 PS2 续行下取消整条输入）/`^U`/长行开窗/历史落盘/deshrc 五组开关）。
+真机：`scripts/desh_check.ko`（`python3 tools/realmachine.py --desh-check`，改动 tty0 上的登录会话：
+sh/desh 的 PS2 `^C`、`[nyae]` 四个答案、灰字提示的来源 —— 判据是 `/tmp/dc.*` 里的证据文件与
+`tty` 网格里灰字那两个格子，见 realmachine.py 的 6a3 门禁）。
 
 #### 选项约定：未知选项与"未实现"的选项一律 fail-fast
 
@@ -902,6 +928,7 @@ shebang 支持 `#!/bin/sh` / `#!/usr/bin/env sh` 等形式，env 特殊解释为
 | `--fast --wait-file <镜像内路径> --grep <tag>` | 只重启 #3、等某个 marker 文件出现、只 dump klog 里带 tag 的行；跳过宿主 ext2 回归与电脑 4 | **~40-90 秒** |
 | `--clean` | 只装干净镜像（只有 dist 产物，不注入任何验证载荷）并开机，交给人手工用 | ~1 分钟 |
 | `--desh-probe` | 注入 `scripts/desh_probe.ko`（交互式诊断载荷：自动登录 → 起 desh → 敲命令 → 把 tty 状态与**每个真实按键事件**写进 klog/文件），并**自动禁用会抢 tty0 的 intrtest/rawtty** | 陪 `--fast` 用 |
+| `--desh-check` | 注入 `scripts/desh_check.ko`（交互式 shell 门禁载荷：自动登录 → sh/desh 的 PS2 `^C` → desh 的 `[nyae]` 四个答案 → 灰字提示来源），同样**禁用会抢 tty0 的 intrtest/rawtty**；停机后由 `realmachine.py` 的 6a3 段逐条判定 `/tmp/dc.*` | 交互式行为改动后跑一轮 |
 
 **排查交互式问题时值得先想到它**：`desh_probe.ko` 的按键注入**照抄调度器的路由**
 （可打印字符 → `feedInput`，回车 → `routeKey` + 随后那个 char 事件），所以它能复现真实键盘的
@@ -1866,9 +1893,9 @@ lua5.1 tools/harness.lua /bin/sh < scripts/lua_test.sh   # /bin/lua 脚本/stdin
 lua5.1 tools/harness.lua /bin/sh < scripts/user_test.sh  # 用户管理(passwd/useradd/usermod/group*/id)自检(与真机比对)
 lua5.1 tools/harness.lua /bin/sh < scripts/sh_expand_test.sh  # sh 展开(通配符/命令替换/算术)自检(与真机比对)
 lua5.1 tools/harness.lua /bin/sh < scripts/desh_test.sh  # desh 非交互(与 sh 逐字节一致: -c/脚本/退出码/报错前缀)自检
-sh scripts/desh_tty_test.sh        # desh 行编辑器(宿主专用: 伪装终端, 33 项按键自检 —— 补全/历史/^R/建议/纠错/deshrc)
+sh scripts/desh_tty_test.sh        # desh 行编辑器(宿主专用: 伪装终端, 43 项按键自检 —— 补全/历史/^R/灰字提示/纠错/^C/deshrc)
 sh scripts/lua_repl_test.sh        # /bin/lua 交互式 REPL(宿主专用: DELIN_HARNESS_TTY=1 伪装终端)
-sh scripts/sh_intr_test.sh         # sh 交互式"提示符处 ^C"(宿主专用: 伪装终端 + 注入中断键)
+sh scripts/sh_intr_test.sh         # sh 交互式"提示符处 ^C"(宿主专用: 伪装终端 + 注入中断键; 含 PS2 续行下取消整条输入)
 lua5.1 tools/ext2test.lua        # ext2 驱动宿主回归: 真实镜像上跑目录增删, 再用宿主 e2fsck -fn 判定
 lua5.1 tools/mdtest.lua          # 软RAID 宿主回归: 五个级别 + 非默认布局, 独立布局模型与独立 GF(2^8)
                                  # 乘法逐块核对成员镜像, 降级/重建/组装/拒绝规则, 阵列上的 ext2 交给 e2fsck
@@ -2085,8 +2112,9 @@ tools/harness.lua          host 测试台: 用真实 Delin 工具源码在宿主
                            走不到, 真机才炸)
                            DELIN_HARNESS_TTY=1 时把 stdin 伪装成终端(isTTY + getDeviceName),
                            输入里以 `\3` 结尾的一行 = "用户打了一半按了 ^C": 行规程丢掉该行、
-                           读返回空行, 同时把 SIGINT 投给顶层那条进程组(与真机 tty.ctrlC 的两件事
-                           一一对应) —— 少了投信号那一半, 提示符处 ^C 的 bug 在宿主上复现不出来
+                           读返回 `("", "intr")`, 同时把 SIGINT 投给顶层那条进程组(与真机 tty.ctrlC
+                           的两件事一一对应) —— 少了投信号那一半, 提示符处 ^C 的 bug 在宿主上复现
+                           不出来; 少了第二个返回值, "PS2 续行下 ^C 能否取消整条输入"就测不了
 tools/hosttest.lua         宿主测试: init 单元引擎/fstab 生成/syslogd 规则/logrotate 轮转/systemctl/sysfs/ccprinter/procfs/tty-ANSI/redstone/devdisk/mkfs.ext2+fsck.ext2(680 项)
 tools/installertest.lua    安装器宿主回归: 假 CraftOS(fs/term/os/http/disk/peripheral + 脚本化事件队列)
                            + 假终端格子(含 fg/bg), 用 loadfile 跑 dist/install.lua, 按键序列驱动向导
@@ -2104,7 +2132,10 @@ tools/md_realmachine.py    软RAID 真机流程(电脑 #6, 两阶段): 干净 CC
 tools/ceecc_realmachine.py CEECC(电脑 #6)真机流程: 先关机->打包->CCFS 根安装+注入 ceecc.service->开机->逐项断言
 tools/realmachine.py       真机流程: 先关机->打包->部署->注入第二分区与 verify.service->fsck 门禁->
                            写磁盘 CC-fs 引导配置(/.boot + /dlub.cfg)->装盘并 md5 校验->开机->
-                           引导门禁(verify.log 必须是本轮写的)->debugfs 取回日志->停机后再 fsck
+                           引导门禁(verify.log 必须是本轮写的)->debugfs 取回日志->停机后再 fsck。
+                           交互式行为另有两个按键注入载荷(与 intrtest/rawtty 三者互斥, 都抢 tty0):
+                           --desh-check 走 scripts/desh_check.ko(sh/desh 的 PS2 ^C、desh 的
+                           [nyae] 四个答案、灰字提示来源), --desh-probe 走 scripts/desh_probe.ko
                            (--printer 额外注入打印机探测/验证服务)
                            还注入 scripts/intr_test.ko(交互式 ^C 载荷, 只进测试镜像): 停机后从镜像
                            判定三份证据 —— /tmp/intr.before(正对照: 注入器真在提示符上执行了命令)、

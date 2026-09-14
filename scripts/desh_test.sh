@@ -76,6 +76,13 @@ lacks notfound_suggest "did you mean" "$out"
 desh -c 'nosuchcmd123' > /dev/null
 eq  notfound_rc "127" "$?"
 
+# 纠错: 交互式是 zsh 的 `correct 'x' to 'y' [nyae]?` 提问; **非交互不提问**(读不到键盘),
+# 只回一句 did-you-mean, 而且排在 command not found **之后**(顺序与从前一致)。
+out=$(desh -c 'echp hi')
+has notfound_hint_err  "desh: echp: command not found" "$out"
+has notfound_hint_line "desh: did you mean 'echo'?" "$out"
+lacks notfound_hint_prompt "correct '" "$out"
+
 # 语法错误: 非交互 shell 以 2 退出
 out=$(desh -c 'if true; then')
 eq  syntax_rc "2" "$?"

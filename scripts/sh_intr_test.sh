@@ -50,5 +50,21 @@ chkcontain "after-intr-still-alive" "MARK3" $T/out
 n=$(grep -o 'root@delin-host:/#' $T/out | wc -l)
 eq_rc "prompt-count" "$n" "9"
 
+# ---------------------------------------------------------------
+# 第二段: PS2 续行下按 ^C 必须取消**整条**输入(真实 bash/dash/zsh 同此)。
+# 曾经的 bug: ^C 只丢掉当前这一行, 于是 `echo "abc` 之后按 ^C 又出一个 PS2(退不出去),
+# 而之后打的每一行都被并进那条没闭合的引号里, 直到 EOF 才报 unexpected end of file。
+# ---------------------------------------------------------------
+printf 'echo "abc\n\003\necho PS2OK\n' > $T/in2.sh
+DELIN_HARNESS_TTY=1 lua5.1 tools/harness.lua /bin/sh < $T/in2.sh > $T/out2 2>&1
+rc2=$?
+sed -n '1,20p' $T/out2
+eq_rc      "ps2-intr-exit-code"    "$rc2" "0"
+chkcontain "ps2-intr-next-runs"    "PS2OK" $T/out2
+chkempty   "ps2-intr-no-syntaxerr" "syntax error" $T/out2
+# 取消后回 PS1(只有一个 PS2 提示符: 第一行不完整那一次)
+n2=$(grep -o '> ' $T/out2 | wc -l)
+eq_rc      "ps2-intr-one-continuation" "$n2" "1"
+
 if [ $outcome -eq 0 ]; then echo "sh_intr_test: all ok"; else echo "sh_intr_test: FAILED"; fi
 exit $outcome

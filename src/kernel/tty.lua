@@ -904,6 +904,9 @@ local function openHandle(ctx, mode)
 
     --- 阻塞读取一整行。调度器把键盘事件喂进 ctx.lineQueue; 这里轮询队列。
     --- 也消费 ^D(EOF) 与 ^C/^Z(中断) 标志。
+    --- **^C 返回 ("", "intr") 而不是单纯的 ""**: 空行与"被 ^C 取消的行"在交互式 shell 里
+    --- 是两件事 —— 取消要把**整条输入**(含 PS2 续行里已经读进去的那些行)都作废, 空行只结束
+    --- 当前这一行。第二个返回值就是给 shell 的判断依据(bash/dash/zsh 同此)。
     --- 后台进程组读控制终端: 经 readGuard 投 SIGTTIN 后阻塞(被 SIGCONT/`fg` 恢复后重查)。
     handle.readLine = function()
         if ctx.closed then return nil, "device closed" end
@@ -920,7 +923,7 @@ local function openHandle(ctx, mode)
                 ctx.intr = false
                 ctx.inputBuffer = ""
                 ctx.reading = false
-                return ""
+                return "", "intr"
             elseif #ctx.lineQueue > 0 then
                 local line = table.remove(ctx.lineQueue, 1)
                 ctx.inputBuffer = ""

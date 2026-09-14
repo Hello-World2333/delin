@@ -41,6 +41,8 @@ lacks() { if grep -aqF -- "$2" $T/out; then ng "$1"; echo "    unexpected [$2]";
 # has_line <名字> <整行文本>: 屏幕流里出现过**恰好这一行**(编辑器画的行前面挂着提示符, 不算)
 has_line() { if grep -aq "^$2\$" $T/out; then ok "$1"; else ng "$1"; echo "    missing line [$2]"; fi; }
 lacks_line() { if grep -aq "^$2\$" $T/out; then ng "$1"; echo "    unexpected line [$2]"; else ok "$1"; fi; }
+# grey_after <名字> <已打的字> <灰字>: 屏幕上出现过"这几个字 + 灰字 + 复位"的一帧
+grey_after() { if grep -aqF -- "$2${GREY}$3${RESET}" $T/out; then ok "$1"; else ng "$1"; echo "    missing frame [$2 <grey>$3<reset>]"; fi; }
 # eqrc <名字> <期望退出码>
 eqrc() { if [ "$(cat $T/rc)" = "$2" ]; then ok "$1"; else ng "$1"; echo "    rc=$(cat $T/rc) expected $2"; fi; }
 
@@ -70,15 +72,21 @@ has  tab-many-asks 'possibilities?'
 run_desh 'echo $HO\t\n'
 has  tab-var-complete '$HOME'
 
-# ---------- 7. 灰字智能提示(历史内联建议) ----------
+# ---------- 7. 灰字内联提示: **与 Tab 补全同源**(补的是命令/目录/变量名, 不是历史命令) ----------
 run_desh 'echo one\nech'
 has  suggest-grey "$GREY"
-has  suggest-suffix 'one'
+# Tab 在 `ech` 上补的是 `echo` -> 灰字提示的就是剩下的那一截 "o"
+grey_after suggest-same-as-tab 'ech' 'o'
+# 从前的实现提示的是历史里那条 `echo one` 的尾巴("o one"), 那正是被去掉的行为
+lacks suggest-not-history "ech${GREY}o one"
+run_desh 'cat /pu'
+grey_after suggest-path 'cat /pu' 'b'   # 唯一候选 public(Tab 也补它)
+run_desh 'echo $HO'
+grey_after suggest-var 'echo $HO' 'ME'  # 唯一候选 $HOME
 
-# ---------- 8. → 接受建议(回车只执行真实输入) ----------
-run_desh 'echo one\nech\033[C\n'
-n=$(grep -acF -- 'one' $T/out)
-if [ "$n" -ge 3 ]; then ok suggest-accept; else ng suggest-accept; echo "    one lines=$n"; fi
+# ---------- 8. → 接受提示(= 补上 Tab 第一次会补的那一截) ----------
+run_desh 'basen\033[C /a/b\n'
+has_line suggest-accept 'b'   # basen -> basename, 执行后输出 b
 
 # ---------- 9. 上箭头翻历史 ----------
 run_desh 'echo two\n\033[A\n'
@@ -94,6 +102,13 @@ run_desh 'echo abc\003echo after\n'
 has_line  ctrl-c-next-runs 'after'
 lacks_line ctrl-c-cancelled 'abc'
 
+# ---------- 11b. ^C 在 PS2 续行下取消**整条**输入(真实 bash/dash/zsh 同此) ----------
+# 曾经的 bug: ^C 只丢当前这一行, 于是 `echo "abc` 之后按 ^C 又出一个 PS2 退不出去,
+# 而之后打的每一行都被并进那条没闭合的引号里(最后报 unexpected end of file)。
+run_desh 'echo "abc\n\003echo AFTER\n'
+has_line  ps2-ctrl-c-next-runs 'AFTER'
+lacks     ps2-ctrl-c-not-merged 'syntax error'
+
 # ---------- 12. ^U 清行 ----------
 run_desh 'junk line\025echo ok\n'
 has_line  ctrl-u-clears 'ok'
@@ -103,11 +118,26 @@ lacks_line ctrl-u-no-junk 'junk line'
 run_desh 'echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'
 has  long-line-window '<'
 
-# ---------- 14. 错误更正: command not found 的 did-you-mean ----------
-run_desh 'sl\nexit\n'
-has  correct-sl "did you mean 'ls'"
-run_desh 'echp hi\nexit\n'
-has  correct-echp "did you mean 'echo'"
+# ---------- 14. 纠错: zsh 的 `correct 'x' to 'y' [nyae]?` 提问 ----------
+# y = 按更正后的命令执行(zsh 同此), n = 不更正(照常报 command not found)
+run_desh 'sl\ny\n'
+has  correct-prompt "desh: correct 'sl' to 'ls' [nyae]? "
+has  correct-y-runs 'bin'          # ls / 的输出
+lacks correct-y-no-error 'command not found'
+run_desh 'echp hi\nn\n'
+has  correct-n-echp "desh: correct 'echp' to 'echo' [nyae]? "
+has  correct-n-error 'desh: echp: command not found'
+# a = 放弃整条命令行(本行剩下的命令也不跑), $? 为 1
+run_desh 'sl; echo SECOND\na\necho rc=$?\n'
+has   correct-a-no-error-later 'rc=1'
+lacks_line correct-a-rest-not-run 'SECOND'  # 只算"真的跑出来的输出", 编辑器回显的那行挂提示符
+# e = 把更正后的命令行摆回行编辑器(回车即执行)
+run_desh 'echp hi\ne\n\n'
+has   correct-e-prefix 'correct '\''echp'\'' to '\''echo'\'' [nyae]? e'
+has_line correct-e-runs 'hi'
+# 不存在的命令没有候选 -> 连提问都不该出现
+run_desh 'nosuch123cmd\n'
+lacks correct-none 'correct '
 
 # ---------- 15. ^D 空行 = EOF, 干净退出 ----------
 run_desh 'echo bye\n\004'
@@ -142,19 +172,20 @@ else
     ng deshrc-histfile; echo "    HISTFILE from deshrc not honored"
 fi
 
-# ---------- 19. deshrc: 关掉智能提示 ----------
+# ---------- 19. deshrc: 关掉灰字提示 ----------
 seed2=$T/seed2
 mkdir -p $seed2/root
 printf 'DESH_AUTOSUGGEST=0\n' > $seed2/root/.deshrc
 run_desh 'echo one\nech' "$seed2"
 lacks deshrc-suggest-off "$GREY"
 
-# ---------- 20. deshrc: 关掉纠错建议 ----------
+# ---------- 20. deshrc: 关掉纠错提问 ----------
 seed3=$T/seed3
 mkdir -p $seed3/root
 printf 'DESH_CORRECT=0\n' > $seed3/root/.deshrc
-run_desh 'sl\nexit\n' "$seed3"
-lacks deshrc-correct-off 'did you mean'
+run_desh 'sl\ny\n' "$seed3"
+lacks deshrc-correct-off 'correct '
+has   deshrc-correct-off-err 'desh: sl: command not found'
 
 # ---------- 21. deshrc 里的别名/函数在交互式下可用 ----------
 seed4=$T/seed4

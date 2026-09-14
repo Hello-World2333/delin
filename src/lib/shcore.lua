@@ -1782,6 +1782,7 @@ function F.tryAlias(cmd, rest)
         return true
     end
     if ctrl == "exit" then return true, "exit" end
+    if ctrl == "abort" then return true, "abort" end
     return true
 end
 
@@ -2168,10 +2169,9 @@ builtins.command = function(args)
             lastExit = 127
             return
         end
-        F.runExternal(p, cargs, nil, cmd)
-        return
+        return F.runExternal(p, cargs, nil, cmd)
     end
-    F.runExternal(cmd, cargs, nil, cmd)
+    return F.runExternal(cmd, cargs, nil, cmd)
 end
 
 -- ===============================================================
@@ -2199,10 +2199,10 @@ local OPTS = {
     { name = "xtrace",     desc = "trace expanded commands to stderr (set -x)",
       get = function() return opt.xtrace end,    set = function(v) opt.xtrace = v end },
     -- desh 的三个开关(前端每次用时现读这些变量, 见 src/bin/desh 的 cfgOn)
-    { name = "autosuggest", desc = "grey inline history suggestion (desh)",
+    { name = "autosuggest", desc = "grey inline completion hint (desh)",
       get = function() return F.optVarOn("DESH_AUTOSUGGEST") end,
       set = function(v) vars.DESH_AUTOSUGGEST = v and "1" or "0" end },
-    { name = "correct",    desc = "'did you mean' for unknown commands (desh)",
+    { name = "correct",    desc = "'correct X to Y [nyae]?' for unknown commands (desh)",
       get = function() return F.optVarOn("DESH_CORRECT") end,
       set = function(v) vars.DESH_CORRECT = v and "1" or "0" end },
     { name = "history",    desc = "keep the history file (desh)",
@@ -3020,11 +3020,31 @@ end
 
 F.runExternal = function(cmd, argv, stdio, text)
     local child, cerr = F.spawnChild(cmd, argv, stdio)
+    local hint
+    if not child and cerr == "command not found" and UI and UI.commandNotFound then
+        -- 纠错钩子(zsh 的 correct / desh 的 did-you-mean)。**必须在报错之前问**: 用户接受更正
+        -- 时不该先看到 "command not found"; 而"报错之后再补一句提示"(非交互)由下面的 hint 走。
+        --   返回 ("retry", 名字)   -> 用更正后的名字重跑
+        --   返回 ("abort")        -> 放弃整条命令行(desh 的 [nyae] 里选了 a/e)
+        --   返回 ("hint", 文本)    -> 照常报错, 之后补打这一行
+        local action, val = UI.commandNotFound(cmd, text)
+        if action == "abort" then
+            -- 提问里按 ^C 也走这条路: 那个 SIGINT 到此为止, 不能留到下一轮被 pollWait 当成中断
+            -- (否则下一条外部命令刚 spawn 就被 SIGKILL —— 见交互循环里那段说明)。
+            sigintPending = false
+            lastExit = 1
+            return "abort"
+        elseif action == "retry" then
+            child, cerr = F.spawnChild(val, argv, stdio)
+            cmd = val
+        elseif action == "hint" then
+            hint = val
+        end
+    end
     if not child then
         F.errln(shName .. ": " .. cmd .. ": " .. tostring(cerr))
         lastExit = (cerr == "command not found") and 127 or 126
-        -- 前端纠错钩子(desh 的 did-you-mean): 只打印建议, 退出码/后续流程不受影响。
-        if UI and UI.commandNotFound then UI.commandNotFound(cmd) end
+        if hint then F.errln(shName .. ": " .. hint) end
         return
     end
     local pgid = nil
@@ -3176,7 +3196,8 @@ F.evalSimple = function(node)
                 ctrl = builtins[cmd](rest)
             else
                 local s = (needOut or needIn) and { input = inH, output = outH } or nil
-                F.runExternal(cmd, rest, s, node.src)
+                -- 返回值可能是 "abort"(前端纠错里放弃了整条命令行), 必须往上透传。
+                ctrl = F.runExternal(cmd, rest, s, node.src)
             end
         end
     end
@@ -3443,6 +3464,7 @@ evalNode = function(node)
             vars[node.var] = it
             local rt, c = F.evalList(node.body)
             if c == "exit" then return rt, "exit" end
+            if c == "abort" then return rt, "abort" end
             if c == "return" then return rt, "return" end -- return 穿透循环(函数体里的 return)
             if c == "break" then break end
             lastst = rt  -- continue: 走到下一个迭代即可
@@ -3462,6 +3484,7 @@ evalNode = function(node)
             if not take then break end
             local rt, cc = F.evalList(node.body)
             if cc == "exit" then return rt, "exit" end
+            if cc == "abort" then return rt, "abort" end
             if cc == "return" then return rt, "return" end
             if cc == "break" then break end
             lastst = rt
@@ -3510,6 +3533,7 @@ evalNode = function(node)
             posArgs, posArg0 = saveArgs, saveArg0
             lastExit = rt or 0
             if c == "exit" then return "exit" end
+            if c == "abort" then return "abort" end -- 纠错里放弃整条命令行: 穿透函数体
             -- c == "return" 或 nil: 函数正常返回, 已设置 lastExit
         end
         return 0
@@ -3529,6 +3553,8 @@ F.evalList = function(items)
         else
             local rt, c, exempt = evalNode(it.node)
             if c == "exit" then lastExit = rt or lastExit; return rt or 0, "exit" end
+            -- "abort": 前端纠错里放弃了整条命令行(zsh 的 correct 选 a/e), 本行剩下的命令不再跑。
+            if c == "abort" then lastExit = rt or 0; return rt or 0, "abort" end
             if c == "break" then return rt or 0, "break" end
             if c == "continue" then return rt or 0, "continue" end
             if c == "return" then lastExit = rt or lastExit; return rt or 0, "return" end
@@ -3568,10 +3594,15 @@ F.evalProgram = function(src)
             (t.t == "op" and ("'" .. tostring(t.op) .. "'") or ("'" .. tostring(t.raw) .. "'"))
     end
     local rt, c = F.evalList(items)
-    -- 把 "exit" 控制信号透传给顶层调用者(交互循环/`.` 内建靠它终止/退出当前 shell)。
+    -- 把 "exit" 控制信号透传给顶层调用者(交互循环/`.` 内建靠它终止/退出当前 shell);
+    -- "abort"(前端纠错里放弃整条命令行)同样要透传, 由交互循环把整个输入缓冲区丢掉。
     if c == "exit" then
         lastExit = rt or lastExit
         return true, nil, nil, "exit"
+    end
+    if c == "abort" then
+        lastExit = rt or 0
+        return true, nil, nil, "abort"
     end
     return true
 end
@@ -3630,9 +3661,13 @@ end
 --   ui = { ... }        -> 前端接管(src/bin/desh: 行编辑器/历史/补全/纠错)
 -- 钩子:
 --   ui.name                 shell 名(报错前缀、PS1 的 \s、用法文本); 缺省 "sh"
---   ui.readLine(prompt, cont) 交互式读一行(cont=true 表示这是续行); 返回 nil = EOF。
+--   ui.readLine(prompt, cont) 交互式读一行(cont=true 表示这是续行); 返回 nil = EOF;
+--                             返回 ("", "intr") = 这一行被 ^C 取消(整条输入作废, 见交互循环)。
 --                             前端在返回前必须把终端恢复成规范模式 —— 子进程要拿回正常的行输入。
---   ui.commandNotFound(cmd) 命令找不到时的额外提示(did-you-mean); 只打印, 不动退出码。
+--   ui.commandNotFound(cmd, text)
+--                             命令找不到时的纠错钩子(zsh 的 setopt CORRECT); text = 该命令的源文本。
+--                             返回 ("retry", 名字) 用更正后的名字重跑 / ("abort") 放弃整条命令行 /
+--                             ("hint", 文本) 报错后补打一行(desh 的非交互 did-you-mean) / nil 什么也不做。
 --   S(table|nil)            前端要用的核心接口(见下面的暴露点); sh 传 nil。
 -- 返回退出码(POSIX: 最后一条命令的状态; 后台子 shell 的 wait 状态即由此而来)。
 -- ---------------------------------------------------------------
@@ -3665,13 +3700,17 @@ end
             local prompt = F.promptExpand(p)
             if stdout and stdout.write then stdout:write(prompt) end
             -- 前端(desh)自己画行/光标; 没有前端时就是 tty 行规程读一整行。
-            local line
+            -- 第二个返回值 "intr" = 这一行被 ^C 取消(与"读到一行空行"是两件事, 见 kernel/tty.lua)。
+            local line, lintr
             if UI and UI.readLine then
-                line = UI.readLine(prompt, #buf > 0)
-            else
-                line = stdin and stdin.readLine and stdin:readLine()
+                line, lintr = UI.readLine(prompt, #buf > 0)
+            elseif stdin and stdin.readLine then
+                -- **不能写成 `line, lintr = stdin and stdin.readLine and stdin:readLine()`**:
+                -- Lua 的 and/or 表达式只产生**一个**值, 第二个返回值会在这里丢掉 ——
+                -- 症状是 ^C 的 "intr" 永远读不到, 交互式 sh 上 PS2 续行按 ^C 依旧退不出去。
+                line, lintr = stdin:readLine()
             end
-            -- 提示符处的 ^C 只用来取消当前输入行: tty 行规程已经回显 "^C"、丢掉该行(返回空行),
+            -- 提示符处的 ^C 只用来取消当前输入行: tty 行规程已经回显 "^C"、丢掉该行(返回 ("", "intr")),
             -- 并给前台进程组投了 SIGINT —— 那个 SIGINT 的目的**已经达成**, 必须在这里消费掉。
             -- 留着它的话, 下一条外部命令刚 spawn 就被 pollWait 当成"^C 中断"立刻 SIGKILL:
             -- 症状是"取消输入后的一条命令静默不执行(退出码 130), 再下一条才恢复"。
@@ -3681,16 +3720,28 @@ end
                 if #buf > 0 then F.errln(shName .. ": syntax error: unexpected end of file") end
                 break
             end
-            buf = buf .. line .. "\n"
-            local ok, inc, err, ctrl = F.evalProgram(buf)
-            if ctrl == "exit" then break end
-            if inc then
-                -- 命令不完整: 保留缓冲区, 下一轮用 PS2 提示继续读。
-            elseif ok then
+            if lintr == "intr" then
+                -- ^C: **整条输入作废** —— 包括 PS2 续行里已经读进来的那几行(bash/dash/zsh 同此)。
+                -- 从前只丢当前这一行, 于是 `echo "abc` 之后按 ^C 只是又出一个 PS2, 退不出去,
+                -- 而之后打的每一行都被并进那条没闭合的引号里(真机/宿主都复现过)。
                 buf = ""
+                lastExit = 130 -- 与 bash/dash 一致: ^C 取消后 $? 为 128+SIGINT
             else
-                -- 语法错误: 丢弃这条命令继续(POSIX 交互式语义), $? 置 2(dash/bash 同此)。
-                F.errln(shName .. ": " .. tostring(err)); buf = ""; lastExit = 2
+                buf = buf .. line .. "\n"
+                local ok, inc, err, ctrl = F.evalProgram(buf)
+                if ctrl == "exit" then break end
+                if ctrl == "abort" then
+                    -- 前端纠错里选了 a/e(zsh 的 correct): 整条命令行作废, 回 PS1。
+                    buf = ""
+                    lastExit = 1
+                elseif inc then
+                    -- 命令不完整: 保留缓冲区, 下一轮用 PS2 提示继续读。
+                elseif ok then
+                    buf = ""
+                else
+                    -- 语法错误: 丢弃这条命令继续(POSIX 交互式语义), $? 置 2(dash/bash 同此)。
+                    F.errln(shName .. ": " .. tostring(err)); buf = ""; lastExit = 2
+                end
             end
         end
     else

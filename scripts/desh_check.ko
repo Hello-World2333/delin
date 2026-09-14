@@ -1,0 +1,277 @@
+--@name deshcheck
+--@version 0.0.1
+--@deps
+--@description real-machine interactive checks for sh/desh (test image only, never shipped in dist/)
+--[[ Real-machine payload for the interactive shell fixes (computer #3 + disk 0).
+
+     tools/realmachine.py --desh-check injects this file into the *test* root image as
+     /lib/modules/<version>/deshcheck.ko and appends "deshcheck" to that image's module manifest.
+     It is not part of dist/: nothing ships it to a user machine.
+
+     Why a kernel module: the same reason as scripts/intr_test.ko (read its header) -- the line
+     discipline is what a real ^C goes through, and only the kernel may drive it without going
+     through the CC event queue (queued keys are eaten by filtered pulls inside os.sleep).
+
+     What it checks (all three are behaviours the host harness can only approximate):
+       1. sh: an incomplete line (PS2) cancelled with ^C must discard the WHOLE input, not just
+          the current line.  Evidence: the command typed right after the ^C runs at all (before the
+          fix its text was swallowed into the unterminated quote) and $? is 130.
+       2. desh: same for the raw-mode editor path (EINTR from rawRead -> core discards the buffer).
+       3. desh [nyae]: `correct 'x' to 'y' [nyae]?`
+            y -> the corrected command runs   (/tmp/dc.y)
+            n -> nothing runs, command not found (/tmp/dc.n must NOT exist, /tmp/dc.n.done does)
+            a -> the rest of the line is dropped too (/tmp/dc.a and /tmp/dc.a.tail must NOT exist)
+            e -> the corrected line is put back into the editor and Enter runs it (/tmp/dc.e)
+       4. desh grey hint: it must be the completion prefix (what Tab would insert), NOT a tail of
+          the history.  Evidence: /tmp/dc.sug holds the cells drawn after the cursor and which of
+          them are grey (tty colour index 8).  Type "ech" with a history entry "echo DCHISTONLY":
+          the expected report is grey=[o] -- an implementation that suggests history would report
+          grey=[o DCHISTONLY].
+
+     Synchronisation: every step waits for the state its keys are meant for (the editor blocks in
+     raw mode; the [nyae] question also blocks in raw mode) or for a file the command wrote -- never
+     for the display (kernel/user console writes clobber the tty cells, see intr_test.ko).
+     Keys are only fed while the reader that wants them is blocked: setRaw(false) flushes type-ahead,
+     so a key sent too early would simply be dropped.
+
+     ASCII only: this file is copied onto the CC computer. ]]
+
+local PASSWORD = "12345678" -- root's password (the installer sets root/12345678)
+
+local function initModule()
+    local klog = require("kernel.klog")
+    local vfs_api = require("kernel.vfs_api")
+    local platform = require("kernel.platform")
+    local PRI = klog.makePri(klog.FACILITIES.kern, klog.SEVERITIES.info)
+    local function log(s) klog.write(PRI, "[deshcheck] " .. s) end
+
+    local pkind = platform.detect()
+    if pkind ~= "cc" then
+        log("skip: platform=" .. tostring(pkind) .. " (payload only drives a plain CC computer)")
+        return
+    end
+
+    local tty = require("kernel.tty")
+    local focus = tty.getFocus()
+    local fsx = vfs_api.fs
+
+    -- Injection counters: separate "never reached the line discipline" from "reached it, nobody read".
+    local fed, routed = 0, 0
+    local origFeed, origRoute = tty.feedInput, tty.routeKey
+    tty.feedInput = function(ev) fed = fed + 1; return origFeed(ev) end
+    tty.routeKey = function(ev) routed = routed + 1; return origRoute(ev) end
+
+    local function exists(p) return fsx.exists(p) == true end
+    local function readAll(p)
+        local f = fsx.open(p, "r")
+        if not f then return nil end
+        local s = f:readAll() or ""
+        f:close()
+        return s
+    end
+    local function writeAll(p, s)
+        local f = fsx.open(p, "w")
+        if not f then return false end
+        f:write(s)
+        f:close()
+        return true
+    end
+
+    -- Wipe the previous boot's evidence: the image is reused across boots and a leftover
+    -- /tmp/dc.y would make a gate pass before the machine ever did anything.
+    local EVIDENCE = {
+        "/tmp/dc.before", "/tmp/dc.sh.ps2rc", "/tmp/dc.sh.after", "/tmp/dc.ps2err",
+        "/tmp/dc.y", "/tmp/dc.n", "/tmp/dc.n.done", "/tmp/dc.a", "/tmp/dc.a.tail",
+        "/tmp/dc.a.done", "/tmp/dc.e", "/tmp/dc.sug", "/tmp/dc.desh.ps2rc",
+        "/tmp/dc.done", "/tmp/dc.progress",
+    }
+    local stale = 0
+    for _, p in ipairs(EVIDENCE) do
+        if exists(p) then fsx.delete(p); stale = stale + 1 end
+    end
+    log("cleared " .. stale .. " stale evidence file(s)")
+
+    local function send(s)
+        for i = 1, #s do tty.feedInput({ "char", s:sub(i, i) }) end
+    end
+    local function pressCtrlC()
+        tty.routeKey({ "key", keys.leftCtrl, false })
+        tty.routeKey({ "key", keys.c, false })
+        tty.routeKey({ "key_up", keys.c })
+        tty.routeKey({ "key_up", keys.leftCtrl })
+    end
+
+    local function ctx() return tty.get(focus) end
+    --- desh blocks in raw mode while reading a line or asking the [nyae] question.
+    local function deshReading()
+        local c = ctx()
+        return c ~= nil and c.raw == true and c.reading == true
+    end
+    --- login / sh block in canonical mode.
+    local function shellReading()
+        local c = ctx()
+        return c ~= nil and c.raw ~= true and c.reading == true
+    end
+
+    --- Copy what is drawn AFTER the cursor on the current row, plus which of those cells are grey
+    --- (tty colour index 8 == ANSI 90).  That is exactly the inline hint.
+    local function dumpHintRow()
+        local c = ctx()
+        if not c then return "no-ctx" end
+        local base = c.cursorY * c.cols
+        local after, grey = {}, {}
+        for col = c.cursorX, c.cols - 1 do
+            local cell = c.grid[base + col + 1]
+            local ch = (cell and cell.ch) or " "
+            if ch ~= " " then
+                after[#after + 1] = ch
+                if cell.fg == 8 then grey[#grey + 1] = ch end
+            end
+        end
+        return "after=[" .. table.concat(after) .. "] grey=[" .. table.concat(grey) .. "]"
+    end
+
+    local function state()
+        local c = ctx()
+        return string.format("focus=%s raw=%s reading=%s keyBuf=%d queue=%d buf=%d fed=%d routed=%d",
+            tostring(focus), tostring(c and c.raw), tostring(c and c.reading), c and #c.keyBuf or -1,
+            c and #c.lineQueue or -1, c and #c.inputBuffer or -1, fed, routed)
+    end
+
+    -- ---------------------------------------------------------------
+    -- Plan: each step waits for `ready` (default: the previous step's `wait` file exists, plus
+    -- `gap` ms), then runs `act`.  `wait` names the evidence file the step is expected to leave.
+    -- ---------------------------------------------------------------
+    local PLAN = {
+        { n = "sh-login", ready = function() return true end,
+          act = function() send("root\n" .. PASSWORD .. "\n") end, gap = 2000 },
+
+        { n = "sh-before", ready = shellReading,
+          act = function() send("echo DC-BEFORE > /tmp/dc.before\n") end },
+        { n = "sh-before-ok", wait = "/tmp/dc.before", gap = 1000,
+          act = function() send("echo \"abc\n") end, note = "incomplete line -> PS2" },
+        { n = "sh-ps2-ctrlc", ready = shellReading, gap = 1500,
+          act = pressCtrlC, note = "SH: ^C on an incomplete line (canonical: raw stays false)" },
+        { n = "sh-ps2rc", ready = shellReading,
+          act = function() send("echo RC=$? > /tmp/dc.sh.ps2rc\n") end },
+        { n = "sh-ps2rc-ok", wait = "/tmp/dc.sh.ps2rc", gap = 800,
+          act = function() send("echo SH-AFTER > /tmp/dc.sh.after\n") end },
+        { n = "sh-after-ok", wait = "/tmp/dc.sh.after", gap = 1200,
+          act = function() send("desh\n") end, note = "start desh" },
+
+        { n = "desh-up", ready = deshReading, gap = 2000, act = function() end },
+        { n = "desh-y", ready = deshReading,
+          act = function() send("echp DC-Y > /tmp/dc.y\n") end, note = "[nyae] y: corrected command runs" },
+        { n = "desh-y-ask", ready = deshReading, act = function() send("y") end },
+        { n = "desh-y-ok", wait = "/tmp/dc.y", gap = 1000, act = function() end },
+
+        { n = "desh-n", ready = deshReading,
+          act = function() send("echp DC-N > /tmp/dc.n\n") end, note = "[nyae] n: nothing runs" },
+        { n = "desh-n-ask", ready = deshReading, act = function() send("n") end },
+        { n = "desh-n-next", ready = deshReading, gap = 1500,
+          act = function() send("echo DC-NDONE > /tmp/dc.n.done\n") end },
+        { n = "desh-n-ok", wait = "/tmp/dc.n.done", gap = 800, act = function() end },
+
+        { n = "desh-a", ready = deshReading,
+          act = function() send("echp DC-A > /tmp/dc.a; echo DC-ATAIL > /tmp/dc.a.tail\n") end,
+          note = "[nyae] a: whole line dropped" },
+        { n = "desh-a-ask", ready = deshReading, act = function() send("a") end },
+        { n = "desh-a-next", ready = deshReading, gap = 1500,
+          act = function() send("echo DC-ADONE > /tmp/dc.a.done\n") end },
+        { n = "desh-a-ok", wait = "/tmp/dc.a.done", gap = 800, act = function() end },
+
+        { n = "desh-e", ready = deshReading,
+          act = function() send("echp DC-E > /tmp/dc.e\n") end, note = "[nyae] e: line comes back" },
+        { n = "desh-e-ask", ready = deshReading, act = function() send("e") end },
+        { n = "desh-e-enter", ready = deshReading, gap = 2000, act = function() send("\n") end },
+        { n = "desh-e-ok", wait = "/tmp/dc.e", gap = 1000, act = function() end },
+
+        { n = "desh-hint-run", ready = deshReading,
+          act = function() send("echo DCHISTONLY\n") end, note = "grey hint source check" },
+        { n = "desh-hint-type", ready = deshReading, gap = 1500, act = function() send("ech") end },
+        { n = "desh-hint-dump", ready = deshReading, gap = 1500,
+          act = function() writeAll("/tmp/dc.sug", dumpHintRow() .. "\n") end },
+        { n = "desh-hint-clear", ready = deshReading, gap = 800, act = function() send("\025") end },
+
+        { n = "desh-ps2", ready = deshReading, gap = 1000,
+          act = function() send("echo \"abc\n") end, note = "desh: incomplete line -> PS2" },
+        { n = "desh-ps2-ctrlc", ready = deshReading, gap = 1500,
+          act = pressCtrlC, note = "desh: ^C must drop the whole input" },
+        { n = "desh-ps2rc", ready = deshReading, gap = 1000,
+          act = function() send("echo RC2=$? > /tmp/dc.desh.ps2rc\n") end },
+        { n = "desh-ps2rc-ok", wait = "/tmp/dc.desh.ps2rc", gap = 800, act = function() end },
+
+        { n = "cleanup", ready = deshReading, gap = 500,
+          act = function()
+              send("exit\nexit\n")
+              writeAll("/tmp/dc.done", "done fed=" .. fed .. " routed=" .. routed .. "\n")
+          end },
+    }
+
+    local pull = os.pullEventRaw -- handed back when the payload finishes (see the wrapper below)
+    local wrapper
+    local function disarm()
+        if os.pullEventRaw == wrapper then os.pullEventRaw = pull end
+    end
+
+    local pi, lastAct = 1, os.epoch("utc")
+    local function note(name, extra)
+        writeAll("/tmp/dc.progress", name .. " " .. (extra or "") .. " " .. state() .. "\n")
+    end
+    local function finish(why)
+        log("finish: " .. why .. " (" .. state() .. ")")
+        note("finish", why)
+        disarm()
+        pi = #PLAN + 1
+    end
+    local function step()
+        local it = PLAN[pi]
+        if not it then return end
+        local now = os.epoch("utc")
+        -- "ready" defaults to the previous step's evidence file; `gap` is an extra settle time.
+        local ready
+        if it.ready then
+            ready = it.ready()
+        else
+            ready = it.wait ~= nil and exists(it.wait)
+        end
+        if not ready then
+            if now - lastAct > 60000 then
+                note(it.n, "timeout")
+                finish("stuck at step " .. it.n .. " for 60s")
+            end
+            return
+        end
+        if it.gap and now - lastAct < it.gap then return end
+        log("step " .. it.n .. (it.note and (" -- " .. it.note) or "") .. " (" .. state() .. ")")
+        note(it.n)
+        it.act()
+        lastAct = now
+        pi = pi + 1
+    end
+
+    -- Wrap the event pull only: the injector lives inside the scheduler's own event loop, so it
+    -- needs no extra coroutine or timer.  Once a second is enough for the file lookups; the last
+    -- step hands os.pullEventRaw back to the kernel.
+    local lastPoll = 0
+    wrapper = function(...)
+        if pi <= #PLAN then
+            local now = os.epoch("utc")
+            if now - lastPoll >= 1000 then
+                lastPoll = now
+                -- An error here would tear through the boot (pullEventRaw is boot's main path) and
+                -- the only symptom would be "the machine did not come up"; log it instead.
+                local ok, err = pcall(step)
+                if not ok then
+                    log("step error (injector stopped): " .. tostring(err))
+                    finish("step error")
+                end
+            end
+        end
+        return pull(...)
+    end
+    os.pullEventRaw = wrapper
+    log("armed (" .. state() .. ")")
+end
+
+return { init = initModule }
