@@ -1019,39 +1019,34 @@ find . -exec echo {} \; | wc -l                 # 同理
 
 
 
-   **0.4.0 的尝试（未落地，留档给下一轮）**：既然"计数器只能有一个读者"、而"只有一个等待者能精确定时"
-   又不合用，正解应当是「**一个专用泵协程拉事件 + 到点唤醒等待者**」：
+   **最终做法：一个独立泵进程 + 到点唤醒**（用户给的方案，已落地为 `cc_hse.ko` v0.5.0）：
 
-   - 泵：内核在第一次有人要睡时 spawn 一个独立进程（`hse-pump`），**只有它**调 `waitNextTick()`，
-     把拍累加进共享单调时钟，每推进一次就 `queueEvent("hse_wake")`；没有等待者时它 `os.sleep(0.05)`
-     歇着（既不烧 CPU，也不会像 2kHz 推模式那样淹 256 事件队列）。
-   - 等待者：进程侧 `os.msleep(ms)` 只算自己的 deadline，然后 `pulledEvent("hse_wake")` 让出，
-     醒来重新判定（condition-variable 风格）。进程**永远不碰**那个外设计数器。
-   - `cc_hse.ko` v0.4.0 已按这个写完并编过，但**真机上第一次 `os.msleep` 就挂住**（ybench 的日志文件
-     被创建、一行没写；探针那侧进程表里既没有 `lua` 也没有 `hse-pump`），而且**在这些上下文里
-     `kapi.log`/`kprint` 的日志没有进 `/var/log/messages`**，所以没能定位到是在 `ensurePump`、
-     `queueEvent` 还是 `pulledEvent` 那一环卡的。已回退到 v0.3.0（单泵 + 共享时钟：不挂、单进程
-     6-11ms、并发时非泵者退回 CC 定时器粒度）。
-   - 下一轮要查的四条（按可能性排）：
-     1. **进程侧 `os.pullEvent`/`os.queueEvent` 的可用性**：模块拿的是内核态 `_G.os` 的引用，
-        但在**进程协程里**调用它是否符合调度器的 resume 契约（scheduler 用 `proc.filter` 匹配事件名，
-        见 `kernel/scheduler.lua`）；`os.queueEvent` 是否在 procenv 白名单里（泵进程要用）。
-     2. `process.spawn` **从 syscall 内部**（也就是正在跑 `os.msleep` 的进程协程里）spawn 是否安全。
-     3. **模块侧日志在运行期是否真的进 klog**（先用 `/tmp` 文件写日志验证，别依赖 klog）。
-     4. 泵进程 `waitNextTick()` 的 yield 是否被调度器按事件名正确 resume（外设给的 tick 事件叫什么名字）。
-   - 复现工具已就绪：`scripts/desh_probe.ko`（注入按键 + 写 bench 脚本 + 读结果）、
-     `python3 tools/realmachine.py --clean --desh-probe --fast --grep X --wait-file /tmp/desh_probe_done`
-     （干净系统 + 只注入探针，一轮约 50 秒）。
-   - 另一条**必须记住**的教训：模块在 init 里 `process.spawn` 会**抢走 pid 1**（实测进程表出现
-     `1:hse-pump 2:init`）—— 模块装载早于 init，所以任何"内核自己起的进程"都要**延迟到 init 之后**
-     再 spawn（v0.4.0 里就是改成"第一次有人睡时才 spawn"）。
-2. **"延迟/轮询间隔"不能用 `msleep(0)` 充当** —— 它在 HSE 下只有 2ms，循环会变成热循环。
-   要等一段时间就用 `msleep(ms)`，且**默认值 ≥50ms** 走定时器那条路；真要亚 50ms 的间隔
-   （<50 是逐拍唤醒，代价是每拍一个事件）得自己想清楚。
-   更好的做法是**根本不轮询**：`/dev/kmsg` 的 `readLine` 天然阻塞（内部 `os.sleep(0.05)`），
-   `dmesg -w` 因此改成阻塞读而不是"`readAvailable` + `msleep(50)`"。
+   - **泵**：内核在**第一次有人要睡时** spawn 一个独立进程 `hse-pump`，**只有它**调 `waitNextTick()`，
+     把拍累加进一条**全系统共享的单调时钟**，每推进一次就 `queueEvent("hse_wake")`；没有等待者时
+     它 `os.sleep(0.05)` 歇着（既不烧 CPU，也不会像 2kHz 推模式那样淹 256 事件队列）。
+   - **等待者**：进程侧 `os.msleep(ms)` 只算自己的 deadline，然后 `pulledEvent("hse_wake")` 让出，
+     醒来重新判定（condition-variable 风格）。**进程侧永不碰那个外设计数器**，所以没有互斥、
+     没有互相偷拍，所有等待者同等精度。
 
-#### 批次 2：各工具常用选项的落地（与 GNU 的取舍）
+   实测（电脑 #3，干净镜像；10 次 `os.msleep(0)` 的累计耗时）：
+
+   | 场景 | v0.3.0（各自去等 + 单泵兜底） | v0.5.0（专用泵进程） |
+   |---|---|---|
+   | 单进程 | 6–8 ms/次 | ~24 ms/次 |
+   | 三个进程同时 | 49–51 ms/次（只有一个精确） | **~29 ms/次，三者完全同步** |
+   | 并发过去之后单进程 | 49 ms（**粘性**） | ~29 ms（无粘性） |
+
+   为什么 v0.5.0 单进程反而慢：多了一跳「等待者 → 泵(等拍) → 事件 → 等待者」。实测**每多一次
+   调度器往返就多 ~6–10ms** —— 这也解释了为什么**进程侧根本拿不到 2ms 级的睡眠**（那需要 0 跳）。
+   v0.5.0 换来的是**一致性**：谁都不吃亏，也没有 0.3.0 那种"并发之后整机钉在 50ms"的粘性。
+
+   两个坑（都真机踩过，都已修）：
+   1. **模块 init 里 spawn 会抢走 pid 1**（实测进程表 `1:hse-pump 2:init`）：模块装载早于 init，
+      所以内核自己起的进程必须**延迟到 init 之后**（v0.5.0 改成"第一次有人睡时才 spawn"，
+      ppid 显式给 1）。
+   2. **`process.spawn` 的签名是 `(src, name, ppid, uid, gid, argv, opts)`**：漏掉 `gid` 时那个
+      argv 表会落到 gid 上，进程 gid 变成 table → `/proc/<pid>/stat` 写坏 → 真机上 `ps` 输出**为空**
+      （`proc_test.sh` 的 `ps_*_nonempty` 全 ng，是**真机全量验证**抓出来的）。
 
 用户态工具的选项一律**照宿主 GNU 逐项实测**对齐；下面只记那些"有坑"或"有取舍"的：
 

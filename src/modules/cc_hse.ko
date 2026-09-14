@@ -1,14 +1,49 @@
 --@name cc_hse
---@version 0.3.0
---@description HSE clock acceleration: os.msleep(ms) via pull-mode waitNextTick
+--@version 0.5.0
+--@description HSE clock acceleration: dedicated pump process owns waitNextTick and wakes every os.msleep waiter at its deadline
 --@deps
 
-local FREQ = 2000  -- Hz, 每 tick 0.5ms
+--[[ HSE 时钟加速(亚刻精度的 os.msleep)。
+
+     结构(一个泵 + 一群等待者):
+       1) **泵进程**: 内核在第一次有人要睡时 spawn 一个独立进程(`hse-pump`), 只有它调
+          waitNextTick()。它把读到的拍累加进一条**全系统共享的单调时钟**, 每推进一次就
+          queue 一个 "hse_wake" 事件。没有等待者时不推进(去 os.sleep(0.05) 歇着), 所以既不
+          白烧 CPU, 也不会像 2kHz 推模式那样淹事件队列(上限 256, CC 对满队列是静默丢弃)。
+       2) **等待者**: 进程侧 os.msleep(ms) 只算自己的 deadline, 然后 `pulledEvent("hse_wake")`
+          让出, 醒来重新判定(condition-variable 风格)。进程侧**永不碰**那个外设计数器。
+
+     为什么不能各自去等: hse.waitNextTick() 返回「距上一次调用过了多少拍」, 那个计数器是
+     **以外设为单位**记的、读后即清 —— 只允许一个读者(用户指出的, 实测证实): 各自去等的时候,
+     单进程 7.6ms/次, 三个进程同时 49.5ms/次, 而且**并发之后单进程仍然 49ms**(粘性)。
+
+     实测(电脑 #3, 干净镜像; 每项是 10 次 os.msleep(0) 的累计耗时):
+       单进程  : ~24ms/次     三个进程同时: ~29ms/次(三者完全同步, 谁也不吃亏)
+       并发之后: ~29ms/次 —— 没有 0.3.0 那种"并发过后整机钉在 50ms"的粘性退化
+     比 0.3.0 的单进程(6-8ms)慢, 因为多了一跳: 等待者 -> 泵(等拍) -> 事件 -> 等待者;
+     实测每多一次"调度器往返"就多 ~6-10ms(这也是为什么进程侧拿不到 2ms 级的睡眠)。
+     换来的是一致性: **所有等待者同等精度, 没有互斥, 也没有互相偷拍**。
+
+     坑(记下来): 模块在 init 里 spawn 会**抢走 pid 1**(实测进程表 `1:hse-pump 2:init`),
+     因为模块装载早于 init —— 所以泵必须**延迟到第一次有人要睡时**再 spawn, ppid 显式给 1。
+     (0.4.0 挂在 pid 1 被抢, 现象是工具完全不响应; 0.4.1 改成延迟 spawn 之后就正常了。) ]]
+
+local FREQ = 2000            -- Hz, 每拍 0.5ms
+local TICK_MS = 1000 / FREQ
+
+--- 泵进程的程序(内核进程, 只调模块注册的那两个 syscall)。
+local PUMP_SRC = [[
+local sc = syscalls
+while true do
+    if not sc["hse.pump"]() then
+        sc["hse.idle"]()
+    end
+end
+]]
 
 return {
     init = function(kapi, device)
         local log = kapi.log
-        -- device = 外设 side 名 (如 "back")
         local hse = peripheral.wrap(device)
         if not hse then
             error("cc_hse: cannot wrap peripheral '" .. tostring(device) .. "'", 2)
@@ -17,107 +52,87 @@ return {
             error("cc_hse: peripheral has no waitNextTick (need pull-mode cc_hse)", 2)
         end
 
-        -- 拉模式: 关掉 hse_tick 推送, 只在 os.msleep 里按需 waitNextTick。
-        -- 推模式 @2kHz 会在 ~128ms 内塞满电脑事件队列(上限 256), CC 对满队列是静默丢弃,
-        -- 长命令输出期间键盘事件就是这样被丢掉的("不响应键盘")。
-        -- waitNextTick 只在有人等待时产生一个唤醒事件, tick 不会在队列里积压。
         hse.setFrequency(FREQ)
         hse.setPushEvents(false)
         hse.setOn(true)
         log("cc_hse: pull mode on " .. device .. " @ " .. FREQ .. "Hz (pushEvents=false)")
 
-        -- ---------------------------------------------------------------
-        -- **只有一个泵, 全系统共享一条单调时钟**
-        -- ---------------------------------------------------------------
-        -- 为什么必须这样(真机实测踩出来的):
-        --   waitNextTick() 返回的是"**距上一次调用**过了多少拍", 而这个计数器是**以外设为单位**
-        --   记的、读后即清 —— 它天然假设"只有一个调用者"。一旦有第二个进程在同一个时间窗里也
-        --   调它(工具/服务/shell 都会各自 os.msleep), 两边的读法就互相把对方的拍消费掉:
-        --   实测三个进程同时各调 20 次 os.msleep(0) —— 每个都掉到 **49-51ms/次**(单进程独自
-        --   等待时只要 6-8ms), 而且**并发过去之后单进程也回不到 6ms**(粘性, 实测 after 49.2ms)。
-        -- 另外实测确认: waitNextTick() **会让出电脑**(泵在里面的这段时间, 别的协程会跑起来),
-        --   所以"同时有两个等待者"是真会发生的 —— 第二个必须在**不进泵**的前提下等。
-        -- 修法: 计数器只由**本文件里的一个循环**读, 读到的拍全部累加进一条**共享的单调时钟**;
-        --   谁要睡就把自己的 deadline 记在共享时钟上, 循环推进到所有等待者都过线为止。
-        --   于是"别人消费掉我的拍"不再有害 —— 拍是真实时间, 累加到同一条时钟上, 每个等待者
-        --   的 deadline 都按同一条时钟判定。
-        -- 协作式 VM 下同一时刻只有一个线程在跑, 所以"只有一个泵"是天然成立的; 这里显式兜底,
-        -- 真出现重入就直接报错(那说明有人绕过了本模块自己去调外设)。
-        local TICK_MS = 1000 / FREQ
-        local clockMs = 0     -- 单调毫秒(全系统共享, 只由泵循环推进)
-        local pumping = false
-        local stat = { pumps = 0, ticks = 0, maxElapsed = 0 }
+        local pulledEvent = os.pullEvent    -- 模块持有的内核态引用(进程环境里没有它)
+        local queueEvent = os.queueEvent
+        local realSleep = os.sleep
 
-        local function advanceClock()
-            local elapsed = hse.waitNextTick()      -- **唯一**的调用点
+        local clockMs = 0
+        local waiters = 0
+        local pumpPid = nil
+
+        --- 泵一拍: 推进共享时钟 + 唤醒所有等待者。
+        local function hsePump()
+            if waiters <= 0 then return false end
+            local elapsed = hse.waitNextTick()
             if type(elapsed) ~= "number" or elapsed < 1 then elapsed = 1 end
             clockMs = clockMs + elapsed * TICK_MS
-            stat.ticks = stat.ticks + elapsed
-            if elapsed > stat.maxElapsed then stat.maxElapsed = elapsed end
+            queueEvent("hse_wake")
+            return true
         end
 
-        --- 推进共享时钟直到 now >= deadline。
-        local function pumpUntil(deadline)
-            if pumping then
-                error("cc_hse: reentrant pump (waitNextTick must have a single caller)", 2)
+        local function ensurePump()
+            if pumpPid then return pumpPid end
+            local process = require("kernel.process")
+            -- 签名是 (src, name, ppid, uid, gid, argv, opts) —— **别漏 gid**: 漏了的话那个 argv
+            -- 表会落到 gid 上, 进程的 gid 变成 table, /proc/<pid>/stat 随之写坏, 真机上表现为
+            -- `ps` 输出为空(proc_test 里 ps_*_nonempty 全 ng)。
+            pumpPid = process.spawn(PUMP_SRC, "hse-pump", 1, 0, 0, { [0] = "hse-pump" }, nil)
+            log("cc_hse: pump process pid " .. tostring(pumpPid) .. " (single waitNextTick owner)")
+            return pumpPid
+        end
+
+        --- 进程侧等待(跑在调用者的协程里, 所以 pulledEvent 让出的是这个进程)。
+        local function hseWait(ms)
+            ensurePump()
+            local ticks = math.floor((ms or 0) * FREQ / 1000 + 0.5)
+            if ticks < 4 then ticks = 4 end
+            local wantMs = ticks * TICK_MS
+            local deadline = clockMs + wantMs
+            local t0 = os.epoch("utc")
+            waiters = waiters + 1
+            while clockMs < deadline do
+                local ok = pcall(pulledEvent, "hse_wake")
+                if not ok then break end -- pullEvent 不可用(理论上不会): 走下面的兜底
+                if os.epoch("utc") - t0 > wantMs + 200 then
+                    realSleep(math.max(wantMs, 1) / 1000)
+                    break
+                end
             end
-            pumping = true
-            stat.pumps = stat.pumps + 1
-            while clockMs < deadline do advanceClock() end
-            pumping = false
+            waiters = waiters - 1
+            return true
         end
 
-        -- 注入 os.msleep 到内核的全局 os 表。进程环境是白名单(kernel/procenv.lua), 每个进程
-        -- 创建时浅拷贝一份 os 表 —— 模块装载早于 launch init, 所以之后起来的进程都拿得到它。
-        -- os.msleep(ms): 睡约 ms 毫秒, 亚 tick 精度(0.5ms)。
-        --   ms <= 0    -> 让出: 4 tick(名义 2ms)。调用者(工具/sh)只在时间片边界让出。
-        --   0 < ms < 50 -> 按拍推进共享时钟到 deadline。
-        --   ms >= 50   -> 一次 CC 定时器睡完: 逐拍等要为每拍付一个唤醒事件(50ms = 100 拍),
-        --                 定时器 1 个事件就够。
+        kapi.registerSyscall("hse.pump", hsePump)
+        kapi.registerSyscall("hse.idle", function() realSleep(0.05) end)
+        kapi.registerSyscall("hse.now", function() return clockMs end)
+        kapi.registerSyscall("hse.wait", hseWait)
+
         os.msleep = function(ms)
             ms = tonumber(ms) or 0
             if ms >= 50 then
-                os.sleep(ms / 1000)
+                realSleep(ms / 1000)
                 return
             end
-            local ticks = math.floor(ms * FREQ / 1000 + 0.5)
-            if ticks < 4 then ticks = 4 end
-            local deadline = clockMs + ticks * TICK_MS
-            if pumping then
-                -- **已经有人在泵**: 绝不能再去读那个"距上次调用"的计数器(会互相扰乱 ——
-                -- 真机实测把整机让出拖到 50ms 并且并发过后仍然粘着)。这里退回 CC 定时器:
-                -- 每步 ~50ms, 精度粗但**不破坏共享时钟**; 关键是 os.sleep 会让出电脑,
-                -- 正在泵的那个协程因此得以推进(它是在外设调用里被挂起的)。
-                -- 上限 64 步是防"泵那边永远回不来"的死循环(协作式 VM 下会拖死整机)。
-                local guard = 0
-                while clockMs < deadline and guard < 64 do
-                    guard = guard + 1
-                    os.sleep(0)
-                end
-                return
-            end
-            pumpUntil(deadline)
+            hseWait(ms)
         end
-
-        -- 给自检/诊断用: 共享时钟读数 + 泵统计(进程侧可以读, 便于真机上量让出成本)。
         os.hseClockMs = function() return clockMs end
-        os.hseStat = function() return stat.pumps, stat.ticks, stat.maxElapsed end
 
-        log("cc_hse: os.msleep installed (pull mode)")
+        log("cc_hse: os.msleep installed (0.4.1: pump on first sleep, file-logged)")
     end,
 
     exit = function()
-        -- 禁用时钟
         for _, name in ipairs(peripheral.getNames()) do
             if peripheral.getType(name) == "cc_hse" then
                 local hse = peripheral.wrap(name)
-                if hse then
-                    pcall(hse.setOn, false)
-                end
+                if hse then pcall(hse.setOn, false) end
             end
         end
         os.msleep = nil
         os.hseClockMs = nil
-        os.hseStat = nil
     end,
 }
