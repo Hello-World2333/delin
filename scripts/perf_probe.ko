@@ -1,0 +1,341 @@
+--@name perfprobe
+--@version 0.0.2
+--@deps
+--@description real-machine scheduler CPU/latency probe (test image only, never shipped in dist/)
+--[[ 临时诊断载荷(**不随 dist/ 发布**, 与 desh_probe.ko / intr_test.ko 同一类):
+     回答三个只有真机能回答的问题 ——
+       1. "空闲"的 Delin 到底把 CPU 花在哪(每 2s 一条归因行);
+       2. 一次事件的端到端投递延迟(≈ 敲一个键到内核看见它要多久);
+       3. 后台进程(不同让出习惯)会把上面的延迟推到什么程度。
+
+     量法(都在**调度器自己的事件泵**里做, 不额外起协程):
+       * pass  = 相邻两次 os.pullEventRaw 之间的时间 = 一轮调度(CPU 时间, 不含阻塞等待);
+       * lat   = 自己 queueEvent 一个合成事件, 到它被 pull 出来为止 —— 与按键事件走同一条队列,
+                 因此就是"按键要等多久才被内核看见";
+       * cpu   = 包住 coroutine.resume, 把时间归到每个进程协程上; pass 总和减去全部 resume 的
+                 时间 = 内核循环自身(routeEvent/熵池/心跳钩子...)的开销;
+       * ev    = 每轮各事件的条数(谁在制造事件);
+       * PS    = 进程表快照(pid:name:status)。
+
+     负载相位(用 process.spawn 起普通进程, 模拟三种"后台任务"):
+       20s: A = 1 个**从不让出**的忙等进程(等价于 du/find 这类没有 yieldCheck 的工具);
+       45s: B = 3 个**每 20ms 忙完让出一次**(os.msleep(0))的进程;
+       70s: C = 1 个不停 spawn 子进程的服务型负载;
+       95s: 杀掉全部负载; 110s 收尾(还原 pullEventRaw/coroutine.resume)。
+
+     注意: 包装只对**主协程**(调度器的事件泵)生效 —— 进程自己 os.pullEvent 时的过滤拉取也会
+     走到同一个 os.pullEventRaw 字段上, 不按 coroutine 分辨就会把两种拉取混在一起量。 ]]
+
+local function initModule()
+    local klog = require("kernel.klog")
+    local process = require("kernel.process")
+    local PRI = klog.makePri(klog.FACILITIES.kern, klog.SEVERITIES.info)
+    local function log(s) klog.write(PRI, "[perf] " .. s) end
+
+    local now = os.epoch
+    local queueEvent = os.queueEvent
+    local pull = os.pullEventRaw
+    local mainCo = coroutine.running()
+
+    -- ---------------------------------------------------------------
+    -- CPU 归因: 包住 coroutine.resume (只影响内核侧那张 coroutine 表)
+    -- ---------------------------------------------------------------
+    local acc = {} -- co -> {ms=, n=}
+    local accMax = 0 -- 单次 resume 的最长耗时(**必须在 wrappedResume 之前声明**: Lua 的 local
+                     -- 作用域从声明语句之后才开始, 写在后面就成了全局 nil, 一比较就抛错)
+    local origResume = coroutine.resume
+    local function wrappedResume(co, ...)
+        local t0 = now("utc")
+        local a, b, c, d, e = origResume(co, ...)
+        local dt = now("utc") - t0
+        local r = acc[co]
+        if r then r.ms = r.ms + dt; r.n = r.n + 1 else acc[co] = { ms = dt, n = 1 } end
+        if dt > accMax then accMax = dt end
+        return a, b, c, d, e
+    end
+    coroutine.resume = wrappedResume
+
+    -- ---------------------------------------------------------------
+    -- 负载程序(普通进程环境: os/spawn 都在)
+    -- ---------------------------------------------------------------
+    local SRC_HOG = [[
+-- 从不让出: 等价于没有 yieldCheck 的工具(du/find/bc/...)
+local t = os.epoch("utc")
+local s = 0
+while os.epoch("utc") - t < 20000 do
+    for i = 1, 20000 do s = s + i end
+end
+return 0
+]]
+    local SRC_WORKER = [[
+-- 有让出: 忙 20ms 左右让出一次(与工具的 yieldCheck 时间片同一量级)
+local nap
+if os.msleep then nap = os.msleep else nap = function() os.sleep(0.05) end end
+local t = os.epoch("utc")
+local s = 0
+while os.epoch("utc") - t < 20000 do
+    for i = 1, 20000 do s = s + i end
+    nap(0)
+end
+return 0
+]]
+    local SRC_SPAWNER = [[
+-- 服务型负载: 不断 spawn 子进程跑一小段(像自检脚本/服务循环)
+local t = os.epoch("utc")
+local src = "local s = 0 for i = 1, 5000 do s = s + i end return 0"
+while os.epoch("utc") - t < 20000 do
+    spawn(src, "perfchild", 0, 0, { [0] = "perfchild" }, nil)
+    os.sleep(0.05)
+end
+return 0
+]]
+
+    local loads = {} -- 起过的负载 {name=, pid=}
+    local function startLoad(src, name)
+        local pid, _, err = process.spawn(src, name, 1, 0, 0, { [0] = name }, nil)
+        if not pid then
+            log("spawn " .. name .. " FAILED: " .. tostring(err))
+            return
+        end
+        loads[#loads + 1] = pid
+        log("load " .. name .. " started pid=" .. tostring(pid))
+    end
+    local function killLoads()
+        local n = 0
+        for _, p in ipairs(process.list()) do
+            local nm = tostring(p.name or "")
+            if nm:sub(1, 4) == "perf" then
+                p.sig.pending[9] = true -- SIGKILL
+                n = n + 1
+            end
+        end
+        log("killed " .. n .. " load process(es)")
+    end
+
+    -- ---------------------------------------------------------------
+    -- 计数与报告
+    -- ---------------------------------------------------------------
+    local armedAt = now("utc")
+    local lastReport = armedAt
+    local lastProcDump = armedAt
+    local lastReturn = nil   -- 上一轮 pull **返回**的时刻(阻塞结束)
+    local waitSum = 0        -- 阻塞等待(不是 CPU)
+    local evName = "?"       -- 上一轮处理的事件名
+    local passN, passSum, passMax = 0, 0, 0
+    local latN, latSum, latMax = 0, 0, 0
+    local pend = nil         -- 合成事件 {t0=, tag=}
+    local evCount = {}
+    local phase = 0
+    local finished = false
+    local reports = 0
+    local bootDone = false
+
+    local function dumpProcs()
+        local out = {}
+        for _, p in ipairs(process.list()) do
+            out[#out + 1] = p.pid .. ":" .. tostring(p.name) .. ":" .. tostring(p.status)
+        end
+        log("PS(" .. #out .. ") " .. table.concat(out, " "))
+    end
+
+    local function topCpu()
+        -- co -> name (按 process.list 的 co 反查)
+        local nameOf = {}
+        for _, p in ipairs(process.list()) do nameOf[p.co] = tostring(p.name) end
+        local rows = {}
+        local own = 0
+        for co, r in pairs(acc) do
+            own = own + r.ms
+            rows[#rows + 1] = { n = nameOf[co] or ("co" .. tostring(co)), ms = r.ms, k = r.n }
+        end
+        table.sort(rows, function(a, b) return a.ms > b.ms end)
+        local parts = {}
+        for i = 1, math.min(4, #rows) do
+            parts[#parts + 1] = string.format("%s=%.0fms/%d", rows[i].n, rows[i].ms, rows[i].k)
+        end
+        return table.concat(parts, " "), own
+    end
+
+    local function topEvents()
+        local rows = {}
+        for n, c in pairs(evCount) do rows[#rows + 1] = { n = n, c = c } end
+        table.sort(rows, function(a, b) return a.c > b.c end)
+        local parts = {}
+        for i = 1, math.min(4, #rows) do
+            parts[#parts + 1] = string.format("%s=%d", rows[i].n, rows[i].c)
+        end
+        return table.concat(parts, " ")
+    end
+
+    local function report(t)
+        local win = t - lastReport
+        if win <= 0 then win = 1 end
+        local cpu, own = topCpu()
+        -- passSum = 每轮调度**真正花掉的 CPU**(pull 返回 -> 下一次 pull 入口),
+        -- 不含阻塞等待; own = 其中落在 coroutine.resume 里的部分。
+        local kern = passSum - own
+        if kern < 0 then kern = 0 end
+        log(string.format("W t=%ds npass=%d workavg=%.1f workmax=%d cpu=%dms(%d%%) own=%dms(%d%%) kern=%dms lat_n=%d latavg=%.0f latmax=%d wait=%dms parts[feed=%d sig=%d hook=%d tty=%d] %s",
+            math.floor((t - armedAt) / 1000), passN, passN > 0 and (passSum / passN) or 0, passMax,
+            passSum, math.floor(passSum * 100 / win), own, math.floor(own * 100 / win), kern,
+            latN, latN > 0 and (latSum / latN) or 0, latMax, waitSum,
+            feedMs, sigMs, hookMs, ttyMs,
+            "maxres=" .. math.floor(accMax) .. "ms ev[" .. topEvents() .. "] cpu[" .. cpu .. "]"))
+        -- 复位
+        reports = reports + 1
+        lastReport = t
+        passN, passSum, passMax = 0, 0, 0
+        waitSum = 0
+        accMax = 0
+        feedMs, sigMs, hookMs, ttyMs = 0, 0, 0, 0
+        latN, latSum, latMax = 0, 0, 0
+        evCount = {}
+        acc = {}
+    end
+
+    local benchDone = false
+    local function bench()
+        benchDone = true
+        local n = 200
+        local t0 = now("utc")
+        for _ = 1, n do local _ = now("utc") end
+        local d1 = now("utc") - t0
+        local co = coroutine.create(function() while true do coroutine.yield() end end)
+        t0 = now("utc")
+        for _ = 1, n do origResume(co) end
+        local d2 = now("utc") - t0
+        log(string.format("bench n=%d epoch=%.2fms/call resume=%.2fms/call", n, d1 / n, d2 / n))
+    end
+
+    --- 把调度器每一轮里的各个钩子分别计时, 回答"这 12ms 花在哪"。
+    --- 事件钩子/信号检查/心跳钩子都是**注入式**的, 所以要在引导把它们装好之后再换掉。
+    local feedMs, sigMs, hookMs, ttyMs = 0, 0, 0, 0
+    local hooksDone = false
+    local function installHooks()
+        hooksDone = true
+        local scheduler = require("kernel.scheduler")
+        local rnd = require("kernel.random")
+        local kt = require("kernel.tty")
+        scheduler.setEventHook(function(ev)
+            local t0 = now("utc")
+            rnd.feedEvent(ev)
+            feedMs = feedMs + (now("utc") - t0)
+        end)
+        scheduler.setSignalCheck(function(p)
+            local t0 = now("utc")
+            local st = process.applySignals(p)
+            sigMs = sigMs + (now("utc") - t0)
+            return st
+        end)
+        local mtick = nil
+        pcall(function() mtick = require("kernel.md").tick end)
+        if type(mtick) == "function" then
+            scheduler.setTickHook(function()
+                local t0 = now("utc")
+                mtick()
+                hookMs = hookMs + (now("utc") - t0)
+            end)
+        end
+        local of, ork, ob = kt.feedInput, kt.routeKey, kt.blinkTick
+        kt.feedInput = function(e) local t0 = now("utc"); local r = of(e); ttyMs = ttyMs + (now("utc") - t0); return r end
+        kt.routeKey = function(e) local t0 = now("utc"); local r = ork(e); ttyMs = ttyMs + (now("utc") - t0); return r end
+        kt.blinkTick = function() local t0 = now("utc"); local r = ob(); ttyMs = ttyMs + (now("utc") - t0); return r end
+    end
+
+    local function step(t)
+        -- 引导完成(init 已 spawn)之后才起负载 —— 别在引导期间往系统里塞进程。
+        if not bootDone then
+            if not process.info(1) then return end
+            bootDone = true
+            armedAt, lastReport, lastProcDump = t, t, t
+            installHooks()
+            log("boot done (init spawned), phases start; hooks timed")
+        end
+        -- 相位
+        if phase == 0 and t - armedAt >= 20000 then
+            phase = 1
+            log("=== phase A: 1 x no-yield hog ===")
+            startLoad(SRC_HOG, "perfloadA")
+        elseif phase == 1 and t - armedAt >= 45000 then
+            phase = 2
+            log("=== phase B: 3 x yielding workers (msleep(0) every ~20ms) ===")
+            for i = 1, 3 do startLoad(SRC_WORKER, "perfloadB" .. i) end
+        elseif phase == 2 and t - armedAt >= 70000 then
+            phase = 3
+            log("=== phase C: 1 x spawner service ===")
+            startLoad(SRC_SPAWNER, "perfloadC")
+        elseif phase == 3 and t - armedAt >= 95000 then
+            phase = 4
+            killLoads()
+        elseif phase == 4 and t - armedAt >= 110000 then
+            phase = 5
+            log("=== final: process table ===")
+            dumpProcs()
+            log("os.msleep=" .. tostring(os.msleep) .. " hseClock=" .. tostring(os.hseClockMs))
+            finished = true
+            local f = fs.open("/tmp/perfprobe_done", "w")
+            if f then f.write("done\n"); f.close() end
+            log("perfprobe done (handing pullEventRaw/coroutine.resume back)")
+            if os.pullEventRaw == wrapper then os.pullEventRaw = pull end
+            if coroutine.resume == wrappedResume then coroutine.resume = origResume end
+            return
+        end
+        if t - lastReport >= 2000 then
+            report(t)
+            if not benchDone then bench() end
+        end
+        if t - lastProcDump >= 10000 then
+            lastProcDump = t
+            dumpProcs()
+        end
+    end
+
+    local wrapper
+    wrapper = function(...)
+        -- 只量**调度器的事件泵**(主协程); 进程自己的过滤拉取直接放行。
+        if coroutine.running() ~= mainCo then return pull(...) end
+        local tEnter = now("utc")
+        if lastReturn then
+            -- 上一轮从 pull 返回之后到这一轮 pull 入口之间的时间 = 那一轮的 CPU
+            local d = tEnter - lastReturn
+            passN = passN + 1
+            passSum = passSum + d
+            if d > passMax then passMax = d end
+        end
+        -- **必须原样透传全部返回值**: os.pullEventRaw 返回的是事件名 + 各参数(不是一张表),
+        -- 少传一个值就等于把 timer id / 按键字符全吃掉 —— 主协程里 os.sleep 的
+        -- "等到自己那个 timer" 循环会永远等不到(实测: 引导停在 tom 模块的 sleep(0), 整机零执行)。
+        local r = table.pack(pull(...))
+        local tReturn = now("utc")
+        waitSum = waitSum + (tReturn - tEnter)
+        lastReturn = tReturn
+        local nm = (type(r[1]) == "string") and r[1] or "?"
+        evCount[nm] = (evCount[nm] or 0) + 1
+        if pend and nm == pend.tag then
+            local lat = now("utc") - pend.t0
+            latN = latN + 1
+            latSum = latSum + lat
+            if lat > latMax then latMax = lat end
+            pend = nil
+        end
+        if not finished then
+            local ok, err = pcall(step, now("utc"))
+            if not ok then
+                log("step error: " .. tostring(err))
+                finished = true
+                if os.pullEventRaw == wrapper then os.pullEventRaw = pull end
+                if coroutine.resume == wrappedResume then coroutine.resume = origResume end
+            end
+        end
+        -- 合成事件: 在报告之后 queue 一个, 下一轮 pull 收到它时算延迟
+        if reports > 0 and not pend and not finished and (now("utc") - lastReport) < 200 then
+            pend = { t0 = now("utc"), tag = "perfping" }
+            queueEvent("perfping")
+        end
+        return table.unpack(r, 1, r.n)
+    end
+    os.pullEventRaw = wrapper
+    log("PERF-V2 armed (mainCo=" .. tostring(mainCo) .. ") os.msleep=" .. tostring(os.msleep))
+end
+
+return { init = initModule }

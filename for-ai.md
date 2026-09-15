@@ -1075,6 +1075,58 @@ find . -exec echo {} \; | wc -l                 # 同理
       argv 表会落到 gid 上，进程 gid 变成 table → `/proc/<pid>/stat` 写坏 → 真机上 `ps` 输出**为空**
       （`proc_test.sh` 的 `ps_*_nonempty` 全 ng，是**真机全量验证**抓出来的）。
 
+#### 空闲也不空闲：调度器事件泵的 CPU 与输入延迟（真机实测，电脑 #3）
+
+**症状（用户反馈，未修复）**：无论装不装 HSE，Delin 都很卡；电脑 #3（3 个 tty + syslogd + hse-pump
++ 一个 shell）上敲键盘"非常卡顿"，且**受后台任务影响**。
+
+**实测手段**：`scripts/perf_probe.ko`（临时诊断载荷，不进 dist）+ `tools/realmachine.py
+--clean --perf-probe`。探针包住调度器的事件泵（`os.pullEventRaw`）量三件事：
+`workavg` = 一轮调度真正花掉的 CPU（上次 pull 返回到这次 pull 入口，**不含阻塞**）、
+`lat` = 自己 queue 一个合成事件到它被 pull 出来（与按键同一条队列）、
+`cpu[...]` = 按 `coroutine.resume` 归因到各进程。
+
+| 量 | 数值（电脑 #3，干净镜像 + 3 个 getty 登录 + 一个 sh） |
+|---|---|
+| 事件速率 | 60–95 个 / 秒（timer ≈ 70/s，另加 hse_wake / hse_tick_wait 各 ~20/s） |
+| 单轮调度 CPU | **8–23 ms**（workmax 到 190–490 ms） |
+| 事件泵占用 | **cpu 1464–1748 ms / 2000 ms ≈ 72–87% 的一个核** |
+| 合成事件投递延迟 | 平均 **33–133 ms**，最大 186 ms（还只是"内核看见这个事件"，不含 echo/读进程被调度） |
+| 对照：不让出的进程 | 起一个纯忙等进程（等价于 `du`/`find` 这类**没有任何 yieldCheck** 的工具），**9.4 s 后被 CC 的 watchdog 杀掉**（`Too long without yielding`）—— 这 9.4 秒整机（含键盘）全冻结 |
+| 探针自身开销 | `os.epoch` 0.00 ms/call、`coroutine.resume` 0.01 ms/call → 上面不是量出来的假象 |
+
+**三条机制（都能从代码直接对上）**：
+
+1. **84/109 个 `/bin` 工具从头到尾不让出**（`grep -L 'yieldCheck\|schedYield\|msleep' src/bin/*`）：
+   `sort find du wc tr cut uniq join od diff patch xargs split csplit comm paste fold expand
+   strings cmp pr bc file ps` 全在里面。协作式调度下它们一跑，整机（含键盘、^C、其它 tty）停摆，
+   到 9.4 s 被 watchdog 打死为止 —— 真机日志里 `du` 就是这么死的。
+2. **每个"等输入"的进程都会被每一个事件唤醒**：`scheduler.run` 对 `proc.filter == nil` 一律
+   resume（`tty.readLine`/`rawRead` 都是裸 `os.pullEvent()`）。3 个 getty + 交互 shell = 4 个等待者
+   × 70 个事件/秒 ≈ 280 次唤醒/秒，**每个 tty 空闲会话都在给整机加税**。
+3. **让出本身是"事件往返"，不是"切换协程"**：HSE v0.5.0 下一次 `os.msleep(0)` ≈ 24 ms，
+   没装 HSE 时退化成 `os.sleep(0.05)` = 50 ms。于是工具只能把时间片放到 50 ms（`DELIN_YIELD_MS`
+   默认 50）—— 那又意味着**任何命令运行期间输入延迟至少一个时间片**。低延迟与吞吐在这个设计里
+   是对立的（文档里"把时间片调小只会更慢"就是这条）。
+
+**还没拆开的一环**：单轮 8–23 ms 具体花在哪（`random.feedEvent` 的熵池混合 / 各进程 resume /
+`tty.blinkTick` 重绘 / `md.tick` 心跳）——探针 v0.0.2 已经把 `parts[feed= sig= hook= tty=]`
+分项计时写好并装在机器上，但**日志取不回来**：CC 侧文件写在 `close`/轮转前不进宿主机看到的
+那份镜像（`debugfs` 读到的 `/var/log/kern.log*` 一直是上一轮的内容，`/mnt/computer/3/delin.log`
+同样滞后）。下一轮要么让探针自己给 syslogd 发 SIGHUP 逼它 close，要么把结果写进电脑自带存储。
+
+**探针踩过的两个坑（都会让整机零执行地"假死"）**：
+- 包 `os.pullEventRaw` **必须原样透传全部返回值**（事件名 + 各参数，不是一张表）。少传一个值 =
+  把 timer id 吃掉 → 主协程里 `os.sleep` 的"等到自己那个 timer"永远等不到 → 引导停在
+  `tom` 模块的 `sleep(0)`，日志停在 0.182 s，`/computercraft track` 显示该电脑零执行。
+- 局部变量**先声明后使用**：探针里 `accMax` 写在 `wrappedResume` 之后，于是它成了全局 `nil`，
+  第一次 resume 就 `attempt to compare number with nil` —— 同样的症状（引导死在 0.052 s）。
+  `src/` 有 shadow 门禁，`scripts/*.ko` 没有，自己长点心。
+
+**真机日志怎么取**：宿主机看到的是 NFS 上的游戏侧文件，**开机后 100 s 还是旧内容**（这条一直在），
+本轮又踩到一次更狠的：CC 自己也在缓冲文件写，`/var/log/*` 只有在 syslogd 收到 SIGHUP / 轮转
+（`logrotate.timer` 每 300 s）或写句柄 close 之后才在宿主机可见。
+
 用户态工具的选项一律**照宿主 GNU 逐项实测**对齐；下面只记那些"有坑"或"有取舍"的：
 
 - **`ls`**：新增 `-i -n -F -p -S -U -X -Q -L -H -G -g -o --color[=WHEN]`（`--color` 认 `LS_COLORS`，

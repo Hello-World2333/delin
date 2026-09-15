@@ -166,6 +166,7 @@ def main():
     clean = False
     desh_probe = False
     desh_check = False
+    perf_probe = False
     fast = False
     grep_tag = None
     wait_file = None
@@ -186,6 +187,8 @@ def main():
             desh_probe = True
         elif a == "--desh-check":
             desh_check = True
+        elif a == "--perf-probe":
+            perf_probe = True
         elif a == "--fast":
             fast = True
         elif a == "--grep":
@@ -222,8 +225,8 @@ def main():
     # payload 指纹没变就复用上一轮注入好的镜像: deploy(拷基镜像+铺文件) 与 40 来次 debugfs
     # 注入在迭代工具选项时要几十秒, 而 payload 里往往只变了一个 dist/bin/<tool>。
     # 指纹一变(reused=False)就整段重做, 不会测到旧镜像。--rebuild 可强制重建。
-    fp = payload_fingerprint('clean=%d desh_probe=%d desh_check=%d printer=%d'
-                         % (clean, desh_probe, desh_check, printer))
+    fp = payload_fingerprint('clean=%d desh_probe=%d desh_check=%d perf_probe=%d printer=%d'
+                         % (clean, desh_probe, desh_check, perf_probe, printer))
     fp_path = os.path.join(WORK, 'payload.fingerprint')
     reused = (not force_rebuild) and os.path.exists(fp_path) and open(fp_path).read().strip() == fp and os.path.exists(os.path.join(WORK, 'root.img'))
     if reused:
@@ -256,8 +259,10 @@ def main():
             print('--clean: 跳过验证载荷注入(镜像里只有 dist 产物 + fstab/data 分区)')
             # --clean + --desh-probe: 干净系统上只注入诊断载荷 —— 量让出/渲染这类
             # "会被别的进程干扰"的东西时, 需要一台没有自检服务的机器(噪声源)。
-            for modfile, modname in (("desh_probe.ko", "deshprobe"), ("desh_check.ko", "deshcheck")):
-                if (modfile == "desh_probe.ko" and not desh_probe) or (modfile == "desh_check.ko" and not desh_check):
+            for modfile, modname in (("desh_probe.ko", "deshprobe"), ("desh_check.ko", "deshcheck"),
+                                     ("perf_probe.ko", "perfprobe")):
+                if (modfile == "desh_probe.ko" and not desh_probe) or (modfile == "desh_check.ko" and not desh_check) \
+                        or (modfile == "perf_probe.ko" and not perf_probe):
                     continue
                 pv = re.search(r'^\s*return\s+"([^"]+)"',
                                open(os.path.join(REPO, "src/kernel/version.lua")).read(), re.M).group(1)
@@ -265,8 +270,10 @@ def main():
                 df_write(out, os.path.join(REPO, "scripts/" + modfile), pmoddir + "/" + modname + ".ko")
                 add_module(out, pmoddir, modname)
         else:
-            for modfile, modname in (("desh_probe.ko", "deshprobe"), ("desh_check.ko", "deshcheck")):
-                if (modfile == "desh_probe.ko" and not desh_probe) or (modfile == "desh_check.ko" and not desh_check):
+            for modfile, modname in (("desh_probe.ko", "deshprobe"), ("desh_check.ko", "deshcheck"),
+                                     ("perf_probe.ko", "perfprobe")):
+                if (modfile == "desh_probe.ko" and not desh_probe) or (modfile == "desh_check.ko" and not desh_check) \
+                        or (modfile == "perf_probe.ko" and not perf_probe):
                     continue
                 pv = re.search(r'^\s*return\s+"([^"]+)"',
                                open(os.path.join(REPO, "src/kernel/version.lua")).read(), re.M).group(1)
