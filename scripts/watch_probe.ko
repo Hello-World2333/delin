@@ -199,6 +199,13 @@ local function initModule(kapi)
         if not ok or type(st) ~= "table" then return "hse.stat=?" end
         return string.format("hse[waiters=%s clock=%.1f]", tostring(st.waiters), tonumber(st.clockMs) or -1)
     end
+    --- 内核睡眠因**丢失定时器事件**而靠墙钟兜底醒来的次数(见 kernel/sleep.lua)。
+    --- 这个数字 >0 就是"事件真的被丢了"的硬证据。
+    local function lostStat()
+        local ok, m = pcall(require, "kernel.sleep")
+        if not ok or not m or not m.lostCount then return "lost=?" end
+        return "lost=" .. tostring(m.lostCount())
+    end
     local function tickStat()
         local ok, p = pcall(require, "kernel.procenv")
         if not ok or not p then return "tick=?" end
@@ -490,7 +497,7 @@ return i
                 say("   tb(若有效): " .. tostring(okTb and tb or ("error:" .. tostring(tb))))
             end
             say("   " .. ttyLine())
-            say("   " .. hseStat() .. " " .. tickStat() .. " " .. lockStat())
+            say("   " .. hseStat() .. " " .. tickStat() .. " " .. lostStat() .. " " .. lockStat())
             for _, p in ipairs(process.list()) do say(row(p)) end
             local names = {}
             for n, c in pairs(evNames) do names[#names + 1] = n .. "=" .. c end
@@ -507,7 +514,7 @@ return i
         if not heartbeatAt or t - heartbeatAt > 5000 then
             heartbeatAt = t
             say(string.format("t=%dms heartbeat procs=%d bad=%d %s", t, #process.list(), #bad, ttyLine()))
-            say("   " .. hseStat() .. " " .. tickStat() .. " " .. lockStat())
+            say("   " .. hseStat() .. " " .. tickStat() .. " " .. lostStat() .. " " .. lockStat())
             for _, p in ipairs(process.list()) do say(row(p)) end
             for _, l in ipairs(infoRing) do say("   info| " .. l) end
             infoRing = {}

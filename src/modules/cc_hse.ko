@@ -61,7 +61,9 @@ return {
 
         local pulledEvent = os.pullEvent    -- 模块持有的内核态引用(进程环境里没有它)
         local queueEvent = os.queueEvent
-        local realSleep = os.sleep
+        -- **动态取 os.sleep**: 内核在装载模块之前就把它换成了带墙钟兜底的版本
+        -- (kernel/sleep.lua), 这里不能再抓引用 —— 抓了就绕过了那层保护。
+        local function realSleep(sec) return os.sleep(sec) end
 
         local clockMs = 0
         local waiters = 0

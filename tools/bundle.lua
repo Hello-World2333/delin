@@ -60,6 +60,7 @@ local profiles = {
             ["kernel.manifest"]  = "src/kernel/manifest.lua",
             ["kernel.fstab"]     = "src/kernel/fstab.lua",
             ["kernel.klog"]      = "src/kernel/klog.lua",
+            ["kernel.sleep"]     = "src/kernel/sleep.lua",
             ["kernel.ext2"]      = "src/kernel/ext2.lua",
             ["kernel.user"]      = "src/kernel/user.lua",
             ["kernel.display"]   = "src/kernel/display.lua",

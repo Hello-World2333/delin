@@ -3347,6 +3347,36 @@ do
         sched.setPreempt(false)
     end
 
+    -- **睡眠不能只等一个唤醒源**(真机 bug, 见 for-ai.md「坑 5」的续集): CC 的 sleep 是
+    -- "等自己那个**一次性**定时器的 id", 事件被丢一次就永远出不来 —— 真机上交互 shell 就是这样
+    -- 卡在 `F.pollWait -> msleep -> os.sleep` 里再也回不到提示符。内核版改成裸让出 + 墙钟兜底。
+    do
+        local sleepmod = require("kernel.sleep")
+        local realSleep, realStart, realPull, realEpoch = os.sleep, os.startTimer, os.pullEventRaw, os.epoch
+        local now = 0
+        os.startTimer = function() return 42 end
+        os.epoch = function() return now end
+        -- 故意只喂"别人的"定时器事件: 进程自己那个(42)**永远不来**
+        os.pullEventRaw = function()
+            now = now + 50
+            return "timer", 7
+        end
+        sleepmod.install()
+        local lost0 = sleepmod.lostCount()
+        os.sleep(0.2)
+        eq(now >= 200, true, "sleep: 定时器事件丢了也按时返回(墙钟兜底)")
+        eq(sleepmod.lostCount(), lost0 + 1, "sleep: 靠兜底醒来会记账(证明确实丢了定时器事件)")
+        -- sleep(0) 必须**仍然让出一次**(CC 语义: 它是让出点, 不少工具靠它)。
+        -- 注意要**重新 install**: install 时会把当时的 os.pullEventRaw 抓成引用(故意的 —— 装上之后
+        -- 别人再包 os.pullEventRaw 也绕不过它), 所以换桩之后必须重装。
+        local pulls0 = 0
+        os.pullEventRaw = function() pulls0 = pulls0 + 1; now = now + 50; return "timer", 42 end
+        sleepmod.install()
+        os.sleep(0)
+        eq(pulls0 >= 1, true, "sleep: sleep(0) 仍然让出一次")
+        os.sleep, os.startTimer, os.pullEventRaw, os.epoch = realSleep, realStart, realPull, realEpoch
+    end
+
     -- 判据: preemptOn 跟锁的启用走, inProcess 跟"调度器设的当前进程"走
     do
         local lock = require("kernel.lock")

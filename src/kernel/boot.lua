@@ -404,6 +404,10 @@ local function bootFromInfo(bi)
     -- 用户库(从根的 /etc/passwd 读) + 注册 user.* syscalls
     if not setupUsers() then return end
 
+    -- **必须在模块装载之前**: cc_hse 在装载期就抓走了 `os.sleep` 的引用, 而它的 os.msleep
+    -- 正是要保护的那条路(见 kernel/sleep.lua 的说明)。
+    require("kernel.sleep").install()
+
     -- 内核模块: 只从根自带的 /lib/modules/<version>/ 装载(自包含, fail-fast)。
     -- 绝不回退到引导盘/CC fs 的 /lib —— 那上面本就不该有模块。
     local mdir = "/lib/modules/" .. modules.version
@@ -458,6 +462,10 @@ function boot.boot()
     setupDevices()    -- /dev/sdX 设备节点(磁盘不自动挂载)
     registerConsole() -- 电脑自身 term 控制台(键盘输入焦点)
     if not setupUsers() then return end -- 用户库来自根(电脑自身 FS)的 /etc/{passwd,shadow,group}
+
+    -- **必须在模块装载之前**: cc_hse 在装载期就抓走了 `os.sleep` 的引用, 而它的 os.msleep
+    -- 正是要保护的那条路(见 kernel/sleep.lua 的说明)。
+    require("kernel.sleep").install()
 
     local mdir = findModuleDir()
     if mdir then
