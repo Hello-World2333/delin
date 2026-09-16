@@ -33,6 +33,10 @@ local function initModule(kapi)
 
     local bootT0 = now("utc") -- 必须在任何用到它的闭包**之前**声明(否则解析成全局 nil, 踩过)
 
+    --- 活动量计数(性能回归时看这几个数): 事件/秒、协程 resume/秒、内核 sleep 调用/秒。
+    --- **声明必须在使用之前** —— 宿主门禁"局部被读成全局"就是专门拦这个的。
+    local evCount, resCount, metricAt, lastSleeps = 0, 0, nil, 0
+
     local lines = {}
     local function say(s) lines[#lines + 1] = s end
     --- **追加**写: 0.0.1 每次 flush 都重写整个文件, 日志一长就越来越慢且吃内存。
@@ -164,6 +168,7 @@ local function initModule(kapi)
     local lastAt, lastYield = {}, {}
     local origResume = coroutine.resume
     coroutine.resume = function(co, ...)
+        resCount = resCount + 1
         local r = table.pack(origResume(co, ...))
         lastAt[co] = now("utc")
         if coroutine.status(co) == "suspended" then lastYield[co] = tostring(r[2]) end
@@ -201,10 +206,18 @@ local function initModule(kapi)
     end
     --- 内核睡眠被**墙钟兜底**叫醒的次数(见 kernel/sleep.lua): 兜底路径确实在工作。
     --- **不是**丢事件的证据 —— 调度心跳先到也会走这条, 所以正常运行时它也在涨。
-    local function clockStat()
+    local function activityStat(t)
         local ok, m = pcall(require, "kernel.sleep")
-        if not ok or not m or not m.wokeByClockCount then return "clk=?" end
-        return "clk=" .. tostring(m.wokeByClockCount())
+        local sleeps = (ok and m and m.callCount) and m.callCount() or -1
+        if not metricAt then metricAt = t; evCount = 0; resCount = 0; return "act=warming" end
+        local dt = (t - metricAt) / 1000
+        if dt < 1 then return string.format("act[ev=%d res=%d]", evCount, resCount) end
+        local s = string.format("act[ev/s=%.0f res/s=%.0f sleeps/s=%.0f clk=%d]",
+            evCount / dt, resCount / dt, (sleeps - (lastSleeps or 0)) / dt,
+            (ok and m and m.wokeByClockCount) and m.wokeByClockCount() or -1)
+        lastSleeps = sleeps
+        metricAt, evCount, resCount = t, 0, 0
+        return s
     end
     local function tickStat()
         local ok, p = pcall(require, "kernel.procenv")
@@ -497,7 +510,7 @@ return i
                 say("   tb(若有效): " .. tostring(okTb and tb or ("error:" .. tostring(tb))))
             end
             say("   " .. ttyLine())
-            say("   " .. hseStat() .. " " .. tickStat() .. " " .. clockStat() .. " " .. lockStat())
+            say("   " .. hseStat() .. " " .. tickStat() .. " " .. activityStat(t) .. " " .. lockStat())
             for _, p in ipairs(process.list()) do say(row(p)) end
             local names = {}
             for n, c in pairs(evNames) do names[#names + 1] = n .. "=" .. c end
@@ -514,7 +527,7 @@ return i
         if not heartbeatAt or t - heartbeatAt > 5000 then
             heartbeatAt = t
             say(string.format("t=%dms heartbeat procs=%d bad=%d %s", t, #process.list(), #bad, ttyLine()))
-            say("   " .. hseStat() .. " " .. tickStat() .. " " .. clockStat() .. " " .. lockStat())
+            say("   " .. hseStat() .. " " .. tickStat() .. " " .. activityStat(t) .. " " .. lockStat())
             for _, p in ipairs(process.list()) do say(row(p)) end
             for _, l in ipairs(infoRing) do say("   info| " .. l) end
             infoRing = {}
@@ -531,6 +544,7 @@ return i
     os.pullEventRaw = function(...)
         if coroutine.running() ~= mainCo then return pull(...) end
         local r = table.pack(pull(...))
+        evCount = evCount + 1
         local nm = (type(r[1]) == "string") and r[1] or "?"
         evNames[nm] = (evNames[nm] or 0) + 1
         local ok, err = pcall(check, now("utc"))

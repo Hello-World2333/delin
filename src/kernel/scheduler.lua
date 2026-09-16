@@ -174,6 +174,15 @@ end
 --- 正常、别的 tty 照常 —— 而且日志里那个进程一直 y=timer(等定时器)。
 --- 所以: 进程在等事件就立刻交付; 已经在可运行队列里(或正在跑)就先按顺序存起来,
 --- 等它下次真正阻塞时再交付下一个(事件不会因为"来得不是时候"而丢)。
+--- 这个事件是不是它正在等的? 裸让出(filter=nil)= 任何事件; terminate 永远要送(否则进程收不到
+--- 关闭通知)。filter=false 是"刚被抢占、什么都没等"(见 park), 它不匹配任何事件名。
+---@param proc DelinProc
+---@param name string
+---@return boolean
+local function wants(proc, name)
+    return proc.filter == nil or proc.filter == name or name == "terminate"
+end
+
 ---@param proc DelinProc
 ---@param event table
 local function deliver(proc, event)
@@ -183,6 +192,10 @@ local function deliver(proc, event)
         makeReady(proc)
         return
     end
+    -- 它已经在可运行队列里(或刚被抢占): 只把**它确实在等的**事件排进队列。
+    -- 不感兴趣的事件直接丢 —— 这正是 CC 的语义(事件按名字过滤, 没人在等就过去了),
+    -- 而"什么都排队"会让每个进程为每个事件多跑一轮(真机上是能看出来的开销)。
+    if not wants(proc, event[1]) then return end
     local q = proc.eventQ
     if not q then q = {}; proc.eventQ = q end
     q[#q + 1] = event
@@ -221,13 +234,21 @@ local function park(proc, param)
     end
     proc.filter = param
     proc.state = "wait"
-    -- 跑的时候攒下的事件: 现在它真的在等了, 按顺序交付下一个(见 deliver)。
+    -- 跑的时候攒下的事件: 现在它真的在等了, 交付**第一个它等得着的**(见 deliver/wants);
+    -- 期间它换了等待对象的话, 那些旧事件直接丢, 不要为此白白唤醒它。
     local q = proc.eventQ
-    if q and #q > 0 then
-        proc.pendingEvent = table.remove(q, 1)
+    local deliverIdx = nil
+    if q then
+        for qi = 1, #q do
+            if wants(proc, q[qi][1]) then deliverIdx = qi; break end
+        end
+    end
+    if deliverIdx then
+        proc.pendingEvent = table.remove(q, deliverIdx)
         proc.parked = false
         makeReady(proc)
     else
+        if q then proc.eventQ = nil end -- 队列里没有它要的: 整条丢掉, 别留着
         proc.parked = true
     end
 end
@@ -319,7 +340,7 @@ end
 
 --- 事件分发(协作模式的"resume"阶段 / 抢占模式的"标可运行"阶段)。
 ---@param event table
----@param kernelTimer boolean 当前 timer 事件是否属于内核(闪烁/心跳)
+---@param kernelTimer string|nil nil=真实事件, "blink"=内核慢拍, "beat"=内核心跳(闪烁/心跳)
 local function dispatch(event, kernelTimer)
     -- "delin_slice" 只是"把控制权还回事件泵"的标记(见 run 里自己 queue 的那一段):
     -- 它不是系统事件, 不路由、也不唤醒任何进程(裸让出/等 timer 的进程不该被它叫醒)。
@@ -375,9 +396,11 @@ local function dispatch(event, kernelTimer)
                 if resumeProc(proc, i, event, false) == "removed" then step = false end
             end
         elseif proc.filter == event[1] then
-            -- 等具体事件的进程: 只有内核自己的计时器(光标闪烁/调度心跳)**不**算它的唤醒源
-            -- (否则等 "timer" 的进程会被心跳叫醒, 空转一整轮)。
-            if not kernelTimer then
+            -- 等具体事件的进程: 内核自己的**快拍**(20Hz 调度心跳)**不**算它的唤醒源(否则空转一整轮);
+            -- 但**慢拍**(0.5s 光标闪烁)要投 —— 它是"等 timer 的进程"的兜底唤醒源: 一旦某个
+            -- 一次性定时器事件丢了(见 kernel/sleep.lua), 这些进程还能靠它醒来查墙钟, 而不是永久卡住。
+            -- 慢拍 2Hz 对唤醒量的贡献可以忽略(实测 ev/s 48 -> 30)。
+            if kernelTimer ~= "beat" then
                 if preempt then
                     deliver(proc, event)
                 else
@@ -422,9 +445,9 @@ function scheduler.run()
     -- 时才会被恢复; 空闲期没有键盘/定时器事件, 必须靠心跳推进, 否则会永久挂起。
     -- 20Hz 对事件队列(上限 256)压力可忽略 —— 与旧 hse_tick 2kHz 推模式完全不是一回事。
     local beatTimer = os.startTimer(0.05)
-    local kernelTimer = false -- 当前 timer 事件是否属于内核(闪烁/心跳)
+    local kernelTimer = false -- nil=真实事件 / "blink"=内核慢拍(0.5s) / "beat"=内核心跳(20Hz)
     while #procs > 0 do
-        kernelTimer = false
+        kernelTimer = nil
 
         -- 0) 键盘路由: 在 resume 进程前, 先把当前事件路由给 tty。
         --    这确保 ^C 的 SIGINT 在进程被 resume 前已投递到前台进程组。
@@ -432,10 +455,10 @@ function scheduler.run()
             if event[2] == blinkTimer then
                 tty.blinkTick()
                 blinkTimer = os.startTimer(0.5)
-                kernelTimer = true
+                kernelTimer = "blink"
             elseif event[2] == beatTimer then
                 beatTimer = os.startTimer(0.05)
-                kernelTimer = true
+                kernelTimer = "beat"
                 if tickHook then tickHook() end
             end
         end

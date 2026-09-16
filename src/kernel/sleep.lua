@@ -20,9 +20,13 @@
 
 local M = {}
 
---- 被墙钟兜底叫醒的次数(**不是**丢事件的证据: 心跳先到也会走这条; 见文件头的说明)。
+--- 靠墙钟(而不是自己那个定时器事件)结束的 sleep 次数。注意**不是**丢事件的证据:
+--- 调度心跳(20Hz)常常与 50ms 的睡眠同拍、并且先到, 那时也会走墙钟; 它只说明兜底路径在工作。
 local wokeByClock = 0
 function M.wokeByClockCount() return wokeByClock end
+--- 进来睡过多少次(诊断/性能度量用)。
+local calls = 0
+function M.callCount() return calls end
 
 --- 装上这个 os.sleep。**必须在模块装载之前调用**: kernel module `cc_hse` 在装载期就抓走了
 --- `os.sleep` 的引用(`local realSleep = os.sleep`), 而它的 `os.msleep` 就是我们这里要保护的那条路。
@@ -30,21 +34,30 @@ function M.install()
     local realStartTimer, realPull, realEpoch = os.startTimer, os.pullEventRaw, os.epoch
 
     --- 睡够 sec 秒; **sec <= 0 也要让出一次**(CC 语义: sleep(0) = 让出点, 不少工具靠它)。
+    ---
+    --- 两条设计约束(都是踩出来的):
+    ---   1. **只武装一个定时器, 绝不重武装** —— 第一版是"每被叫醒就按剩余时间再武装一个",
+    ---      配上"任何事件都唤醒"的裸让出, N 个睡眠者互相唤醒、每次又造一个新定时器事件,
+    ---      事件量按 N² 涨(真机实测: 用户一眼看出"性能明显掉了一截")。
+    ---   2. **只被定时器事件唤醒**(filter="timer"), 不裸让出 —— 裸让出会让每个睡眠者被
+    ---      每个事件唤醒(实测 ev/s 48 里有一半是心跳), 纯属白烧。
+    --- 那"自己那个定时器事件丢了怎么办?"的两条兜底:
+    ---   * 系统里一直有别的定时器(sleeping 的 init / hse-pump / login), 醒来就查一次墙钟;
+    ---   * 内核的**慢拍**(0.5s 光标闪烁)在调度器里**会**投给等 "timer" 的进程(快拍 20Hz 心跳
+    ---     不投, 免得空转) —— 于是"所有定时器事件都断了"也不会永久卡住。
+    ---   * 再加自己的墙钟判定: 到点一定返回, 与有没有事件无关。
     ---@param sec number
     local function sleep(sec)
+        calls = calls + 1
         sec = math.max(tonumber(sec) or 0, 0)
         local deadline = realEpoch("utc") + sec * 1000
+        local tid = realStartTimer(sec)
         repeat
-            local left = deadline - realEpoch("utc")
-            local tid = realStartTimer(math.max(left, 0) / 1000)
-            local got = false
-            repeat
-                local name, id = realPull()
-                if name == "terminate" then error("Terminated", 0) end
-                if id == tid then got = true end
-            until got or realEpoch("utc") >= deadline
-            if not got and left > 0 then wokeByClock = wokeByClock + 1 end
+            local name, id = realPull("timer")
+            if name == "terminate" then error("Terminated", 0) end
+            if id == tid then return end
         until realEpoch("utc") >= deadline
+        wokeByClock = wokeByClock + 1
     end
 
     os.sleep = sleep

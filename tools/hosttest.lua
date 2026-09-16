@@ -3377,6 +3377,25 @@ do
         os.sleep, os.startTimer, os.pullEventRaw, os.epoch = realSleep, realStart, realPull, realEpoch
     end
 
+    -- 睡一次**只准武装一个定时器**: 被别的事件叫醒时只能查墙钟, 不能重新武装 ——
+    -- 否则 N 个睡眠者互相唤醒 + 每次又造一个定时器事件 = 事件量按 N² 涨(真机实测: 性能掉一截)。
+    do
+        local sleepmod = require("kernel.sleep")
+        local realSleep, realStart, realPull, realEpoch = os.sleep, os.startTimer, os.pullEventRaw, os.epoch
+        local now, starts, id = 0, 0, 100
+        os.startTimer = function() starts = starts + 1; id = id + 1; return id end
+        os.epoch = function() return now end
+        -- 只喂"别人的"事件(自己那个 101 永远不来): 每次醒来都加 20ms
+        local filterSeen = nil
+        os.pullEventRaw = function(f) filterSeen = f; now = now + 20; return "timer", 999 end
+        sleepmod.install()
+        os.sleep(0.2)
+        eq(starts, 1, "sleep: 只武装一个定时器(不因虚假唤醒重新武装)")
+        eq(filterSeen, "timer", "sleep: 只等 timer 事件(不裸让出, 免得被所有事件唤醒)")
+        eq(now >= 200, true, "sleep: 虚假唤醒也会在到点后返回")
+        os.sleep, os.startTimer, os.pullEventRaw, os.epoch = realSleep, realStart, realPull, realEpoch
+    end
+
     -- 判据: preemptOn 跟锁的启用走, inProcess 跟"调度器设的当前进程"走
     do
         local lock = require("kernel.lock")
