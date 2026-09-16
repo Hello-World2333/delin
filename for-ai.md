@@ -1257,6 +1257,41 @@ find . -exec echo {} \; | wc -l                 # 同理
 电脑自带存储，两者不是一个地方，踩过），结果：**跑完 3/3，没有进程停在等锁上**，
 期间事件延迟 14–126ms、tty 读进程每秒被恢复 16–19 次（终端跟手）。
 
+**用户实测的坑 5（已修）：提示符再也不回来 —— 抢占模式下事件被静默丢弃**。
+用户第三次复现（tty1，跑完 `find /` 后提示符不回来；^C/^D 无反应，整机正常、别的 tty 照常）时，
+看门狗日志给出一条很硬的线索：那个 shell 一直在 `y=timer`（等定时器）上被反复唤醒，却永远回不到读键盘。
+
+根因在 `scheduler.dispatch`：抢占模式下被唤醒的进程**先进可运行队列**，要等下一次 `runReady`
+才真的跑；这期间如果**它自己的**事件到了，`makeReady(proc, event)` 因为 `proc.inReady` 直接
+`return` —— **事件被丢掉**。对 `os.sleep` 是致命的：CC 的 `os.sleep` 等的是**一次性定时器的 id**
+（`until param == timer`），事件丢了就永远等不到 ⇒ 进程死循环在 `os.sleep` 里。等定时器的进程
+全都可能中：shell 的 `F.pollWait`（`msleep` 落到 `realSleep` 时 yield 的是 `timer`）、
+login 的 `proc.wait`、`pipe`/`fifo`/`klog` 的阻塞循环。这也解释了为什么它只在**忙**的机器上偶发
+（进程要恰好在可运行队列里等下一轮调度），以及为什么"协作式没有这个问题"（协作式是当场 resume，
+没有可运行队列这一层）。
+
+修法（`src/kernel/scheduler.lua`，`deliver`/`park`）：
+- 进程**正在等** ⇒ 立刻交付（老行为）；
+- 已在可运行队列里/正在跑 ⇒ 存进 `proc.eventQ`，等它下次**真正阻塞**时按顺序交付下一条（事件不丢）；
+- 顺带修掉一个同类隐患：`__preempt` 让出时把 `proc.filter` 清成 `false`，否则它带着"上一次等待"
+  的过滤条件，会被不相关的事件匹配上、还拿到一个不属于它的事件。
+- 回归测试：`tools/hosttest.lua` 里用宿主调度器把"事件在进程处于可运行队列期间到达"这一刻钉住
+  （写测试时先确认它能复现老 bug：`got=LOST want=slept`）。
+
+**顺带记下的探针坑（真机上做"某个进程卡在哪一行"这类诊断时，别再走这三条路）**：
+1. `debug.getinfo(挂起的协程, ...)` 在真机上返回的是**当前线程**的调用链（打出来是
+   `bios.lua:42 < delin.lua:1` 那种"内核被 BIOS 启动"的链），对进程栈无效；
+2. `debug.sethook` 装的钩子在真机上像是**全局**生效的，钩子里的 `debug.getinfo` 拿到的是
+   *正在跑*的那个线程（常常是内核事件泵/探针自己），记出来的现场张冠李戴；
+3. 包 `coroutine.yield` 也没用 —— CC 1.20+ 的 `os.pullEventRaw` 是 **Java 函数**，进程阻塞根本不
+   经过 `coroutine.yield`。
+   可用的两条：**`debug.traceback(协程)`**（这条在真机上是**有效**的，能把进程自己的栈连同
+   "谁 resume 的它"一起打出来）、以及**包内核的 `lock.pause`**（内核里所有会让出的等待都走它，
+   在包装器里记"调用者"就是准确的阻塞点）。
+4. **dist 里的行号被剥掉了**：真机上所有帧都报 `…:1`（内核 bundle 报 `/boot/delin.lua:1`、
+   程序报 `/bin/login:1`），所以现场只能靠**函数名**（`readLine/method`、`hseWait/field`、
+   `pollWait/local`……）辨认 —— 别再拿行号当线索（0.0.5~0.0.11 全白折腾）。
+
 **真机全量自检（同一台机器、同一份内核，只差 `/etc/preempt`）**：`tools/realmachine.py` 与
 `tools/realmachine.py --preempt` 各跑一轮，两边都跑到 `=== verify done ===`，**ng 清单逐字节相同**
 （39 项：`env_sandbox_ran`、`lua_*` 一整片、`killall_echo`、`pgrep_*`、`ps_*_nonempty` —— 这些在
