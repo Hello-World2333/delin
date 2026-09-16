@@ -109,7 +109,7 @@ local function initModule()
             for _, l in ipairs(infoRing) do say("   info| " .. l) end
             flush() -- 立刻落盘, 免得整机真的卡死时丢现场
         end
-        if not heartbeatAt or t - heartbeatAt > 10000 then
+        if not heartbeatAt or t - heartbeatAt > 5000 then
             heartbeatAt = t
             say(string.format("t=%dms heartbeat procs=%d bad=%d focus=%s %s %s %s", t, #process.list(),
                 #bad, tostring(tty.getFocus()), ttyState("tty0"), ttyState("tty2"), hseStat()))
@@ -120,6 +120,9 @@ local function initModule()
                     tostring(p.status), tostring(lastYield[p.co]),
                     at and tostring(t - at) or "-"))
             end
+            -- proc.info 轨迹: 交互 shell 卡在"等子进程"时, 这里能看见它在问谁、内核答的什么状态
+            for _, l in ipairs(infoRing) do say("   info| " .. l) end
+            if #infoRing > 0 then infoRing = {} end
             flush()
         end
     end
@@ -136,7 +139,7 @@ local function initModule()
         return table.unpack(r, 1, r.n)
     end
     os.pullEventRaw = wrapper
-    say("watchdog armed (threshold 1200ms, table every 10s)")
+    say("watchdog armed (threshold 1200ms, table+info trace every 5s)")
     flush()
 end
 
