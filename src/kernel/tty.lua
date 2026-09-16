@@ -257,39 +257,21 @@ local function cellColors(ctx, idx)
     return fg, bg
 end
 
---- 绘制脏单元格到设备。光标所在格以反显(前景/背景互换)渲染, 形成区块光标。
---- **同一行里连续、同色的脏格合并成一次 dev.text**: term 型的 dev.text 是
---- `term.setCursorPos` + `term.blit` 两条 CC 调用, 逐格画一屏(51x19)要近千次 —— 整行输出
---- (ls/ps/grep 这类)因此慢得肉眼可见。合并之后一屏通常只剩十几次调用。
---- 一次 flush 最多画多少个**像素格**。
---- **为什么必须有这个上限**: 像素设备(台式机 tty2 = Tom GPU 那种)每格是 `rect` + `text` 两条
---- 外设调用, 而滚一次屏会把整屏(~1000 格)标脏 —— 那是一次**几千次外设调用**的同步阻塞,
---- 期间整台电脑不让出(外设调用不经过调度器), 别的进程全部停摆。真机实测: 在像素终端里跑
---- `find /`, 看门狗记到整机每次停 ~7 秒, `find` 自己被 CC 的 watchdog 以
---- "Too long without yielding" 杀掉(栈顶 rom/apis/peripheral.lua)。term 型设备本来就被
---- 合并成"每行一次", 一屏十几次调用, 不需要这个上限。
---- 超出的部分**留到下次 flush**(标脏不丢), 于是重画变成渐进式的: 屏幕先花后齐, 但不再卡住整机。
-local PIXEL_CELL_BUDGET = 96
-
---- 一次 flush 最多连续干多少毫秒就放锁让出。
---- **为什么需要**: 像素/监视器的每次 `dev.text` 是**外设调用**(Tom GPU / monitor), 一次几毫秒,
---- 而它们**不消耗 VM 指令** —— 调度器的计数钩子在这段里根本不会触发。于是"不停往下写"的工具
---- (比如没有 yieldCheck 的 find/ls) 可以连续几秒不回到调度器: 整机停摆, 直到 CC 的 watchdog
---- 以 "Too long without yielding" 把它打死(真机实测 7 秒级停摆 + find 被杀)。
---- 这里补一个**按时间**的抢占点: 每 5ms 放锁让出一次(lock.pause 会先放锁再让出, 醒来拿回)。
-local FLUSH_YIELD_MS = 5
-
+--- 绘制脏单元格到设备。
+--- **同一行里连续、同色的脏格合并成一次 dev.text**(term 型是 `term.setCursorPos` + `term.blit`
+--- 两条 CC 调用, 逐格画一屏近千次; 合并后一屏只剩十几次)。
+---
+--- 像素设备(台式机 tty2 = Tom GPU 那种)**同样按"合并段"画**: 一段【一次 rect 清整段】+
+--- 【一次 text 画整段】= 2 次外设调用; 从前是逐格 rect+text, 滚一次屏(约 1000 格)要**几千次**
+--- 外设调用 —— 那既是几秒的卡顿, 也让"重画"没法在一帧里做完。
+--- **不要**再把一次 flush 切成"每 N 格/每 N 毫秒"来做渐进重画: 真机上那会变成肉眼看得到的
+--- "扫描式"滚屏和残缺的脏矩形(用户实测)。让出点在**内核调用之间**(scheduler 的延迟让出 +
+--- 输出路径的抢占点), 不在一张画内部。
 local function flushDirty(ctx)
     local dev = ctx.dev
     local list = ctx.dirtyList
     local n = #list
     local i = 1
-    local drawn = 0 -- 这一轮已经画了多少像素格(只对 pixel 型计数)
-    local cut = nil   -- 预算用尽时的断点: 剩下的格子留到下一轮
-    -- 只有"进程上下文里跑进来的"flush 才能让出(内核自己的 blink tick 在宿主上下文里, 让出会炸)。
-    -- **判据用 inProcess 而不是 inKernel**: 有些句柄(引导期建的 stdio)绕过了包装器, 不持锁,
-    -- 但一样在进程上下文里 —— 用 inKernel 判会漏掉它们, 于是狂写输出的进程完全不让出。
-    local yieldAt = (lock.preemptOn() and lock.inProcess()) and os.epoch("utc") or nil
     while i <= n do
         local idx = list[i]
         local col = (idx - 1) % ctx.cols
@@ -311,51 +293,20 @@ local function flushDirty(ctx)
             -- term 型: 传给 dev.text 的是 CC blit 色码序号(hex() 会用), 需从 tty 色序换算。
             dev.text(col, row, text, TO_CC[fg], TO_CC[bg])
         else
-            -- pixel 型: 逐格画(先用背景色填满整个字格, 再居中绘制字形)。比例字体的字格左右
-            -- 留白区不清会残留旧像素; 光标块也因此能整格填充。
-            for k = i, j - 1 do
-                if drawn >= PIXEL_CELL_BUDGET then cut = k; break end
-                drawn = drawn + 1
-                local idxk = list[k]
-                local cell = ctx.grid[idxk]
-                local colk = (idxk - 1) % ctx.cols
-                local rowk = math.floor((idxk - 1) / ctx.cols)
-                local fgk, bgk = cellColors(ctx, idxk)
-                local px = colk * ctx.cellW
-                local py = rowk * ctx.cellH
-                dev.rect(px, py, ctx.cellW, ctx.cellH, PALETTE[bgk])
-                local x = px
-                if dev.getTextWidth then
-                    local cw = dev.getTextWidth(cell.ch)
-                    local off = math.floor((ctx.cellW - cw) / 2)
-                    if off > 0 then x = x + off end
-                end
-                dev.text(x, py, cell.ch, PALETTE[fgk], PALETTE[bgk])
-            end
-        end
-        if cut then break end
-        -- 时间片的抢占点: 外设调用再慢也不占 VM 指令, 计数钩子看不见, 这里自己让。
-        if yieldAt and os.epoch("utc") - yieldAt >= FLUSH_YIELD_MS then
-            yieldAt = os.epoch("utc")
-            if lock.inKernel() then
-                lock.pause(function() coroutine.yield("__preempt") end) -- 持锁: 先放锁再让
-            else
-                coroutine.yield("__preempt")
-            end
+            -- 像素型: **按合并段画** —— 整段先用背景色填一个矩形(清掉比例字体字格两侧的残留像素),
+            -- 再一次性把整段文字交给设备。一段 = 2 次外设调用; 从前是逐格 rect+text, 滚一次屏
+            -- (约 1000 格)要几千次调用 —— 那既是几秒卡顿, 也没法在一帧里画完(会被切成"扫描式")。
+            -- 代价: 不再逐格把字形居中(getTextWidth 那一步), 交给设备的文字排版 —— 视觉上由
+            -- 设备自己的字距决定。
+            local px = col * ctx.cellW
+            local py = row * ctx.cellH
+            dev.rect(px, py, (j - i) * ctx.cellW, ctx.cellH, PALETTE[bg])
+            dev.text(px, py, text, PALETTE[fg], PALETTE[bg])
         end
         i = j
     end
-    if cut then
-        -- 预算用尽: 把**还没画**的格子重新标脏(已经画过的丢掉), 下次 flush 接着画。
-        local rest = {}
-        for k = cut, n do rest[#rest + 1] = list[k] end
-        ctx.dirty = {}
-        ctx.dirtyList = rest
-        for _, idx in ipairs(rest) do ctx.dirty[idx] = true end
-    else
-        ctx.dirty = {}
-        ctx.dirtyList = {}
-    end
+    ctx.dirty = {}
+    ctx.dirtyList = {}
     dev.flush()
 end
 
