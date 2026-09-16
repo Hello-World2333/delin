@@ -293,15 +293,25 @@ local function flushDirty(ctx)
             -- term 型: 传给 dev.text 的是 CC blit 色码序号(hex() 会用), 需从 tty 色序换算。
             dev.text(col, row, text, TO_CC[fg], TO_CC[bg])
         else
-            -- 像素型: **按合并段画** —— 整段先用背景色填一个矩形(清掉比例字体字格两侧的残留像素),
-            -- 再一次性把整段文字交给设备。一段 = 2 次外设调用; 从前是逐格 rect+text, 滚一次屏
-            -- (约 1000 格)要几千次调用 —— 那既是几秒卡顿, 也没法在一帧里画完(会被切成"扫描式")。
-            -- 代价: 不再逐格把字形居中(getTextWidth 那一步), 交给设备的文字排版 —— 视觉上由
-            -- 设备自己的字距决定。
-            local px = col * ctx.cellW
-            local py = row * ctx.cellH
-            dev.rect(px, py, (j - i) * ctx.cellW, ctx.cellH, PALETTE[bg])
-            dev.text(px, py, text, PALETTE[fg], PALETTE[bg])
+            -- pixel 型: 逐格画(先用背景色填满整个字格, 再居中绘制字形)。比例字体的字格左右
+            -- 留白区不清会残留旧像素; 光标块也因此能整格填充。
+            for k = i, j - 1 do
+                local idxk = list[k]
+                local cell = ctx.grid[idxk]
+                local colk = (idxk - 1) % ctx.cols
+                local rowk = math.floor((idxk - 1) / ctx.cols)
+                local fgk, bgk = cellColors(ctx, idxk)
+                local px = colk * ctx.cellW
+                local py = rowk * ctx.cellH
+                dev.rect(px, py, ctx.cellW, ctx.cellH, PALETTE[bgk])
+                local x = px
+                if dev.getTextWidth then
+                    local cw = dev.getTextWidth(cell.ch)
+                    local off = math.floor((ctx.cellW - cw) / 2)
+                    if off > 0 then x = x + off end
+                end
+                dev.text(x, py, cell.ch, PALETTE[fgk], PALETTE[bgk])
+            end
         end
         i = j
     end
