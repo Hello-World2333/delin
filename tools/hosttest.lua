@@ -3159,6 +3159,23 @@ do
         lock.setCurrent(nil)
     end
 
+    -- 临界区里"时间片用完"要**记账**, 出临界区立刻让出(否则密集小内核调用的进程永远抢不到 CPU:
+    -- 真机实测 `find /` 让其他终端读键盘的进程每秒只被恢复 1-2 次)
+    do
+        local t = { f = function(x) return x * 2 end }
+        local proxy = lock.wrapTable(t)
+        local log = {}
+        lock.setCurrent(11)
+        local okr, v = pcall(function()
+            lock.markPreempt()          -- 假装钩子在核心里打了一枪
+            return proxy.f(21)          -- 出临界区时应当让出一次
+        end)
+        eq(v, 42, "lock: 记账让出后返回值不受影响")
+        eq(okr, true, "lock: 记账让出不报错")
+        eq(lock.depthOf(), 0, "lock: 记账让出之后仍然是放锁的")
+        lock.setCurrent(nil)
+    end
+
     -- 包装器: 错误也要把锁放掉
     local wrapped = lock.wrap(function(a, b) return a + b end)
     lock.setCurrent(9)

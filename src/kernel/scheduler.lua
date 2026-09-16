@@ -102,7 +102,12 @@ local sliceInFlight = false
 --- 时间片钩子(挂在每个进程协程上): 用完一片就把 CPU 还给调度器。
 --- **持内核锁时不让出** —— 那一段是不可抢占的临界区(见 kernel/lock.lua 的文件头)。
 local function sliceHook()
-    if lock.inKernel() then return end
+    if lock.inKernel() then
+        -- 核心里不让出(那是临界区), 但**记账**: 出临界区时补一次让出。
+        -- 不记账的话, "密集小内核调用"的进程(fs.list/attributes 那种)永远抢不到 —— 见 lock.lua。
+        lock.markPreempt()
+        return
+    end
     coroutine.yield("__preempt")
 end
 

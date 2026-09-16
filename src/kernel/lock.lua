@@ -55,6 +55,29 @@ function lock.inKernel()
     return depth > 0
 end
 
+--- 临界区里"时间片用完了"的记号(由切片钩子置上)。
+--- **为什么需要它**: 计数钩子只数用户态 VM 指令; 而 `find`/`ls` 这种"密集小内核调用"的进程,
+--- 指令几乎全花在被屏蔽的临界区里 —— 每 N 条指令的窗口都落在核心里被吞掉, 于是**永远抢不到**
+--- CPU(真机实测: `find /` 一跑, 其他终端读键盘的进程每秒只被恢复 1-2 次, 一轮调度 0.5~1 秒)。
+--- 现在的做法: 核心里只记号, **出临界区的那一刻立刻让出** —— 每个内核调用之后都是一个安全点。
+local preemptPending = false
+
+function lock.markPreempt()
+    preemptPending = true
+end
+
+--- 出临界区之后调用: 若钩子在临界区里标记过就让出(此时已不在内核里, 安全)。
+---@return boolean 是否让出了
+function lock.yieldIfPending()
+    if not preemptPending or curPid == nil then
+        preemptPending = false
+        return false
+    end
+    preemptPending = false
+    coroutine.yield("__preempt")
+    return true
+end
+
 function lock.depthOf() return depth end
 function lock.ownerOf() return owner end
 
@@ -126,6 +149,11 @@ function lock.wrapTable(t)
             lock.enter()
             local r = pack(pcall(v, self, ...))
             lock.leave()
+            -- 临界区里用完了时间片: 在这里(已经出了临界区)让出, 让别的进程有机会跑。
+            if preemptPending and curPid ~= nil then
+                preemptPending = false
+                coroutine.yield("__preempt")
+            end
             if not r[1] then error(r[2], 0) end
             return unpack(r, 2, r.n)
         end
@@ -175,6 +203,8 @@ function lock.disabled()
     lock.depthOf = function() return 0 end
     lock.ownerOf = function() return nil end
     lock.setCurrent = function() end
+    lock.markPreempt = function() end
+    lock.yieldIfPending = function() return false end
 end
 
 return lock
