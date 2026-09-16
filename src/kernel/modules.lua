@@ -6,6 +6,7 @@
      信任: 内核态, 不沙箱。 ]]
 
 local vfs_api = require("kernel.vfs_api")
+local lock    = require("kernel.lock")
 local scheduler = require("kernel.scheduler")
 local vfs     = require("kernel.vfs")
 local display = require("kernel.display")
@@ -236,9 +237,12 @@ function modules.syscalls()
 end
 
 --- 注入进程环境: env.syscalls
+--- **按进程包一层内核锁**(抢占式调度用): syscall 是内核入口, 进去就得进临界区,
+--- 否则被抢占的半个内核操作会和另一个进程的同名操作交错(见 kernel/lock.lua)。
+--- 惰性包装(用到谁包谁), 所以这里只是一张代理表 + 元表。
 ---@param env table
 function modules.applyToEnv(env)
-    env.syscalls = syscalls
+    env.syscalls = lock.wrapTable(syscalls)
 end
 
 -- ---------------------------------------------------------------

@@ -3071,5 +3071,155 @@ do
     eq(dd.sde, nil, "devdisk: fs 看不见的挂载路径不造节点")
 end
 
+-- ===============================================================
+-- K. kernel.lock: 抢占式调度的内核临界区锁(不变量 + 放锁等待)
+--    锁本身是纯 Lua, 宿主就能验: 重入/不平衡/被别的 pid 撞上都要 fail-fast,
+--    而 lock.pause(内核里阻塞等)必须"放锁 -> 跑 -> 拿回"。
+-- ===============================================================
+do
+    local lock = require("kernel.lock")
+
+    local cur = nil
+    lock.setCurrent(1)
+    eq(lock.depthOf(), 0, "lock: 初始深度 0")
+    lock.enter()
+    eq(lock.depthOf(), 1, "lock: enter 后深度 1")
+    lock.enter()
+    eq(lock.depthOf(), 2, "lock: 同 pid 可重入")
+    ok(lock.inKernel(), "lock: 持锁时 inKernel=true")
+    lock.leave()
+    lock.leave()
+    eq(lock.depthOf(), 0, "lock: leave 后回到 0")
+    eq(lock.inKernel(), false, "lock: 放完 inKernel=false")
+
+    -- 被别的 pid 撞上(说明"持锁者被抢占/在持锁时阻塞"了)必须当场报错
+    lock.enter()
+    lock.setCurrent(2)
+    local okE, errE = pcall(lock.enter)
+    ok(not okE and tostring(errE):find("kernel lock held by pid"), "lock: 别的 pid 撞上 -> fail-fast", errE)
+    lock.setCurrent(1)
+    lock.leave()
+
+    -- 不平衡的 leave 也是错误
+    local okL = pcall(lock.leave)
+    ok(not okL, "lock: 没持锁就 leave -> 报错")
+
+    -- lock.pause: 放的这段时间里"别人能进来", 回来后深度原样恢复
+    lock.setCurrent(7)
+    lock.enter()
+    local inner = nil
+    lock.pause(function()
+        inner = lock.depthOf()
+        lock.setCurrent(8) -- 假装另一个进程进来了
+        lock.enter()
+        lock.leave()
+        lock.setCurrent(7)
+    end)
+    eq(inner, 0, "lock.pause: 等待期间是放锁的(别人能进内核)")
+    eq(lock.depthOf(), 1, "lock.pause: 回来后深度恢复")
+    eq(lock.ownerOf(), 7, "lock.pause: 回来后持有者仍是自己")
+    lock.leave()
+
+    -- 不在临界区时 pause 直接跑(宿主测试台/内核直接调用)
+    eq(lock.pause(function() return 42 end), 42, "lock.pause: 不在临界区时直接跑")
+
+    -- 反复取用同一张表里的函数**不能越包越深**(真机踩过: proxy[k]=w 写回原表 -> 无限套娃
+    -- -> stack overflow, cmp/syslogd/sh/init 全死)
+    do
+        local t = { f = function(x) return x + 1 end }
+        local proxy = lock.wrapTable(t)
+        local first = proxy.f
+        ok(proxy.f == first, "lock.wrapTable: 同一个函数只包一次(取用多次不叠包装)")
+        ok(t.f == t.f and t.f(1) == 2, "lock.wrapTable: 原表没被改写")
+        lock.setCurrent(5)
+        eq(proxy.f(41), 42, "lock.wrapTable: 包装后仍正常返回")
+        eq(lock.depthOf(), 0, "lock.wrapTable: 调用完放锁")
+        lock.setCurrent(nil)
+    end
+
+    -- **代理表不能把 self 换成自己**(真机踩过: wrapCCHandle 靠 `self == 自己` 判点号/冒号,
+    -- 换成代理就落进点号那一支 —— 文件里出现 `table: 0x...`, 分区路径变成 "/6030d5c6",
+    -- mkfs/mount/fsck 全找不到文件)。这里用一份"照抄 wrapCCHandle 判据"的假句柄锁住它。
+    do
+        local sink = ""
+        local cch = {} -- CC 原生句柄: 点号调用 h.write(s)
+        cch.write = function(a, b) sink = sink .. tostring(a == cch and b or a) end
+        local delin -- 先声明: 闭包要捕获自身(与 wrapCCHandle 同一写法)
+        delin = {
+            write = function(a, ...)
+                if a == delin then return cch.write(...) end -- 冒号: 句柄自己是 self
+                return cch.write(a, ...)                    -- 点号: 第一个参数就是数据
+            end,
+        }
+        local proxy = lock.wrapTable(delin)
+        lock.setCurrent(3)
+        proxy:write("hi")          -- 冒号调用必须落到"数据 = hi"
+        eq(sink, "hi", "lock.wrapTable: 冒号调用的 self 换回原表(不写成 table: ...)")
+        eq(lock.depthOf(), 0, "lock.wrapTable: 方法调用后放锁")
+        lock.setCurrent(nil)
+    end
+
+    -- 包装器: 错误也要把锁放掉
+    local wrapped = lock.wrap(function(a, b) return a + b end)
+    lock.setCurrent(9)
+    eq(wrapped(2, 3), 5, "lock.wrap: 正常返回")
+    eq(lock.depthOf(), 0, "lock.wrap: 正常返回后放锁")
+    local bad = lock.wrap(function() error("boom") end)
+    local okB = pcall(bad)
+    ok(not okB, "lock.wrap: 错误照原样抛出")
+    eq(lock.depthOf(), 0, "lock.wrap: 出错也放锁")
+    lock.setCurrent(nil)
+end
+
+-- ===============================================================
+-- L. kernel.scheduler 抢占模式: run queue 的时间片轮转
+--    宿主 Lua(PUC 5.1/5.4)里"在钩子里 yield"是不允许的(真机 Cobalt 可以), 所以这里
+--    把 debug.sethook 换成空实现, 让进程**显式** yield("__preempt") 来模拟"时间片用完" ——
+--    验的正是调度器那半边: 可运行队列轮转 + 预算 + 事件分发。
+-- ===============================================================
+do
+    local savedHook = debug.sethook
+    debug.sethook = function() end
+    local savedPull, savedTimer, savedEpoch = os.pullEventRaw, os.startTimer, os.epoch
+    local evq = {}
+    os.startTimer = function() return 1 end
+    os.epoch = function() return 0 end -- 预算判据恒为"没超"(宿主没有真实时钟): 队列一路轮转到底
+    os.pullEventRaw = function()
+        local e = table.remove(evq, 1)
+        if not e then return "terminate" end -- 队列空: 用 terminate 把剩下的进程一次性唤醒
+        return table.unpack(e)
+    end
+
+    local sched = require("kernel.scheduler")
+    local log = {}
+    local function mkproc(pid, name, steps)
+        local co = coroutine.create(function()
+            for i = 1, steps do
+                log[#log + 1] = name .. i
+                coroutine.yield("__preempt") -- 模拟"时间片用完"
+            end
+            return 0
+        end)
+        return { pid = pid, co = co, name = name }
+    end
+
+    sched.setPreempt(true)
+    local a, b, c = mkproc(11, "A", 2), mkproc(12, "B", 2), mkproc(13, "C", 2)
+    sched.addProcess(a); sched.addProcess(b); sched.addProcess(c)
+    sched.run()
+    eq(table.concat(log, " "), "A1 B1 C1 A2 B2 C2",
+       "scheduler(preempt): 三个进程按时间片轮转(不是跑完一个再跑下一个)")
+    eq(a.status, "dead", "scheduler(preempt): 跑完的进程被回收")
+    eq(sched.preemptActive(), true, "scheduler(preempt): 开关状态可查")
+
+    -- 关掉抢占之后, "__preempt" 不再是"还能跑", 而是一个等不到的事件名(与历史行为一致:
+    -- 协作模式下没人会 yield "__preempt", 这里只验开关能关)。
+    sched.setPreempt(false)
+    eq(sched.preemptActive(), false, "scheduler: 能切回协作式")
+
+    os.pullEventRaw, os.startTimer, os.epoch = savedPull, savedTimer, savedEpoch
+    debug.sethook = savedHook
+end
+
 io.write(string.format("\n%d passed, %d failed\n", pass, fail))
 os.exit(fail == 0 and 0 or 1)

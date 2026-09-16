@@ -44,6 +44,8 @@ end
 return {
     init = function(kapi, device)
         local log = kapi.log
+        -- 内核临界区锁(抢占式调度): 外设调用/等待都可能是让出点, 持锁让出会把锁焊死。
+        local lock = require("kernel.lock")
         local hse = peripheral.wrap(device)
         if not hse then
             error("cc_hse: cannot wrap peripheral '" .. tostring(device) .. "'", 2)
@@ -68,7 +70,8 @@ return {
         --- 泵一拍: 推进共享时钟 + 唤醒所有等待者。
         local function hsePump()
             if waiters <= 0 then return false end
-            local elapsed = hse.waitNextTick()
+            -- waitNextTick 会挂起电脑(实测: 挂起期间别的协程会跑起来), 所以它是个让出点。
+            local elapsed = lock.pause(function() return hse.waitNextTick() end)
             if type(elapsed) ~= "number" or elapsed < 1 then elapsed = 1 end
             clockMs = clockMs + elapsed * TICK_MS
             queueEvent("hse_wake")
@@ -96,10 +99,10 @@ return {
             local t0 = os.epoch("utc")
             waiters = waiters + 1
             while clockMs < deadline do
-                local ok = pcall(pulledEvent, "hse_wake")
+                local ok = pcall(lock.pause, function() return pulledEvent("hse_wake") end)
                 if not ok then break end -- pullEvent 不可用(理论上不会): 走下面的兜底
                 if os.epoch("utc") - t0 > wantMs + 200 then
-                    realSleep(math.max(wantMs, 1) / 1000)
+                    lock.pause(function() realSleep(math.max(wantMs, 1) / 1000) end)
                     break
                 end
             end
@@ -108,7 +111,7 @@ return {
         end
 
         kapi.registerSyscall("hse.pump", hsePump)
-        kapi.registerSyscall("hse.idle", function() realSleep(0.05) end)
+        kapi.registerSyscall("hse.idle", function() lock.pause(function() realSleep(0.05) end) end)
         kapi.registerSyscall("hse.now", function() return clockMs end)
         kapi.registerSyscall("hse.wait", hseWait)
 

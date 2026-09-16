@@ -10,6 +10,7 @@
      里等着 syslogd 启动后一次性取走落盘, 满了丢最旧。 ]]
 
 local vfs_api = require("kernel.vfs_api")
+local lock = require("kernel.lock")
 
 local klog = {}
 
@@ -134,7 +135,7 @@ local function kmsgReader()
                     pos = pos + 1
                     if e then return kmsgLine(e) end
                 else
-                    os.sleep(0.05)
+                    lock.pause(function() os.sleep(0.05) end)
                 end
             end
             return nil
@@ -222,7 +223,7 @@ local function logReader()
                     logBytes = logBytes - (#line + 1)
                     return line
                 end
-                os.sleep(0.05)
+                lock.pause(function() os.sleep(0.05) end)
             end
             return nil
         end,

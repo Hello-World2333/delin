@@ -10,6 +10,8 @@
 
 local signal = require("kernel.signal")
 
+local lock = require("kernel.lock")
+
 local tty = {}
 
 -- ^C/^Z 信号路由回调(boot 注入): (sig) -> nil。避免 tty 依赖 process 造成循环。
@@ -822,7 +824,7 @@ local function rawRead(ctx, n)
     while true do
         if ctx.closed then return done(nil, "device closed") end
         if tty.readGuard and tty.readGuard(ctx.name) then
-            os.pullEvent() -- 投递 SIGTTIN 后阻塞(与 readLine 同一套)
+            lock.pause(os.pullEvent) -- 投递 SIGTTIN 后阻塞(与 readLine 同一套)
         elseif #ctx.keyBuf > 0 then
             local take = math.min(n, #ctx.keyBuf)
             local out = ctx.keyBuf:sub(1, take)
@@ -835,7 +837,7 @@ local function rawRead(ctx, n)
             ctx.eof = false
             return done(nil)
         else
-            os.pullEvent()
+            lock.pause(os.pullEvent)
         end
     end
 end
@@ -914,7 +916,7 @@ local function openHandle(ctx, mode)
         ctx.reading = true
         while true do
             if tty.readGuard and tty.readGuard(ctx.name) then
-                os.pullEvent() -- 投递 SIGTTIN 后让出: 调度器会停止本进程直到 SIGCONT
+                lock.pause(os.pullEvent) -- 投递 SIGTTIN 后让出: 调度器会停止本进程直到 SIGCONT
             elseif ctx.eof then
                 ctx.eof = false
                 ctx.reading = false
@@ -931,7 +933,9 @@ local function openHandle(ctx, mode)
                 return line
             else
                 -- 阻塞进程直到有事件; feedInput 已处理缓冲+回显。忽略非键盘事件。
-                os.pullEvent()
+                -- **放锁再等**(lock.pause): 持着内核锁阻塞会把锁焊死 —— 所有进程(包括读键盘的
+                -- 那个)都进不了内核。见 kernel/lock.lua 的文件头。
+                lock.pause(os.pullEvent)
             end
         end
     end
@@ -967,7 +971,8 @@ local function openHandle(ctx, mode)
     end
     handle.isRaw = function() return ctx.raw end
 
-    return handle
+    -- 句柄交给进程用: 每个方法都进内核临界区(抢占式调度, 见 kernel/lock.lua)。
+    return lock.wrapTable(handle)
 end
 
 --- 注册一个 /dev/ttyN 设备。

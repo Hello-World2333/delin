@@ -1,0 +1,182 @@
+--@name schedprobe
+--@version 0.0.1
+--@deps
+--@description real-machine A/B probe: cooperative vs preemptive scheduling (test image only)
+--[[ 同一台机器、同一次开机里对照两种调度模式:
+       协作式(default)  vs  抢占式(debug.sethook, scheduler.setPreempt(true))
+
+     每秒一行, 记: 事件延迟(自己 queue 一个事件 -> 内核 pull 到它的时间, 与按键同一条队列)、
+     一轮调度的 CPU、可运行进程数、当前模式。结果写**电脑自带存储** /sched.log
+     (宿主机 /mnt/computer/3/sched.log 直接可读; 不走 klog —— CC 侧文件在 close 前宿主机看不到)。
+
+     场景(每一步都由事件泵驱动, 不用协程):
+       t=2..15   协作 + 空闲          基线
+       t=15      切抢占
+       t=17..30  抢占 + 空闲
+       t=30      起 1 个**不让出**的忙等进程(等价 du/find)
+       t=30..50  抢占 + 不让出的负载
+       t=50      杀掉负载, 起 3 个"每 20ms 让出一次"的负载
+       t=50..65  抢占 + 3 个有让出的负载
+       t=65      切回协作(负载仍在跑)
+       t=65..80  协作 + 3 个有让出的负载
+       t=80      收尾, 写 /sched.log 并卸掉 pullEventRaw 包装 ]]
+
+local function initModule()
+    local fs = _G.fs
+    local now = os.epoch
+    local process = require("kernel.process")
+    local scheduler = require("kernel.scheduler")
+    local tty = require("kernel.tty")
+
+    local lines = {}
+    local function say(s) lines[#lines + 1] = s end
+    local function flush(path)
+        local f = fs.open(path or "/sched.log", "w")
+        if f then f.write(table.concat(lines, "\n") .. "\n"); f.close() end
+    end
+
+    -- ---------------- 负载 ----------------
+    local SRC_HOG = [[
+local t = os.epoch("utc")
+local s = 0
+while os.epoch("utc") - t < 20000 do
+    for i = 1, 20000 do s = s + i end
+end
+return 0
+]]
+    local SRC_WORKER = [[
+local nap
+if os.msleep then nap = os.msleep else nap = function() os.sleep(0.05) end end
+local t = os.epoch("utc")
+local s = 0
+while os.epoch("utc") - t < 20000 do
+    for i = 1, 4000 do s = s + i end
+    nap(0)
+end
+return 0
+]]
+    local loads = {}
+    local function startLoad(src, name)
+        local pid, _, err = process.spawn(src, name, 1, 0, 0, { [0] = name }, nil)
+        if pid then loads[#loads + 1] = pid else say("spawn " .. name .. " FAILED: " .. tostring(err)) end
+    end
+    local function killLoads()
+        local n = 0
+        for _, p in ipairs(process.list()) do
+            local nm = tostring(p.name or "")
+            if nm:sub(1, 5) == "sched" or nm:sub(1, 4) == "perf" then
+                p.sig.pending[9] = true; n = n + 1
+            end
+        end
+        return n
+    end
+
+    -- ---------------- 统计 ----------------
+    local lastReturn = nil
+    local passN, passSum = 0, 0
+    local latSum, latN, latMax = 0, 0, 0
+    local pend = nil
+    local armedAt = now("utc")
+    local bootAt = nil
+    local phase, phaseAt = 0, 0
+    local lastTick = nil
+
+    local function mode() return scheduler.preemptActive() and "preempt" or "coop" end
+    local function rcount() return #process.list() end
+
+    local function report(t)
+        local avg = latN > 0 and (latSum / latN) or -1
+        say(string.format("t=%3ds mode=%-7s lat_avg=%6.1f lat_max=%5d npass=%3d workavg=%5.1f procs=%d",
+            math.floor((t - bootAt) / 1000), mode(), avg, latMax, passN,
+            passN > 0 and (passSum / passN) or 0, rcount()))
+        passN, passSum, latSum, latN, latMax = 0, 0, 0, 0, 0
+    end
+
+    local function step(t)
+        if not bootAt then
+            if not process.info(1) then return end
+            bootAt = t
+            say("== Delin scheduler A/B probe ==")
+            say("Lua=" .. tostring(_VERSION) .. " preempt=" .. tostring(scheduler.preemptActive()))
+        end
+        local el = t - bootAt
+        -- 每秒: 报一行 + 发一个合成事件量延迟
+        if not lastTick or t - lastTick >= 1000 then
+            lastTick = t
+            if pend then
+                say(string.format("t=%3ds !! 上一秒的合成事件还没回来(延迟 >1s)", math.floor(el / 1000)))
+                pend = nil
+            end
+            report(t)
+            pend = { t0 = t, tag = "schedping" }
+            os.queueEvent("schedping")
+        end
+        -- 场景
+        if phase == 0 and el >= 2000 then
+            phase = 1
+            say("-- 场景: 协作 + 空闲 --")
+        elseif phase == 1 and el >= 15000 then
+            phase = 2
+            scheduler.setPreempt(true)
+            say("-- 切抢占 (scheduler.setPreempt(true)) --")
+        elseif phase == 2 and el >= 30000 then
+            phase = 3
+            startLoad(SRC_HOG, "schedloadHog")
+            say("-- 起 1 个不让出的忙等进程(等价 du/find), 抢占模式 --")
+        elseif phase == 3 and el >= 50000 then
+            phase = 4
+            say("-- 杀负载(" .. killLoads() .. " 个), 起 3 个每 20ms 让出一次的负载, 抢占模式 --")
+            for i = 1, 3 do startLoad(SRC_WORKER, "schedloadW" .. i) end
+        elseif phase == 4 and el >= 65000 then
+            phase = 5
+            scheduler.setPreempt(false)
+            say("-- 切回协作(3 个让出型负载仍在跑) --")
+        elseif phase == 5 and el >= 80000 then
+            phase = 6
+            say("-- 收尾: 杀掉 " .. killLoads() .. " 个负载 --")
+            report(t)
+            flush()
+            local d = fs.open("/tmp/sched_done", "w")
+            if d then d.write("done\n"); d.close() end
+            if os.pullEventRaw == wrapper then os.pullEventRaw = pull end
+            return
+        end
+    end
+
+    local pull = os.pullEventRaw
+    local wrapper
+    local mainCo = coroutine.running()
+    wrapper = function(...)
+        if coroutine.running() ~= mainCo then return pull(...) end
+        local tEnter = now("utc")
+        if lastReturn then
+            local d = tEnter - lastReturn
+            passN = passN + 1
+            passSum = passSum + d
+        end
+        local r = table.pack(pull(...))
+        local tReturn = now("utc")
+        lastReturn = tReturn
+        if pend and r[1] == pend.tag then
+            local lat = tReturn - pend.t0
+            latN = latN + 1
+            latSum = latSum + lat
+            if lat > latMax then latMax = lat end
+            pend = nil
+        end
+        if phase < 6 then
+            local ok, err = pcall(step, now("utc"))
+            if not ok then
+                say("STEP ERROR: " .. tostring(err))
+                flush()
+                phase = 6
+                if os.pullEventRaw == wrapper then os.pullEventRaw = pull end
+            end
+        end
+        return table.unpack(r, 1, r.n)
+    end
+    os.pullEventRaw = wrapper
+    say("schedprobe armed")
+end
+
+return { init = initModule }

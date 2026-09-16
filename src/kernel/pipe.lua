@@ -5,6 +5,8 @@
      EOF: write 端全部 close(或写端进程退出)后, read 端读完剩余数据返回 nil。
      broken pipe: 所有 read 端关闭后, write 返错, 防止生产端无限挂起。 ]]
 
+local lock = require("kernel.lock")
+
 local pipe = {}
 
 local CAP = 16384 -- 管道缓冲上限(字节)
@@ -44,7 +46,8 @@ local function makeWriteEnd(buf)
                 if noReader(buf) then return nil, "broken pipe" end
                 local space = CAP - #buf.data
                 if space <= 0 then
-                    os.sleep(0.05) -- 缓冲已满: 让出, 等读者腾空间。
+                    -- 缓冲已满: 让出, 等读者腾空间(**放锁再等**, 见 kernel/lock.lua)。
+                    lock.pause(function() os.sleep(0.05) end)
                 else
                     local chunk = s:sub(i, i + space - 1)
                     buf.data = buf.data .. chunk
@@ -65,7 +68,8 @@ local function makeWriteEnd(buf)
         --- (真机症状: `printf 'a:b:c' | xargs -d: -n1 echo | wc -l` 只数到 1)。
         ref = function() return makeWriteEnd(buf) end,
     }
-    return h
+    -- 句柄给进程用: 每个方法进内核临界区(抢占式调度, 见 kernel/lock.lua)。
+    return lock.wrapTable(h)
 end
 
 --- 构造 read 端句柄(每创建一个句柄, readers+1)。
@@ -90,7 +94,8 @@ local function makeReadEnd(buf)
                     if #buf.data > 0 then local rest = buf.data; buf.data = ""; return rest end
                     return nil
                 end
-                os.sleep(0.05) -- 缓冲无新行且写端仍开: 让出, 等更多数据或 EOF。
+                -- 缓冲无新行且写端仍开: 让出, 等更多数据或 EOF(放锁再等)。
+                lock.pause(function() os.sleep(0.05) end)
             end
         end,
         read = function(_, fmt)
@@ -101,7 +106,7 @@ local function makeReadEnd(buf)
             if n <= 0 then return "" end
             while #buf.data == 0 do
                 if noWriter(buf) then return nil end
-                os.sleep(0.05)
+                lock.pause(function() os.sleep(0.05) end)
             end
             local chunk = buf.data:sub(1, n)
             buf.data = buf.data:sub(n + 1)
@@ -113,7 +118,7 @@ local function makeReadEnd(buf)
             while true do
                 if #buf.data > 0 then acc[#acc + 1] = buf.data; buf.data = "" end
                 if noWriter(buf) then break end
-                os.sleep(0.05)
+                lock.pause(function() os.sleep(0.05) end)
             end
             local all = table.concat(acc)
             return all ~= "" and all or nil
@@ -125,7 +130,7 @@ local function makeReadEnd(buf)
             return true
         end,
     }
-    return h
+    return lock.wrapTable(h)
 end
 
 --- 创建一个管道, 返回 read 端与 write 端。

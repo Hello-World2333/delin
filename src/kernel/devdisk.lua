@@ -16,6 +16,7 @@
            未知 fstype 直接报错(fail-fast, 不回退)。 ]]
 
 local vfs      = require("kernel.vfs")
+local lock = require("kernel.lock")
 local vfs_api  = require("kernel.vfs_api")
 local manifest = require("kernel.manifest")
 local platform = require("kernel.platform")
@@ -544,7 +545,10 @@ function devdisk.fsck(spec, opts)
         mode = opts.mode, ask = opts.ask, emit = opts.emit,
         -- 长循环必须让出调度器: 不让出就收不到 ^C, 整个系统也跟着卡住(见 for-ai 的"信号"一节)。
         yield = function()
-            if os.msleep then os.msleep(0) else os.sleep(0) end
+            -- 内核里的让出: 放锁再让(见 kernel/lock.lua)。
+            lock.pause(function()
+                if os.msleep then os.msleep(0) else os.sleep(0) end
+            end)
         end,
     })
     bd.close()

@@ -10,6 +10,7 @@
            在 syslogd 起来之前/起不来时仍能排障(CC 无法读屏)。 ]]
 
 local scheduler = require("kernel.scheduler")
+local lock      = require("kernel.lock")
 local process    = require("kernel.process")
 local vfs        = require("kernel.vfs")
 local vfs_api    = require("kernel.vfs_api")
@@ -113,11 +114,21 @@ local function setupUsers()
     return db
 end
 
+--- 抢占式调度原型开关: 根上存在 /etc/preempt 就开(见 for-ai.md「抢占式调度」)。
+--- 运行时也能用 syscall `sched.mode` 切换(自检/对照实验用)。
+local function setupSchedulerMode()
+    local on = false
+    pcall(function() on = vfs_api.fs.exists("/etc/preempt") == true end)
+    scheduler.setPreempt(on)
+    kprint("scheduler: " .. (on and "PREEMPTIVE (prototype, /etc/preempt)" or "cooperative"))
+end
+
 local function launch(initSrc, label)
     if type(initSrc) ~= "string" then kprint("FATAL: " .. label .. " init source missing"); return end
     local pid, proc, err = process.spawn(initSrc, "init", 0)
     if not pid then kprint("FATAL: spawn " .. label .. " init failed: " .. tostring(err)); return end
     kprint("spawned " .. label .. " init as pid #" .. pid)
+    setupSchedulerMode()
     kprint("running scheduler (all processes concurrently) ...")
     scheduler.run()
     kprint("kernel: all processes exited, shutting down")
@@ -146,10 +157,23 @@ local function registerRuntimeSyscalls()
                 if p.termSig then return -p.termSig end
                 return p.exitCode or 0
             end
-            if os.sleep then os.sleep(0.05) end
+            -- 放锁再睡: 这是一个会阻塞的 syscall(见 kernel/lock.lua)。
+            if os.sleep then lock.pause(function() os.sleep(0.05) end) end
         end
     end
     sc["proc.info"] = function(pid) return process.info(pid) end
+    -- 调度模式: 无参/"get" = 查询, "preempt"/"coop" = 切换(抢占式调度原型, 见 for-ai.md)。
+    -- 进程侧 os.msleep 不必再当让出用, 但保留(兼容已有工具)。
+    sc["sched.mode"] = function(mode)
+        if mode == nil or mode == "get" then
+            return scheduler.preemptActive() and "preempt" or "coop"
+        elseif mode == "preempt" then
+            scheduler.setPreempt(true); return "preempt"
+        elseif mode == "coop" or mode == "cooperative" then
+            scheduler.setPreempt(false); return "coop"
+        end
+        return nil, "usage: sched.mode [get|preempt|coop]"
+    end
     -- 子进程退出钩子(init 服务监督用; 回调在调度器上下文同步调用, 不得让出)。
     sc["proc.onExit"] = function(fn) process.setExitHook(fn) end
     -- execve 语义: 按路径装载可执行文件(处理 shebang)并 spawn。init 的 ExecStart 用它。

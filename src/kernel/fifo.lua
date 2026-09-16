@@ -18,6 +18,8 @@
 
 local pipe = require("kernel.pipe")
 
+local lock = require("kernel.lock")
+
 local fifo = {}
 
 -- 后端对象 -> { [inode/路径] = 缓冲区 }。弱键: 文件系统被卸载并回收后, 它的管道一起消失。
@@ -56,7 +58,7 @@ function fifo.open(owner, id, mode)
         local seen = buf.readerEpoch
         buf.pendingWriters = buf.pendingWriters + 1
         while buf.readers == 0 and buf.pendingReaders == 0 and buf.readerEpoch == seen do
-            os.sleep(0.05)
+            lock.pause(function() os.sleep(0.05) end)
         end
         buf.pendingWriters = buf.pendingWriters - 1
         return pipe.attachWrite(buf)
@@ -65,7 +67,7 @@ function fifo.open(owner, id, mode)
         local seen = buf.writerEpoch
         buf.pendingReaders = buf.pendingReaders + 1
         while buf.writers == 0 and buf.pendingWriters == 0 and buf.writerEpoch == seen do
-            os.sleep(0.05)
+            lock.pause(function() os.sleep(0.05) end)
         end
         buf.pendingReaders = buf.pendingReaders - 1
         return pipe.attachRead(buf)

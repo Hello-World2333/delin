@@ -3,6 +3,8 @@
 
 local vfs = require("kernel.vfs")
 
+local lock = require("kernel.lock")
+
 local vfsapi = {}
 
 -- 设备注册表: name -> handler
@@ -135,7 +137,14 @@ function fsapi.setTimes(path, atime, mtime)
 end
 function fsapi.copy(a, b) local ba, ra = dispatch(a); local bb, rb = dispatch(b); return ba.copy(ra, rb) end
 function fsapi.delete(path) local b, r = dispatchNoFollow(path); return b.delete(r) end
-function fsapi.open(path, mode) local b, r = dispatch(path); return b.open(r, mode) end
+--- 打开文件/设备。**返回的句柄也包一层内核锁**: 进程随后对句柄的每次 read/write/close
+--- 都是内核代码(见 kernel/lock.lua), 只包 fsapi 本身是漏的。
+function fsapi.open(path, mode)
+    local b, r = dispatch(path)
+    local h, err = b.open(r, mode)
+    if type(h) == "table" then return lock.wrapTable(h) end
+    return h, err
+end
 function fsapi.chmod(path, mode) local b, r = dispatch(path); if b.chmod then return b.chmod(r, mode) end return nil, "chmod not supported" end
 function fsapi.chown(path, uid, gid) local b, r = dispatch(path); if b.chown then return b.chown(r, uid, gid) end return nil, "chown not supported" end
 --- 不跟随最后一段的 chown(= Linux `lchown`)。`chown -h` / `chgrp -h` / 递归遍历里的链接
@@ -338,7 +347,8 @@ end
 -- ---------------------------------------------------------------
 ---@param env table 进程环境
 function vfsapi.installForEnv(env)
-    env.fs = fsapi
+    -- fs/io 是进程碰内核的另外两个入口(与 syscalls 一样要进临界区, 见 kernel/lock.lua)。
+    env.fs = lock.wrapTable(fsapi)
     -- 每个进程独立的 stdio 表(由 process.spawn 填充); io 闭包捕获它。
     local stdio = { input = nil, output = nil }
     env.__stdio = stdio
