@@ -42,7 +42,10 @@ local function preemptTick()
     procenv.tickCalls = procenv.tickCalls + 1
     if not lock.preemptOn() or not lock.inProcess() then return end
     local now = os.epoch("utc")
-    if now - _sliceAt < 5 then return end
+    -- 25ms: 原先是 5ms, 但那样"每个输出调用都让一次"会把 fs/输出密集的工具(如 find)拖到跑不完
+    -- (真机实测: find 在抢占模式下慢到让人以为提示符卡死了)。25ms 与协作模式的时间片同量级,
+    -- 又能保证"整机停摆"不再发生(那需要几秒级的不让出)。
+    if now - _sliceAt < 25 then return end
     _sliceAt = now
     procenv.tickYields = procenv.tickYields + 1
     coroutine.yield("__preempt")

@@ -191,11 +191,20 @@ return i
         return name:find("login") or name:find("sh") or name:find("lua") or name:find("desh")
     end
 
+    --- 该 tty 的前台进程组(^C/^Z 就是发给它的)。
+    local function fgPgrp(name)
+        local ok, process = pcall(require, "kernel.process")
+        if not ok then return "?" end
+        local ok2, p = pcall(process.tcgetpgrp, name)
+        return ok2 and tostring(p) or "?"
+    end
+
     local function ttyState(name)
         local c = tty.get(name)
         if not c then return name .. "=(none)" end
-        return string.format("%s{raw=%s rd=%s q=%d buf=%d kb=%d}", name,
-            tostring(c.raw), tostring(c.reading), #c.lineQueue, #c.inputBuffer, #c.keyBuf)
+        return string.format("%s{raw=%s rd=%s q=%d buf=%d kb=%d fg=%s}", name,
+            tostring(c.raw), tostring(c.reading), #c.lineQueue, #c.inputBuffer, #c.keyBuf,
+            fgPgrp(name))
     end
 
     local alerted = {}
