@@ -1,204 +1,217 @@
 --@name watchprobe
---@version 0.0.1
+--@version 0.0.3
 --@deps
---@description real-machine watchdog: log any interactive process that stops being scheduled (test image only)
---[[ 用途: 用户复现"提示符不回来"时(整机正常、光标在闪、别的 tty 能用), 自动留下现场 ——
-     不需要用户抄屏, 也不依赖那个卡住的进程自己会写日志。
+--@description real-machine watchdog: 卡住的交互进程自己交代"卡在哪一行"(记 yield 现场) + 自动复现 tty1 上的 find /
+--[[ 用途: 用户复现"提示符不回来"时(整机正常、别的 tty 能用)留下**代码位置级**的现场。
 
-     判据: 一个交互进程(名字像 sh/login/lua/desh)多久没有被调度器 resume 过。
-       正常: 等输入(裸 pullEvent)每来一个事件就被唤醒 -> gap 几十毫秒;
-             等子进程(pollWait 的 os.sleep(0.05)) -> gap ~50ms。
-       异常: gap 持续 > 3s -> 说明它停在一个永远等不到的东西上(记录它最后 yield 出去的 filter,
-             那个 filter 就是答案: "__lock"=等内核锁 / "hse_wake"=等 HSE 拍 / "timer"=等定时器 /
-             其它字符串=等某个事件 / nil=在裸等)。
+     仪表选择(0.0.2 踩的坑, 别再试回去):
+       * `debug.getinfo(挂起的协程, ...)` 在真机上**不可靠** —— 每条 tr= 打出来的都是看门狗
+         自己的调用栈(bios.lua:38 < ... < delin.lua:1), 等于噪音。开局有个自测把这件事钉死。
+       * 改用"记 yield 现场": 进程阻塞在哪就在哪 yield, 于是包装 coroutine.yield, 在**调用者
+         那一层**取 debug.getinfo(2..5, "Sl") 记成一条调用链。与线程参数无关, 稳。
+         进程侧拿到的 coroutine 表是 spawn 时从 _G 拷的(见 kernel/procenv.lua), 补丁在模块
+         装载期(早于任何 spawn)打上, 所以每个进程都用得到包装版。内核里那些 os.sleep 阻塞
+         (pipe/fifo/klog)也跑在**进程自己的协程**里, 同样会被记到。
 
-     输出: 电脑自带存储的 /watchdog.log(宿主机 /mnt/computer/3/watchdog.log 直接可读),
-     每 30s 一行心跳(证明看门狗自己在跑), 命中异常时把整张进程表 + 每个 tty 的行规程状态写下来。 ]]
+     输出: 电脑自身 FS 的 /watchdog.log(宿主机 /mnt/computer/3/watchdog.log 直接可读)。
+       - 每 5s 心跳: 每个进程 pid/名/y=/gap= + 它最后一次 yield 的位置; 每个 tty 的规程状态; 锁持有者。
+       - 交互进程的 yield 位置变了就立刻记一行 T|。
+       - 交互进程 >1.2s 没被调度: !! 块(整表 + tty + 锁 + 事件直方图 + 屏幕内容)。
+       - 屏幕快照(screen|): 把 tty 的内核 grid 文本行倒出来 —— 真机上没法读屏, 但内核有。
+       - proc.info 轨迹(info|): by=/ask=/-> st= (答案:"这个 shell 到底在等谁")。
+
+     自动复现(没有 sh 进程时执行一次): 把 root/r00ts4lt 打进 tty1 的 login, 登录后敲 `find /`。
+]]
 
 local function initModule(kapi)
     local fs = _G.fs
     local now = os.epoch
+    local keys = _G.keys
     local process = require("kernel.process")
     local tty = require("kernel.tty")
+    local lock = require("kernel.lock")
 
-    local bootT0 = now("utc") -- 注意: 必须在任何使用它的闭包**之前**声明(否则解析成全局 nil, 踩过)
+    local bootT0 = now("utc") -- 必须在任何用到它的闭包**之前**声明(否则解析成全局 nil, 踩过)
+
     local lines = {}
     local function say(s) lines[#lines + 1] = s end
+    --- **追加**写: 0.0.1 每次 flush 都重写整个文件, 日志一长就越来越慢且吃内存。
     local function flush()
+        if #lines == 0 then return end
+        local f = fs.open("/watchdog.log", "a")
+        if f then
+            f.write(table.concat(lines, "\n") .. "\n")
+            f.close()
+        end
+        lines = {}
+    end
+    do -- 开机截断(追加模式自己不会清旧内容)
         local f = fs.open("/watchdog.log", "w")
-        if f then f.write(table.concat(lines, "\n") .. "\n"); f.close() end
+        if f then f.close() end
     end
 
-    -- 记录每个协程最后一次被 resume 的时刻与它上次 yield 出去的 filter
+    ------------------------------------------------------------------
+    -- 仪表 1: yield 现场(进程阻塞在哪一行)
+    ------------------------------------------------------------------
+    local mainCo = coroutine.running()
+    --- 进程协程集合(co -> "name#pid"): 只有**进程自己的协程**才值得记。
+    --- 踩过两次: 主线程/内核事件泵协程的 yield 与钩子也会被记进来(它们跑的是 BIOS→内核→看门狗
+    --- 这条链), 于是所有进程的"现场"都长成 watchprobe:63 < bios.lua:42 < delin.lua:1。
+    local procCo = {}
+    local function refreshProcCo()
+        local m = {}
+        for _, p in ipairs(process.list()) do
+            if p.co then m[p.co] = tostring(p.name) .. "#" .. tostring(p.pid) end
+        end
+        procCo = m
+    end
+    --- 取当前调用链的若干帧(level 1 起)。**pcall 会多一层 C 帧**, 所以不猜帧号, 只按来源过滤。
+    local function chain(level, depth)
+        local out = {}
+        for lvl = level, level + depth - 1 do
+            local ok, info = pcall(debug.getinfo, lvl, "Sl")
+            if not ok or not info then break end
+            local src = tostring(info.short_src or "?")
+            src = src:match("([^/\\]+)$") or src
+            out[#out + 1] = { src = src, line = tonumber(info.currentline) or -1,
+                              name = info.name and ("(" .. tostring(info.name) .. ")") or "" }
+        end
+        return out
+    end
+    local function framesFrom(level, depth)
+        local keep = {}
+        for _, f in ipairs(chain(level, depth)) do
+            if not (f.src:find("watchprobe", 1, true) or f.src == "[C]") then
+                keep[#keep + 1] = string.format("%s:%d%s", f.src, f.line, f.name)
+            end
+        end
+        return table.concat(keep, " < ")
+    end
+
+    --- **阻塞现场**(blk=): 内核里所有"会让出的等待"都走 `lock.pause(fn)`(tty 读、管道、proc.wait、
+    --- FIFO、klog、HSE 等拍…… 见 kernel/lock.lua)。把它包一层, 在**调用者那一层**记下是谁在等,
+    --- 就得到了"进程卡住的准确位置" —— 不依赖任何线程栈/钩子/字节码技巧。
+    ---
+    --- 走过的弯路(别再回去): `debug.getinfo(挂起的协程)` 在真机上返回**当前线程**的链;
+    --- `debug.sethook` 在真机上是**全局**生效, 钩子里取到的是正在跑的线程(常常是内核泵/探针自己);
+    --- 包 `coroutine.yield` 也没用 —— CC 1.20+ 的 `os.pullEventRaw` 是 **Java 函数**, 阻塞不过那里。
+    local coBlk = {}
+    local rawDumps, forceRaw = 0, false
+    --- 收集"谁在等"的**名字链**。
+    --- **为什么只认名字**: dist 里的内核/程序都是压缩过的 chunk, 行号被剥掉了 —— 真机上
+    --- `debug.getinfo` 对 bundle 里的每一帧都报 `/boot/delin.lua:1`、对程序报 `/bin/login:1`
+    --- (0.0.5~0.0.11 一直在拿行号当线索, 所以全是 1, 白折腾)。名字还在: readLine/method、
+    --- hseWait/field、pollWait/local ... 足够定位到具体那个等待循环。
+    local function nameChain(fromLevel, want)
+        local out = {}
+        for lvl = fromLevel, fromLevel + 12 do
+            if #out >= want then break end
+            local ok, info = pcall(debug.getinfo, lvl, "Sn")
+            if not ok or not info then break end
+            local src = tostring(info.source or "?")
+            if not (src:find("watchprobe", 1, true) or info.what == "C" or src == "=[C]") then
+                local nm = info.name or ("?" .. tostring(info.what))
+                out[#out + 1] = nm .. "/" .. tostring(info.namewhat)
+            end
+        end
+        return table.concat(out, " < ")
+    end
+    local origPause = lock.pause
+    lock.pause = function(fn, ...)
+        -- 探针自己的错误绝不能影响内核的阻塞原语(0.0.8 漏了 pcall: 整机停摆)。
+        pcall(function()
+            local cur = coroutine.running()
+            if not (cur and procCo[cur]) then return end
+            local s2 = nameChain(5, 4)
+            if s2 ~= "" then coBlk[cur] = s2 end
+            rawDumps = rawDumps + 1
+            if rawDumps <= 2 or forceRaw then
+                forceRaw = false
+                say(string.format("RAW[%d] proc=%s chain= %s", rawDumps, tostring(procCo[cur]), s2))
+                flush()
+            end
+        end)
+        return origPause(fn, ...)
+    end
+
+    ------------------------------------------------------------------
+    -- 自测: debug.getinfo(线程) 在这台机器上到底行不行(确认 0.0.2 的 tr= 是不是噪音)
+    ------------------------------------------------------------------
+    local threadInfoOK = "?"
+    do
+        local probe = coroutine.create(function()
+            coroutine.yield("selftest") -- <<< 探针期望在这里(pcall 会让帧号变, 用固定行号判断)
+        end)
+        local okRes = coroutine.resume(probe)
+        local ok1, info = pcall(debug.getinfo, probe, 1, "Sl")
+        if not ok1 or not info then
+            threadInfoOK = "error:" .. tostring(info)
+        else
+            threadInfoOK = "line=" .. tostring(info.currentline) .. " src=" .. tostring(info.short_src)
+        end
+        say("selftest: getinfo(thread) -> " .. threadInfoOK .. " (resume=" .. tostring(okRes) .. ")")
+    end
+
+    --- 交互进程(卡住才有意义的那几个)。
+    local function interactive(name)
+        name = tostring(name)
+        return name:find("sh") or name:find("desh") or name:find("login") or name:find("lua")
+    end
+
+    ------------------------------------------------------------------
+    -- 记账: 每个协程最后一次被 resume 的时刻 / 最后一次 yield 出去的值
+    ------------------------------------------------------------------
     local lastAt, lastYield = {}, {}
     local origResume = coroutine.resume
-    local wrappedResume
-    wrappedResume = function(co, ...)
+    coroutine.resume = function(co, ...)
         local r = table.pack(origResume(co, ...))
         lastAt[co] = now("utc")
         if coroutine.status(co) == "suspended" then lastYield[co] = tostring(r[2]) end
         return table.unpack(r, 1, r.n)
     end
-    coroutine.resume = wrappedResume
 
-    local sc = require("kernel.modules").syscalls()
-    local lock = require("kernel.lock")
-
-    -- 输出出口计数: storm 到底从哪条路把字吐出去的
-    local sink = { write = 0, print = 0, termwrite = 0, stdio = 0 }
-    do
-        local w0, p0 = _G.write, _G.print
-        _G.write = function(...) sink.write = sink.write + 1; return w0(...) end
-        _G.print = function(...) sink.print = sink.print + 1; return p0(...) end
-        if _G.term and _G.term.write then
-            local t0 = _G.term.write
-            _G.term.write = function(...) sink.termwrite = sink.termwrite + 1; return t0(...) end
-        end
-        local vapi = require("kernel.vfs_api")
-        local stdio = vapi.getStdio and vapi.getStdio()
-        if stdio and stdio.output and stdio.output.write then
-            local s0 = stdio.output.write
-            stdio.output.write = function(...) sink.stdio = sink.stdio + 1; return s0(...) end
-        end
+    ------------------------------------------------------------------
+    -- proc.info 轨迹: 谁在问谁的生死
+    ------------------------------------------------------------------
+    local infoRing = {}
+    local origInfo = process.info
+    process.info = function(pid)
+        local p = origInfo(pid)
+        local cur = process.current()
+        if #infoRing > 24 then table.remove(infoRing, 1) end
+        infoRing[#infoRing + 1] = string.format("by=%s ask=%s -> st=%s",
+            cur and tostring(cur.pid) or "k", tostring(pid), p and tostring(p.status) or "nil")
+        return p
     end
+
     local reports = {}
     kapi.registerSyscall("watch.report", function(who, what)
         reports[#reports + 1] = tostring(who) .. ": " .. tostring(what)
         return true
     end)
-    local infoRing = {}
-    do
-        local origInfo = sc["proc.info"]
-        sc["proc.info"] = function(pid)
-            local cur = require("kernel.process").current()
-            local p = origInfo(pid)
-            if #infoRing > 24 then table.remove(infoRing, 1) end
-            infoRing[#infoRing + 1] = string.format("by=%s ask=%s -> %s st=%s",
-                cur and tostring(cur.pid) or "?", tostring(pid), p and "yes" or "nil",
-                p and tostring(p.status) or "-")
-            return p
-        end
-    end
 
-    local function sinkStat()
-        return string.format("sink[w=%d print=%d term=%d stdio=%d] lock[%s on=%s inproc=%s] rep=%d",
-            sink.write, sink.print, sink.termwrite, sink.stdio, tostring(lock),
-            tostring(lock.preemptOn()), tostring(lock.inProcess()), #reports)
+    ------------------------------------------------------------------
+    -- 状态行 / 屏幕快照
+    ------------------------------------------------------------------
+    local function hseStat()
+        local sc = require("kernel.modules").syscalls()
+        local ok, st = pcall(function() return sc["hse.stat"]() end)
+        if not ok or type(st) ~= "table" then return "hse.stat=?" end
+        return string.format("hse[waiters=%s clock=%.1f]", tostring(st.waiters), tonumber(st.clockMs) or -1)
     end
-
     local function tickStat()
         local ok, p = pcall(require, "kernel.procenv")
         if not ok or not p then return "tick=?" end
         return string.format("tick[calls=%s yields=%s]", tostring(p.tickCalls), tostring(p.tickYields))
     end
-
-    local function hseStat()
-        local ok, st = pcall(function() return sc["hse.stat"]() end)
-        if not ok or type(st) ~= "table" then return "hse.stat=?" end
-        return string.format("hse[waiters=%s clock=%.1f]", tostring(st.waiters), tonumber(st.clockMs) or -1)
+    local function lockStat()
+        return string.format("lock[on=%s depth=%s owner=%s]",
+            tostring(lock.preemptOn()), tostring(lock.depthOf()), tostring(lock.ownerOf()))
     end
-
-    ------------------------------------------------------------------
-    -- 显示路径 bench(回答"为什么 find / 会卡死整机"): 往每个 tty 写 60 行(会滚动/整屏重画),
-    -- 量各自要多久 —— 像素设备(台式机上 tty2 = Tom GPU)每格 2 次外设调用, 一次滚屏近千格。
-    ------------------------------------------------------------------
-    --- 设备路径 bench: `find /` 会 stat /dev 下的节点; 若那一步去枚举所有外设
-    --- (含 modem 枢纽后面的远端驱动器, 每次 disk.* 都是网络往返), 整机就会同步卡住几秒。
-    local devBenchDone = false
-    local function devBench()
-        devBenchDone = true
-        local vfs = require("kernel.vfs_api")
-        local cases = {
-            { "fs.attributes(/dev)", function() return vfs.fs.attributes("/dev") end },
-            { "fs.attributes(/dev/sda)", function() return vfs.fs.attributes("/dev/sda") end },
-            { "fs.attributes(/dev/sda1)", function() return vfs.fs.attributes("/dev/sda1") end },
-            { "fs.list(/dev)", function() return vfs.fs.list("/dev") end },
-            { "fs.list(/sys)", function() return vfs.fs.list("/sys") end },
-            { "blkdev.list()", function() return sc["blkdev.list"]() end },
-            { "blkdev.list() again", function() return sc["blkdev.list"]() end },
-        }
-        for _, c in ipairs(cases) do
-            local t0 = now("utc")
-            local ok, r = pcall(c[2])
-            local n = (type(r) == "table") and #r or -1
-            say(string.format("DEVBENCH %-22s = %5dms ok=%s n=%d", c[1], now("utc") - t0,
-                tostring(ok), n))
-            flush()
-        end
-    end
-
-    --- **输出风暴**回归: 一个进程狂写 stdout(= 控制台 tty)。修好之前, 它会连续几秒不让出 ->
-    --- 别的进程 gap 涨到秒级、它自己被 CC watchdog 杀掉; 修好之后 gap 应该一直很小。
-    local stormDone, stormB = false, false
-    local function stormB()
-        stormB = true
-        local SRC = [[
-local t = os.epoch("utc")
-local f = fs.open("/dev/tty0", "w")
-if not f then return -1 end
-local i = 0
-while os.epoch("utc") - t < 6000 do
-    i = i + 1
-    f:write("stormB line " .. i .. " abcdefghijklmnopqrstuvwxyz\n")
-end
-f:close()
-return i
-]]
-        local pid = process.spawn(SRC, "stormB", 1, 0, 0, { [0] = "stormB" }, nil)
-        say("STORMB (写 /dev/tty0) started pid=" .. tostring(pid))
-        flush()
-    end
-
-    local function storm()
-        stormDone = true
-        local SRC = [[
-local out = io.stdout()
-syscalls["watch.report"]("storm", "stdio=" .. tostring(out) .. " hasWrite=" .. tostring(out ~= nil and out.write ~= nil))
-local t = os.epoch("utc")
-local i = 0
-while os.epoch("utc") - t < 6000 do
-    i = i + 1
-    io.write("storm line " .. i .. " abcdefghijklmnopqrstuvwxyz\n")
-end
-syscalls["watch.report"]("storm", "wrote=" .. i)
-return i
-]]
-        local pid = process.spawn(SRC, "storm", 1, 0, 0, { [0] = "storm" }, nil)
-        say("STORM started pid=" .. tostring(pid))
-        flush()
-    end
-
-    local benchDone = false
-    local function bench()
-        benchDone = true
-        for _, name in ipairs({ "tty0", "tty1", "tty2" }) do
-            local h = tty.open(name)
-            if h then
-                local t0 = now("utc")
-                local ok, err = pcall(function()
-                    for i = 1, 60 do h:write("bench line " .. i .. " abcdefghijklmnopqrstuvwxyz\n") end
-                end)
-                say(string.format("BENCH %s: 60 行 = %dms ok=%s %s", name, now("utc") - t0,
-                    tostring(ok), ok and "" or tostring(err)))
-                flush()
-            else
-                say("BENCH " .. name .. ": 打不开")
-            end
-        end
-    end
-
-    local function interesting(name)
-        return name:find("login") or name:find("sh") or name:find("lua") or name:find("desh")
-    end
-
-    --- 该 tty 的前台进程组(^C/^Z 就是发给它的)。
     local function fgPgrp(name)
-        local ok, process = pcall(require, "kernel.process")
-        if not ok then return "?" end
-        local ok2, p = pcall(process.tcgetpgrp, name)
-        return ok2 and tostring(p) or "?"
+        local ok, p = pcall(process.tcgetpgrp, name)
+        return ok and tostring(p) or "?"
     end
-
     local function ttyState(name)
         local c = tty.get(name)
         if not c then return name .. "=(none)" end
@@ -206,80 +219,309 @@ return i
             tostring(c.raw), tostring(c.reading), #c.lineQueue, #c.inputBuffer, #c.keyBuf,
             fgPgrp(name))
     end
+    local function ttyLine()
+        local out = { "focus=" .. tostring(tty.getFocus()) }
+        for _, n in ipairs(tty.list()) do out[#out + 1] = ttyState(n) end
+        return table.concat(out, " ")
+    end
+    --- 屏幕快照: 内核 grid 里的文本行(真机没法读屏, 但内核有 —— 复现时能看到 login/shell 打了什么)。
+    --- **只打非空行**: 0.0.3 固定打"最后 6 行", 而 login 的提示符在最上面几行, 打出来全是空行,
+    --- 于是"屏幕是空的"这个结论本身是错的(踩过)。
+    local function screenDump(name, want)
+        local c = tty.get(name)
+        if not c or not c.grid then return "screen| " .. name .. "=(no grid)" end
+        local out, shown, blank = {}, 0, 0
+        for r = 1, c.rows do
+            local t = {}
+            for cc = 1, c.cols do
+                local cell = c.grid[(r - 1) * c.cols + cc]
+                t[#t + 1] = cell and cell.ch or " "
+            end
+            local text = table.concat(t):gsub("%s+$", "")
+            if text ~= "" then
+                out[#out + 1] = string.format("screen| %s r%d |%s|", name, r, text)
+                shown = shown + 1
+                if shown >= want then break end
+            else
+                blank = blank + 1
+            end
+        end
+        if shown == 0 then return string.format("screen| %s 全空(%d 行)", name, c.rows) end
+        return table.concat(out, "\n") .. string.format("\n screen| %s 共 %d 行, 空行 %d", name, c.rows, blank)
+    end
+    local function row(p)
+        return string.format("   pid=%-4s %-14s ppid=%-4s pgrp=%-4s sid=%-4s st=%-8s y=%-10s gap=%sms blk= %s",
+            tostring(p.pid), tostring(p.name), tostring(p.ppid), tostring(p.pgrp), tostring(p.sid),
+            tostring(p.status), tostring(lastYield[p.co]),
+            lastAt[p.co] and tostring(now("utc") - lastAt[p.co]) or "-",
+            tostring(coBlk[p.co] or "-"))
+    end
 
-    local alerted = {}
-    local heartbeatAt, lastCheck = nil, nil
+    ------------------------------------------------------------------
+    -- 自动复现 tty1: 直接在 tty 上起一个交互 shell, 敲 `find /`
+    --- 为什么不走 login: 镜像里 /etc/shadow 是 `salt$hash`(hash=自研 33 乘法), 明文密码没人知道,
+    --- 自动复现没法"打字登录"(0.0.2~0.0.5 都卡在这里: 屏幕上是 login 循环, 密码永远不对)。
+    --- 于是直接把 /bin/sh 挂到该 tty 上: **父进程给该 tty 的 login**, 这样新 shell 继承它的会话
+    --- (sid/控制终端)⇒ 作业控制照常开, 与用户手打登录进来的 shell 同构。
+    --- 该 tty 上原来的 login 也在 readLine, 会跟新 shell 抢输入 -> 先把它 SIGSTOP 掉(收尾时 SIGCONT)。
+    ------------------------------------------------------------------
+    local REPRO_TTY = "tty1"
+    --- **默认关**: 合成的 shell 复现不出用户那个 bug(0.0.6/0.0.13 两次都没命中), 而它会在
+    --- tty1 上起 shell、把 login 停掉、往 tty2 狂写 —— 正要做手工复现时会互相打架。
+    --- 要跑它就把 stage 改成 "wait"。
+    local repro = { stage = "off", at = 0, shell = nil, focus0 = nil, login = nil }
+    local function typeText(s)
+        for i = 1, #s do tty.feedInput({ "char", s:sub(i, i) }) end
+    end
+    local function pressEnter()
+        tty.feedInput({ "key", keys.enter })
+    end
+    --- **注入前先清修饰键状态**: tty.feedInput 的 char 分支在 ctrlDown 时直接丢弃字符
+    --- (Ctrl+键 归行规程), 而 ctrlDown 只由 key/key_up 事件改变 —— 只要机器侧还欠一个 key_up,
+    --- 之后注入的每个字符都会被静默丢掉。
+    local function clearMods()
+        for _, nm in ipairs({ "leftCtrl", "rightCtrl", "leftAlt", "rightAlt" }) do
+            local k = keys[nm]
+            if k then tty.routeKey({ "key_up", k }) end
+        end
+    end
+    local function loginOnTty(name)
+        for _, p in ipairs(process.list()) do
+            if tostring(p.name):find("login") and process.ttyFor(p.pid) == name then return p end
+        end
+    end
+    --- 把 /bin/sh 挂到 tty 上(父进程 = 该 tty 的 login, 用于继承会话)。
+    local function spawnShellOnTty(ttyName, parentPid)
+        local vfs = require("kernel.vfs_api")
+        local f = vfs.fs.open("/bin/sh", "r")
+        if not f then return nil, "/bin/sh 打不开" end
+        local src = f:readAll(); f:close()
+        local h, err = tty.open(ttyName)
+        if not h then return nil, "tty.open 失败: " .. tostring(err) end
+        local pid, _, serr = process.spawn(src, "sh", parentPid, 0, 0, { [0] = "/bin/sh" }, {
+            cwd = "/root",
+            stdio = { input = h, output = h },
+            env = { USER = "root", LOGNAME = "root", PATH = "/bin", TERM = "linux",
+                    HOME = "/root", PWD = "/root" },
+        })
+        if not pid then return nil, "spawn 失败: " .. tostring(serr) end
+        return pid
+    end
+    --- 负载: 与 find 同时跑一个狂写 tty 的进程(6 秒)。
+    --- 用户在真机上复现时机器本来就忙(后台服务 + 我那个 storm 自检刚跑完) —— 丢事件这类
+    --- 竞态只在忙的时候才露头, 空载跑 find / 十有八九复现不出来(0.0.6 就是这么白跑一趟的)。
+    local STORM_SRC = [[
+local f = fs.open("/dev/tty2", "w")
+if not f then return -1 end
+local t = os.epoch("utc")
+local i = 0
+while os.epoch("utc") - t < 8000 do
+    i = i + 1
+    f:write("storm line " .. i .. " abcdefghijklmnopqrstuvwxyz\n")
+end
+f:close()
+return i
+]]
+    local function startStorm()
+        local pid = process.spawn(STORM_SRC, "storm", 1, 0, 0, { [0] = "storm" }, nil)
+        return pid
+    end
+
+    --- 复现状态机: 由 check 节流驱动, 绝不阻塞。
+    local function reproStep(t)
+        if repro.stage == "off" or repro.stage == "hit" then return end
+        if t < repro.at then return end
+        if repro.stage == "wait" then
+            local lg = loginOnTty(REPRO_TTY)
+            if not lg then
+                say("REPRO: " .. REPRO_TTY .. " 上没有 login, 跳过自动复现")
+                repro.stage = "off"; flush(); return
+            end
+            repro.login = lg.pid
+            process.kill(lg.pid, 19) -- SIGSTOP: 别跟我抢这个 tty 的输入
+            repro.focus0 = tty.getFocus()
+            tty.setFocus(REPRO_TTY)
+            clearMods()
+            local pid, err = spawnShellOnTty(REPRO_TTY, lg.pid)
+            if not pid then
+                say("REPRO: 起 shell 失败: " .. tostring(err))
+                process.kill(lg.pid, 18) -- SIGCONT
+                repro.stage = "off"; flush(); return
+            end
+            repro.shell = pid
+            repro.storm = startStorm()
+            say(string.format("REPRO t=%d 在 %s 上起了 shell pid=%s(父进程=sid 的 login %s, 已 STOP); 负载 storm pid=%s",
+                t, REPRO_TTY, tostring(pid), tostring(lg.pid), tostring(repro.storm)))
+            repro.stage = "cmd"; repro.at = t + 1500
+        elseif repro.stage == "cmd" then
+            local cur
+            for _, p in ipairs(process.list()) do if p.pid == repro.shell then cur = p end end
+            if not cur then
+                say("REPRO t=" .. t .. " shell 一上来就没了(见 klog)"); repro.stage = "off"; flush(); return
+            end
+            say(string.format("REPRO t=%d shell 活着 y=%s blk= %s", t, tostring(lastYield[cur.co]),
+                tostring(coBlk[cur.co] or "-")))
+            typeText("find /"); pressEnter()
+            say("   已输入 find /: " .. ttyState(REPRO_TTY))
+            repro.stage = "watch"; repro.at = t + 2000; flush()
+        elseif repro.stage == "watch" then
+            repro.at = t + 2000
+            local cur
+            for _, p in ipairs(process.list()) do if p.pid == repro.shell then cur = p end end
+            if not cur then
+                say("REPRO t=" .. t .. " shell 不见了"); repro.stage = "off"; flush(); return
+            end
+            local kids = 0
+            for _, p in ipairs(process.list()) do if p.ppid == repro.shell then kids = kids + 1 end end
+            local site = tostring(coBlk[cur.co] or "-")
+            say(string.format("REPRO t=%d shell pid=%s kids=%d y=%s blk= %s", t, tostring(repro.shell),
+                kids, tostring(lastYield[cur.co]), site))
+            if repro.shellSite ~= site then repro.shellSite = site; repro.siteAt = t end
+            local stable = t - (repro.siteAt or t)
+            if kids == 0 and stable > 3000 and not site:find("tty.lua") then
+                say("REPRO t=" .. t .. " *** 命中: 子进程已退出, 而 shell 不在 tty 读上 ***")
+                say("   " .. ttyLine())
+                for _, nm in ipairs(tty.list()) do say(screenDump(nm, 8)) end
+                if repro.focus0 then tty.setFocus(repro.focus0) end
+                repro.stage = "hit"; flush()
+                return
+            end
+            if kids == 0 and stable > 3000 and site:find("tty.lua") then
+                say("REPRO t=" .. t .. " 没复现: shell 已回到 tty 读(提示符回来了), 收尾")
+                typeText("exit"); pressEnter()
+                if repro.login then process.kill(repro.login, 18) end -- SIGCONT 还 login
+                if repro.focus0 then tty.setFocus(repro.focus0) end
+                repro.stage = "off"; flush()
+            end
+            flush()
+        end
+    end
+
+    ------------------------------------------------------------------
+    -- 采样 / 心跳 / 告警
+    ------------------------------------------------------------------
+    local evNames = {}
+    local lastSite = {}
+    local spinState = {}
+    local lastCheck, sampleAt, heartbeatAt, reproAt = nil, 0, nil, 0
+    local alerted = 0
 
     local function check(t)
-        -- 第一次进来只是记基准(写 `if not lastCheck then return end` 又不赋值 = 永远不干活, 踩过)
-        if not lastCheck then lastCheck = t; heartbeatAt = t; return end
-        if t - lastCheck < 1000 then return end
+        if not lastCheck then lastCheck = t; heartbeatAt = t; repro.at = t + 12000 end
+        if t - lastCheck < 250 then return end
         lastCheck = t
-        local bad = {}
-        for _, p in ipairs(process.list()) do
-            local nm = tostring(p.name)
-            if interesting(nm) then
-                local at = lastAt[p.co]
-                local gap = at and (t - at) or -1
-                if gap > 1200 then
-                    bad[#bad + 1] = { pid = p.pid, name = nm, gap = gap,
-                                      y = lastYield[p.co], p = p }
+        refreshProcCo()
+
+        -- 1) 采样: 交互进程的 yield 现场变了就立刻记一行(不等心跳)
+        if t - sampleAt >= 400 then
+            sampleAt = t
+            for _, p in ipairs(process.list()) do
+                local site = tostring(coBlk[p.co] or "-")
+                if lastSite[p.co] ~= site then
+                    lastSite[p.co] = site
+                    if interactive(p.name) then
+                        say(string.format("T| t=%d pid=%s %s y=%s gap=%sms blk= %s", t, tostring(p.pid),
+                            tostring(p.name), tostring(lastYield[p.co]),
+                            lastAt[p.co] and tostring(t - lastAt[p.co]) or "-", site))
+                        -- **debug.traceback(协程) 在真机上是有效的**(与 getinfo 不同): 它会把
+                        -- 进程自己的栈连同"谁 resume 的它"一起打出来 —— 卡住时这就是决定性证据。
+                        local ok, tb = pcall(debug.traceback, p.co, "", 1)
+                        if ok and tb then
+                            local n = 0
+                            for _, l in ipairs(tb:gmatch("[^\n]+")) do
+                                if n > 0 then say("   tb| " .. l) end
+                                n = n + 1
+                                if n > 6 then break end
+                            end
+                        end
+                    end
                 end
             end
         end
+
+        -- 1b) "睡死在 os.sleep 里"检测: y=timer 且现场一直停在 ROM 的 os.lua 上。
+        --     这是"事件(定时器)被丢"的典型症状 —— 进程一直在被唤醒(gap 小)却回不去。
+        --     不自动判定, 只留一行给读日志的人(配合 info| 轨迹判断是 pollWait 还是死循环)。
+        for _, p in ipairs(process.list()) do
+            local site = tostring(coBlk[p.co] or "-")
+            local y = tostring(lastYield[p.co])
+            local sp = spinState[p.co]
+            if y == "timer" and site:find("os.lua", 1, true) then
+                if not sp or sp.site ~= site then
+                    spinState[p.co] = { site = site, since = t, done = false }
+                elseif not sp.done and t - sp.since > 5000 then
+                    sp.done = true
+                    forceRaw = true
+                    say(string.format("!!SPIN t=%d pid=%s %s y=timer 卡在 %s 已 %dms (gap=%sms)",
+                        t, tostring(p.pid), tostring(p.name), site, t - sp.since,
+                        lastAt[p.co] and tostring(t - lastAt[p.co]) or "-"))
+                    say("   " .. ttyLine())
+                    for _, l in ipairs(infoRing) do say("   info| " .. l) end
+                    flush()
+                end
+            else
+                spinState[p.co] = nil
+            end
+        end
+
+        -- 2) 自动复现
+        if t - reproAt >= 500 then
+            reproAt = t
+            local ok, err = pcall(reproStep, t)
+            if not ok then say("REPRO ERROR: " .. tostring(err)); repro.stage = "off"; flush() end
+        end
+
+        -- 3) 告警: 交互进程超过 1.2s 没被调度(只报一次一个, 免得刷屏)
+        local bad = {}
+        for _, p in ipairs(process.list()) do
+            if interactive(p.name) then
+                local at = lastAt[p.co]
+                local gap = at and (t - at) or -1
+                if gap > 1200 then bad[#bad + 1] = { p = p, gap = gap } end
+            end
+        end
         if #bad > 0 then
-            say(string.format("!! t=%dms 有 %d 个交互进程超过 3s 没被调度:", t, #bad))
+            alerted = alerted + 1
+            say(string.format("!! t=%dms 有 %d 个交互进程超过 1.2s 没被调度 (#%d):", t, #bad, alerted))
             for _, b in ipairs(bad) do
-                say(string.format("   pid=%s %s gap=%dms lastYield=%s", tostring(b.pid), b.name,
-                    b.gap, tostring(b.y)))
+                say(string.format("   pid=%s %s gap=%dms y=%s blk= %s", tostring(b.p.pid),
+                    tostring(b.p.name), b.gap, tostring(lastYield[b.p.co]), tostring(coBlk[b.p.co] or "-")))
+                local okTb, tb = pcall(debug.traceback, b.p.co, "tb", 1)
+                say("   tb(若有效): " .. tostring(okTb and tb or ("error:" .. tostring(tb))))
             end
-            say("   focus=" .. tostring(tty.getFocus()) .. " " .. ttyState("tty0") .. " "
-                .. ttyState("tty1") .. " " .. ttyState("tty2"))
-            for _, p in ipairs(process.list()) do
-                say(string.format("   pid=%-4d %-14s ppid=%-4s pgrp=%-4s sid=%-4s st=%-8s y=%s",
-                    p.pid, tostring(p.name), tostring(p.ppid), tostring(p.pgrp), tostring(p.sid),
-                    tostring(p.status), tostring(lastYield[p.co])))
-            end
-            say("   " .. hseStat())
+            say("   " .. ttyLine())
+            say("   " .. hseStat() .. " " .. tickStat() .. " " .. lockStat())
+            for _, p in ipairs(process.list()) do say(row(p)) end
             local names = {}
             for n, c in pairs(evNames) do names[#names + 1] = n .. "=" .. c end
             table.sort(names)
             say("   EV[ " .. table.concat(names, " ") .. " ]")
             evNames = {}
             for _, l in ipairs(infoRing) do say("   info| " .. l) end
-            flush() -- 立刻落盘, 免得整机真的卡死时丢现场
+            infoRing = {}
+            for _, nm in ipairs(tty.list()) do say(screenDump(nm, 6)) end
+            flush()
         end
-        if not devBenchDone and t - bootT0 > 20000 then devBench() end
-        if not stormDone and t - bootT0 > 15000 then storm() end
-        if not stormB and t - bootT0 > 30000 then stormB() end
-        if not benchDone and t - bootT0 > 45000 then bench() end
+
+        -- 4) 心跳
         if not heartbeatAt or t - heartbeatAt > 5000 then
             heartbeatAt = t
-            say(string.format("t=%dms heartbeat procs=%d bad=%d focus=%s %s %s %s", t, #process.list(),
-                #bad, tostring(tty.getFocus()), ttyState("tty0"), ttyState("tty2"),
-                hseStat() .. " " .. tickStat() .. " " .. sinkStat()))
-            for _, p in ipairs(process.list()) do
-                local at = lastAt[p.co]
-                say(string.format("   pid=%-4d %-14s ppid=%-4s pgrp=%-4s sid=%-4s st=%-8s y=%-10s gap=%sms",
-                    p.pid, tostring(p.name), tostring(p.ppid), tostring(p.pgrp), tostring(p.sid),
-                    tostring(p.status), tostring(lastYield[p.co]),
-                    at and tostring(t - at) or "-"))
-            end
-            -- proc.info 轨迹: 交互 shell 卡在"等子进程"时, 这里能看见它在问谁、内核答的什么状态
+            say(string.format("t=%dms heartbeat procs=%d bad=%d %s", t, #process.list(), #bad, ttyLine()))
+            say("   " .. hseStat() .. " " .. tickStat() .. " " .. lockStat())
+            for _, p in ipairs(process.list()) do say(row(p)) end
             for _, l in ipairs(infoRing) do say("   info| " .. l) end
-            if #infoRing > 0 then infoRing = {} end
+            infoRing = {}
             for _, l in ipairs(reports) do say("   rep| " .. l) end
             reports = {}
             flush()
         end
     end
 
-    local evNames = {}
+    ------------------------------------------------------------------
+    -- 事件钩子: 调度器每轮 pull 一次事件, 借它驱动采样
+    ------------------------------------------------------------------
     local pull = os.pullEventRaw
-    local wrapper
-    local mainCo = coroutine.running()
-    local t0 = now("utc")
-    wrapper = function(...)
+    os.pullEventRaw = function(...)
         if coroutine.running() ~= mainCo then return pull(...) end
         local r = table.pack(pull(...))
         local nm = (type(r[1]) == "string") and r[1] or "?"
@@ -288,8 +530,17 @@ return i
         if not ok then say("CHECK ERROR: " .. tostring(err)); flush() end
         return table.unpack(r, 1, r.n)
     end
-    os.pullEventRaw = wrapper
-    say("watchdog armed (threshold 1200ms, table+info trace every 5s)")
+
+    do
+        local geo = {}
+        for _, n in ipairs(tty.list()) do
+            local c = tty.get(n)
+            geo[#geo + 1] = string.format("%s=%sx%s(%s)", n, tostring(c and c.cols), tostring(c and c.rows),
+                tostring(c and c.mode))
+        end
+        say(string.format("watchdog armed (hook-site trace; lock=%s waker=%s) ttys: %s",
+            tostring(lock.preemptOn()), tostring(lock.wakerReady()), table.concat(geo, " ")))
+    end
     flush()
 end
 

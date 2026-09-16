@@ -164,6 +164,31 @@ local function makeReady(proc, eventArgs)
     ready[#ready + 1] = proc
 end
 
+--- 把一个匹配到的事件交给进程(抢占模式的事件分发)。
+---
+--- **事件一个都不能丢**(真机 bug, 见 for-ai.md「丢事件」): 抢占模式下被唤醒的进程先进可运行队列,
+--- 要等下一次 runReady 才真的跑。这期间如果**它自己的**事件到了, 老代码的
+--- `makeReady(proc, event)` 因为 `inReady` 直接返回 —— 事件被静默丢掉。
+--- 对 `os.sleep` 是致命的: 它等的是**一次性**定时器的 id(`until param == timer`), 事件丢了就
+--- 永远等不到 ⇒ 进程死循环在 os.sleep 里。真机症状: 提示符再也不回来、^C/^D 没反应, 但整机
+--- 正常、别的 tty 照常 —— 而且日志里那个进程一直 y=timer(等定时器)。
+--- 所以: 进程在等事件就立刻交付; 已经在可运行队列里(或正在跑)就先按顺序存起来,
+--- 等它下次真正阻塞时再交付下一个(事件不会因为"来得不是时候"而丢)。
+---@param proc DelinProc
+---@param event table
+local function deliver(proc, event)
+    if proc.parked then
+        proc.parked = false
+        proc.pendingEvent = event
+        makeReady(proc)
+        return
+    end
+    local q = proc.eventQ
+    if not q then q = {}; proc.eventQ = q end
+    q[#q + 1] = event
+    makeReady(proc)
+end
+
 --- 让某个进程重新可运行(内核锁的等待队列唤醒用: 见 kernel/lock.lua)。
 ---@param pid integer
 ---@return boolean
@@ -173,6 +198,7 @@ function scheduler.wakePid(pid)
         if p.pid == pid and not p.dead then
             p.state = "wait"
             p.filter = nil
+            p.parked = false
             makeReady(p)
             return true
         end
@@ -186,11 +212,24 @@ end
 local function park(proc, param)
     if preempt and param == "__preempt" then
         -- 时间片用完: 还是可运行的, 排到队尾。
+        -- **filter 必须清掉**: 它带着"上一次等待"的过滤条件, 不清的话会被不相关的事件匹配上
+        -- (进而把那些事件排进它的队列, 还给它一个不属于它的事件)。false 匹配不了任何事件名。
+        proc.filter = false
+        proc.parked = false
         makeReady(proc)
         return
     end
     proc.filter = param
     proc.state = "wait"
+    -- 跑的时候攒下的事件: 现在它真的在等了, 按顺序交付下一个(见 deliver)。
+    local q = proc.eventQ
+    if q and #q > 0 then
+        proc.pendingEvent = table.remove(q, 1)
+        proc.parked = false
+        makeReady(proc)
+    else
+        proc.parked = true
+    end
 end
 
 --- 向调度器注册一个进程协程。
@@ -320,15 +359,27 @@ local function dispatch(event, kernelTimer)
         elseif event[1] == "terminate" then
             -- terminate 事件: 一律唤醒(与历史行为一致)。
             if preempt then
-                makeReady(proc, event)
+                deliver(proc, event)
             else
                 if resumeProc(proc, i, event, false) == "removed" then step = false end
             end
-        elseif proc.filter == nil or proc.filter == event[1] then
-            -- 裸让出(filter=nil)匹配任意事件(含心跳); 内核计时器不唤醒等 "timer" 的进程。
+        elseif proc.filter == nil then
+            -- **裸让出(filter=nil)匹配任何事件, 包括内核心跳** —— tty 的读写等待都是这一类,
+            -- 空闲期就靠 20Hz 心跳推进(见 run() 里 beatTimer 那段说明)。
+            -- **曾经被合并成一个 `if not kernelTimer`(踩过)**: 于是裸让出的进程不再被心跳唤醒,
+            -- 只要真实事件暂时断档, 全系统就再没人被推进 —— 真机现象是"两个 find 退出后整机
+            -- 所有进程 gap 一路涨到几十秒, 而调度器自己还在转"。
+            if preempt then
+                deliver(proc, event)
+            else
+                if resumeProc(proc, i, event, false) == "removed" then step = false end
+            end
+        elseif proc.filter == event[1] then
+            -- 等具体事件的进程: 只有内核自己的计时器(光标闪烁/调度心跳)**不**算它的唤醒源
+            -- (否则等 "timer" 的进程会被心跳叫醒, 空转一整轮)。
             if not kernelTimer then
                 if preempt then
-                    makeReady(proc, event)
+                    deliver(proc, event)
                 else
                     if resumeProc(proc, i, event, false) == "removed" then step = false end
                 end

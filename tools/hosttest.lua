@@ -3300,6 +3300,53 @@ do
         sched.setPreempt(false)
     end
 
+    -- **事件不能丢**(真机 bug, 见 for-ai.md「丢事件」): 抢占模式下进程被唤醒后先进可运行队列,
+    -- 要等下一次 runReady 才真的跑。这期间如果**它自己的**事件到了, 老代码的
+    -- `makeReady(proc, event)` 因为 `inReady` 直接返回 —— 事件被静默丢掉。
+    -- 对 `os.sleep` 是致命的: 它等的是**一次性**定时器的 id (`until param == timer`), 丢了就永远
+    -- 等不到 ⇒ 进程死循环在 os.sleep 里(真机症状: 提示符再也不回来、整机正常、别的 tty 照常、
+    -- 而且日志里那个进程一直 y=timer)。
+    do
+        sched.setPreempt(true)
+        local log3 = {}
+        local busy, nowMs = true, 0
+        local savedEpoch2 = os.epoch
+        os.epoch = function() if busy then nowMs = nowMs + 1000 end return nowMs end
+        local savedPull2, savedQE = os.pullEventRaw, os.queueEvent
+        -- 调度器在"预算用完了但队列还有人"时会自己塞 delin_slice(见 scheduler.run);
+        -- 宿主里也要有这个口, 否则 run() 直接报 queueEvent 是 nil。
+        os.queueEvent = function(...) evq[#evq + 1] = { ... } end
+        os.pullEventRaw = function()
+            local e = table.remove(evq, 1)
+            if not e then return "terminate" end
+            -- 把"它自己那个定时器"交出去时, 时钟不再推进: 让 runReady 真的轮到进程跑
+            if e[1] == "timer" and e[2] == 7 then busy = false end
+            return (table.unpack or unpack)(e)
+        end
+        -- 模拟 os.sleep(0.05): 只认自己那个一次性定时器 id
+        local co = coroutine.create(function()
+            repeat
+                local name, id = coroutine.yield("timer")
+                if name == "terminate" then log3[#log3 + 1] = "LOST"; return 0 end
+            until id == 7
+            log3[#log3 + 1] = "slept"
+            return 0
+        end)
+        local p = { pid = 41, name = "sleeper", co = co, started = true,
+                    state = "wait", filter = "timer" }
+        p.parked = true
+        sched.addProcess(p)
+        -- 注意 id 不能用 1: 宿主里 os.startTimer 固定返回 1, 那个 id 被调度器当成**内核计时器**
+        -- (闪烁/心跳), 而内核计时器对"等具体事件"的进程是**不算唤醒源**的(见 dispatch)。
+        evq[#evq + 1] = { "timer", 99 } -- 别人的定时器: 先把它叫醒(进可运行队列, 但预算用完 -> 还没跑)
+        evq[#evq + 1] = { "timer", 7 }  -- 它自己那个: 必须**不丢**
+        sched.run()
+        eq(table.concat(log3, ","), "slept",
+           "scheduler(preempt): 已在可运行队列里的进程不会丢自己的事件(os.sleep 不会被饿死)")
+        os.epoch, os.pullEventRaw, os.queueEvent = savedEpoch2, savedPull2, savedQE
+        sched.setPreempt(false)
+    end
+
     -- 判据: preemptOn 跟锁的启用走, inProcess 跟"调度器设的当前进程"走
     do
         local lock = require("kernel.lock")
