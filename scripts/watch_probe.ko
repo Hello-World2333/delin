@@ -1,0 +1,112 @@
+--@name watchprobe
+--@version 0.0.1
+--@deps
+--@description real-machine watchdog: log any interactive process that stops being scheduled (test image only)
+--[[ 用途: 用户复现"提示符不回来"时(整机正常、光标在闪、别的 tty 能用), 自动留下现场 ——
+     不需要用户抄屏, 也不依赖那个卡住的进程自己会写日志。
+
+     判据: 一个交互进程(名字像 sh/login/lua/desh)多久没有被调度器 resume 过。
+       正常: 等输入(裸 pullEvent)每来一个事件就被唤醒 -> gap 几十毫秒;
+             等子进程(pollWait 的 os.sleep(0.05)) -> gap ~50ms。
+       异常: gap 持续 > 3s -> 说明它停在一个永远等不到的东西上(记录它最后 yield 出去的 filter,
+             那个 filter 就是答案: "__lock"=等内核锁 / "hse_wake"=等 HSE 拍 / "timer"=等定时器 /
+             其它字符串=等某个事件 / nil=在裸等)。
+
+     输出: 电脑自带存储的 /watchdog.log(宿主机 /mnt/computer/3/watchdog.log 直接可读),
+     每 30s 一行心跳(证明看门狗自己在跑), 命中异常时把整张进程表 + 每个 tty 的行规程状态写下来。 ]]
+
+local function initModule()
+    local fs = _G.fs
+    local now = os.epoch
+    local process = require("kernel.process")
+    local tty = require("kernel.tty")
+
+    local lines = {}
+    local function say(s) lines[#lines + 1] = s end
+    local function flush()
+        local f = fs.open("/watchdog.log", "w")
+        if f then f.write(table.concat(lines, "\n") .. "\n"); f.close() end
+    end
+
+    -- 记录每个协程最后一次被 resume 的时刻与它上次 yield 出去的 filter
+    local lastAt, lastYield = {}, {}
+    local origResume = coroutine.resume
+    local wrappedResume
+    wrappedResume = function(co, ...)
+        local r = table.pack(origResume(co, ...))
+        lastAt[co] = now("utc")
+        if coroutine.status(co) == "suspended" then lastYield[co] = tostring(r[2]) end
+        return table.unpack(r, 1, r.n)
+    end
+    coroutine.resume = wrappedResume
+
+    local function interesting(name)
+        return name:find("login") or name:find("sh") or name:find("lua") or name:find("desh")
+    end
+
+    local function ttyState(name)
+        local c = tty.get(name)
+        if not c then return name .. "=(none)" end
+        return string.format("%s{raw=%s rd=%s q=%d buf=%d kb=%d}", name,
+            tostring(c.raw), tostring(c.reading), #c.lineQueue, #c.inputBuffer, #c.keyBuf)
+    end
+
+    local alerted = {}
+    local heartbeatAt, lastCheck = nil, nil
+
+    local function check(t)
+        -- 第一次进来只是记基准(写 `if not lastCheck then return end` 又不赋值 = 永远不干活, 踩过)
+        if not lastCheck then lastCheck = t; heartbeatAt = t; return end
+        if t - lastCheck < 1000 then return end
+        lastCheck = t
+        local bad = {}
+        for _, p in ipairs(process.list()) do
+            local nm = tostring(p.name)
+            if interesting(nm) then
+                local at = lastAt[p.co]
+                local gap = at and (t - at) or -1
+                if gap > 3000 then
+                    bad[#bad + 1] = { pid = p.pid, name = nm, gap = gap,
+                                      y = lastYield[p.co], p = p }
+                end
+            end
+        end
+        if #bad > 0 then
+            say(string.format("!! t=%dms 有 %d 个交互进程超过 3s 没被调度:", t, #bad))
+            for _, b in ipairs(bad) do
+                say(string.format("   pid=%s %s gap=%dms lastYield=%s", tostring(b.pid), b.name,
+                    b.gap, tostring(b.y)))
+            end
+            say("   focus=" .. tostring(tty.getFocus()) .. " " .. ttyState("tty0") .. " "
+                .. ttyState("tty1") .. " " .. ttyState("tty2"))
+            for _, p in ipairs(process.list()) do
+                say(string.format("   pid=%-4d %-14s ppid=%-4s pgrp=%-4s sid=%-4s st=%-8s y=%s",
+                    p.pid, tostring(p.name), tostring(p.ppid), tostring(p.pgrp), tostring(p.sid),
+                    tostring(p.status), tostring(lastYield[p.co])))
+            end
+            flush() -- 立刻落盘, 免得整机真的卡死时丢现场
+        end
+        if not heartbeatAt or t - heartbeatAt > 30000 then
+            heartbeatAt = t
+            say(string.format("t=%dms heartbeat: procs=%d bad=%d", t, #process.list(), #bad))
+            flush()
+        end
+    end
+
+    local pull = os.pullEventRaw
+    local wrapper
+    local mainCo = coroutine.running()
+    local t0 = now("utc")
+    wrapper = function(...)
+        if coroutine.running() ~= mainCo then return pull(...) end
+        local r = table.pack(pull(...))
+        local ok, err = pcall(check, now("utc"))
+        if not ok then say("CHECK ERROR: " .. tostring(err)); flush() end
+        return table.unpack(r, 1, r.n)
+    end
+    os.pullEventRaw = wrapper
+    say("watchdog armed (threshold 3000ms, heartbeat 30s)")
+    flush()
+end
+
+return { init = initModule }
