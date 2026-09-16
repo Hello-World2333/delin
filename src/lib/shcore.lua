@@ -3693,6 +3693,14 @@ end
         local buf = ""
         while true do
             F.reapJobs(true) -- 提示符前报告已结束的后台作业(`[1]+ Done cmd`)
+            -- **提示符前先确认自己握着 tty 的前台进程组**: 上一条命令的子进程组若因为竞态没被
+            -- 收回(tcsetpgrp(back) 失败/被打断), shell 一读 tty 就会被投 SIGTTIN 停住 ——
+            -- 停住的 shell 不读键盘, 现象正是"提示符再也不回来、^C/^D 无反应(信号发给前台组=
+            -- 已经死掉的子进程)、但整机与别的 tty 都正常"。POSIX 的作业控制 shell 也是这么做的。
+            if hasJobCtl and ttyName and syscalls["job.tcgetpgrp"] then
+                local fg = syscalls["job.tcgetpgrp"](ttyName)
+                if fg and fg ~= shPg then F.fgTakeBack() end
+            end
             -- 缓冲区为空: PS1(默认 \u@\h:\w\$ ); 跨行未结束: PS2(默认 "> ")。
             if #buf == 0 then cmdCount = cmdCount + 1 end
             local p = (#buf == 0) and vars.PS1 or vars.PS2

@@ -3204,7 +3204,7 @@ do
     os.pullEventRaw = function()
         local e = table.remove(evq, 1)
         if not e then return "terminate" end -- 队列空: 用 terminate 把剩下的进程一次性唤醒
-        return table.unpack(e)
+        return (table.unpack or unpack)(e)
     end
 
     local sched = require("kernel.scheduler")
@@ -3228,6 +3228,41 @@ do
        "scheduler(preempt): 三个进程按时间片轮转(不是跑完一个再跑下一个)")
     eq(a.status, "dead", "scheduler(preempt): 跑完的进程被回收")
     eq(sched.preemptActive(), true, "scheduler(preempt): 开关状态可查")
+
+    -- **被 SIGCONT 恢复的进程必须真的回到正常分发**: 曾经的 bug 是"停止的进程只查信号,
+    -- 拿到 run 就什么都不做", 于是它永远停在 state="stopped" 上再也不被 resume ——
+    -- 真机症状就是"交互 shell 被 SIGTTIN 停过一次后提示符再也不回来, 而整机没坏"。
+    do
+        local log2 = {}
+        local mode = "stop"   -- "stop" -> 一直停; "cont" -> 已 SIGCONT; "dead" -> 收尾
+        local p1 = { pid = 21, name = "stopper" }
+        sched.setSignalCheck(function(pr)
+            if pr ~= p1 then return "run" end
+            if mode == "stop" then return "stop" end
+            if mode == "dead" then return "dead" end
+            return "run"
+        end)
+        sched.setPreempt(true)
+
+        -- ① 停着的进程不该被事件唤醒(事件到了也不跑)
+        local co1 = coroutine.create(function() log2[#log2 + 1] = "ran"; return 0 end)
+        p1.co, p1.started, p1.state, p1.filter = co1, true, "stopped", nil
+        sched.addProcess(p1)
+        evq[#evq + 1] = { "timer", 99 }
+        mode = "dead" -- 让它有机会被回收, run() 才能退出
+        sched.run()
+        eq(#log2, 0, "scheduler: 停住的进程不跑(事件到了也不唤醒)")
+
+        -- ② SIGCONT 之后必须重新被调度并跑完
+        local co2 = coroutine.create(function() log2[#log2 + 1] = "ran"; return 0 end)
+        p1.co, p1.started, p1.state, p1.filter = co2, true, "stopped", nil
+        mode = "cont"
+        sched.addProcess(p1)
+        evq[#evq + 1] = { "timer", 99 }
+        sched.run()
+        eq(table.concat(log2, ","), "ran", "scheduler: 被 SIGCONT 恢复的进程重新被调度")
+        sched.setSignalCheck(nil)
+    end
 
     -- 关掉抢占之后, "__preempt" 不再是"还能跑", 而是一个等不到的事件名(与历史行为一致:
     -- 协作模式下没人会 yield "__preempt", 这里只验开关能关)。

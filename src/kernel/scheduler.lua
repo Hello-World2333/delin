@@ -253,10 +253,26 @@ local function dispatch(event, kernelTimer)
     while i <= #procs do
         local proc = procs[i]
         local step = true -- 本轮结束后下标是否 +1(进程被回收时不加: 后一个会滑到当前下标)
+        local skip = false -- 这一轮不参与正常分发(停止中)
         if proc.state == "stopped" then
-            -- 停止的进程不 resume, 但信号检查仍要走一遍(等 SIGCONT)。
+            -- 停止的进程先看信号: SIGCONT 到了就要**放回正常分发**(它还是活的, 只是被暂停)。
+            -- **曾经的 bug**: 这里只查信号、拿到 "run" 就什么都不做 —— 于是被 SIGCONT 恢复的
+            -- 进程永远停在 state="stopped" 上, 再也不会被 resume。真机症状: 交互 shell 被
+            -- SIGTTIN 停过一次(比如读 tty 时正好不在前台进程组)之后, 提示符再也不回来,
+            -- ^C/^D 都没反应(信号发给了前台组=已经死掉的子进程), 但整机没坏、别的 tty 照常。
             local state = signalCheck and signalCheck(proc) or "run"
-            if state == "dead" then reap(proc, i, "dead", nil); step = false end
+            if state == "dead" then
+                reap(proc, i, "dead", nil)
+                step = false
+                skip = true
+            elseif state == "stop" then
+                skip = true
+            else
+                proc.state = "wait" -- 已被 SIGCONT 恢复: 走下面的正常分发
+            end
+        end
+        if skip then
+            -- 什么都不做(停着的进程不该被事件唤醒)
         elseif not proc.started then
             -- 新进程用空事件启动。
             if preempt then
