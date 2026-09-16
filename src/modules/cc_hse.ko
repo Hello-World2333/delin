@@ -113,6 +113,10 @@ return {
         kapi.registerSyscall("hse.pump", hsePump)
         kapi.registerSyscall("hse.idle", function() lock.pause(function() realSleep(0.05) end) end)
         kapi.registerSyscall("hse.now", function() return clockMs end)
+        -- 诊断: 等待者计数 + 共享时钟 + 泵是否在推进(排查"等着 hse_wake 的进程几十秒不被唤醒")。
+        kapi.registerSyscall("hse.stat", function()
+            return { waiters = waiters, clockMs = clockMs, pumpPid = pumpPid }
+        end)
         kapi.registerSyscall("hse.wait", hseWait)
 
         os.msleep = function(ms)

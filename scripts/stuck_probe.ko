@@ -1,0 +1,226 @@
+--@name stuckprobe
+--@version 0.0.1
+--@deps
+--@description real-machine reproducer+diagnoser: two ttys running `find /` (test image only)
+--[[ 用户复现方法: tty0 跑 `find /`, 再在 tty2 跑 `find /`; 两边跑完后有概率某个 tty 的提示符
+     再也不回来(那个 sh 处于 S、不读 tty; 信号也进不去), 而整机与别的 tty 正常。
+
+     本探针把这件事自动化: 自己往两个 tty 里登录、敲 `find /`、再敲 `echo ... > 文件` 看
+     谁还能响应, 并把"卡住的那个 sh 到底停在什么地方"记下来(每次 resume 记下它 yield 出来的
+     filter —— 这就是它阻塞的原因)。
+
+     结果写电脑自带存储 /stuck.log。 ]]
+
+local function initModule()
+    local fs = _G.fs
+    local now = os.epoch
+    local process = require("kernel.process")
+    local tty = require("kernel.tty")
+    local vfsfs = require("kernel.vfs_api").fs
+    local sc = require("kernel.modules").syscalls()
+    -- 追踪 proc.info: 交互 shell 卡在"等子进程"时, 就看它每秒问的是哪个 pid、内核答的什么状态。
+    local infoRing = {}
+    do
+        local origInfo = sc["proc.info"]
+        sc["proc.info"] = function(pid)
+            local cur = require("kernel.process").current()
+            local p = origInfo(pid)
+            if #infoRing > 40 then table.remove(infoRing, 1) end
+            infoRing[#infoRing + 1] = string.format("by=%s ask=%s -> %s st=%s",
+                cur and tostring(cur.pid) or "?", tostring(pid),
+                p and "yes" or "nil", p and tostring(p.status) or "-")
+            return p
+        end
+    end
+
+    local lines = {}
+    local function say(s) lines[#lines + 1] = s end
+    local function flush()
+        local f = fs.open("/stuck.log", "w")
+        if f then f.write(table.concat(lines, "\n") .. "\n"); f.close() end
+    end
+
+    ------------------------------------------------------------------
+    -- 按键注入(照抄 desh_probe: 可打印字符走 char 事件, 回车走 key + char)
+    ------------------------------------------------------------------
+    local function sendFocus(name, s)
+        if tty.get(name) then tty.setFocus(name) end
+        for i = 1, #s do
+            local ch = s:sub(i, i)
+            if ch == "\n" then
+                tty.routeKey({ "key", keys.enter, false })
+                tty.feedInput({ "char", "\n" })
+            else
+                tty.feedInput({ "char", ch })
+            end
+        end
+    end
+
+    ------------------------------------------------------------------
+    -- 每次 resume 记下被恢复的协程 yield 出来的值 = 它阻塞在什么上
+    ------------------------------------------------------------------
+    local lastYield, lastResumeAt, resumeCount = {}, {}, {}
+    local origResume = coroutine.resume
+    local wrappedResume
+    wrappedResume = function(co, ...)
+        local r = table.pack(origResume(co, ...))
+        local t = now("utc")
+        lastResumeAt[co] = t
+        resumeCount[co] = (resumeCount[co] or 0) + 1
+        if coroutine.status(co) == "suspended" then lastYield[co] = tostring(r[2]) end
+        return table.unpack(r, 1, r.n)
+    end
+    coroutine.resume = wrappedResume
+
+    --- 名字像 shell/login 的进程(交互的那几个)
+    local function interactive()
+        local out = {}
+        for _, p in ipairs(process.list()) do
+            local nm = tostring(p.name)
+            if nm:find("login") or nm:find("sh") or nm:find("lua") then out[#out + 1] = p end
+        end
+        return out
+    end
+
+    --- 每个 tty 的行规程状态(谁在读、缓冲里有什么)
+    local function ttyState(name)
+        local c = tty.get(name)
+        if not c then return name .. "=(none)" end
+        return string.format("%s{raw=%s rd=%s q=%d buf=%d kb=%d}", name,
+            tostring(c.raw), tostring(c.reading), #c.lineQueue, #c.inputBuffer, #c.keyBuf)
+    end
+
+    local function dump(tag)
+        say("---- " .. tag .. " ----")
+        for _, l in ipairs(infoRing) do say("  info| " .. l) end
+        say("focus=" .. tostring(tty.getFocus()) .. " " .. ttyState("tty0") .. " " .. ttyState("tty2"))
+        for _, p in ipairs(process.list()) do
+            say(string.format("  pid=%-4d %-14s ppid=%-4s pgrp=%-4s sid=%-4s st=%-8s y=%s gap=%s n=%s",
+                p.pid, tostring(p.name), tostring(p.ppid), tostring(p.pgrp), tostring(p.sid),
+                tostring(p.status), tostring(lastYield[p.co]),
+                lastResumeAt[p.co] and (tostring(now("utc") - lastResumeAt[p.co]) .. "ms") or "-",
+                tostring(resumeCount[p.co])))
+        end
+    end
+
+    ------------------------------------------------------------------
+    -- 轮次状态机
+    ------------------------------------------------------------------
+    local ROUNDS = 3
+    local round = 0
+    local phase = "login" -- login -> ready -> find -> settle -> probe -> (next round)
+    local phaseAt = nil
+
+    local function startRound(t)
+        round = round + 1
+        say(string.format("=== round %d: 往 tty0/tty2 登录 ===", round))
+        sendFocus("tty0", "root\n12345678\n")
+        sendFocus("tty2", "root\n12345678\n")
+        phase, phaseAt = "ready", t
+    end
+
+    --- 还有 find 在跑吗(命令没跑完时"敲命令没反应"是正常的, 不算复现)
+    local function findsRunning()
+        local n = 0
+        for _, p in ipairs(process.list()) do
+            if tostring(p.name):find("find") then n = n + 1 end
+        end
+        return n
+    end
+
+    --- 卡在等 hse_wake 上的进程(实测能一卡几十秒)
+    local function hseWaiters()
+        local out = {}
+        for co, y in pairs(lastYield) do
+            if y == "hse_wake" then
+                for _, p in ipairs(process.list()) do
+                    if p.co == co then out[#out + 1] = p.pid .. ":" .. tostring(p.name) end
+                end
+            end
+        end
+        return table.concat(out, " ")
+    end
+
+    local function hseStat()
+        local ok, st = pcall(function() return sc["hse.stat"]() end)
+        if not ok or type(st) ~= "table" then return "hse.stat=?" end
+        return string.format("waiters=%s clockMs=%.1f pump=%s", tostring(st.waiters),
+            tonumber(st.clockMs) or -1, tostring(st.pumpPid))
+    end
+
+    local function step(t)
+        if not phaseAt then phaseAt = t end
+        local el = t - phaseAt
+        if phase == "login" then
+            startRound(t)
+        elseif phase == "ready" and el > 3000 then
+            say(string.format("-- round %d: tty0 先跑 find /, 再 tty2 跑 find / --", round))
+            dump("find 之前")
+            sendFocus("tty0", "find /\n")
+            sendFocus("tty2", "find /\n")
+            phase, phaseAt = "settle", t
+        elseif phase == "settle" and findsRunning() > 0 and el < 90000 then
+            -- 还在跑: 每秒记一行(顺便看 hse 等待者)
+            if (el % 3000) < 600 then
+                say(string.format("   ... 还有 %d 个 find 在跑, %s, 等 hse_wake 的: [%s]",
+                    findsRunning(), hseStat(), hseWaiters()))
+            end
+        elseif phase == "settle" and (findsRunning() == 0 or el >= 90000) then
+            -- 两个 find 都应该跑完了: 各敲一条命令看谁还能响应
+            say(string.format("-- round %d: find 都跑完了(%s), 两边各敲一条命令看谁还活着 --", round, hseStat()))
+            sendFocus("tty0", "echo R" .. round .. "T0 > /tmp/alive" .. round .. "0\n")
+            sendFocus("tty2", "echo R" .. round .. "T2 > /tmp/alive" .. round .. "2\n")
+            phase, phaseAt = "probe", t
+        elseif phase == "probe" and el > 4000 then
+            local a0 = vfsfs.exists("/tmp/alive" .. round .. "0")
+            local a2 = vfsfs.exists("/tmp/alive" .. round .. "2")
+            say(string.format("-- round %d 结果: tty0 响应=%s  tty2 响应=%s --", round,
+                tostring(a0), tostring(a2)))
+            if not (a0 and a2) then
+                say("!! **复现**: 有 tty 的 shell 不再响应 —— 现场如下; 等 hse_wake 的: ["
+                    .. hseWaiters() .. "] " .. hseStat())
+                dump("卡住现场")
+            end
+            if round >= ROUNDS then
+                say("== 全部轮次结束 ==")
+                flush()
+                local d = fs.open("/tmp/stuck_done", "w")
+                if d then d.write("done\n"); d.close() end
+                if os.pullEventRaw == wrapper then os.pullEventRaw = pull end
+                if coroutine.resume == wrappedResume then coroutine.resume = origResume end
+                phase = "done"
+                return
+            end
+            phase, phaseAt = "login", t
+        end
+    end
+
+    local pull = os.pullEventRaw
+    local wrapper
+    local mainCo = coroutine.running()
+    local armedAt, lastTick = now("utc"), nil
+    local started = false
+    wrapper = function(...)
+        if coroutine.running() ~= mainCo then return pull(...) end
+        local r = table.pack(pull(...))
+        local t = now("utc")
+        if not started and t - armedAt > 10000 then
+            started = true
+            phaseAt = nil
+            say("== stuck probe armed ==")
+        end
+        if started and phase ~= "done" then
+            if not lastTick or t - lastTick >= 500 then
+                lastTick = t
+                local ok, err = pcall(step, t)
+                if not ok then say("STEP ERROR: " .. tostring(err)); flush(); phase = "done" end
+                flush()
+            end
+        end
+        return table.unpack(r, 1, r.n)
+    end
+    os.pullEventRaw = wrapper
+    say("stuckprobe armed")
+end
+
+return { init = initModule }
