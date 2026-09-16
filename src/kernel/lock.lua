@@ -91,7 +91,12 @@ local waiters = {}
 local waker = nil
 
 --- 调度器注入: 把某进程放回可运行队列(抢占模式下由 wakePid 实现)。
+--- **必须在调度器模块加载完之后注册**(模块加载期引用 `scheduler.wakePid` 拿到的是 nil):
+--- 注册成 nil 的后果是"等着锁的进程永远不会被唤醒", 真机上表现为某个终端提示符再也不回来。
 function lock.setWaker(fn) waker = fn end
+
+--- 唤醒器是否已注册(给宿主回归/自检用; 没注册就等锁 = 必然挂死)。
+function lock.wakerReady() return waker ~= nil end
 
 --- 放锁后唤醒队首(没有等待者就什么都不做)。
 local function wakeNext()
@@ -109,6 +114,10 @@ function lock.enter()
         elseif owner == pid then
             depth = depth + 1
             return
+        end
+        -- 没有唤醒器就必然挂死(排队后没人叫醒) —— fail-fast, 别留一个静默的永久阻塞。
+        if not waker then
+            error("kernel lock: no waker registered, a lock wait would hang forever", 2)
         end
         waiters[#waiters + 1] = pid
         coroutine.yield("__lock") -- 调度器会把它停住, 直到 leave() 唤醒队首
@@ -245,6 +254,7 @@ function lock.disabled()
     lock.yieldIfPending = function() return false end
     lock.setWaker = function() end
     lock.forget = function() end
+    lock.wakerReady = function() return true end
 end
 
 return lock

@@ -15,6 +15,9 @@ local function initModule()
     local fs = _G.fs
     local now = os.epoch
     local process = require("kernel.process")
+    -- 标记文件写在**进程的 VFS 根**(ext2 root)上, 所以判据也要用同一个门面 ——
+    -- 内核上下文里的 _G.fs 是电脑自带存储(CC 原生 fs), 两个不是一个地方(踩过)。
+    local vfsfs = require("kernel.vfs_api").fs
 
     local lines = {}
     local function say(s) lines[#lines + 1] = s end
@@ -41,6 +44,11 @@ end
 local t = os.epoch("utc")
 local n = 0
 while os.epoch("utc") - t < 14000 do n = walk("/", n) end
+-- 跑完了就留个标记(探针据此判断"有没有进程永久停在等锁上")
+if args and args[1] then
+    local f = fs.open("/tmp/sched_mark_" .. args[1], "w")
+    if f then f.write("done\n"); f.close() end
+end
 return n
 ]]
     local SRC_OUT = [[
@@ -55,9 +63,19 @@ return i
 ]]
 
     local loads = {}
-    local function startLoad(src, name)
-        local pid = process.spawn(src, name, 1, 0, 0, { [0] = name }, nil)
+    local function startLoad(src, name, tag)
+        local argv = { [0] = name }
+        if tag then argv[1] = tag end
+        local pid = process.spawn(src, name, 1, 0, 0, argv, nil)
         if pid then loads[#loads + 1] = pid; say("load " .. name .. " pid=" .. pid) end
+    end
+    --- 等锁挂死的探测器: 数一数有几个 walker 留了"跑完"标记
+    local function marks(prefix, n)
+        local got = 0
+        for i = 1, n do
+            if vfsfs.exists("/tmp/sched_mark_" .. prefix .. i) then got = got + 1 end
+        end
+        return got
     end
     local function killLoads()
         local n = 0
@@ -142,8 +160,18 @@ return i
             phase = 3; say("-- 杀 B(" .. killLoads() .. ") / C: 两者一起(= 真正的 find /) --")
             startLoad(SRC_WALK, "schedwalkC1"); startLoad(SRC_OUT, "schedoutC2")
         elseif phase == 3 and el >= 54000 then
-            phase = 4; say("-- 收尾: 杀掉 " .. killLoads() .. " 个负载 --")
-            report(t); flush()
+            phase = 4
+            say("-- D: 3 个走全树的进程同时压(等价两个 tty 同时 find /, 制造内核锁竞争) --")
+            for i = 1, 3 do startLoad(SRC_WALK, "schedwD" .. i, "D" .. i) end
+        elseif phase == 4 and el >= 78000 then
+            phase = 5
+            local got = marks("D", 3)
+            say(string.format("-- D 结束: 跑完的 walker = %d/3 %s --", got,
+                got == 3 and "(没有进程停在等锁上)" or "**有进程没跑完 -> 疑似等锁挂死**"))
+            say("-- 收尾: 杀掉 " .. killLoads() .. " 个负载 --")
+            report(t)
+            say(string.format("-- 收尾后仍在的负载: %d 个(应为 0) --", killLoads()))
+            flush()
             local d = fs.open("/tmp/findprobe_done", "w")
             if d then d.write("done\n"); d.close() end
             if os.pullEventRaw == wrapper then os.pullEventRaw = pull end
@@ -171,10 +199,10 @@ return i
             if lat > latMax then latMax = lat end
             pend = nil
         end
-        if phase < 4 then
+        if phase < 5 then
             local ok, err = pcall(step, now("utc"))
             if not ok then
-                say("STEP ERROR: " .. tostring(err)); flush(); phase = 4
+                say("STEP ERROR: " .. tostring(err)); flush(); phase = 5
                 if os.pullEventRaw == wrapper then os.pullEventRaw = pull end
             end
         end

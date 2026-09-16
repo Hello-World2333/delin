@@ -91,7 +91,6 @@ local SLICE_TICKS = 5000
 local BUDGET_MS = 8
 
 local preempt = false
-lock.setWaker(scheduler.wakePid)
 --- 可运行队列(抢占模式): 等 CPU 的进程按 FIFO 轮转。
 ---@type DelinProc[]
 local ready = {}
@@ -122,22 +121,6 @@ local function setHook(proc, on)
     end
 end
 
---- 让某个进程重新可运行(内核锁的等待队列唤醒用: 见 kernel/lock.lua)。
----@param pid integer
----@return boolean
-function scheduler.wakePid(pid)
-    for i = 1, #procs do
-        local p = procs[i]
-        if p.pid == pid and not p.dead then
-            p.state = "wait"
-            p.filter = nil
-            makeReady(p)
-            return true
-        end
-    end
-    return false
-end
-
 --- 抢占开关(默认关)。开着的时候新老进程都会挂上时间片钩子;
 --- 关掉时把钩子卸干净(不留一点开销量)。
 ---@param on boolean
@@ -145,6 +128,12 @@ end
 function scheduler.setPreempt(on)
     preempt = on and true or false
     lock.setEnabled(preempt) -- 关掉时锁整个不启用(默认路径零额外开销)
+    -- **锁的唤醒器必须在这里注册**: 模块加载期写 `lock.setWaker(scheduler.wakePid)` 时
+    -- wakePid 还没定义(Lua 的表字段此刻是 nil), 于是注册进去的是 nil —— 等着锁的进程
+    -- **永远不会被唤醒**(即使锁已经放了)。真机症状: 两个 tty 同时 `find /` 这种锁竞争一出现,
+    -- 某个 shell/login 就永久停在等锁上, 提示符再也不回来、^C/^D 都没反应(信号只在 resume 前
+    -- 投递), 而整机与别的 tty 都正常。见 kernel/lock.lua 的 setWaker。
+    if preempt then lock.setWaker(scheduler.wakePid) end
     for i = 1, #procs do setHook(procs[i], preempt) end
     if not preempt then ready = {}; sliceInFlight = false end
     return preempt
@@ -160,6 +149,22 @@ local function makeReady(proc, eventArgs)
     proc.inReady = true
     if eventArgs then proc.pendingEvent = eventArgs end
     ready[#ready + 1] = proc
+end
+
+--- 让某个进程重新可运行(内核锁的等待队列唤醒用: 见 kernel/lock.lua)。
+---@param pid integer
+---@return boolean
+function scheduler.wakePid(pid)
+    for i = 1, #procs do
+        local p = procs[i]
+        if p.pid == pid and not p.dead then
+            p.state = "wait"
+            p.filter = nil
+            makeReady(p)
+            return true
+        end
+    end
+    return false
 end
 
 --- 进程让出后的状态判定(两种模式共用)。

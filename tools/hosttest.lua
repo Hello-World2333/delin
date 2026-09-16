@@ -3283,6 +3283,36 @@ do
         sched.setSignalCheck(nil)
     end
 
+    -- **wakePid 必须真的能用**: 它引用的 makeReady 曾经定义在它**后面**(local 声明在文件后面),
+    -- 于是运行时解析成全局 nil —— 真机上等着内核锁的 xargs/nohup 当场死在
+    -- "attempt to call global 'makeReady' (a nil value)"。这里直接调一次, 锁住顺序。
+    do
+        local co = coroutine.create(function() return 0 end)
+        local p2 = { pid = 31, name = "locked", co = co, started = true, state = "wait", filter = "__lock" }
+        sched.setPreempt(true)
+        sched.addProcess(p2)
+        eq(sched.wakePid(31), true, "scheduler: wakePid 能找到等锁的进程")
+        eq(p2.inReady, true, "scheduler: wakePid 把它放回了可运行队列(不是停在 wait 里)")
+        eq(sched.wakePid(9999), false, "scheduler: wakePid 对不存在的 pid 返回 false")
+        -- 让它跑完, 免得留在 ready 队列里影响后面的用例
+        evq[#evq + 1] = { "timer", 98 }
+        sched.run()
+        sched.setPreempt(false)
+    end
+
+    -- **唤醒器注册时机**(真机踩过): 模块加载期写 `lock.setWaker(scheduler.wakePid)` 时
+    -- wakePid 还没定义 -> 注册成 nil -> 等锁的进程永远不被唤醒(两个 tty 同时 `find /` 就中)。
+    do
+        local lock = require("kernel.lock")
+        local saved = lock.wakerReady and lock.wakerReady() or nil
+        lock.setWaker(nil) -- 先清掉, 模拟"没注册"
+        eq(lock.wakerReady(), false, "lock: 没注册唤醒器时 wakerReady=false")
+        sched.setPreempt(true)
+        eq(lock.wakerReady(), true, "scheduler: setPreempt(true) 会注册锁的唤醒器(wakePid 已定义)")
+        sched.setPreempt(false)
+        if saved then lock.setWaker(function() end) end
+    end
+
     -- 关掉抢占之后, "__preempt" 不再是"还能跑", 而是一个等不到的事件名(与历史行为一致:
     -- 协作模式下没人会 yield "__preempt", 这里只验开关能关)。
     sched.setPreempt(false)

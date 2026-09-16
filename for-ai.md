@@ -1238,6 +1238,25 @@ find . -exec echo {} \; | wc -l                 # 同理
 修完复测：`tools/realmachine.py --preempt` 跑到 `verify done`、ng 清单与协作模式逐字节相同、
 **`kern.log` 里 0 条 kernel-lock 错误**（改前同一条路径 7 条）。
 
+**用户实测的坑 4（已修）：两个 tty 同时 `find /` → 命令退出后偶发提示符不回来**。
+两次"顺序写错"（都是我这一版引入的，宿主回归现在都锁住了）：
+
+1. `lock.setWaker(scheduler.wakePid)` 写在**模块加载期**，而 `scheduler.wakePid` 定义在文件后面 ——
+   那一刻它是 nil，于是**注册进去的是 nil**：等着内核锁的进程**永远不会被唤醒**（哪怕锁早就放了）。
+   两个 `find /` 同时跑就会在"阻塞式内核调用（tty 读）醒来重新拿锁"这条路上撞锁 —— 于是某个
+   shell/login 永久停在等锁上：提示符不回来、`^C`/`^D` 没反应（信号只在 resume 前投递）、
+   输入没人读，而整机与别的 tty 都正常。修法：唤醒器改到 `scheduler.setPreempt(true)` 里注册
+   （那时模块已加载完），并在 `lock.enter()` 里 fail-fast：要排队却没有唤醒器就直接报错，
+   不再留一个静默的永久阻塞。
+2. `scheduler.wakePid` 里调用的 `makeReady` 是**定义在它后面的 local** → 运行时解析成全局 nil ——
+   真机上等着内核锁的 `xargs`/`nohup` 当场死在 `attempt to call global 'makeReady' (a nil value)`。
+   修法：把 `wakePid` 挪到 `makeReady` 之后（宿主回归里直接调一次 `sched.wakePid` 锁住顺序）。
+
+**复现与验证（等价于"两个 tty 同时 `find /`"）**：探针 D 段同时起 3 个走全树的进程制造锁竞争，
+每个跑完写一个标记（写在**进程的 VFS 根**上，判据也要用同一个门面 —— 内核上下文里的 `_G.fs` 是
+电脑自带存储，两者不是一个地方，踩过），结果：**跑完 3/3，没有进程停在等锁上**，
+期间事件延迟 14–126ms、tty 读进程每秒被恢复 16–19 次（终端跟手）。
+
 **真机全量自检（同一台机器、同一份内核，只差 `/etc/preempt`）**：`tools/realmachine.py` 与
 `tools/realmachine.py --preempt` 各跑一轮，两边都跑到 `=== verify done ===`，**ng 清单逐字节相同**
 （39 项：`env_sandbox_ran`、`lua_*` 一整片、`killall_echo`、`pgrep_*`、`ps_*_nonempty` —— 这些在
