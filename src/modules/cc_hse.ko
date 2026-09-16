@@ -90,6 +90,12 @@ return {
         end
 
         --- 进程侧等待(跑在调用者的协程里, 所以 pulledEvent 让出的是这个进程)。
+        --- **绝不只等一个唤醒源**: HSE 的拍由泵进程产生, 而泵可能被挂住/丢唤醒
+        --- (真机实测: 进程停在等 hse_wake 上 ~20s 不动, 泵却在正常轮流跑)。所以这里用
+        --- **裸让出**(任何事件都唤醒, 与 tty 的读同一个语义)然后自己重判:
+        ---   * HSE 共享时钟过线  -> 正常路径(亚毫秒精度, 与以前一样);
+        ---   * 自己的墙钟兜底过线(ms+200) -> 退化成 CC 定时器精度, 但**一定会返回**。
+        --- 代价: 睡前会跟着系统事件多醒几次(最多几百微秒的睡眠), 换来"任何情况下不会永久卡住"。
         local function hseWait(ms)
             ensurePump()
             local ticks = math.floor((ms or 0) * FREQ / 1000 + 0.5)
@@ -97,14 +103,14 @@ return {
             local wantMs = ticks * TICK_MS
             local deadline = clockMs + wantMs
             local t0 = os.epoch("utc")
+            -- 兜底只留**一个游戏刻**的余量(CC 定时器的最小粒度就是 50ms): HSE 正常时走不到这里,
+            -- HSE 坏掉时退化成"和没有 HSE 一样"的精度, 而不是固定多等 200ms 把工具拖慢。
+            local fallbackMs = wantMs + 60
             waiters = waiters + 1
             while clockMs < deadline do
-                local ok = pcall(lock.pause, function() return pulledEvent("hse_wake") end)
-                if not ok then break end -- pullEvent 不可用(理论上不会): 走下面的兜底
-                if os.epoch("utc") - t0 > wantMs + 200 then
-                    lock.pause(function() realSleep(math.max(wantMs, 1) / 1000) end)
-                    break
-                end
+                local ok = pcall(lock.pause, pulledEvent)
+                if not ok then break end -- pullEvent 不可用(理论上不会): 直接退化成"睡够就走"
+                if os.epoch("utc") - t0 > fallbackMs then break end
             end
             waiters = waiters - 1
             return true

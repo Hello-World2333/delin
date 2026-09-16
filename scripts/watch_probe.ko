@@ -55,6 +55,12 @@ local function initModule()
         end
     end
 
+    local function hseStat()
+        local ok, st = pcall(function() return sc["hse.stat"]() end)
+        if not ok or type(st) ~= "table" then return "hse.stat=?" end
+        return string.format("hse[waiters=%s clock=%.1f]", tostring(st.waiters), tonumber(st.clockMs) or -1)
+    end
+
     local function interesting(name)
         return name:find("login") or name:find("sh") or name:find("lua") or name:find("desh")
     end
@@ -99,13 +105,14 @@ local function initModule()
                     p.pid, tostring(p.name), tostring(p.ppid), tostring(p.pgrp), tostring(p.sid),
                     tostring(p.status), tostring(lastYield[p.co])))
             end
+            say("   " .. hseStat())
             for _, l in ipairs(infoRing) do say("   info| " .. l) end
             flush() -- 立刻落盘, 免得整机真的卡死时丢现场
         end
         if not heartbeatAt or t - heartbeatAt > 10000 then
             heartbeatAt = t
-            say(string.format("t=%dms heartbeat procs=%d bad=%d focus=%s %s %s", t, #process.list(),
-                #bad, tostring(tty.getFocus()), ttyState("tty0"), ttyState("tty2")))
+            say(string.format("t=%dms heartbeat procs=%d bad=%d focus=%s %s %s %s", t, #process.list(),
+                #bad, tostring(tty.getFocus()), ttyState("tty0"), ttyState("tty2"), hseStat()))
             for _, p in ipairs(process.list()) do
                 local at = lastAt[p.co]
                 say(string.format("   pid=%-4d %-14s ppid=%-4s pgrp=%-4s sid=%-4s st=%-8s y=%-10s gap=%sms",
