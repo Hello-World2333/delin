@@ -3092,13 +3092,32 @@ do
     eq(lock.depthOf(), 0, "lock: leave 后回到 0")
     eq(lock.inKernel(), false, "lock: 放完 inKernel=false")
 
-    -- 被别的 pid 撞上(说明"持锁者被抢占/在持锁时阻塞"了)必须当场报错
-    lock.enter()
-    lock.setCurrent(2)
-    local okE, errE = pcall(lock.enter)
-    ok(not okE and tostring(errE):find("kernel lock held by pid"), "lock: 别的 pid 撞上 -> fail-fast", errE)
-    lock.setCurrent(1)
-    lock.leave()
+    -- 被别的 pid 撞上时**排队等**(而不是当场报错): 持锁者可能在核心里阻塞(实测: systemctl
+    -- 调 init.start 时持锁睡了 50ms), fail-fast 会把别的进程当街打死。
+    do
+        local held = false
+        local co = coroutine.create(function()
+            lock.setCurrent(2)
+            lock.enter()          -- 撞上 pid 1 持锁 -> yield "__lock"
+            held = true
+            lock.leave()
+        end)
+        lock.setWaker(function(pid)
+            eq(pid, 2, "lock: 唤醒的是队首等待者")
+            local okR, y = coroutine.resume(co)
+            ok(okR, "lock: 唤醒后等待者继续跑", y)
+        end)
+        lock.setCurrent(1)
+        lock.enter()
+        local okR, y = coroutine.resume(co)
+        eq(okR, true, "lock: 撞上持锁者时不报错")
+        eq(y, "__lock", "lock: 撞上持锁者时 yield \"__lock\" 排队")
+        eq(held, false, "lock: 还没放锁时等待者拿不到")
+        lock.setCurrent(1)
+        lock.leave()              -- 放锁 -> 唤醒队首(上面的 waker 会 resume)
+        eq(held, true, "lock: 放锁后等待者拿到锁")
+        eq(lock.depthOf(), 0, "lock: 等待者用完也放干净了")
+    end
 
     -- 不平衡的 leave 也是错误
     local okL = pcall(lock.leave)

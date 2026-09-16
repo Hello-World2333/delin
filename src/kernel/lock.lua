@@ -13,9 +13,14 @@
        3. **内核里要阻塞等事件的地方**(tty 读、管道读写、FIFO open)必须先 `lock.pause(fn)`
           放锁再等, 醒来再拿回来。持锁阻塞会把锁焊死(所有进程都进不了内核, 包括读键盘的那个)。
 
-     于是锁的持有者永远是"正在跑的进程", 任何进程被恢复时 `depth` 必然是 0 ——
-     `enter()` 因此**不需要等待队列**, 它不是"撞上就阻塞"的锁, 而是"不该撞上"的锁:
-     真撞上(另一个 pid 持锁)就是不变式被破坏, fail-fast。
+     持锁者可能**在核心里阻塞**(内核里有的是会等事件的地方: `proc.wait`、管道、FIFO、
+     `init.start` 里的 os.sleep...), 也可能在让出点被调度器换下去。所以撞上别人持锁时
+     `enter()` **排队等待**(yield "__lock", 由 `leave()` 唤醒队首), 而不是 fail-fast ——
+     真机上 fail-fast 的代价是"另一个进程当场死掉"(实测: systemctl 调 init.start 时持锁睡了
+     50ms, syslogd 与 3 个 login 全被这条打死)。
+
+     等待不会死锁: 持锁者要么在可运行队列里(会被调度器恢复), 要么在等事件(事件到了就恢复),
+     两种情况都会跑到 `leave()`。进程带着锁死掉时由调度器调 `lock.forget(pid)` 兜底。
 
      将来要细化(比如 ext2 一把、tty 一把、管道一把, 允许持锁也被抢占)时, 把 `enter/leave`
      换成带等待队列的多锁、并让钩子改成"只对不可抢占的锁屏蔽"即可 —— 调度器那边不用动。 ]]
@@ -81,24 +86,55 @@ end
 function lock.depthOf() return depth end
 function lock.ownerOf() return owner end
 
---- 进临界区(可重入)。
+-- 等待队列(FIFO 存 pid) + 唤醒器(由调度器注入: 让某个 pid 重新可运行)。
+local waiters = {}
+local waker = nil
+
+--- 调度器注入: 把某进程放回可运行队列(抢占模式下由 wakePid 实现)。
+function lock.setWaker(fn) waker = fn end
+
+--- 放锁后唤醒队首(没有等待者就什么都不做)。
+local function wakeNext()
+    local pid = table.remove(waiters, 1)
+    if pid and waker then waker(pid) end
+end
+
+--- 进临界区(可重入)。撞上别人持锁时**排队等**(yield "__lock"), 醒来重试。
 function lock.enter()
     local pid = curPid
-    if depth == 0 then
-        depth, owner = 1, pid
-    elseif owner == pid then
-        depth = depth + 1
-    else
-        -- 不变式: 持锁者不可能被抢占(见文件头第 2 条), 所以这里永远不该发生。
-        error(string.format("kernel lock held by pid %s, but pid %s entered", tostring(owner), tostring(pid)), 2)
+    while true do
+        if depth == 0 then
+            depth, owner = 1, pid
+            return
+        elseif owner == pid then
+            depth = depth + 1
+            return
+        end
+        waiters[#waiters + 1] = pid
+        coroutine.yield("__lock") -- 调度器会把它停住, 直到 leave() 唤醒队首
     end
 end
 
---- 出临界区。
+--- 出临界区。放到 0 时唤醒一个等待者(把锁交给它)。
 function lock.leave()
     if depth == 0 then error("kernel lock released while not held", 2) end
     depth = depth - 1
-    if depth == 0 then owner = nil end
+    if depth == 0 then
+        owner = nil
+        wakeNext()
+    end
+end
+
+--- 进程带着锁死了: 强制放锁并唤醒等待者(调度器在回收进程时调用, 兜底防死锁)。
+---@param pid integer
+function lock.forget(pid)
+    if depth ~= 0 and owner == pid then
+        depth, owner = 0, nil
+        wakeNext()
+    end
+    for i = #waiters, 1, -1 do
+        if waiters[i] == pid then table.remove(waiters, i) end
+    end
 end
 
 -- 已经包过的函数(弱键): 重复包装会一层套一层, 而包装器是惰性重建的 —— 漏了这条
@@ -186,8 +222,10 @@ function lock.pause(fn)
     end
     local saved = depth
     depth, owner = 0, nil
+    wakeNext() -- 放锁就把等待者让进来(否则他们白等这一整段)
     local r = pack(pcall(fn))
-    depth, owner = saved, curPid
+    -- 拿回来(可能要让出等: 这段等待期间别人可能已经持锁)
+    for _ = 1, saved do lock.enter() end
     if not r[1] then error(r[2], 0) end
     return unpack(r, 2, r.n)
 end
@@ -205,6 +243,8 @@ function lock.disabled()
     lock.setCurrent = function() end
     lock.markPreempt = function() end
     lock.yieldIfPending = function() return false end
+    lock.setWaker = function() end
+    lock.forget = function() end
 end
 
 return lock

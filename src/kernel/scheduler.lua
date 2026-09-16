@@ -91,6 +91,7 @@ local SLICE_TICKS = 5000
 local BUDGET_MS = 8
 
 local preempt = false
+lock.setWaker(scheduler.wakePid)
 --- 可运行队列(抢占模式): 等 CPU 的进程按 FIFO 轮转。
 ---@type DelinProc[]
 local ready = {}
@@ -119,6 +120,22 @@ local function setHook(proc, on)
     else
         pcall(debug.sethook, proc.co) -- 不传钩子 = 卸掉
     end
+end
+
+--- 让某个进程重新可运行(内核锁的等待队列唤醒用: 见 kernel/lock.lua)。
+---@param pid integer
+---@return boolean
+function scheduler.wakePid(pid)
+    for i = 1, #procs do
+        local p = procs[i]
+        if p.pid == pid and not p.dead then
+            p.state = "wait"
+            p.filter = nil
+            makeReady(p)
+            return true
+        end
+    end
+    return false
 end
 
 --- 抢占开关(默认关)。开着的时候新老进程都会挂上时间片钩子;
@@ -191,6 +208,7 @@ local function reap(proc, i, status, err, result)
     proc.status = status == "error" and "error" or "dead"
     proc.dead = true
     proc.state = "dead"
+    lock.forget(proc.pid) -- 带着内核锁死掉的进程: 强制放锁并唤醒等待者(兜底)
     if proc.onExit then proc.onExit(proc, status, err, result) end
     table.remove(procs, i)
 end

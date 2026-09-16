@@ -1214,6 +1214,30 @@ find . -exec echo {} \; | wc -l                 # 同理
 | 只走全树 | 9–56 ms | 58–79 | 22–39 /s |
 | 两者一起（真正的 `find /`） | **8–51 ms** | 59–80 | **34–36 /s** |
 
+**用户实测的坑 2（已修）：高负载下偶发"命令跑完提示符不回来"**（^C/^D 都没反应、但整机与别的 tty 正常）。
+两个独立问题：
+
+1. **被 SIGCONT 恢复的进程永远回不来**（这条是我自己上一版引入的）：`scheduler.dispatch` 里"停止的进程"
+   分支只查信号，拿到 `"run"`（SIGCONT 已到）就什么都不做 —— 于是进程永远停在 `state="stopped"`
+   上再也 ramesume 不了。交互 shell 被 SIGTTIN 停过一次之后就再也不读键盘 = 提示符不回来，
+   **连 `fg`/`kill -CONT` 都救不回来**（正合用户描述的"^C/^D 无效、别的 tty 照常"）。修法：拿到
+   `"run"` 就把 state 放回 `"wait"`，走正常分发 —— 与改动前的协作式行为一致。
+2. **触发条件**：shell 不在 tty 前台进程组时读 tty 会被投 SIGTTIN 停住（子进程组因竞态没被收回）。
+   现在交互循环**每个提示符前**确认自己握着前台进程组（`tcgetpgrp != shPg` 就 `tcsetpgrp` 收回），
+   POSIX 作业控制 shell 同此。
+
+**用户实测的坑 3（已修）：阻塞式内核调用持锁 → 别的进程被 fail-fast 打死**。
+第一版锁是"撞上就报错"（不变式：持锁者不会被抢占）。真机全量自检抓到了它：`systemctl` 调
+`init.start` 时**持着锁睡了 50ms**（service.lua 里等服务的 `os.sleep`），于是 syslogd + 3 个 login
+同时 enter 失败、全部当场死亡，接着 init 也死在 `kernel lock released while not held` 上
+（`kern.log` 里 7 条）。修法就是用户最早要的那版：**会等待的互斥锁** —— 撞上别人持锁时
+`coroutine.yield("__lock")` 排队，`leave()` 唤醒队首（调度器注入 `waker = scheduler.wakePid`，
+把等待者放回可运行队列），进程带着锁死掉时由调度器 `lock.forget(pid)` 兜底放锁。
+`lock.pause`（放锁等待再拿回）也跟着改成"重新逐个 enter"，不再硬把 depth 写回去。
+
+修完复测：`tools/realmachine.py --preempt` 跑到 `verify done`、ng 清单与协作模式逐字节相同、
+**`kern.log` 里 0 条 kernel-lock 错误**（改前同一条路径 7 条）。
+
 **真机全量自检（同一台机器、同一份内核，只差 `/etc/preempt`）**：`tools/realmachine.py` 与
 `tools/realmachine.py --preempt` 各跑一轮，两边都跑到 `=== verify done ===`，**ng 清单逐字节相同**
 （39 项：`env_sandbox_ran`、`lua_*` 一整片、`killall_echo`、`pgrep_*`、`ps_*_nonempty` —— 这些在
