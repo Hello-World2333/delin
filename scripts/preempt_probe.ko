@@ -1,0 +1,300 @@
+--@name preemptprobe
+--@version 0.0.1
+--@deps
+--@description real-machine feasibility probe for preemptive (debug.sethook) scheduling (test image only)
+--[[ 回答一个问题: **能不能用 debug.sethook 的计数钩子做抢占式调度**(钩子里 coroutine.yield
+     把 CPU 还给调度器), 以及代价有多大。
+
+     结果写到**电脑自带存储**的 /preempt.log(内核态 fs.open, 宿主机在 /mnt/computer/3/preempt.log
+     直接可读) —— 不写 klog: 那条路要经 syslogd 落盘, 而 CC 侧文件在 close/轮转之前宿主机看不到
+     (上一轮就是这么丢的数据)。
+
+     **每个测试是一"步", 每步之间回到事件泵**(所以整机不会被这一串测试拖到 CC 的 watchdog 超时)。 ]]
+
+local function initModule()
+    local fs = _G.fs -- 内核态的真实 CC fs(电脑自带存储), 不是进程那份 VFS 门面
+    local now = os.epoch
+    local dbg = debug
+    local lines = {}
+    local function say(s) lines[#lines + 1] = s end
+
+    local function busy(n)
+        local s = 0
+        for i = 1, n do s = s + i end
+        return s
+    end
+    local function ms(fn)
+        local t0 = now("utc")
+        fn()
+        return now("utc") - t0
+    end
+
+    --- 起一个协程, 让它 mount 一个计数钩子, 然后一路 resume 到底(或到次数上限)。
+    ---@return table {ok, err, resumes, fires, firstYield, status}
+    local function drive(count, body, yieldInHook, maxResume, extra)
+        local fires, resumes, firstYield = 0, 0, "?"
+        local co = coroutine.create(function()
+            if count and count > 0 then
+                dbg.sethook(function()
+                    fires = fires + 1
+                    if yieldInHook then
+                        local v = coroutine.yield("PREEMPT")
+                        if firstYield == "?" then firstYield = tostring(v) end
+                    end
+                end, "", count)
+            end
+            if extra then extra(co) end
+            return body()
+        end)
+        local ok, err = pcall(coroutine.resume, co)
+        resumes = 1
+        while ok and coroutine.status(co) == "suspended" and resumes < (maxResume or 3000) do
+            ok, err = pcall(coroutine.resume, co)
+            resumes = resumes + 1
+        end
+        local status = coroutine.status(co)
+        if count and count > 0 then pcall(dbg.sethook, co) end
+        return { ok = ok, err = err, resumes = resumes, fires = fires,
+                 firstYield = firstYield, status = status }
+    end
+
+    local N = 40000 -- 单步的计算量(别太大: 一整步在事件泵里跑, 要留在 watchdog 之内)
+
+    local steps = {}
+    local function step(fn) steps[#steps + 1] = fn end
+
+    step(function()
+        say("== Delin preempt probe (debug.sethook) ==")
+        say("dbg.sethook=" .. tostring(dbg.sethook) .. " dbg.getinfo=" .. tostring(dbg.getinfo))
+        say("_VERSION=" .. tostring(_VERSION))
+    end)
+
+    -- A) 计数钩子会不会触发 + 能不能在钩子里 yield
+    step(function()
+        local r = drive(1000, function() return busy(N) end, true)
+        say(string.format("A hook+yield: ok=%s err=%s resumes=%d fires=%d firstYield=%s endStatus=%s",
+            tostring(r.ok), tostring(r.err), r.resumes, r.fires, tostring(r.firstYield), tostring(r.status)))
+    end)
+
+    -- B) 只计数不让出的钩子(量钩子本身的成本)
+    step(function()
+        local r = drive(1000, function() return busy(N) end, false)
+        say(string.format("B hook-no-yield: ok=%s err=%s resumes=%d fires=%d",
+            tostring(r.ok), tostring(r.err), r.resumes, r.fires))
+    end)
+
+    -- C) 钩子在 pcall 里 yield(工具里到处是 pcall)
+    step(function()
+        local fires, resumes = 0, 0
+        local co = coroutine.create(function()
+            local ok2, err2 = pcall(function()
+                dbg.sethook(function() fires = fires + 1; coroutine.yield("PREEMPT") end, "", 1000)
+                return busy(N)
+            end)
+            return ok2, err2
+        end)
+        local ok, err = pcall(coroutine.resume, co)
+        resumes = 1
+        while ok and coroutine.status(co) == "suspended" and resumes < 3000 do
+            ok, err = pcall(coroutine.resume, co); resumes = resumes + 1
+        end
+        say(string.format("C yield-in-pcall: ok=%s err=%s resumes=%d fires=%d endStatus=%s",
+            tostring(ok), tostring(err), resumes, fires, tostring(coroutine.status(co))))
+    end)
+
+    -- D) 钩子在 table.sort 比较器里 yield(Java/C 边界; Cobalt 文档说支持跨边界让出)
+    step(function()
+        local fires, resumes = 0, 0
+        local co = coroutine.create(function()
+            local t = {}
+            for i = 1, 2000 do t[i] = (i * 7919) % 2001 end
+            dbg.sethook(function() fires = fires + 1; coroutine.yield("PREEMPT") end, "", 1000)
+            table.sort(t, function(a, b) return a < b end)
+            return t[1]
+        end)
+        local ok, err = pcall(coroutine.resume, co)
+        resumes = 1
+        while ok and coroutine.status(co) == "suspended" and resumes < 3000 do
+            ok, err = pcall(coroutine.resume, co); resumes = resumes + 1
+        end
+        say(string.format("D yield-in-table.sort: ok=%s err=%s resumes=%d fires=%d endStatus=%s",
+            tostring(ok), tostring(err), resumes, fires, tostring(coroutine.status(co))))
+    end)
+
+    -- E) 钩子在 string.gsub 回调里 yield
+    step(function()
+        local fires, resumes = 0, 0
+        local co = coroutine.create(function()
+            local src = ("ab "):rep(1500)
+            dbg.sethook(function() fires = fires + 1; coroutine.yield("PREEMPT") end, "", 1000)
+            local out = src:gsub("a", function() return "A" end)
+            return #out
+        end)
+        local ok, err = pcall(coroutine.resume, co)
+        resumes = 1
+        while ok and coroutine.status(co) == "suspended" and resumes < 3000 do
+            ok, err = pcall(coroutine.resume, co); resumes = resumes + 1
+        end
+        say(string.format("E yield-in-gsub: ok=%s err=%s resumes=%d fires=%d endStatus=%s",
+            tostring(ok), tostring(err), resumes, fires, tostring(coroutine.status(co))))
+    end)
+
+    -- F) 粒度与开销(best-of-5, 取最小值: Cobalt 的 GC/抖动会让单次测量漂很多)
+    do
+        local function bench(count, iters, reps)
+            local best = nil
+            local firesLast = 0
+            for _ = 1, reps do
+                local fires = 0
+                local t = ms(function()
+                    local co = coroutine.create(function()
+                        if count > 0 then dbg.sethook(function() fires = fires + 1 end, "", count) end
+                        return busy(iters)
+                    end)
+                    pcall(coroutine.resume, co)
+                end)
+                if not best or t < best then best = t; firesLast = fires end
+            end
+            return best, firesLast
+        end
+        local base, _ = bench(0, 150000, 5)
+        say(string.format("F base(no hook) iters=150000 best=%dms", base))
+        for _, c in ipairs({ 500, 1000, 2000, 5000, 10000, 20000, 50000 }) do
+            local t, fires = bench(c, 150000, 5)
+            say(string.format("F count=%d best=%dms fires=%d overhead=%.0f%% perFire=%.1fus",
+                c, t, fires, base > 0 and ((t - base) * 100 / base) or -1,
+                fires > 0 and ((t - base) * 1000 / fires) or -1))
+        end
+    end
+
+    -- F2) 让出往返成本: 钩子里 yield + 外面 resume 一次要多久(切一次进程的代价)
+    do
+        for _, c in ipairs({ 2000, 5000, 10000 }) do
+            local best = nil
+            local fires = 0
+            for _ = 1, 3 do
+                fires = 0
+                local t = ms(function()
+                    local co = coroutine.create(function()
+                        dbg.sethook(function()
+                            fires = fires + 1
+                            coroutine.yield("PREEMPT")
+                        end, "", c)
+                        return busy(150000)
+                    end)
+                    local ok = pcall(coroutine.resume, co)
+                    while ok and coroutine.status(co) == "suspended" do
+                        ok = pcall(coroutine.resume, co)
+                    end
+                end)
+                if not best or t < best then best = t end
+            end
+            say(string.format("F2 count=%d best=%dms yields=%d perYield=%.1fus",
+                c, best, fires, fires > 0 and (best * 1000 / fires) or -1))
+        end
+    end
+
+    -- F3) 子协程会不会继承钩子(parallel 这类嵌套协程能不能被抢占)
+    do
+        local fires = 0
+        local co = coroutine.create(function()
+            dbg.sethook(function() fires = fires + 1 end, "", 1000)
+            local inner = coroutine.create(function() return busy(150000) end)
+            coroutine.resume(inner)
+            return 1
+        end)
+        local outerFires = fires
+        pcall(coroutine.resume, co)
+        say(string.format("F3 子协程继承钩子? outerFires=%d afterSubFires=%d (相等=子协程没被钩到)",
+            outerFires, fires))
+    end
+
+    -- H) 线程参数形式是否支持
+    step(function()
+        local ok, err = pcall(function()
+            local co = coroutine.create(function() return busy(1000) end)
+            dbg.sethook(co, function() end, "", 1000)
+        end)
+        say("H sethook(thread,...): ok=" .. tostring(ok) .. " err=" .. tostring(err))
+    end)
+
+    -- I) 行钩子("l")
+    step(function()
+        local fires = 0
+        local co = coroutine.create(function()
+            dbg.sethook(function() fires = fires + 1 end, "l")
+            local s = 0
+            for i = 1, 5000 do s = s + i end
+            return s
+        end)
+        local ok, err = pcall(coroutine.resume, co)
+        say("I line hook: ok=" .. tostring(ok) .. " err=" .. tostring(err) .. " fires=" .. fires)
+    end)
+
+    -- J) 钩子能不能在**内核 syscall 里**yield(抢占安全点的关键: 能不能屏蔽内核态)
+    step(function()
+        local fires, resumes = 0, 0
+        local co = coroutine.create(function()
+            local vfs = require("kernel.vfs_api")
+            dbg.sethook(function() fires = fires + 1; coroutine.yield("PREEMPT") end, "", 500)
+            local n = 0
+            for i = 1, 200 do
+                local names = vfs.fs.list("/bin")
+                if names then n = n + #names end
+                vfs.fs.attributes("/etc/passwd")
+            end
+            return n
+        end)
+        local ok, err = pcall(coroutine.resume, co)
+        resumes = 1
+        while ok and coroutine.status(co) == "suspended" and resumes < 5000 do
+            ok, err = pcall(coroutine.resume, co); resumes = resumes + 1
+        end
+        say(string.format("J yield-in-kernel-syscall: ok=%s err=%s resumes=%d fires=%d endStatus=%s",
+            tostring(ok), tostring(err), resumes, fires, tostring(coroutine.status(co))))
+    end)
+
+    step(function()
+        local f = fs.open("/preempt.log", "w")
+        if f then
+            f.write(table.concat(lines, "\n") .. "\n")
+            f.close()
+        end
+        say("wrote /preempt.log")
+    end)
+
+    -- 一步一个事件泵周期, 而且每一步之后让出去(不把整机拖住)
+    local pull = os.pullEventRaw
+    local wrapper
+    local mainCo = coroutine.running()
+    local armedAt = now("utc")
+    local idx = 1
+    local lastStep = 0
+    local function finish()
+        local f = fs.open("/preempt.log", "w")
+        if f then f.write(table.concat(lines, "\n") .. "\n"); f.close() end
+        local d = fs.open("/tmp/preempt_done", "w")
+        if d then d.write("done\n"); d.close() end
+        if os.pullEventRaw == wrapper then os.pullEventRaw = pull end
+    end
+    wrapper = function(...)
+        if coroutine.running() ~= mainCo then return pull(...) end
+        local ev = table.pack(pull(...))
+        local t = now("utc")
+        if idx <= #steps and t - armedAt > 12000 and t - lastStep > 250 then
+            lastStep = t
+            local fn = steps[idx]
+            idx = idx + 1
+            local ok, err = pcall(fn)
+            if not ok then
+                say("STEP " .. idx .. " ERROR: " .. tostring(err))
+                idx = #steps + 1
+            end
+            if idx > #steps then finish() end
+        end
+        return table.unpack(ev, 1, ev.n)
+    end
+    os.pullEventRaw = wrapper
+end
+
+return { init = initModule }
