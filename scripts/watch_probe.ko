@@ -61,13 +61,14 @@ local function initModule(kapi)
     --- 进程协程集合(co -> "name#pid"): 只有**进程自己的协程**才值得记。
     --- 踩过两次: 主线程/内核事件泵协程的 yield 与钩子也会被记进来(它们跑的是 BIOS→内核→看门狗
     --- 这条链), 于是所有进程的"现场"都长成 watchprobe:63 < bios.lua:42 < delin.lua:1。
-    local procCo = {}
+    local procCo, procByPid = {}, {}
     local function refreshProcCo()
-        local m = {}
+        local m, byPid = {}, {}
         for _, p in ipairs(process.list()) do
             if p.co then m[p.co] = tostring(p.name) .. "#" .. tostring(p.pid) end
+            byPid[p.pid] = p
         end
-        procCo = m
+        procCo, procByPid = m, byPid
     end
     --- 取当前调用链的若干帧(level 1 起)。**pcall 会多一层 C 帧**, 所以不猜帧号, 只按来源过滤。
     local function chain(level, depth)
@@ -139,6 +140,38 @@ local function initModule(kapi)
     end
 
     ------------------------------------------------------------------
+    -- **定时器台账**(回答"事件到底怎么丢的", 不做任何修补):
+    --   * os.startTimer 被谁调用 -> timerOwner[id] = "名字#pid"
+    --   * 事件泵 pull 到 ("timer", id) -> timerFired[id] = 时刻
+    --   * 协程被 resume 时带的第一个参数是 ("timer", id) -> 说明这个 id **真的送到了那个进程**
+    --     (抢占模式下 runReady 就是这么把事件交给进程的, 所以这个观测是准的)
+    -- 于是: "某个进程起的定时器已经 fire 过、却迟迟没有送到它手上" = **事件被丢了**, 而且现场
+    -- (谁起的、什么时候 fire 的、当时它自己在干什么)全都留得下来。
+    local timerOwner, timerStart, timerFired, timerOwnerGot, timerOrder, timerEvAt = {}, {}, {}, {}, {}, {}
+    local lostTimers, lastLostReport = 0, 0
+    local MAXT = 96
+    do
+        local origStartTimer = os.startTimer
+        os.startTimer = function(sec)
+            local tid = origStartTimer(sec)
+            local cur = coroutine.running()
+            local owner = cur and procCo[cur] or nil
+            if owner then
+                timerOwner[tid] = owner
+                timerStart[tid] = now("utc")
+                timerEvAt[tid] = evCount
+                timerOrder[#timerOrder + 1] = tid
+                if #timerOrder > MAXT then
+                    local old = table.remove(timerOrder, 1)
+                    timerOwner[old], timerStart[old], timerFired[old], timerOwnerGot[old] = nil, nil, nil, nil
+                    timerEvAt[old] = nil
+                end
+            end
+            return tid
+        end
+    end
+
+    ------------------------------------------------------------------
     -- 自测: debug.getinfo(线程) 在这台机器上到底行不行(确认 0.0.2 的 tr= 是不是噪音)
     ------------------------------------------------------------------
     local threadInfoOK = "?"
@@ -169,6 +202,13 @@ local function initModule(kapi)
     local origResume = coroutine.resume
     coroutine.resume = function(co, ...)
         resCount = resCount + 1
+        -- 台账: 事件是否被交给了**它自己的主人**(见上面"定时器台账"的说明)
+        if select("#", ...) > 0 then
+            local ev = ...
+            if type(ev) == "table" and ev[1] == "timer" and timerOwner[ev[2]] == procCo[co] then
+                timerOwnerGot[ev[2]] = true
+            end
+        end
         local r = table.pack(origResume(co, ...))
         lastAt[co] = now("utc")
         if coroutine.status(co) == "suspended" then lastYield[co] = tostring(r[2]) end
@@ -212,8 +252,8 @@ local function initModule(kapi)
         if not metricAt then metricAt = t; evCount = 0; resCount = 0; return "act=warming" end
         local dt = (t - metricAt) / 1000
         if dt < 1 then return string.format("act[ev=%d res=%d]", evCount, resCount) end
-        local s = string.format("act[ev/s=%.0f res/s=%.0f sleeps/s=%.0f clk=%d]",
-            evCount / dt, resCount / dt, (sleeps - (lastSleeps or 0)) / dt,
+        local s = string.format("act[ev/s=%.0f res/s=%.0f sleeps/s=%.0f lostT=%d clk=%d]",
+            evCount / dt, resCount / dt, (sleeps - (lastSleeps or 0)) / dt, lostTimers,
             (ok and m and m.wokeByClockCount) and m.wokeByClockCount() or -1)
         lastSleeps = sleeps
         metricAt, evCount, resCount = t, 0, 0
@@ -347,6 +387,72 @@ return i
         return pid
     end
 
+    --- **自动压力**(不需要用户): 制造"抢占 + 事件洪水 + 多个等定时器的进程"——就是真机丢事件
+    --- 那几次的现场条件。跑在 boot 之后 20 秒, 持续 20 秒。
+    local SLEEPER_SRC = [[
+local n, worst = 0, 0
+while os.epoch("utc") - T0 < ROUND_MS do
+    local t0 = os.epoch("utc")
+    os.sleep(SLEEP_S)
+    local dt = os.epoch("utc") - t0
+    n = n + 1
+    if dt > worst then worst = dt end
+    if dt > 400 then
+        syscalls["watch.report"]("sleeper", "late dt=" .. dt .. " at #" .. n)
+    end
+end
+syscalls["watch.report"]("sleeper", "done n=" .. n .. " worst=" .. worst .. "ms")
+return n
+]]
+    local HOG_SRC = [[
+local x, t = 0, os.epoch("utc")
+while os.epoch("utc") - t < 20000 do
+    for i = 1, 200 do x = x + i * 2 end
+end
+return x
+]]
+    --- **声明必须在使用者之前**: stressStep 和 check 都读它们(踩过两次: 局部后声明 -> 读成全局 nil)。
+    local stress = { round = 0, at = 0, pids = {} }
+    local flood = { done = false, at = 0, round = 0, active = false, untilT = 0 }
+
+    --- **队列淹没实验**(证明"事件是怎么丢的"): CC 的 ComputerExecutor.queueEvent 在事件队列
+    --- 满(上限 256)**静默丢弃**, 而定时器/闹钟就是走它投递的。于是: 先让一个进程睡下, 再把队列
+    --- 灌满并**持续压住** ~1.5 秒 —— 这中间到点的定时器事件就会被丢掉, 台账会记 NOFIRE。
+    local floodStep
+    floodStep = function(t)
+        if flood.done or t < flood.at then return end
+        flood.done = true
+        local pid = process.spawn(SLEEPER_SRC, "flood-sleeper", 1, 0, 0, { [0] = "sleeper" },
+            { env = { T0 = tostring(t), ROUND_MS = "1500", SLEEP_S = "0.05" } })
+        say(string.format("FLOOD t=%d: 起了 sleeper pid=%s, 现在把事件队列灌满压住 1.5s", t, tostring(pid)))
+        flood.active, flood.untilT = true, t + 1500
+        flush()
+    end
+
+    --- **多轮**: 丢事件是竞态, 一轮撞不上就多来几轮(用户三次就复现过一次)。
+
+    local ROUNDS, ROUND_MS, SLEEP_S = 5, 12000, 0.02
+    local function stressStep(t)
+        if stress.round >= ROUNDS or t < stress.at then return end
+        stress.round = stress.round + 1
+        stress.at = t + ROUND_MS + 4000
+        local pids = {}
+        for i = 1, 4 do
+            pids[#pids + 1] = process.spawn(SLEEPER_SRC, "sleep" .. i, 1, 0, 0, { [0] = "sleeper" }, {
+                env = { T0 = tostring(t), ROUND_MS = tostring(ROUND_MS), SLEEP_S = tostring(SLEEP_S) },
+            })
+        end
+        pids[#pids + 1] = process.spawn(HOG_SRC, "hog", 1, 0, 0, { [0] = "hog" }, nil)
+        pids[#pids + 1] = startStorm()
+        -- 一次 800 行的 write 到 tty2(Tom 的像素屏): 制造一个**秒级**的持锁不让出段 ——
+        -- 事件泵在这段时间里完全停摆, CC 的事件队列(256)会被定时器事件填满并**静默丢事件**。
+        pids[#pids + 1] = process.spawn(BIGWRITE_SRC, "bigwrite", 1, 0, 0, { [0] = "bigwrite" },
+            { env = { LINES = "800" } })
+        say(string.format("STRESS round %d/%d t=%d: 4 sleepers(%.0fms) + hog + storm pids=%s",
+            stress.round, ROUNDS, t, SLEEP_S * 1000, table.concat(pids, ",")))
+        flush()
+    end
+
     --- 复现状态机: 由 check 节流驱动, 绝不阻塞。
     local function reproStep(t)
         if repro.stage == "off" or repro.stage == "hit" then return end
@@ -423,11 +529,16 @@ return i
     local evNames = {}
     local lastSite = {}
     local spinState = {}
-    local lastCheck, sampleAt, heartbeatAt, reproAt = nil, 0, nil, 0
+    local lastCheck, sampleAt, heartbeatAt, reproAt, stressAt = nil, 0, nil, 0, 0
+    local lastPullAt, lastStallReport = nil, 0
+    local floodAt = 0
     local alerted = 0
 
     local function check(t)
-        if not lastCheck then lastCheck = t; heartbeatAt = t; repro.at = t + 12000 end
+        if not lastCheck then
+            lastCheck = t; heartbeatAt = t; repro.at = t + 12000; stress.at = t + 15000
+            flood.at = t + 90000
+        end
         if t - lastCheck < 250 then return end
         lastCheck = t
         refreshProcCo()
@@ -443,19 +554,68 @@ return i
                         say(string.format("T| t=%d pid=%s %s y=%s gap=%sms blk= %s", t, tostring(p.pid),
                             tostring(p.name), tostring(lastYield[p.co]),
                             lastAt[p.co] and tostring(t - lastAt[p.co]) or "-", site))
-                        -- **debug.traceback(协程) 在真机上是有效的**(与 getinfo 不同): 它会把
-                        -- 进程自己的栈连同"谁 resume 的它"一起打出来 —— 卡住时这就是决定性证据。
-                        local ok, tb = pcall(debug.traceback, p.co, "", 1)
-                        if ok and tb then
-                            local n = 0
-                            for _, l in ipairs(tb:gmatch("[^\n]+")) do
-                                if n > 0 then say("   tb| " .. l) end
-                                n = n + 1
-                                if n > 6 then break end
-                            end
+                    end
+                end
+            end
+        end
+
+        -- 0) 停摆检测: 事件泵长时间没拉到事件 = 内核里有超长的不可中断段(持锁不让出)。
+        --    这正是"CC 事件队列(上限 256)会满 -> 静默丢事件"的温床, 所以单独记一笔。
+        if lastPullAt and t - lastPullAt > 800 and t - lastStallReport > 5000 then
+            lastStallReport = t
+            say(string.format("!!STALL t=%d 距上一个事件 %dms 没拉到任何事件 (ev=%d) %s",
+                t, t - lastPullAt, evCount, lockStat()))
+            say("   " .. ttyLine())
+            for _, p in ipairs(process.list()) do say(row(p)) end
+            flush()
+        end
+
+        -- 1a) 台账判定(两种丢法都要认出来, 现场写清楚):
+        --   * NOFIRE : 起了定时器, 事件**根本没到内核事件泵** -> CC 侧就丢了(队列满/被吞)
+        --   * LOST   : 事件到了事件泵, 但 1 秒内**没送到它主人手上** -> 内核分发环节丢了
+        for _, tid in ipairs(timerOrder) do
+            local startedAt, firedAt = timerStart[tid], timerFired[tid]
+            if lostTimers < 50 and not timerOwnerGot[tid] and not firedAt and startedAt
+                and evCount > (timerEvAt[tid] or 0) + 3 -- 泵在动(排除"整机停摆"的误报)
+                and t - startedAt > 1500 and t - lastLostReport > 1000 then
+                lostTimers = lostTimers + 1
+                lastLostReport = t
+                say(string.format("!!NOFIRE-TIMER t=%d timer=%s owner=%s 起了 %dms 事件都没到泵(泵期间拉了 %d 个事件) = CC 把它丢了",
+                    t, tostring(tid), tostring(timerOwner[tid]), t - startedAt, evCount - (timerEvAt[tid] or 0)))
+                local p = procByPid[tonumber((timerOwner[tid] or "#?"):match("#(%d+)$")) or -1]
+                if p then
+                    say(string.format("   该进程: pid=%s %s y=%s gap=%sms blk= %s", tostring(p.pid),
+                        tostring(p.name), tostring(lastYield[p.co]),
+                        lastAt[p.co] and tostring(t - lastAt[p.co]) or "-", tostring(coBlk[p.co] or "-")))
+                end
+                say("   " .. ttyLine())
+                for _, l in ipairs(infoRing) do say("   info| " .. l) end
+                flush()
+            end
+            if lostTimers < 50 and firedAt and not timerOwnerGot[tid] and t - firedAt > 1000 and t - lastLostReport > 1000 then
+                lostTimers = lostTimers + 1
+                lastLostReport = t
+                local owner = timerOwner[tid]
+                local p = procByPid[tonumber((owner or "#?"):match("#(%d+)$")) or -1]
+                say(string.format("!!LOST-TIMER t=%d timer=%s owner=%s firedAt=%d (+%dms) 仍没送到",
+                    t, tostring(tid), tostring(owner), firedAt, t - firedAt))
+                if p then
+                    say(string.format("   该进程: pid=%s %s y=%s gap=%sms blk= %s", tostring(p.pid),
+                        tostring(p.name), tostring(lastYield[p.co]),
+                        lastAt[p.co] and tostring(t - lastAt[p.co]) or "-", tostring(coBlk[p.co] or "-")))
+                    local ok2, tb = pcall(debug.traceback, p.co, "", 1)
+                    if ok2 and tb then
+                        local n = 0
+                        for _, l in ipairs(tb:gmatch("[^\n]+")) do
+                            if n > 0 then say("   tb| " .. l) end
+                            n = n + 1
+                            if n > 6 then break end
                         end
                     end
                 end
+                say("   " .. ttyLine())
+                for _, l in ipairs(infoRing) do say("   info| " .. l) end
+                flush()
             end
         end
 
@@ -482,6 +642,32 @@ return i
             else
                 spinState[p.co] = nil
             end
+        end
+
+        -- 1b2) 队列淹没: 每次 check 都补 300 个事件, 把 CC 的队列(上限 256)**持续压满** ——
+        --     定时器/闹钟这一段时间里 fire 的话, CC 会静默丢掉它(见 ComputerExecutor.queueEvent)。
+        if flood.active then
+            if t < flood.untilT then
+                for i = 1, 300 do os.queueEvent("flood", i) end
+            else
+                flood.active = false
+                say(string.format("FLOOD end t=%d(队列已放开)", t))
+                flush()
+            end
+        end
+
+        -- 1b3) 队列淹没实验(见 floodStep)
+        if t - floodAt >= 500 then
+            floodAt = t
+            local okF, errF = pcall(floodStep, t)
+            if not okF then say("FLOOD ERROR: " .. tostring(errF)); flood.done = true; flush() end
+        end
+
+        -- 1c) 自动压力(见 stressStep)
+        if t - stressAt >= 500 then
+            stressAt = t
+            local okS, errS = pcall(stressStep, t)
+            if not okS then say("STRESS ERROR: " .. tostring(errS)); stress.done = true; flush() end
         end
 
         -- 2) 自动复现
@@ -546,6 +732,8 @@ return i
         local r = table.pack(pull(...))
         evCount = evCount + 1
         local nm = (type(r[1]) == "string") and r[1] or "?"
+        if nm == "timer" and timerOwner[r[2]] then timerFired[r[2]] = now("utc") end
+        lastPullAt = now("utc")
         evNames[nm] = (evNames[nm] or 0) + 1
         local ok, err = pcall(check, now("utc"))
         if not ok then say("CHECK ERROR: " .. tostring(err)); flush() end
