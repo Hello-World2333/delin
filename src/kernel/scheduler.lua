@@ -128,6 +128,10 @@ end
 function scheduler.setPreempt(on)
     preempt = on and true or false
     lock.setEnabled(preempt) -- 关掉时锁整个不启用(默认路径零额外开销)
+    if klog then
+        klog.kern(string.format("[scheduler] setPreempt(%s) lock=%s enabled=%s",
+            tostring(on), tostring(lock), tostring(lock.preemptOn())))
+    end
     -- **锁的唤醒器必须在这里注册**: 模块加载期写 `lock.setWaker(scheduler.wakePid)` 时
     -- wakePid 还没定义(Lua 的表字段此刻是 nil), 于是注册进去的是 nil —— 等着锁的进程
     -- **永远不会被唤醒**(即使锁已经放了)。真机症状: 两个 tty 同时 `find /` 这种锁竞争一出现,

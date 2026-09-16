@@ -454,15 +454,15 @@ def main():
                 df_write(out, os.path.join(REPO, "scripts/rawtty_test.ko"), moddir + "/rawtty.ko")
                 add_module(out, moddir, "rawtty")
     
-            # 3f6) 抢占式调度原型开关: 根上存在 /etc/preempt 即开(见 src/kernel/boot.lua
-            #      的 setupSchedulerMode 与 for-ai.md「抢占式调度原型」)。
-            if preempt:
-                pf = os.path.join(work, "preempt.flag")
-                with open(pf, "w") as f:
-                    f.write("1\n")
-                df_write(out, pf, "/etc/preempt")
-                print("   injected /etc/preempt -> 抢占式调度原型开启")
-    
+        # 3f6) 抢占式调度原型开关(**clean 与非 clean 都要注入**: 之前只写在 else 分支里,
+        #      于是 `--clean --preempt` 静默变成协作模式 —— 好几轮实验都白跑了)。
+        if preempt:
+            pf = os.path.join(work, "preempt.flag")
+            with open(pf, "w") as f:
+                f.write("1\n")
+            df_write(out, pf, "/etc/preempt")
+            print("   injected /etc/preempt -> 抢占式调度原型开启")
+
             # 3g) 门禁: 注入后镜像仍必须干净, 不把坏镜像带上真机
             p = subprocess.run([FSCK, "-fn", out], capture_output=True, text=True)
             if p.returncode != 0:

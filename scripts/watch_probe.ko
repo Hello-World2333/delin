@@ -15,7 +15,7 @@
      输出: 电脑自带存储的 /watchdog.log(宿主机 /mnt/computer/3/watchdog.log 直接可读),
      每 30s 一行心跳(证明看门狗自己在跑), 命中异常时把整张进程表 + 每个 tty 的行规程状态写下来。 ]]
 
-local function initModule()
+local function initModule(kapi)
     local fs = _G.fs
     local now = os.epoch
     local process = require("kernel.process")
@@ -42,6 +42,30 @@ local function initModule()
     coroutine.resume = wrappedResume
 
     local sc = require("kernel.modules").syscalls()
+    local lock = require("kernel.lock")
+
+    -- 输出出口计数: storm 到底从哪条路把字吐出去的
+    local sink = { write = 0, print = 0, termwrite = 0, stdio = 0 }
+    do
+        local w0, p0 = _G.write, _G.print
+        _G.write = function(...) sink.write = sink.write + 1; return w0(...) end
+        _G.print = function(...) sink.print = sink.print + 1; return p0(...) end
+        if _G.term and _G.term.write then
+            local t0 = _G.term.write
+            _G.term.write = function(...) sink.termwrite = sink.termwrite + 1; return t0(...) end
+        end
+        local vapi = require("kernel.vfs_api")
+        local stdio = vapi.getStdio and vapi.getStdio()
+        if stdio and stdio.output and stdio.output.write then
+            local s0 = stdio.output.write
+            stdio.output.write = function(...) sink.stdio = sink.stdio + 1; return s0(...) end
+        end
+    end
+    local reports = {}
+    kapi.registerSyscall("watch.report", function(who, what)
+        reports[#reports + 1] = tostring(who) .. ": " .. tostring(what)
+        return true
+    end)
     local infoRing = {}
     do
         local origInfo = sc["proc.info"]
@@ -54,6 +78,12 @@ local function initModule()
                 p and tostring(p.status) or "-")
             return p
         end
+    end
+
+    local function sinkStat()
+        return string.format("sink[w=%d print=%d term=%d stdio=%d] lock[%s on=%s inproc=%s] rep=%d",
+            sink.write, sink.print, sink.termwrite, sink.stdio, tostring(lock),
+            tostring(lock.preemptOn()), tostring(lock.inProcess()), #reports)
     end
 
     local function tickStat()
@@ -122,12 +152,15 @@ return i
     local function storm()
         stormDone = true
         local SRC = [[
+local out = io.stdout()
+syscalls["watch.report"]("storm", "stdio=" .. tostring(out) .. " hasWrite=" .. tostring(out ~= nil and out.write ~= nil))
 local t = os.epoch("utc")
 local i = 0
 while os.epoch("utc") - t < 6000 do
     i = i + 1
     io.write("storm line " .. i .. " abcdefghijklmnopqrstuvwxyz\n")
 end
+syscalls["watch.report"]("storm", "wrote=" .. i)
 return i
 ]]
         local pid = process.spawn(SRC, "storm", 1, 0, 0, { [0] = "storm" }, nil)
@@ -210,7 +243,7 @@ return i
             heartbeatAt = t
             say(string.format("t=%dms heartbeat procs=%d bad=%d focus=%s %s %s %s", t, #process.list(),
                 #bad, tostring(tty.getFocus()), ttyState("tty0"), ttyState("tty2"),
-                hseStat() .. " " .. tickStat()))
+                hseStat() .. " " .. tickStat() .. " " .. sinkStat()))
             for _, p in ipairs(process.list()) do
                 local at = lastAt[p.co]
                 say(string.format("   pid=%-4d %-14s ppid=%-4s pgrp=%-4s sid=%-4s st=%-8s y=%-10s gap=%sms",
@@ -221,6 +254,8 @@ return i
             -- proc.info 轨迹: 交互 shell 卡在"等子进程"时, 这里能看见它在问谁、内核答的什么状态
             for _, l in ipairs(infoRing) do say("   info| " .. l) end
             if #infoRing > 0 then infoRing = {} end
+            for _, l in ipairs(reports) do say("   rep| " .. l) end
+            reports = {}
             flush()
         end
     end
