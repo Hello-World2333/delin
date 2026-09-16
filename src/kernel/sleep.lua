@@ -13,16 +13,16 @@
      调度心跳(20Hz)会把我们叫醒, 到点就返回。代价是睡前多醒几次(与 tty 读、cc_hse 的 hseWait
      同款取舍: "绝不只等一个唤醒源"是那里先总结出来的教训)。
 
-     顺带: 走兜底返回说明**确实丢了定时器事件**, 记一笔(klog + 计数器), 下次复现就有硬证据。
+     另外记一个计数: **被墙钟兜底叫醒**的次数。注意它**不是**"丢事件"的证据 —— 调度心跳(20Hz)
+     本来就会先到(裸让出=任何事件都唤醒), 所以正常运行时这个数也在涨; 它只是"兜底路径真的在工作"
+     的证据。真要证明某个事件被丢, 得看进程是不是**再也回不来**(而这条修好了: 它会回来)。
 ]]
-
-local klog = require("kernel.klog")
 
 local M = {}
 
---- 走墙钟兜底醒来的次数(= 丢失的定时器事件次数)。
-local lost = 0
-function M.lostCount() return lost end
+--- 被墙钟兜底叫醒的次数(**不是**丢事件的证据: 心跳先到也会走这条; 见文件头的说明)。
+local wokeByClock = 0
+function M.wokeByClockCount() return wokeByClock end
 
 --- 装上这个 os.sleep。**必须在模块装载之前调用**: kernel module `cc_hse` 在装载期就抓走了
 --- `os.sleep` 的引用(`local realSleep = os.sleep`), 而它的 `os.msleep` 就是我们这里要保护的那条路。
@@ -43,12 +43,7 @@ function M.install()
                 if name == "terminate" then error("Terminated", 0) end
                 if id == tid then got = true end
             until got or realEpoch("utc") >= deadline
-            if not got and left > 0 then
-                lost = lost + 1
-                klog.kern(string.format(
-                    "sleep: timer event lost (waited %dms, lost=%d) -- woke by wall clock instead",
-                    math.floor(sec * 1000), lost))
-            end
+            if not got and left > 0 then wokeByClock = wokeByClock + 1 end
         until realEpoch("utc") >= deadline
     end
 

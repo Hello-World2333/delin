@@ -199,12 +199,12 @@ local function initModule(kapi)
         if not ok or type(st) ~= "table" then return "hse.stat=?" end
         return string.format("hse[waiters=%s clock=%.1f]", tostring(st.waiters), tonumber(st.clockMs) or -1)
     end
-    --- 内核睡眠因**丢失定时器事件**而靠墙钟兜底醒来的次数(见 kernel/sleep.lua)。
-    --- 这个数字 >0 就是"事件真的被丢了"的硬证据。
-    local function lostStat()
+    --- 内核睡眠被**墙钟兜底**叫醒的次数(见 kernel/sleep.lua): 兜底路径确实在工作。
+    --- **不是**丢事件的证据 —— 调度心跳先到也会走这条, 所以正常运行时它也在涨。
+    local function clockStat()
         local ok, m = pcall(require, "kernel.sleep")
-        if not ok or not m or not m.lostCount then return "lost=?" end
-        return "lost=" .. tostring(m.lostCount())
+        if not ok or not m or not m.wokeByClockCount then return "clk=?" end
+        return "clk=" .. tostring(m.wokeByClockCount())
     end
     local function tickStat()
         local ok, p = pcall(require, "kernel.procenv")
@@ -497,7 +497,7 @@ return i
                 say("   tb(若有效): " .. tostring(okTb and tb or ("error:" .. tostring(tb))))
             end
             say("   " .. ttyLine())
-            say("   " .. hseStat() .. " " .. tickStat() .. " " .. lostStat() .. " " .. lockStat())
+            say("   " .. hseStat() .. " " .. tickStat() .. " " .. clockStat() .. " " .. lockStat())
             for _, p in ipairs(process.list()) do say(row(p)) end
             local names = {}
             for n, c in pairs(evNames) do names[#names + 1] = n .. "=" .. c end
@@ -514,7 +514,7 @@ return i
         if not heartbeatAt or t - heartbeatAt > 5000 then
             heartbeatAt = t
             say(string.format("t=%dms heartbeat procs=%d bad=%d %s", t, #process.list(), #bad, ttyLine()))
-            say("   " .. hseStat() .. " " .. tickStat() .. " " .. lostStat() .. " " .. lockStat())
+            say("   " .. hseStat() .. " " .. tickStat() .. " " .. clockStat() .. " " .. lockStat())
             for _, p in ipairs(process.list()) do say(row(p)) end
             for _, l in ipairs(infoRing) do say("   info| " .. l) end
             infoRing = {}

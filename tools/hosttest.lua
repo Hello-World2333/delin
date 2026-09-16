@@ -3362,10 +3362,10 @@ do
             return "timer", 7
         end
         sleepmod.install()
-        local lost0 = sleepmod.lostCount()
+        local woke0 = sleepmod.wokeByClockCount()
         os.sleep(0.2)
         eq(now >= 200, true, "sleep: 定时器事件丢了也按时返回(墙钟兜底)")
-        eq(sleepmod.lostCount(), lost0 + 1, "sleep: 靠兜底醒来会记账(证明确实丢了定时器事件)")
+        eq(sleepmod.wokeByClockCount(), woke0 + 1, "sleep: 靠兜底醒来会记账(兜底路径在工作)")
         -- sleep(0) 必须**仍然让出一次**(CC 语义: 它是让出点, 不少工具靠它)。
         -- 注意要**重新 install**: install 时会把当时的 os.pullEventRaw 抓成引用(故意的 —— 装上之后
         -- 别人再包 os.pullEventRaw 也绕不过它), 所以换桩之后必须重装。
