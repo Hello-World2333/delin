@@ -98,6 +98,16 @@ function lock.setWaker(fn) waker = fn end
 --- 唤醒器是否已注册(给宿主回归/自检用; 没注册就等锁 = 必然挂死)。
 function lock.wakerReady() return waker ~= nil end
 
+--- 抢占模式是否开着(与"这把锁有没有启用"同一个开关)。
+--- 内核里想插"按时间的抢占点"的地方用它判开关 —— 不依赖"当前是否持锁":
+--- 有些路径(例如引导期建好、直接交给进程的 stdio 句柄)绕过了包装器, `inKernel()` 是 false,
+--- 但它们**仍然是在进程上下文里**跑的, 照样需要让出点(真机踩过: 狂写输出的进程因为这条
+--- 完全不让出, 整机停摆 6 秒直到被 CC 的 watchdog 杀掉)。
+function lock.preemptOn() return enabled end
+
+--- 当前是否跑在"某个进程"的上下文里(调度器自己跑在宿主上下文, curPid 是 nil)。
+function lock.inProcess() return curPid ~= nil end
+
 --- 放锁后唤醒队首(没有等待者就什么都不做)。
 local function wakeNext()
     local pid = table.remove(waiters, 1)
@@ -255,6 +265,8 @@ function lock.disabled()
     lock.setWaker = function() end
     lock.forget = function() end
     lock.wakerReady = function() return true end
+    lock.preemptOn = function() return false end
+    lock.inProcess = function() return false end
 end
 
 return lock

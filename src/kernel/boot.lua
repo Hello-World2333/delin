@@ -11,6 +11,7 @@
 
 local scheduler = require("kernel.scheduler")
 local lock      = require("kernel.lock")
+local procenv   = require("kernel.procenv")
 local process    = require("kernel.process")
 local vfs        = require("kernel.vfs")
 local vfs_api    = require("kernel.vfs_api")
@@ -72,7 +73,9 @@ local function setupVfs()
     -- 终端 stdio(io.write/read 兜底)。用冒号调用(io.write 经 stdio.output:write)。
     vfs_api.setStdio(
         { read = function(self, ...) return read(...) end },
-        { write = function(self, s) return write(s) end, writeLine = function(self, s) return write(s .. "\n") end, flush = function(self) return true end }
+        { write = function(self, s) return procenv.preemptWrap(write)(s) end,
+          writeLine = function(self, s) return procenv.preemptWrap(write)(s .. "\n") end,
+          flush = function(self) return true end }
     )
 end
 
@@ -394,7 +397,9 @@ local function bootFromInfo(bi)
     vfs.mount("/", rootBackend, mountInfo)
     vfs_api.setStdio(
         { read = function(self, ...) return read(...) end },
-        { write = function(self, s) return write(s) end, writeLine = function(self, s) return write(s .. "\n") end, flush = function(self) return true end }
+        { write = function(self, s) return procenv.preemptWrap(write)(s) end,
+          writeLine = function(self, s) return procenv.preemptWrap(write)(s .. "\n") end,
+          flush = function(self) return true end }
     )
     -- 用户库(从根的 /etc/passwd 读) + 注册 user.* syscalls
     if not setupUsers() then return end

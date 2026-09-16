@@ -261,11 +261,35 @@ end
 --- **同一行里连续、同色的脏格合并成一次 dev.text**: term 型的 dev.text 是
 --- `term.setCursorPos` + `term.blit` 两条 CC 调用, 逐格画一屏(51x19)要近千次 —— 整行输出
 --- (ls/ps/grep 这类)因此慢得肉眼可见。合并之后一屏通常只剩十几次调用。
+--- 一次 flush 最多画多少个**像素格**。
+--- **为什么必须有这个上限**: 像素设备(台式机 tty2 = Tom GPU 那种)每格是 `rect` + `text` 两条
+--- 外设调用, 而滚一次屏会把整屏(~1000 格)标脏 —— 那是一次**几千次外设调用**的同步阻塞,
+--- 期间整台电脑不让出(外设调用不经过调度器), 别的进程全部停摆。真机实测: 在像素终端里跑
+--- `find /`, 看门狗记到整机每次停 ~7 秒, `find` 自己被 CC 的 watchdog 以
+--- "Too long without yielding" 杀掉(栈顶 rom/apis/peripheral.lua)。term 型设备本来就被
+--- 合并成"每行一次", 一屏十几次调用, 不需要这个上限。
+--- 超出的部分**留到下次 flush**(标脏不丢), 于是重画变成渐进式的: 屏幕先花后齐, 但不再卡住整机。
+local PIXEL_CELL_BUDGET = 96
+
+--- 一次 flush 最多连续干多少毫秒就放锁让出。
+--- **为什么需要**: 像素/监视器的每次 `dev.text` 是**外设调用**(Tom GPU / monitor), 一次几毫秒,
+--- 而它们**不消耗 VM 指令** —— 调度器的计数钩子在这段里根本不会触发。于是"不停往下写"的工具
+--- (比如没有 yieldCheck 的 find/ls) 可以连续几秒不回到调度器: 整机停摆, 直到 CC 的 watchdog
+--- 以 "Too long without yielding" 把它打死(真机实测 7 秒级停摆 + find 被杀)。
+--- 这里补一个**按时间**的抢占点: 每 5ms 放锁让出一次(lock.pause 会先放锁再让出, 醒来拿回)。
+local FLUSH_YIELD_MS = 5
+
 local function flushDirty(ctx)
     local dev = ctx.dev
     local list = ctx.dirtyList
     local n = #list
     local i = 1
+    local drawn = 0 -- 这一轮已经画了多少像素格(只对 pixel 型计数)
+    local cut = nil   -- 预算用尽时的断点: 剩下的格子留到下一轮
+    -- 只有"进程上下文里跑进来的"flush 才能让出(内核自己的 blink tick 在宿主上下文里, 让出会炸)。
+    -- **判据用 inProcess 而不是 inKernel**: 有些句柄(引导期建的 stdio)绕过了包装器, 不持锁,
+    -- 但一样在进程上下文里 —— 用 inKernel 判会漏掉它们, 于是狂写输出的进程完全不让出。
+    local yieldAt = (lock.preemptOn() and lock.inProcess()) and os.epoch("utc") or nil
     while i <= n do
         local idx = list[i]
         local col = (idx - 1) % ctx.cols
@@ -290,6 +314,8 @@ local function flushDirty(ctx)
             -- pixel 型: 逐格画(先用背景色填满整个字格, 再居中绘制字形)。比例字体的字格左右
             -- 留白区不清会残留旧像素; 光标块也因此能整格填充。
             for k = i, j - 1 do
+                if drawn >= PIXEL_CELL_BUDGET then cut = k; break end
+                drawn = drawn + 1
                 local idxk = list[k]
                 local cell = ctx.grid[idxk]
                 local colk = (idxk - 1) % ctx.cols
@@ -307,10 +333,29 @@ local function flushDirty(ctx)
                 dev.text(x, py, cell.ch, PALETTE[fgk], PALETTE[bgk])
             end
         end
+        if cut then break end
+        -- 时间片的抢占点: 外设调用再慢也不占 VM 指令, 计数钩子看不见, 这里自己让。
+        if yieldAt and os.epoch("utc") - yieldAt >= FLUSH_YIELD_MS then
+            yieldAt = os.epoch("utc")
+            if lock.inKernel() then
+                lock.pause(function() coroutine.yield("__preempt") end) -- 持锁: 先放锁再让
+            else
+                coroutine.yield("__preempt")
+            end
+        end
         i = j
     end
-    ctx.dirty = {}
-    ctx.dirtyList = {}
+    if cut then
+        -- 预算用尽: 把**还没画**的格子重新标脏(已经画过的丢掉), 下次 flush 接着画。
+        local rest = {}
+        for k = cut, n do rest[#rest + 1] = list[k] end
+        ctx.dirty = {}
+        ctx.dirtyList = rest
+        for _, idx in ipairs(rest) do ctx.dirty[idx] = true end
+    else
+        ctx.dirty = {}
+        ctx.dirtyList = {}
+    end
     dev.flush()
 end
 

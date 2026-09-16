@@ -3300,6 +3300,21 @@ do
         sched.setPreempt(false)
     end
 
+    -- 判据: preemptOn 跟锁的启用走, inProcess 跟"调度器设的当前进程"走
+    do
+        local lock = require("kernel.lock")
+        lock.setEnabled(false)
+        eq(lock.preemptOn(), false, "lock: 关锁时 preemptOn=false")
+        lock.setEnabled(true)
+        eq(lock.preemptOn(), true, "lock: 开锁时 preemptOn=true")
+        lock.setCurrent(nil)
+        eq(lock.inProcess(), false, "lock: 调度器上下文里 inProcess=false")
+        lock.setCurrent(42)
+        eq(lock.inProcess(), true, "lock: 进程上下文里 inProcess=true")
+        lock.setCurrent(nil)
+        lock.setEnabled(false)
+    end
+
     -- **唤醒器注册时机**(真机踩过): 模块加载期写 `lock.setWaker(scheduler.wakePid)` 时
     -- wakePid 还没定义 -> 注册成 nil -> 等锁的进程永远不被唤醒(两个 tty 同时 `find /` 就中)。
     do

@@ -4,6 +4,9 @@
 local vfs = require("kernel.vfs")
 
 local lock = require("kernel.lock")
+-- 抢占点(可选依赖: 宿主测试台里没有它也要能跑)
+local procenv = nil
+pcall(function() procenv = require("kernel.procenv") end)
 
 local vfsapi = {}
 
@@ -259,8 +262,13 @@ local function makeIoapi(stdio)
         write = function(...)
             local parts = {}
             for i = 1, select("#", ...) do parts[i] = tostring(select(i, ...)) end
-            if stdio.output then return stdio.output:write(table.concat(parts)) end
-            return write(table.concat(parts))
+            local s = table.concat(parts)
+            if stdio.output then return stdio.output:write(s) end
+            -- 兜底: 直接写 CC 终端(内核上下文里的 raw `write`)。**这条路不经过 tty 层**,
+            -- 也就没有任何让出点 —— 狂写输出的进程(工具通常没有 yieldCheck)能让整机停摆到
+            -- CC 的 watchdog 把它打死(真机实测 6 秒级停摆, tick[calls=35588 yields=0] 就是这条路径)。
+            if procenv then procenv.preemptTick() end
+            return write(s)
         end,
         read = function(...)
             if stdio.input then return stdio.input:read(...) end

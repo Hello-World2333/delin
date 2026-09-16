@@ -28,7 +28,34 @@
      其它标准库(string/table/math/coroutine)与 CC 的表一律**浅拷贝**给进程: 进程改了副本
      不会影响内核与其它进程。 ]]
 
+local lock = require("kernel.lock")
+
 local procenv = {}
+
+--- 直连控制台/外设的 CC API(`write`/`term`/`printError`...) 是 Java 调用, **不消耗 VM 指令**,
+--- 于是调度器的计数钩子看不见它们: 一个狂写输出的进程可以连续几秒不让出, 整机停摆到 CC 的
+--- watchdog 把它打死(真机实测: 默认 stdout 就是直接调 CC 的 `write`, 6 秒级停摆)。
+--- 这里给这些入口补一个**按时间**的抢占点(每 ~5ms 让出一次), 只在抢占模式 + 进程上下文里生效。
+local _sliceAt = os.epoch("utc")
+procenv.tickCalls, procenv.tickYields = 0, 0
+local function preemptTick()
+    procenv.tickCalls = procenv.tickCalls + 1
+    if not lock.preemptOn() or not lock.inProcess() then return end
+    local now = os.epoch("utc")
+    if now - _sliceAt < 5 then return end
+    _sliceAt = now
+    procenv.tickYields = procenv.tickYields + 1
+    coroutine.yield("__preempt")
+end
+procenv.preemptTick = preemptTick
+
+--- 包一层抢占点(给 kernel/boot 的默认 stdio 与进程 env 里的直连 API 用)。
+function procenv.preemptWrap(fn)
+    return function(...)
+        preemptTick()
+        return fn(...)
+    end
+end
 
 -- 允许暴露的 CC 全局(宽松部分): 常量表、纯计算、控制台直连、网络、外设类库里不出逃的。
 local ALLOW_CC = {
@@ -93,8 +120,23 @@ function procenv.apply(env)
     env.os = os
     for _, name in ipairs(ALLOW_CC) do
         local v = _G[name]
-        if type(v) == "table" then env[name] = copy(v)
-        elseif v ~= nil then env[name] = v end
+        if type(v) == "table" then
+            local c = copy(v)
+            -- term 的写方法直连控制台, 同样要插抢占点(否则 term.write 狂刷能卡死整机)。
+            if name == "term" then
+                for _, m in ipairs({ "write", "blit", "clear", "setCursorPos", "scroll" }) do
+                    if type(c[m]) == "function" then c[m] = procenv.preemptWrap(c[m]) end
+                end
+            end
+            env[name] = c
+        elseif v ~= nil then
+            -- 标量/函数型 CC 全局: 直连控制台的几个(printError/write)要插抢占点。
+            if (name == "write" or name == "printError") and type(v) == "function" then
+                env[name] = procenv.preemptWrap(v)
+            else
+                env[name] = v
+            end
+        end
     end
     -- 只给 traceback: 别的 debug 一律不给(debug 是逃出沙箱的经典通道: 经 registry 就能摸到
     -- 内核自己的表和 CC 原生 API)。

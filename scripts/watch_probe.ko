@@ -21,6 +21,7 @@ local function initModule()
     local process = require("kernel.process")
     local tty = require("kernel.tty")
 
+    local bootT0 = now("utc") -- 注意: 必须在任何使用它的闭包**之前**声明(否则解析成全局 nil, 踩过)
     local lines = {}
     local function say(s) lines[#lines + 1] = s end
     local function flush()
@@ -55,10 +56,102 @@ local function initModule()
         end
     end
 
+    local function tickStat()
+        local ok, p = pcall(require, "kernel.procenv")
+        if not ok or not p then return "tick=?" end
+        return string.format("tick[calls=%s yields=%s]", tostring(p.tickCalls), tostring(p.tickYields))
+    end
+
     local function hseStat()
         local ok, st = pcall(function() return sc["hse.stat"]() end)
         if not ok or type(st) ~= "table" then return "hse.stat=?" end
         return string.format("hse[waiters=%s clock=%.1f]", tostring(st.waiters), tonumber(st.clockMs) or -1)
+    end
+
+    ------------------------------------------------------------------
+    -- 显示路径 bench(回答"为什么 find / 会卡死整机"): 往每个 tty 写 60 行(会滚动/整屏重画),
+    -- 量各自要多久 —— 像素设备(台式机上 tty2 = Tom GPU)每格 2 次外设调用, 一次滚屏近千格。
+    ------------------------------------------------------------------
+    --- 设备路径 bench: `find /` 会 stat /dev 下的节点; 若那一步去枚举所有外设
+    --- (含 modem 枢纽后面的远端驱动器, 每次 disk.* 都是网络往返), 整机就会同步卡住几秒。
+    local devBenchDone = false
+    local function devBench()
+        devBenchDone = true
+        local vfs = require("kernel.vfs_api")
+        local cases = {
+            { "fs.attributes(/dev)", function() return vfs.fs.attributes("/dev") end },
+            { "fs.attributes(/dev/sda)", function() return vfs.fs.attributes("/dev/sda") end },
+            { "fs.attributes(/dev/sda1)", function() return vfs.fs.attributes("/dev/sda1") end },
+            { "fs.list(/dev)", function() return vfs.fs.list("/dev") end },
+            { "fs.list(/sys)", function() return vfs.fs.list("/sys") end },
+            { "blkdev.list()", function() return sc["blkdev.list"]() end },
+            { "blkdev.list() again", function() return sc["blkdev.list"]() end },
+        }
+        for _, c in ipairs(cases) do
+            local t0 = now("utc")
+            local ok, r = pcall(c[2])
+            local n = (type(r) == "table") and #r or -1
+            say(string.format("DEVBENCH %-22s = %5dms ok=%s n=%d", c[1], now("utc") - t0,
+                tostring(ok), n))
+            flush()
+        end
+    end
+
+    --- **输出风暴**回归: 一个进程狂写 stdout(= 控制台 tty)。修好之前, 它会连续几秒不让出 ->
+    --- 别的进程 gap 涨到秒级、它自己被 CC watchdog 杀掉; 修好之后 gap 应该一直很小。
+    local stormDone, stormB = false, false
+    local function stormB()
+        stormB = true
+        local SRC = [[
+local t = os.epoch("utc")
+local f = fs.open("/dev/tty0", "w")
+if not f then return -1 end
+local i = 0
+while os.epoch("utc") - t < 6000 do
+    i = i + 1
+    f:write("stormB line " .. i .. " abcdefghijklmnopqrstuvwxyz\n")
+end
+f:close()
+return i
+]]
+        local pid = process.spawn(SRC, "stormB", 1, 0, 0, { [0] = "stormB" }, nil)
+        say("STORMB (写 /dev/tty0) started pid=" .. tostring(pid))
+        flush()
+    end
+
+    local function storm()
+        stormDone = true
+        local SRC = [[
+local t = os.epoch("utc")
+local i = 0
+while os.epoch("utc") - t < 6000 do
+    i = i + 1
+    io.write("storm line " .. i .. " abcdefghijklmnopqrstuvwxyz\n")
+end
+return i
+]]
+        local pid = process.spawn(SRC, "storm", 1, 0, 0, { [0] = "storm" }, nil)
+        say("STORM started pid=" .. tostring(pid))
+        flush()
+    end
+
+    local benchDone = false
+    local function bench()
+        benchDone = true
+        for _, name in ipairs({ "tty0", "tty1", "tty2" }) do
+            local h = tty.open(name)
+            if h then
+                local t0 = now("utc")
+                local ok, err = pcall(function()
+                    for i = 1, 60 do h:write("bench line " .. i .. " abcdefghijklmnopqrstuvwxyz\n") end
+                end)
+                say(string.format("BENCH %s: 60 行 = %dms ok=%s %s", name, now("utc") - t0,
+                    tostring(ok), ok and "" or tostring(err)))
+                flush()
+            else
+                say("BENCH " .. name .. ": 打不开")
+            end
+        end
     end
 
     local function interesting(name)
@@ -109,10 +202,15 @@ local function initModule()
             for _, l in ipairs(infoRing) do say("   info| " .. l) end
             flush() -- 立刻落盘, 免得整机真的卡死时丢现场
         end
+        if not devBenchDone and t - bootT0 > 20000 then devBench() end
+        if not stormDone and t - bootT0 > 15000 then storm() end
+        if not stormB and t - bootT0 > 30000 then stormB() end
+        if not benchDone and t - bootT0 > 45000 then bench() end
         if not heartbeatAt or t - heartbeatAt > 5000 then
             heartbeatAt = t
             say(string.format("t=%dms heartbeat procs=%d bad=%d focus=%s %s %s %s", t, #process.list(),
-                #bad, tostring(tty.getFocus()), ttyState("tty0"), ttyState("tty2"), hseStat()))
+                #bad, tostring(tty.getFocus()), ttyState("tty0"), ttyState("tty2"),
+                hseStat() .. " " .. tickStat()))
             for _, p in ipairs(process.list()) do
                 local at = lastAt[p.co]
                 say(string.format("   pid=%-4d %-14s ppid=%-4s pgrp=%-4s sid=%-4s st=%-8s y=%-10s gap=%sms",
