@@ -100,6 +100,13 @@ local ready = {}
 --- **必须记账**: 不记的话, 只要可运行队列一直非空, 每轮都塞一颗, 塞得比处理得快 ->
 --- 队列越积越长, 真实事件(按键!)被埋在后面 —— 实测延迟从 30ms 一路涨到 963ms。
 local sliceInFlight = false
+--- 连续"自己塞事件叫醒自己"的次数上限。
+--- **为什么要有上限**(真机现场): 两个 find 正常退出后, 所有进程再也不被唤醒(gap 涨到 92 秒),
+--- 而调度器仍在转 —— 看着就像"我们自己的 delin_slice 把自己淹了": 可运行队列一直非空 ->
+--- 每轮塞一颗自己的事件 -> 每个 pass 只处理自己的事件 -> 真实事件(定时器/键盘)进不来。
+--- 于是给自旋加一个上限, 到点就做一次**真·阻塞 pull**, 把机会让给真实事件。
+local MAX_SLICE_SPINS = 20
+local sliceSpins = 0
 
 --- 时间片钩子(挂在每个进程协程上): 用完一片就把 CPU 还给调度器。
 --- **持内核锁时不让出** —— 那一段是不可抢占的临界区(见 kernel/lock.lua 的文件头)。
@@ -391,7 +398,8 @@ function scheduler.run()
         if preempt then more = runReady(BUDGET_MS) end
 
         if #procs > 0 then
-            if more and not sliceInFlight then
+            if more and not sliceInFlight and sliceSpins < MAX_SLICE_SPINS then
+                sliceSpins = sliceSpins + 1
                 -- 队列里还有人, 但这一轮的预算用完了: **自己塞一个事件**再 pull ——
                 -- pull 立刻返回(FIFO 里排在真实的键盘/定时器事件之后), 于是既让出了主机
                 -- (CC 的 watchdog 计数归零), 又不会去等一个游戏刻(50ms)而白白饿着可运行的进程。
@@ -400,7 +408,11 @@ function scheduler.run()
                 os.queueEvent("delin_slice")
             end
             event = pack(os.pullEventRaw())
-            if event[1] == "delin_slice" then sliceInFlight = false end
+            if event[1] == "delin_slice" then
+                sliceInFlight = false
+            else
+                sliceSpins = 0 -- 收到真实事件: 重新允许自旋
+            end
             -- 随机数熵源: 每一个系统事件都掺进内核熵池(见 kernel/random.lua)。
             -- 放在这里而不是 routeEvent 里 —— 这是**唯一的事件入口**, 每个事件恰好掺一次,
             -- 与"哪些进程在等什么事件"无关。

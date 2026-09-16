@@ -241,6 +241,11 @@ return i
                     tostring(p.status), tostring(lastYield[p.co])))
             end
             say("   " .. hseStat())
+            local names = {}
+            for n, c in pairs(evNames) do names[#names + 1] = n .. "=" .. c end
+            table.sort(names)
+            say("   EV[ " .. table.concat(names, " ") .. " ]")
+            evNames = {}
             for _, l in ipairs(infoRing) do say("   info| " .. l) end
             flush() -- 立刻落盘, 免得整机真的卡死时丢现场
         end
@@ -269,6 +274,7 @@ return i
         end
     end
 
+    local evNames = {}
     local pull = os.pullEventRaw
     local wrapper
     local mainCo = coroutine.running()
@@ -276,6 +282,8 @@ return i
     wrapper = function(...)
         if coroutine.running() ~= mainCo then return pull(...) end
         local r = table.pack(pull(...))
+        local nm = (type(r[1]) == "string") and r[1] or "?"
+        evNames[nm] = (evNames[nm] or 0) + 1
         local ok, err = pcall(check, now("utc"))
         if not ok then say("CHECK ERROR: " .. tostring(err)); flush() end
         return table.unpack(r, 1, r.n)
