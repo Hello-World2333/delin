@@ -168,6 +168,7 @@ def main():
     desh_check = False
     perf_probe = False
     sched_probe = False
+    preempt = False
     fast = False
     grep_tag = None
     wait_file = None
@@ -192,6 +193,8 @@ def main():
             perf_probe = True
         elif a == "--sched-probe":
             sched_probe = True
+        elif a == "--preempt":
+            preempt = True
         elif a == "--fast":
             fast = True
         elif a == "--grep":
@@ -228,8 +231,8 @@ def main():
     # payload 指纹没变就复用上一轮注入好的镜像: deploy(拷基镜像+铺文件) 与 40 来次 debugfs
     # 注入在迭代工具选项时要几十秒, 而 payload 里往往只变了一个 dist/bin/<tool>。
     # 指纹一变(reused=False)就整段重做, 不会测到旧镜像。--rebuild 可强制重建。
-    fp = payload_fingerprint('clean=%d desh_probe=%d desh_check=%d perf_probe=%d sched_probe=%d printer=%d'
-                         % (clean, desh_probe, desh_check, perf_probe, sched_probe, printer))
+    fp = payload_fingerprint('clean=%d desh_probe=%d desh_check=%d perf_probe=%d sched_probe=%d preempt=%d printer=%d'
+                         % (clean, desh_probe, desh_check, perf_probe, sched_probe, preempt, printer))
     fp_path = os.path.join(WORK, 'payload.fingerprint')
     reused = (not force_rebuild) and os.path.exists(fp_path) and open(fp_path).read().strip() == fp and os.path.exists(os.path.join(WORK, 'root.img'))
     if reused:
@@ -436,6 +439,15 @@ def main():
             if not desh_probe and not desh_check:
                 df_write(out, os.path.join(REPO, "scripts/rawtty_test.ko"), moddir + "/rawtty.ko")
                 add_module(out, moddir, "rawtty")
+    
+            # 3f6) 抢占式调度原型开关: 根上存在 /etc/preempt 即开(见 src/kernel/boot.lua
+            #      的 setupSchedulerMode 与 for-ai.md「抢占式调度原型」)。
+            if preempt:
+                pf = os.path.join(work, "preempt.flag")
+                with open(pf, "w") as f:
+                    f.write("1\n")
+                df_write(out, pf, "/etc/preempt")
+                print("   injected /etc/preempt -> 抢占式调度原型开启")
     
             # 3g) 门禁: 注入后镜像仍必须干净, 不把坏镜像带上真机
             p = subprocess.run([FSCK, "-fn", out], capture_output=True, text=True)
